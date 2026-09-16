@@ -9,12 +9,12 @@ This is integration software for #1045/#1046, **not** Unikraft image or Azure
 performance qualification. The native ELF/EFI application and image/boot/hardware
 acceptance remain [cataggar/unikraft#156](https://github.com/cataggar/unikraft/issues/156).
 
-**Measurement is currently fail-closed with `LifecycleProtocolPending`.** The
-host-owned protocol must bind the same full-snapshot/reset-outside-timing policy
-into both targets' requests, receipts and observed results before this producer
-can publish steady-invocation measurements. A prose-only reset description is not
-enough. No unknown v1 field or ordinary steady-state record is emitted as a
-substitute. Correctness checks and private failure evidence remain runnable.
+Measurement uses the host-owned **version 2 / `wamr-embedding-v2`** contract.
+The exact `snapshot-replay` lifecycle must match the request, target and independent
+image receipt. Snapshot creation, each reset and each invocation have separate
+actual timings. Version 1 and warm-instance lifecycle declarations are rejected;
+restored-state replay is never published as warm steady state. Qualified deployment
+inputs remain mandatory; enabling this software does not qualify hardware or images.
 
 ## Build and correctness checks
 
@@ -43,10 +43,13 @@ No receipts, Azure names, image identities, or performance results are generated
 by this mode.
 
 The arguments are `--check ARTIFACT ITERATIONS TOTAL_INVOCATIONS WORKLOAD`.
-An optional final `closing-clock`, `backwards-clock` or `report-oom` injects a
-**correctness-only negative-test failure**, never a measurement capability.
-These modes execute the real guest and verify that private capture retains its
-actual terminal/output when the closing timer or later report allocation fails.
+An optional final fault name injects a **correctness-only negative-test failure**,
+never a measurement capability. Supported names are `opening-clock`,
+`closing-clock`, `backwards-clock`, `report-oom`, `output-limit`, `reset-clock`,
+`reset-backwards-clock`, `reset-protect`, `steady-opening-clock`,
+`steady-closing-clock` and `steady-output-limit`. They exercise real guest calls,
+capture buffers and protection transitions. An opening-clock failure prevents the
+call; a closing-clock or later allocation failure retains the actual terminal/output.
 Iteration counts affect CoreMark only. Tests use 100 iterations and independently
 check `seedcrc=e9f5`, `crclist=e714`, `crcmatrix=1fd7`, `crcstate=8e3a`, and
 repeatable `crcfinal=988c` in both variants. These short runs intentionally retain
@@ -83,24 +86,48 @@ clock is used for CoreMark. These clocks are not guest-instruction counters.
   A failed staged instantiation is not retryable: its owner must call `deinit`.
   Non-timing options are frozen at load and must match at instantiation; a later
   stage cannot silently change memory/table/CPU or subsequently added budget caps.
+* **Lifecycle setup:** snapshot construction after successful instantiation and
+  module start, before the first invocation, including allocation and copying.
 * **First invocation:** export lookup and `_start` call through the terminal
   returned/proc_exit/trap/host-error outcome, including output callbacks.
-* **Steady invocations:** the **same instance and native code** are called again
+* **Repeated invocations:** the **same instance and native code** are called again
   after a full initialized-state snapshot reset. This is not an assumption of
   libc command reentrancy and is not warm-libc-state reuse.
 
-The reusable `src/bench/native_runner.zig` snapshots initialized linear memory,
-globals, table contents/signatures and passive-segment state. Before each repeat,
+The reusable `src/bench/native_runner.zig` implements
+`reset_policy: restore-post-start-snapshot`. Its exact sorted `reset_scope` is
+`globals`, `invocation-output`, `linear-memory-access-protection`,
+`linear-memory-contents`, `linear-memory-logical-size`, `passive-segment-drop-state`,
+`table-entries-signatures`, `wasi-context`. Before each repeat,
 `Instance.restoreMemory` revokes the grown suffix with `protect(.none)`, restores
 the original bytes and logical bounds, and leaves the original reservation in
 place. A later `memory.grow` commits and zeroes pages normally. Table-size changes
-are rejected rather than silently approximated. A fresh WASI Context restores
-descriptors, deferred output errors and sticky exit state; output buffers clear.
-Exact repeated CoreMark CRCs and real memory-grow/reset regressions qualify this
-specific reset path. Reset/snapshot costs are outside invocation timing; do not
+are rejected before restoration rather than silently approximated. A fresh WASI
+Context restores the original descriptors and sticky exit state; output buffers
+clear while retaining capacity. Pending output errors prevent reset before any
+state mutation, so context replacement cannot erase an unreported failure.
+The minimal adapter acquires no external files or sockets.
+
+Code/import pointers, reservations, immutable artifact bytes and completed
+module-start state are reused. The module start section is not rerun. Native
+pending-terminal and per-call execution setup occur inside the timed API call;
+reset does not copy a continuation or overwrite that private execution state.
+This producer-specific boundary is covered by memory/global/table/drop-state
+mutation, growth, descriptor/exit, partial-protection and resource-failure
+regressions as well as exact repeated CoreMark CRCs. It is not a generic runtime
+checkpoint API. Reset/snapshot costs are outside invocation timing; do not
 describe these numbers as uninterrupted process-state or end-to-end steady-state
 throughput. The snapshots consume memory, which the coverage declaration below
 explicitly excludes.
+
+`phases.lifecycle_setup_ticks` records snapshot creation. Each attempted reset
+has a `reset_events` entry containing its 2-based `before_invocation`, actual
+`outcome` and optional `elapsed_ticks`, plus an allocation-free private
+`WAMR_NATIVE_RESET=` diagnostic. Failed resets stop before another call; a
+completed reset may also be the final event when the next opening clock fails.
+Neither case invents an invocation. Host reports separate snapshot call-only,
+reset and reset-plus-call distributions; `steady_state_seconds` remains null
+for snapshot replay.
 
 The instance is made non-callable **before** revoking protection, and becomes
 callable again only after the whole restoration succeeds. If protection fails,
@@ -117,11 +144,15 @@ does not allocate or copy output after execution. `Invocation` borrows the
 Session's buffers until another invocation, reset or teardown; callers must
 persist evidence before then.
 
-A failed/backwards closing clock leaves `ticks: null` but preserves the true
-terminal reason and bytes. Later report-allocation failure cannot erase the
-already-written private record. If a canonical timed result cannot represent
-that untimed call, the producer fails without fabricating a duration or silently
-omitting its actual terminal from the private evidence. Existing host capture
+A failed/backwards closing clock leaves the actual invocation duration null and
+adds `post-call-clock` to `measurement_errors`, preserving the terminal and bytes
+in the failed v2 result. Incomplete stdout remains canonical base64 of the known
+prefix with `stdout_complete: false` and `stdout-copy`; callback/pending write
+errors add `pending-output`. The error list is sorted. Such failures stop further
+calls or resets, and never contribute successful timing statistics.
+Later report-allocation failure cannot erase the already-written private record.
+If report serialization is impossible, the producer fails without fabricating a
+duration or silently omitting the terminal from private evidence. Existing host capture
 saves stderr and its digest before validation. Transport/write failure can still
 truncate a stream and must be handled as a failed capture, not a successful event.
 
@@ -139,14 +170,14 @@ create a new host schema, cloud pipeline, or image receipt. First obtain genuine
 image/build/ABI qualification and create a host plan with sufficient common
 CoreMark iterations (the existing protocol fixes both variants at 400000).
 The producer performs no calibration or iteration override in measurement mode.
-The setup below remains gated until the coordinated lifecycle schema is integrated.
+Only the exact version 2 lifecycle is accepted by the setup below.
 
 The image integrator supplies a **private, independent deployment configuration**,
 not values copied from the incoming request. Its fields are:
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | `1` |
+| `schema_version` | `1` for this local deployment configuration; native receipts/results use `2` |
 | `kind` | `wamr-linux-producer-deployment` |
 | `qualification` | `hardware`; an explicit integrator attestation, not automatic proof |
 | `producer_sha256` | Hash of the actual deployed `wamr-native-bench` ELF |
@@ -176,7 +207,8 @@ Thus Linux's runtime-size observation is the **whole linked compiler-free consum
 ELF**, including Linux integration code, not an isolated archive/text-size claim.
 The receipt's optimize mode must also match the executing binary.
 
-The receipt must declare `runtime_linkage: static` and all required safety
+The receipt must declare the exact `execution_lifecycle` above,
+`runtime_linkage: static` and all required safety
 properties enabled. Its `memory_policy` must describe this actual implementation:
 `allocator_by_phase.load` and `.instantiate` are `counted-zig016-debug-and-arena`;
 `.first` and `.steady` are `counted-zig016-debug-output`. The single-threaded, libc-free
@@ -198,11 +230,19 @@ environment from measurement mode.
 observations; Azure SKU/region, source/compile-option lineage, configured VM RAM
 and the relationship between the complete image and this boot are **qualified
 receipt attestations**. They cannot be independently discovered from arbitrary
-request strings or proved by hashing a local image file. Protocol v1's `observed`
+request strings or proved by hashing a local image file. Protocol v2's `observed`
 object consolidates those two sources; it must not be described as guest discovery
 of Azure placement or proof of physical hardware. Review deployment/receipt origin
 privately. No programmatic receipt or hardware-certification bypass is provided.
 An edited `"hardware"` label is not valid qualification.
+
+The per-field origin is fixed, not inferred from the word `observed`: CPU model
+and active CPU count come from Linux; runtime/AOT/wasm/compiler/image byte hashes
+come from local file reads; SKU/region, source lineage, build settings, configured
+RAM and boot-to-image relationship come from the independent qualified receipt.
+The executing optimization mode and required safety settings are also checked by
+the producer. These are not all independent hardware observations. Version 2 has
+no separate per-field provenance map or automatic native-hardware certification.
 
 The private build evidence must bind the source commit, complete actual source
 input digest, tracked-diff digest, Zig version, compiler binary and full commands.
@@ -251,7 +291,7 @@ live=... peak=...` after instantiation, every invocation and final release. `pea
 is cumulative for that attempt; final `live` must be zero. These counts exclude
 input/request/JSON transport allocations and allocator bookkeeping/backing-page
 slack. They are not combined with mmap bytes, which would double-count or mix
-incompatible meanings. Protocol v1 has no allocation-byte sample field: its
+incompatible meanings. Protocol v2 has no allocation-byte sample field: its
 canonical memory receipt stays explicitly partial; these supplementary diagnostic
 counts are retained privately by capture, not promoted into a paired public
 allocation result. The reusable counter and actual release are regression-tested.

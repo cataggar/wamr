@@ -5,6 +5,19 @@ pub const aot = @import("../api/aot.zig");
 const wasi = @import("minimal-wasi");
 const adapter = @import("native-wasi").Adapter(aot);
 
+pub const execution_lifecycle = .{
+    .mode = "snapshot-replay",
+    .reset_policy = "restore-post-start-snapshot",
+    .reset_before = "each-steady-invocation",
+    .reset_timing = "excluded-from-invocation",
+    .reset_scope = &[_][]const u8{
+        "globals",                         "invocation-output",
+        "linear-memory-access-protection", "linear-memory-contents",
+        "linear-memory-logical-size",      "passive-segment-drop-state",
+        "table-entries-signatures",        "wasi-context",
+    },
+};
+
 /// CRC-only gate for the pinned 2K fixtures. Full timing/output qualification
 /// remains in native_benchmark.py; sub-ten-second checks are not measurements.
 pub fn coremarkCrc(stdout: []const u8) ?u16 {
@@ -33,6 +46,8 @@ pub const Output = struct {
     stdout: std.ArrayList(u8) = .empty,
     stderr: std.ArrayList(u8) = .empty,
     failure: ?wasi.Errno = null,
+    stdout_complete: bool = true,
+    stderr_complete: bool = true,
     limit: usize = 1024 * 1024,
     /// Test injection still consumes a genuine prefix and preserves the errno.
     fail_after: ?usize = null,
@@ -46,6 +61,8 @@ pub const Output = struct {
         self.stdout.clearRetainingCapacity();
         self.stderr.clearRetainingCapacity();
         self.failure = null;
+        self.stdout_complete = true;
+        self.stderr_complete = true;
     }
 
     pub fn write(raw: ?*anyopaque, fd: u32, bytes: []const u8) wasi.WriteResult {
@@ -55,15 +72,18 @@ pub const Output = struct {
             2 => &self.stderr,
             else => return .{ .errno = .badf },
         };
+        const complete = if (fd == 1) &self.stdout_complete else &self.stderr_complete;
         const length = self.stdout.items.len + self.stderr.items.len;
         const remaining = @min(self.limit, self.fail_after orelse self.limit) -| length;
         const count = @min(remaining, bytes.len);
         buffer.appendSlice(self.allocator, bytes[0..count]) catch {
             self.failure = .io;
+            complete.* = false;
             return .{ .errno = .io };
         };
         if (count != bytes.len) {
             self.failure = .nospc;
+            complete.* = false;
             return .{ .written = count, .errno = .nospc };
         }
         return .{ .written = count };
@@ -79,11 +99,37 @@ pub const Invocation = struct {
     diagnostic: ?[]const u8 = null,
     output_failure: bool = false,
     timing_error: ?[]const u8 = null,
+    stdout_complete: bool = true,
+    stderr_complete: bool = true,
 
     pub fn succeeded(self: Invocation) bool {
-        return self.ticks != null and !self.output_failure and (std.mem.eql(u8, self.outcome, "returned") or
+        return self.ticks != null and self.stdout_complete and self.stderr_complete and !self.output_failure and (std.mem.eql(u8, self.outcome, "returned") or
             (std.mem.eql(u8, self.outcome, "proc_exit") and self.exit_code == 0));
     }
+
+    pub fn measurementErrors(self: Invocation, storage: *[3][]const u8) []const []const u8 {
+        var count: usize = 0;
+        if (self.output_failure) {
+            storage[count] = "pending-output";
+            count += 1;
+        }
+        if (self.timing_error != null) {
+            storage[count] = "post-call-clock";
+            count += 1;
+        }
+        if (!self.stdout_complete) {
+            storage[count] = "stdout-copy";
+            count += 1;
+        }
+        return storage[0..count];
+    }
+};
+
+pub const Reset = struct {
+    outcome: enum { completed, @"error" } = .@"error",
+    elapsed_ticks: ?u64 = null,
+    diagnostic: ?[]const u8 = null,
+    timing_error: ?[]const u8 = null,
 };
 
 /// Allocation-free private evidence, written before any report serialization.
@@ -105,6 +151,13 @@ pub fn writeInvocationEvidence(writer: *std.Io.Writer, phase: []const u8, index:
     try std.json.Stringify.value(invocation.diagnostic, .{}, writer);
     try writer.writeAll(",\"output_failure\":");
     try std.json.Stringify.value(invocation.output_failure, .{}, writer);
+    try writer.writeAll(",\"stdout_complete\":");
+    try std.json.Stringify.value(invocation.stdout_complete, .{}, writer);
+    try writer.writeAll(",\"stderr_complete\":");
+    try std.json.Stringify.value(invocation.stderr_complete, .{}, writer);
+    try writer.writeAll(",\"measurement_errors\":");
+    var errors: [3][]const u8 = undefined;
+    try std.json.Stringify.value(invocation.measurementErrors(&errors), .{}, writer);
     try writer.writeAll(",\"stdout_base64\":");
     try writeBase64(writer, invocation.stdout);
     try writer.writeAll(",\"stderr_base64\":");
@@ -134,10 +187,12 @@ pub const Session = struct {
     snapshot: ?Snapshot = null,
     load_ticks: u64 = 0,
     instantiate_ticks: u64 = 0,
+    lifecycle_setup_ticks: u64 = 0,
 
     pub const Progress = struct {
         load_ticks: ?u64 = null,
         instantiate_ticks: ?u64 = null,
+        lifecycle_setup_ticks: ?u64 = null,
     };
 
     pub fn create(allocator: std.mem.Allocator, native: aot.Platform, bytes: []const u8, args: []const []const u8, environment: []const []const u8, clock: wasi.Clock) !*Session {
@@ -171,8 +226,14 @@ pub const Session = struct {
         progress.instantiate_ticks = instantiate_end - instantiate_begin;
         try initialized;
         self.instantiate_ticks = progress.instantiate_ticks.?;
-        const snapshot = try Snapshot.capture(allocator, self.instance.?);
-        self.snapshot = snapshot;
+        const snapshot_begin = try native.monotonicNs();
+        const snapshot = Snapshot.capture(allocator, self.instance.?);
+        if (snapshot) |saved| self.snapshot = saved else |_| {}
+        const snapshot_end = try native.monotonicNs();
+        if (snapshot_end < snapshot_begin) return error.ClockFailed;
+        progress.lifecycle_setup_ticks = snapshot_end - snapshot_begin;
+        _ = try snapshot;
+        self.lifecycle_setup_ticks = progress.lifecycle_setup_ticks.?;
         return self;
     }
 
@@ -198,9 +259,40 @@ pub const Session = struct {
     /// Reset/capture cost is outside invocation timing and must be identified
     /// as snapshot-reset semantics, not warm libc/process reuse.
     pub fn reset(self: *Session) !void {
+        const instance = self.instance.?;
+        if (!instance.instantiated) return error.NotInstantiated;
+        if (instance.active) return error.Busy;
+        if (!instance.started or instance.start_failed) return error.StartFailed;
+        if (self.output.failure != null or self.context.pendingWriteError(1) != null or self.context.pendingWriteError(2) != null)
+            return error.OutputFailurePending;
+        const context = try wasi.Context.init(self.wasi_options);
         try self.snapshot.?.restore(self.instance.?);
-        self.context = try wasi.Context.init(self.wasi_options);
+        self.context = context;
         self.output.clear();
+    }
+
+    /// Every attempted reset has its own outcome and optional measured time,
+    /// including attempts that fail before any subsequent guest call.
+    pub fn resetTimed(self: *Session) Reset {
+        var result: Reset = .{};
+        const begin = self.native.monotonicNs() catch |failure| {
+            result.timing_error = @errorName(failure);
+            return result;
+        };
+        const restored = self.reset();
+        const end_reading = self.native.monotonicNs();
+        if (restored) |_| {} else |failure| result.diagnostic = @errorName(failure);
+        const end = end_reading catch |failure| {
+            result.timing_error = @errorName(failure);
+            return result;
+        };
+        if (end < begin) {
+            result.timing_error = "ClockWentBackwards";
+            return result;
+        }
+        result.elapsed_ticks = end - begin;
+        if (result.diagnostic == null) result.outcome = .completed;
+        return result;
     }
 
     /// Output is borrowed until reset, another invocation or deinit. No
@@ -215,6 +307,8 @@ pub const Session = struct {
             .exit_code = null,
             .stdout = self.output.stdout.items,
             .stderr = self.output.stderr.items,
+            .stdout_complete = self.output.stdout_complete,
+            .stderr_complete = self.output.stderr_complete,
         };
         if (outcome) |terminal| {
             switch (terminal) {

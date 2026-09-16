@@ -6,8 +6,6 @@ const runner = @import("bench/native_runner.zig");
 const allocations = @import("bench/native_allocations.zig");
 const json = @import("bench/native_json.zig");
 const Value = json.Value;
-// Enable only with the host-owned request/receipt/result lifecycle binding.
-const lifecycle_protocol_supported = false;
 
 const Files = struct {
     allocator: std.mem.Allocator,
@@ -86,6 +84,17 @@ fn invocationJson(a: std.mem.Allocator, invocation: runner.Invocation, phase: []
     try set(a, &obj, "outcome", invocation.outcome);
     try set(a, &obj, "exit_code", invocation.exit_code);
     try set(a, &obj, "stdout_base64", try base64(a, invocation.stdout));
+    try set(a, &obj, "stdout_complete", invocation.stdout_complete);
+    var errors: [3][]const u8 = undefined;
+    try set(a, &obj, "measurement_errors", invocation.measurementErrors(&errors));
+    return obj;
+}
+
+fn resetJson(a: std.mem.Allocator, event: runner.Reset, ordinal: usize) !Value {
+    var obj = json.object(a);
+    try set(a, &obj, "before_invocation", ordinal);
+    try set(a, &obj, "outcome", @tagName(event.outcome));
+    try set(a, &obj, "elapsed_ticks", event.elapsed_ticks);
     return obj;
 }
 
@@ -136,9 +145,36 @@ fn diagnostics(io: std.Io, phase: []const u8, index: usize, invocation: runner.I
     try output.interface.flush();
 }
 
+fn resetDiagnostic(io: std.Io, event: runner.Reset, ordinal: usize) !void {
+    var buffer: [2048]u8 = undefined;
+    var output = std.Io.File.stderr().writer(io, &buffer);
+    try output.interface.writeAll("WAMR_NATIVE_RESET=");
+    try std.json.Stringify.value(.{
+        .before_invocation = ordinal,
+        .outcome = @tagName(event.outcome),
+        .elapsed_ticks = event.elapsed_ticks,
+        .diagnostic = event.diagnostic,
+        .timing_error = event.timing_error,
+    }, .{}, &output.interface);
+    try output.interface.writeByte('\n');
+    try output.interface.flush();
+}
+
 fn check(init: std.process.Init, args: []const []const u8) !void {
     if (args.len != 6 and args.len != 7) return error.Usage;
-    const Fault = enum { @"closing-clock", @"backwards-clock", @"report-oom" };
+    const Fault = enum {
+        @"opening-clock",
+        @"closing-clock",
+        @"backwards-clock",
+        @"steady-opening-clock",
+        @"steady-closing-clock",
+        @"steady-output-limit",
+        @"report-oom",
+        @"reset-clock",
+        @"reset-backwards-clock",
+        @"reset-protect",
+        @"output-limit",
+    };
     const fault: ?Fault = if (args.len == 7) std.meta.stringToEnum(Fault, args[6]) orelse return error.Usage else null;
     const a = init.arena.allocator();
     const iterations = try std.fmt.parseInt(u32, args[3], 10);
@@ -156,6 +192,7 @@ fn check(init: std.process.Init, args: []const []const u8) !void {
         &.{args[5]};
     var records = json.array(a);
     var steady_ticks = json.array(a);
+    var reset_events = json.array(a);
     var samples = json.array(a);
     var phases = json.object(a);
     var good = true;
@@ -166,13 +203,34 @@ fn check(init: std.process.Init, args: []const []const u8) !void {
         try set(a, &phases, "compile_ticks", @as(?u64, null));
         try set(a, &phases, "load_ticks", session.load_ticks);
         try set(a, &phases, "instantiate_ticks", session.instantiate_ticks);
+        try set(a, &phases, "lifecycle_setup_ticks", session.lifecycle_setup_ticks);
+        try set(a, &phases, "first_invocation_ticks", @as(?u64, null));
         try samples.array.append(try snapshotJson(a, &pages, "after_instantiation"));
         var first_crc: ?u16 = null;
         for (0..repeats) |index| {
-            if (index != 0) try session.reset();
+            if (index != 0) {
+                if (fault == .@"reset-clock") pages.fail_clock_at = pages.clock_reads + 2;
+                if (fault == .@"reset-backwards-clock") pages.backwards_clock_at = pages.clock_reads + 2;
+                if (fault == .@"reset-protect") pages.fail_protect_after_transition = true;
+                const event = session.resetTimed();
+                try resetDiagnostic(init.io, event, index + 1);
+                try reset_events.array.append(try resetJson(a, event, index + 1));
+                if (event.outcome != .completed) {
+                    good = false;
+                    break;
+                }
+            }
             if (fault == .@"closing-clock") pages.fail_clock_at = pages.clock_reads + 2;
+            if (fault == .@"opening-clock" or (index == 1 and fault == .@"steady-opening-clock"))
+                pages.fail_clock_at = pages.clock_reads + 1;
+            if (index == 1 and fault == .@"steady-closing-clock") pages.fail_clock_at = pages.clock_reads + 2;
             if (fault == .@"backwards-clock") pages.backwards_clock_at = pages.clock_reads + 2;
-            const result = try session.invoke("_start");
+            if (fault == .@"output-limit" or (index == 1 and fault == .@"steady-output-limit")) session.output.limit = 7;
+            const result = session.invoke("_start") catch |failure| {
+                std.debug.print("native invocation was not reached: {s}\n", .{@errorName(failure)});
+                good = false;
+                break;
+            };
             const phase = if (index == 0) "first" else "steady";
             try diagnostics(init.io, phase, index, result);
             var report_allocations: allocations.Counter = .{ .child = a, .fail_allocations = fault == .@"report-oom" };
@@ -195,7 +253,7 @@ fn check(init: std.process.Init, args: []const []const u8) !void {
             if (index == 0) {
                 try set(a, &phases, "first_invocation_ticks", result.ticks);
                 try samples.array.append(try snapshotJson(a, &pages, "after_first"));
-            } else if (result.ticks) |ticks| try steady_ticks.array.append(json.num(ticks));
+            } else try steady_ticks.array.append(if (result.ticks) |ticks| json.num(ticks) else .null);
             if (!good) break;
         }
         if (steady_ticks.array.items.len != 0) try samples.array.append(try snapshotJson(a, &pages, "after_steady"));
@@ -205,6 +263,8 @@ fn check(init: std.process.Init, args: []const []const u8) !void {
     try set(a, &result, "kind", "wamr-native-correctness-check");
     try set(a, &result, "qualification", "correctness-only-not-performance");
     try set(a, &result, "reset_semantics", "same-instance-full-snapshot-reset");
+    try set(a, &result, "execution_lifecycle", runner.execution_lifecycle);
+    try json.put(a, &result, "reset_events", reset_events);
     try set(a, &result, "injected_fault", if (fault) |f| @as(?[]const u8, @tagName(f)) else null);
     try set(a, &result, "outcome", if (good) @as([]const u8, "success") else "error");
     try set(a, &result, "artifact_sha256", try json.digest(a, bytes));
@@ -257,7 +317,6 @@ fn observedPlatform(files: Files, receipt_platform: Value) !Value {
 }
 
 fn measure(init: std.process.Init, deployment_path: []const u8) !void {
-    if (!lifecycle_protocol_supported) return error.LifecycleProtocolPending;
     const a = init.arena.allocator();
     const files: Files = .{ .allocator = a, .io = init.io };
     const deployment = try files.parse(deployment_path);
@@ -273,7 +332,7 @@ fn measure(init: std.process.Init, deployment_path: []const u8) !void {
     try json.require(std.mem.eql(u8, config_hash, try json.string(request, "config_sha256")));
     const run = try json.field(config, "run");
     try json.require(json.matches(try json.field(run, "target"), "linux"));
-    try json.require(json.matches(try json.field(config, "phase_contract"), "wamr-embedding-v1"));
+    try json.require(json.matches(try json.field(config, "phase_contract"), "wamr-embedding-v2"));
     const target = try json.field(config, "target");
     const receipt_path = try json.string(deployment, "receipt_path");
     const receipt = try files.parse(receipt_path);
@@ -281,6 +340,7 @@ fn measure(init: std.process.Init, deployment_path: []const u8) !void {
     try json.require(std.mem.eql(u8, receipt_hash, try json.string(target, "image_receipt_sha256")));
     try json.require(try json.equal(a, receipt, try json.field(target, "image_receipt")));
     try json.require(json.matches(try json.field(receipt, "kind"), "wamr-native-image-receipt"));
+    try json.require(try json.number(receipt, "schema_version") == 2);
     try json.require(json.matches(try json.field(receipt, "evidence_kind"), "measurement"));
     try json.require(json.matches(try json.field(receipt, "os"), "linux"));
     try json.require(json.matches(try json.field(receipt, "compile_profile"), "unikraft-x86_64"));
@@ -327,7 +387,7 @@ fn measure(init: std.process.Init, deployment_path: []const u8) !void {
     try set(a, &observed, "jit_preset", @as(?u8, null));
     try set(a, &observed, "compile_profile", "unikraft-x86_64");
     var result = json.object(a);
-    try set(a, &result, "schema_version", 1);
+    try set(a, &result, "schema_version", 2);
     try set(a, &result, "kind", "wamr-native-benchmark-result");
     try set(a, &result, "evidence_kind", "measurement");
     try json.put(a, &result, "campaign_id", try json.field(config, "campaign_id"));
@@ -335,7 +395,11 @@ fn measure(init: std.process.Init, deployment_path: []const u8) !void {
     try set(a, &result, "config_sha256", config_hash);
     try set(a, &result, "image_receipt_sha256", receipt_hash);
     try json.put(a, &result, "observed", observed);
-    try set(a, &result, "phase_contract", "wamr-embedding-v1");
+    try set(a, &result, "phase_contract", "wamr-embedding-v2");
+    try set(a, &result, "execution_lifecycle", runner.execution_lifecycle);
+    try json.require(try json.equal(a, try json.field(result, "execution_lifecycle"), try json.field(config, "execution_lifecycle")));
+    try json.require(try json.equal(a, try json.field(result, "execution_lifecycle"), try json.field(target, "execution_lifecycle")));
+    try json.require(try json.equal(a, try json.field(result, "execution_lifecycle"), try json.field(receipt, "execution_lifecycle")));
     try set(a, &result, "clock", .{
         .source = "linux-clock-monotonic",
         .unit = "ns",
@@ -346,6 +410,7 @@ fn measure(init: std.process.Init, deployment_path: []const u8) !void {
     try set(a, &phases, "compile_ticks", @as(?u64, null));
     var invocations = json.array(a);
     var steady_ticks = json.array(a);
+    var reset_events = json.array(a);
     var samples = json.array(a);
     var first_ticks: ?u64 = null;
     var outcome: []const u8 = "error";
@@ -363,12 +428,16 @@ fn measure(init: std.process.Init, deployment_path: []const u8) !void {
         outcome = "success";
         var first_crc: ?u16 = null;
         for (0..@intCast(steady + 1)) |index| {
-            if (index != 0) session.reset() catch |failure| {
-                std.debug.print("native reset failed: {s}\n", .{@errorName(failure)});
-                outcome = "error";
-                memory_reliable = false;
-                break;
-            };
+            if (index != 0) {
+                const event = session.resetTimed();
+                try resetDiagnostic(init.io, event, index + 1);
+                try reset_events.array.append(try resetJson(a, event, index + 1));
+                if (event.outcome != .completed) {
+                    outcome = "error";
+                    memory_reliable = false;
+                    break;
+                }
+            }
             const invocation = session.invoke(try json.string(workload, "export")) catch |failure| {
                 std.debug.print("native invocation capture failed: {s}\n", .{@errorName(failure)});
                 outcome = "error";
@@ -376,10 +445,9 @@ fn measure(init: std.process.Init, deployment_path: []const u8) !void {
             };
             const phase = if (index == 0) "first" else "steady";
             try diagnostics(init.io, phase, index, invocation);
-            const ticks = invocation.ticks orelse return error.UntimedInvocation;
             try allocationDiagnostic(init.io, &counter, if (index == 0) "after_first" else "after_steady");
             exit_code = invocation.exit_code;
-            if (index == 0) first_ticks = ticks else try steady_ticks.array.append(json.num(ticks));
+            if (index == 0) first_ticks = invocation.ticks else try steady_ticks.array.append(if (invocation.ticks) |ticks| json.num(ticks) else .null);
             try invocations.array.append(try invocationJson(a, invocation, phase));
             if (index == 0) try samples.array.append(try snapshotJson(a, &pages, "after_first"));
             const crc = runner.coremarkCrc(invocation.stdout);
@@ -402,10 +470,12 @@ fn measure(init: std.process.Init, deployment_path: []const u8) !void {
     }
     try set(a, &phases, "load_ticks", progress.load_ticks);
     try set(a, &phases, "instantiate_ticks", progress.instantiate_ticks);
+    try set(a, &phases, "lifecycle_setup_ticks", progress.lifecycle_setup_ticks);
     try set(a, &phases, "first_invocation_ticks", first_ticks);
     try json.put(a, &phases, "steady_state_ticks", steady_ticks);
     try json.put(a, &result, "phases", phases);
     try json.put(a, &result, "invocations", invocations);
+    try json.put(a, &result, "reset_events", reset_events);
     try set(a, &result, "outcome", outcome);
     try set(a, &result, "exit_code", exit_code);
     if (!memory_reliable or samples.array.items.len == 0) {
@@ -435,7 +505,7 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and std.mem.eql(u8, args[1], "--check")) return check(init, args);
     if (args.len == 3 and std.mem.eql(u8, args[1], "--deployment")) return measure(init, args[2]);
     std.debug.print(
-        \\usage: wamr-native-bench --check FILE.cwasm ITERATIONS REPEATS WORKLOAD [closing-clock|backwards-clock|report-oom]
+        \\usage: wamr-native-bench --check FILE.cwasm ITERATIONS REPEATS WORKLOAD [FAULT]
         \\       wamr-native-bench --deployment DEPLOYMENT.json
         \\--check is correctness-only, including on QEMU; it is never benchmark evidence.
         \\

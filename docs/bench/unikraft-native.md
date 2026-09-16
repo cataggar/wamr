@@ -24,9 +24,9 @@ phase timers by timing a subprocess. The separate
 API phase clocks and qualified same-instance snapshot-reset execution. Native
 Unikraft image integration and both targets' hardware/deployment qualification
 remain necessary before real paired measurements can be collected.
-Linux measurement additionally fails closed until the host-owned schema binds
-the explicit reset/lifecycle policy into requests, receipts and results; its
-correctness checks and private failure evidence remain available.
+Linux measurement binds the explicit version 2 snapshot-replay policy to requests,
+receipts and results, with separate snapshot setup/reset costs and retained partial
+failure evidence. It rejects warm-instance or version 1 declarations for this path.
 Standalone parser/capture tests do not depend on those APIs.
 
 Concrete integration dependencies identified during the native API handoff:

@@ -4,6 +4,7 @@ extern "wasi_unstable" fn environ_sizes_get(*u32, *u32) u32;
 extern "wasi_unstable" fn environ_get([*]u32, [*]u8) u32;
 extern "wasi_unstable" fn fd_write(u32, [*]const Iovec, u32, *u32) u32;
 extern "wasi_unstable" fn proc_exit(u32) void;
+extern "wasi_unstable" fn fd_close(u32) u32;
 const Iovec = extern struct { pointer: [*]const u8, length: u32 };
 
 export fn args_environment_output() void {
@@ -58,4 +59,10 @@ export fn binary_output() void {
     const iov = [_]Iovec{.{ .pointer = &bytes, .length = bytes.len }};
     var written: u32 = 0;
     if (fd_write(1, &iov, 1, &written) != 0 or written != bytes.len) @trap();
+}
+
+export fn close_stdout_and_exit() void {
+    if (fd_close(1) != 0) @trap();
+    proc_exit(0);
+    @trap();
 }
