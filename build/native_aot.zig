@@ -104,15 +104,8 @@ pub fn addTests(b: *std.Build, wamrc: *std.Build.Step.Compile, hosted_module: *s
     fixture_step.dependOn(&b.addInstallFile(tables, "fixtures/native-tables.cwasm").step);
 }
 
-pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
-    if (target.result.cpu.arch != .x86_64 or target.result.os.tag != .freestanding or target.result.abi != .none)
-        std.debug.panic("unikraft-aot requires x86_64-freestanding-none", .{});
-    inline for (.{ "interp", "fast_interp", "jit", "lazy_jit", "fast_jit", "wamr_compiler", "component_model", "lib_pthread", "lib_wasi_threads", "thread_mgr", "shared_memory", "link-libc" }) |name| {
-        if (b.option(bool, name, "Unsupported in the native AOT profile") orelse false)
-            std.debug.panic("unikraft-aot excludes -D{s}=true", .{name});
-    }
-    const module = b.addModule("wamr-aot", .{
-        .root_source_file = b.path("src/aot_native.zig"),
+pub fn moduleOptions(target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) std.Build.Module.CreateOptions {
+    return .{
         .target = target,
         .optimize = optimize,
         .single_threaded = true,
@@ -122,7 +115,19 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .unwind_tables = .none,
         .error_tracing = false,
         .link_libc = false,
-    });
+    };
+}
+
+pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    if (target.result.cpu.arch != .x86_64 or target.result.os.tag != .freestanding or target.result.abi != .none)
+        std.debug.panic("unikraft-aot requires x86_64-freestanding-none", .{});
+    inline for (.{ "interp", "fast_interp", "jit", "lazy_jit", "fast_jit", "wamr_compiler", "component_model", "lib_pthread", "lib_wasi_threads", "thread_mgr", "shared_memory", "link-libc" }) |name| {
+        if (b.option(bool, name, "Unsupported in the native AOT profile") orelse false)
+            std.debug.panic("unikraft-aot excludes -D{s}=true", .{name});
+    }
+    var options = moduleOptions(target, optimize);
+    options.root_source_file = b.path("src/aot_native.zig");
+    const module = b.addModule("wamr-aot", options);
     const library = b.addLibrary(.{ .name = "wamr-aot", .linkage = .static, .root_module = module });
     library.bundle_compiler_rt = true;
     b.installArtifact(library);

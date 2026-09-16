@@ -23,22 +23,20 @@ pub fn build(b: *std.Build) void {
             .{},
     });
     const optimize = b.standardOptimizeOption(.{});
+    var wasi_module_options: std.Build.Module.CreateOptions = if (profile == .@"unikraft-aot")
+        @import("build/native_aot.zig").moduleOptions(target, optimize)
+    else
+        .{ .target = target, .optimize = optimize };
+    wasi_module_options.root_source_file = b.path("src/wasi/minimal.zig");
+    const minimal_wasi_module = b.addModule("minimal-wasi", wasi_module_options);
+    wasi_module_options.root_source_file = b.path("src/wasi/native_aot.zig");
+    const native_wasi_module = b.addModule("native-wasi", wasi_module_options);
+    native_wasi_module.addImport("minimal-wasi", minimal_wasi_module);
     if (profile == .@"unikraft-aot") {
         @import("build/native_aot.zig").build(b, target, optimize);
         return;
     }
 
-    const minimal_wasi_module = b.addModule("minimal-wasi", .{
-        .root_source_file = b.path("src/wasi/minimal.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const native_wasi_module = b.addModule("native-wasi", .{
-        .root_source_file = b.path("src/wasi/native_aot.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    native_wasi_module.addImport("minimal-wasi", minimal_wasi_module);
     const minimal_wasi_test_module = b.createModule(.{
         .root_source_file = b.path("tests/minimal_wasi.zig"),
         .target = target,

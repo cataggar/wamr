@@ -18,6 +18,10 @@ The early build-graph return precedes hosted dependencies and configuration.
 The installed artifacts are `lib/libwamr-aot.a` and `include/wamr_aot.h`.
 The exported Zig module is `wamr-aot`; its `aot` namespace provides the Zig API.
 Both APIs reach the same implementation.
+The optional `minimal-wasi` context and `native-wasi` import adapter are also
+exported with the same freestanding module settings. They are not linked into
+`wamr-aot` unless the embedding application imports them; their hosted test
+artifacts are not constructed in this profile.
 
 The graph comprises `aot_native.zig`, `api/aot.zig`, `native_format.zig`,
 `native_abi.zig`, `trap_jmp.zig`, `platform/unikraft.zig`, and Zig standard-library
