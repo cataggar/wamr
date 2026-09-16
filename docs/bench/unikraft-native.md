@@ -23,6 +23,25 @@ phase timers by timing a subprocess. The Linux and Unikraft native embedding
 producers must implement the contract below before real measurements can be collected.
 Standalone parser/capture tests do not depend on those APIs.
 
+Concrete integration dependencies identified during the native API handoff:
+
+* The reported `src/api/aot.zig` `Instance.load(...)` implementation combines
+  parse/load with instance, memory and table setup. Its outer-call duration cannot
+  honestly populate separate `load_ticks` and `instantiate_ticks`. API staging or
+  internal native phase instrumentation is required; duplicating the duration or
+  inventing a zero instantiation duration is not an adapter.
+* The standalone `src/wasi/minimal.zig` context supplies imports, bytes and tagged
+  terminal outcomes, not a native executable, load/instantiate timers or memory
+  snapshots. Those belong to the native embedding producer.
+* WASI exit state is deliberately sticky. An explicit re-arm operation alone does
+  not prove pinned libc `_start`, its stack state and the module's mutable state
+  can safely execute again on the same instance. That requires actual qualification.
+
+Neither an API build nor context/import fixture tests establish native CoreMark CRC
+success, valid clock execution or benchmark measurements. These dependencies must
+be resolved by the native integration before this host adapter can accept a complete
+real campaign.
+
 The unit tests use explicitly `synthetic` artifacts, clocks, outputs, CPU descriptions
 and receipts. A test-only Python keyword enables them; **no CLI option accepts
 synthetic measurement evidence**. Relabeling test data as real is not evidence.
