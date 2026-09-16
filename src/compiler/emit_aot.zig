@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const types = @import("../runtime/common/types.zig");
+pub const native_abi = @import("../runtime/aot/native_abi.zig");
 
 /// AOT binary magic number ("\0aot" little-endian).
 pub const aot_magic: u32 = 0x746f6100;
@@ -38,8 +39,17 @@ pub const AotEmitOptions = struct {
     e_type: u16 = 0,
     e_machine: u16 = 0,
     e_flags: u32 = 0,
+    runtime_contract: u32 = 0,
     target_features: u64 = 0,
 };
+
+pub fn nativeTargetInfoOptions() AotEmitOptions {
+    var options = targetInfoOptions(.x86_64_sysv);
+    options.e_flags = native_abi.profile_flag;
+    options.runtime_contract = native_abi.contract_version;
+    options.target_features = native_abi.cpu_features;
+    return options;
+}
 
 pub const TargetInfoKind = enum {
     x86_64_sysv,
@@ -491,7 +501,7 @@ fn buildTargetInfo(options: AotEmitOptions) [40]u8 {
     std.mem.writeInt(u16, info[4..6], options.e_type, .little);
     std.mem.writeInt(u16, info[6..8], options.e_machine, .little);
     std.mem.writeInt(u32, info[8..12], options.e_flags, .little);
-    std.mem.writeInt(u32, info[12..16], 0, .little); // reserved
+    std.mem.writeInt(u32, info[12..16], options.runtime_contract, .little);
     @memcpy(info[16..32], &options.arch);
     std.mem.writeInt(u64, info[32..40], options.target_features, .little);
     return info;

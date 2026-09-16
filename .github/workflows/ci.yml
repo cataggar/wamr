@@ -57,6 +57,14 @@ jobs:
       - name: Unit tests
         run: zig build test
 
+      - name: Compiler-free native AOT contract and execution
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        run: |
+          zig build test-native-aot test-native-aot-abi -j2 --summary all
+          zig build -Dprofile=unikraft-aot -Doptimize=ReleaseSafe -j2 --summary all
+          zig cc -target x86_64-freestanding-none -ffreestanding -std=c11 -Werror \
+            -Iinclude -c tests/unikraft-aot/header.c -o .zig-cache/native-header.o
+
       - name: WASI thread lifecycle (enabled interpreter)
         run: zig build test-thread-lifecycle -Dlib_wasi_threads=true -Daot=false
 

@@ -1,0 +1,106 @@
+const std = @import("std");
+
+pub fn addTests(b: *std.Build, wamrc: *std.Build.Step.Compile, hosted_module: *std.Build.Module) void {
+    const abi_tests = b.addTest(.{
+        .root_module = hosted_module,
+        .filters = &.{ "native embedding ABI", "trap_jmp:" },
+    });
+    const abi_step = b.step("test-native-aot-abi", "Verify hosted/native VmCtx layout and explicit trap unwind");
+    abi_step.dependOn(&b.addRunArtifact(abi_tests).step);
+    const policy_tests = b.addTest(.{
+        .root_module = wamrc.root_module,
+        .filters = &.{"native profile:"},
+    });
+    const policy_step = b.step("test-native-aot-policy", "Verify compiler native-profile admission policy");
+    policy_step.dependOn(&b.addRunArtifact(policy_tests).step);
+    const wasm = b.addExecutable(.{
+        .name = "native-aot-fixture",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/unikraft-aot/fixture.zig"),
+            .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
+            .optimize = .ReleaseSmall,
+        }),
+    });
+    wasm.entry = .disabled;
+    wasm.rdynamic = true;
+    wasm.stack_size = 16384;
+    wasm.initial_memory = 131072;
+    wasm.max_memory = 524288;
+    const compile = b.addRunArtifact(wamrc);
+    compile.addArgs(&.{ "compile", "--target=x86_64", "--profile=unikraft-x86_64" });
+    compile.addFileArg(wasm.getEmittedBin());
+    compile.addArg("-o");
+    const fixture = compile.addOutputFileArg("native-fixture.cwasm");
+    const files = b.addWriteFiles();
+    _ = files.addCopyFile(fixture, "native-fixture.cwasm");
+    const fixture_module = files.add("fixture.zig", "pub const bytes = @embedFile(\"native-fixture.cwasm\");\n");
+    const target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl });
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/aot_native_tests.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    tests.root_module.addAnonymousImport("native_fixture", .{ .root_source_file = fixture_module });
+    const test_step = b.step("test-native-aot", "Run real precompiled native embedding API regressions");
+    test_step.dependOn(policy_step);
+    const format_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/aot_native_format_tests.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    format_tests.root_module.addAnonymousImport("native_fixture", .{ .root_source_file = fixture_module });
+    const format_step = b.step("test-native-aot-format", "Run native artifact parser regressions on the build host");
+    format_step.dependOn(&b.addRunArtifact(format_tests).step);
+    test_step.dependOn(format_step);
+    const compile_step = b.step("test-native-aot-build", "Build native AOT regressions without executing x86 code");
+    _ = tests.getEmittedBin();
+    compile_step.dependOn(&tests.step);
+    if (b.graph.host.result.cpu.arch == .x86_64 and b.graph.host.result.os.tag == .linux) {
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+    } else {
+        const run = b.addSystemCommand(&.{ "qemu-x86_64", "-cpu", "max" });
+        run.addArtifactArg(tests);
+        test_step.dependOn(&run.step);
+    }
+    const fixture_step = b.step("native-aot-fixture", "Build the matching host-wamrc native fixture");
+    const install_fixture = b.addInstallFile(fixture, "fixtures/native-fixture.cwasm");
+    const install_wasm = b.addInstallFile(wasm.getEmittedBin(), "fixtures/native-fixture.wasm");
+    fixture_step.dependOn(&install_fixture.step);
+    fixture_step.dependOn(&install_wasm.step);
+}
+
+pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    if (target.result.cpu.arch != .x86_64 or target.result.os.tag != .freestanding or target.result.abi != .none)
+        std.debug.panic("unikraft-aot requires x86_64-freestanding-none", .{});
+    inline for (.{ "interp", "fast_interp", "jit", "lazy_jit", "fast_jit", "wamr_compiler", "component_model", "lib_pthread", "lib_wasi_threads", "thread_mgr", "shared_memory", "link-libc" }) |name| {
+        if (b.option(bool, name, "Unsupported in the native AOT profile") orelse false)
+            std.debug.panic("unikraft-aot excludes -D{s}=true", .{name});
+    }
+    const module = b.addModule("wamr-aot", .{
+        .root_source_file = b.path("src/aot_native.zig"),
+        .target = target,
+        .optimize = optimize,
+        .single_threaded = true,
+        .red_zone = false,
+        .stack_check = false,
+        .stack_protector = false,
+        .link_libc = false,
+    });
+    const library = b.addLibrary(.{ .name = "wamr-aot", .linkage = .static, .root_module = module });
+    library.bundle_compiler_rt = true;
+    b.installArtifact(library);
+    b.installFile("include/wamr_aot.h", "include/wamr_aot.h");
+    // Export every real embedding entry point in a freestanding ELF. Unlike a
+    // library-only compile this catches unresolved hosted/runtime dependencies.
+    const link_check = b.addExecutable(.{ .name = "wamr-aot-link-check", .root_module = module });
+    link_check.entry = .{ .symbol_name = "wamr_aot_contract_version" };
+    link_check.rdynamic = true;
+    _ = link_check.getEmittedBin();
+    const check_step = b.step("native-aot-check", "Link the complete compiler-free freestanding API");
+    check_step.dependOn(&link_check.step);
+    b.getInstallStep().dependOn(check_step);
+}

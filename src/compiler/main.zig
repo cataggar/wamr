@@ -26,6 +26,7 @@ const verify_mod = @import("verify.zig");
 // explicit anchor.
 comptime {
     _ = @import("verify_args.zig");
+    _ = @import("native_profile.zig");
 }
 
 const Subcommand = enum { compile, compile_component, run, serve, verify, version, help };
@@ -107,6 +108,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
     var enable_aarch64_scheduler = true;
     var enable_aarch64_xreg_alloc = true;
     var benchmark_disable_cancel_points = false;
+    var native_profile = false;
     var target_arch: TargetArch = switch (builtin.cpu.arch) {
         .aarch64 => .aarch64,
         else => .x86_64,
@@ -143,6 +145,8 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
             output_path = sub_args[i];
         } else if (std.mem.eql(u8, a, "-O0")) {
             optimize = false;
+        } else if (std.mem.eql(u8, a, "--profile=unikraft-x86_64")) {
+            native_profile = true;
         } else if (std.mem.eql(u8, a, "--target") and i + 1 < sub_args.len) {
             i += 1;
             if (std.mem.eql(u8, sub_args[i], "aarch64")) {
@@ -265,6 +269,13 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
     };
 
     std.debug.print("Lowered {d} functions to IR\n", .{ir_module.functions.items.len});
+    if (native_profile) {
+        if (target_arch != .x86_64 or builtin.os.tag == .windows) {
+            std.debug.print("error: unikraft-x86_64 requires --target=x86_64 and a SysV host compiler\n", .{});
+            return error.UnsupportedNativeTarget;
+        }
+        try @import("native_profile.zig").validate(module, &ir_module);
+    }
 
     // Build a func-index → exported-name lookup. Wasm name custom
     // sections aren't currently parsed by the loader, so fall back to
@@ -730,7 +741,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
         compiled.code,
         compiled.offsets,
         exports.items,
-        emit_aot.targetInfoOptions(switch (target_abi) {
+        if (native_profile) emit_aot.nativeTargetInfoOptions() else emit_aot.targetInfoOptions(switch (target_abi) {
             .x86_64_sysv => .x86_64_sysv,
             .x86_64_win64 => .x86_64_win64,
             .aarch64_aapcs => .aarch64_aapcs64,
@@ -1640,6 +1651,7 @@ const compile_usage =
     \\Options:
     \\  -o <path>                     Output .cwasm path (default: <input>.cwasm)
     \\  --target=<x86_64|aarch64>     Target architecture (default: host)
+    \\  --profile=unikraft-x86_64    Validate and emit the native embedding contract
     \\  -O0                           Disable IR optimizations
     \\  --aarch64-no-scheduler        Disable AArch64 instruction scheduler
     \\  --aarch64-no-xreg-alloc       Disable AArch64 X-register allocator

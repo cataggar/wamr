@@ -15,8 +15,18 @@ const fuzz_seed_wasms = [_][]const u8{
 };
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    const profile = b.option(enum { hosted, @"unikraft-aot" }, "profile", "Build profile (default: hosted)") orelse .hosted;
+    const target = b.standardTargetOptions(.{
+        .default_target = if (profile == .@"unikraft-aot")
+            .{ .cpu_arch = .x86_64, .os_tag = .freestanding, .abi = .none }
+        else
+            .{},
+    });
     const optimize = b.standardOptimizeOption(.{});
+    if (profile == .@"unikraft-aot") {
+        @import("build/native_aot.zig").build(b, target, optimize);
+        return;
+    }
 
     const minimal_wasi_module = b.addModule("minimal-wasi", .{
         .root_source_file = b.path("src/wasi/minimal.zig"),
@@ -428,6 +438,7 @@ pub fn build(b: *std.Build) void {
         .name = "wamrc",
         .root_module = wamrc_module,
     });
+    @import("build/native_aot.zig").addTests(b, wamrc, lib_module);
     b.installArtifact(wamrc);
 
     // ── Spec test runner ─────────────────────────────────────────────

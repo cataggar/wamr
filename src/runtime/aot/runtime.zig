@@ -715,6 +715,14 @@ pub const VmCtx = extern struct {
     _pad_cancel_group: u32 = 0,
 };
 
+test "native embedding ABI matches every hosted VmCtx field" {
+    const Native = @import("native_abi.zig").VmCtx;
+    try std.testing.expectEqual(@sizeOf(VmCtx), @sizeOf(Native));
+    inline for (@typeInfo(Native).@"struct".fields) |field| {
+        try std.testing.expectEqual(@offsetOf(VmCtx, field.name), @offsetOf(Native, field.name));
+    }
+}
+
 /// Entry in the sorted `ptr_to_sig` array. 16 bytes per entry.
 pub const PtrSigEntry = extern struct {
     ptr: u64 = 0,
