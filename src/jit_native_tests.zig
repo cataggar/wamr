@@ -214,3 +214,24 @@ test "native JIT rejects an oversized generated native frame" {
         "\x0a\x07\x01\x05\x01\xd0\x0f\x7f\x0b";
     try std.testing.expectError(error.UnsupportedNativeFeature, jit.compile(std.testing.allocator, large_frame, .{}));
 }
+
+test "native JIT bounded load preserves shared phase instrumentation" {
+    var artifact = try jit.compile(std.testing.allocator, wasm, .{ .monotonic_ns = compilerClock });
+    defer artifact.deinit();
+    var pages: Pages = .{};
+    var timings: aot.LoadTimings = .{};
+    var options = jit.runtime_options;
+    options.timings = &timings;
+    {
+        const inst = try aot.Instance.load(std.testing.allocator, pages.platform(), artifact.bytes, &.{}, options);
+        defer inst.deinit();
+        try equal(@as(u32, 3), timings.completed);
+        try expect(inst.memoryStats().heap_peak_bytes <= options.max_heap_bytes.?);
+        try equal(@as(i32, @bitCast(reference(2000))), try call(inst, "workload", &.{.{ .i32 = 2000 }}));
+    }
+    try equal(@as(usize, 0), pages.live);
+    options.max_run_fuel = null;
+    try std.testing.expectError(error.UnsupportedRunBudget, aot.Instance.load(std.testing.allocator, pages.platform(), artifact.bytes, &.{}, options));
+    try equal(@as(u32, 0), timings.completed);
+    try equal(@as(usize, 0), pages.live);
+}

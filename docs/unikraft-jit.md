@@ -135,6 +135,13 @@ and linear reserved/committed bytes. These are explicit software allocation
 metrics, **not RSS, page-table overhead, or image size**. Respect the supplied
 clock's actual resolution.
 
+The shared native loader's `Options.timings = &load_timings` composes with
+`jit.runtime_options`: retain its mandatory caps and set that optional pointer.
+`LoadTimings.completed` bit 0 validates `load_ns` (metadata/import admission);
+bit 1 validates `instantiate_ns` (allocation, initialization and RW-to-RX).
+Failed loads do not make unfinished phases valid. Export start, first result
+and repeated calls remain distinct outer measurements, not loader phases.
+
 The Linux producer/matched report work in #1046 owns complete compile,
 load/instantiate, first-result and steady-state measurements. Compare the same
 wasm and exact output, record fast/full and fuel instrumentation differences,
