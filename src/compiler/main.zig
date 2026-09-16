@@ -26,7 +26,6 @@ const verify_mod = @import("verify.zig");
 // explicit anchor.
 comptime {
     _ = @import("verify_args.zig");
-    _ = wamr.native_profile;
 }
 
 const Subcommand = enum { compile, compile_component, run, serve, verify, version, help };

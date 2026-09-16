@@ -13,7 +13,8 @@ pub fn addTests(b: *std.Build, wamrc: *std.Build.Step.Compile, hosted_module: *s
     const abi_step = b.step("test-native-aot-abi", "Verify hosted/native VmCtx layout and explicit trap unwind");
     abi_step.dependOn(&b.addRunArtifact(abi_tests).step);
     const policy_tests = b.addTest(.{
-        .root_module = wamrc.root_module,
+        // Policy tests belong to the library module, not the CLI's imports.
+        .root_module = hosted_module,
         .filters = &.{"native profile:"},
     });
     const policy_step = b.step("test-native-aot-policy", "Verify compiler native-profile admission policy");
