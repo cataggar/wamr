@@ -32,6 +32,7 @@ from bench_wasi_threads import (
     PROFILE_COUNTS,
     REPORT_SCHEMA_VERSION,
     measurement_plan_sha256,
+    position_balanced_ratio_stats,
     validate_sizing_plan,
     validate_report,
 )
@@ -1393,6 +1394,19 @@ def _sample_median(values: Any, label: str) -> float:
     return float(statistics.median(normalized))
 
 
+def _position_balanced_sample_estimate(values: Any, label: str) -> float:
+    if not isinstance(values, list):
+        raise HarnessError(f"{label} is missing raw per-report metric samples")
+    normalized = [
+        _finite_number(value, f"{label}[{index}]", positive=True)
+        for index, value in enumerate(values)
+    ]
+    try:
+        return float(position_balanced_ratio_stats(normalized)["median"])
+    except BenchmarkDataError as exc:
+        raise HarnessError(f"{label}: {exc}") from exc
+
+
 def _metric_key(item: dict[str, Any], kind: str) -> tuple[str, ...]:
     if kind == "comparison":
         keys = ("pair_key", "condition", "metric_kind")
@@ -1421,10 +1435,16 @@ def _indexed_metrics(
         normalized = dict(item)
         for field in sample_fields:
             normalized[field] = list(item.get(field, []))
-            _sample_median(
-                normalized[field],
-                f"{context}[{index}].{field}",
-            )
+            if kind == "direct candidate single-infrastructure":
+                _sample_median(
+                    normalized[field],
+                    f"{context}[{index}].{field}",
+                )
+            else:
+                _position_balanced_sample_estimate(
+                    normalized[field],
+                    f"{context}[{index}].{field}",
+                )
         indexed[key] = normalized
     return indexed
 
@@ -1904,16 +1924,17 @@ def derive_one_sided_threshold(
     }
 
 
-def _observation_metric_median(
+def _observation_metric_estimate(
     observation: dict[str, Any],
     collection: str,
     key: tuple[str, ...],
     field: str,
 ) -> float:
-    return _sample_median(
-        observation[collection][key][field],
-        f"{observation['run_id']}/{observation['platform']}/{key}/{field}",
-    )
+    values = observation[collection][key][field]
+    label = f"{observation['run_id']}/{observation['platform']}/{key}/{field}"
+    if collection == "direct":
+        return _sample_median(values, label)
+    return _position_balanced_sample_estimate(values, label)
 
 
 def derive_budget_documents(
@@ -1941,7 +1962,7 @@ def derive_budget_documents(
         comparison_evidence = []
         for key in sorted(validated["metric_keys"]["comparisons"]):
             throughput_values = [
-                _observation_metric_median(
+                _observation_metric_estimate(
                     item,
                     "comparisons",
                     key,
@@ -1950,7 +1971,7 @@ def derive_budget_documents(
                 for item in training
             ]
             elapsed_values = [
-                _observation_metric_median(
+                _observation_metric_estimate(
                     item,
                     "comparisons",
                     key,
@@ -1985,13 +2006,13 @@ def derive_budget_documents(
             }
             holdout_results = []
             for item in holdout:
-                throughput = _observation_metric_median(
+                throughput = _observation_metric_estimate(
                     item,
                     "comparisons",
                     key,
                     "throughput_candidate_over_baseline",
                 )
-                elapsed = _observation_metric_median(
+                elapsed = _observation_metric_estimate(
                     item,
                     "comparisons",
                     key,
@@ -2040,7 +2061,7 @@ def derive_budget_documents(
         ratio_evidence = []
         for key in sorted(validated["metric_keys"]["ratio_of_ratios"]):
             throughput_values = [
-                _observation_metric_median(
+                _observation_metric_estimate(
                     item,
                     "ratio_of_ratios",
                     key,
@@ -2049,7 +2070,7 @@ def derive_budget_documents(
                 for item in training
             ]
             elapsed_values = [
-                _observation_metric_median(
+                _observation_metric_estimate(
                     item,
                     "ratio_of_ratios",
                     key,
@@ -2084,13 +2105,13 @@ def derive_budget_documents(
             }
             holdout_results = []
             for item in holdout:
-                throughput = _observation_metric_median(
+                throughput = _observation_metric_estimate(
                     item,
                     "ratio_of_ratios",
                     key,
                     "throughput_ratio_of_ratios",
                 )
-                elapsed = _observation_metric_median(
+                elapsed = _observation_metric_estimate(
                     item,
                     "ratio_of_ratios",
                     key,
@@ -2141,10 +2162,10 @@ def derive_budget_documents(
         for key in sorted(validated["metric_keys"]["direct"]):
             results = []
             for item in selected:
-                throughput = _observation_metric_median(
+                throughput = _observation_metric_estimate(
                     item, "direct", key, "throughput_right_over_left"
                 )
-                elapsed = _observation_metric_median(
+                elapsed = _observation_metric_estimate(
                     item, "direct", key, "elapsed_right_over_left"
                 )
                 throughput_delta = abs(throughput - 1.0)

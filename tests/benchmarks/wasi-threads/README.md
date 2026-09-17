@@ -261,6 +261,30 @@ and
 `7fc85e837ab2fc817e014ffa17fecb6ec845389945cc532bfb07429aa28bea20`.
 No v15 observation is eligible for authoritative derivation.
 
+Immutable v16 smoke cohort `61a39f7ff4f441269726df6bd16a8687`
+balanced every revision/condition combination across all four invocation
+positions and retained 12 measured samples in each of eight valid reports. The
+frozen policy still rejected two Arm interpreter:AOT `atomic/4`
+ratio-of-ratios checks in holdout sequence 4: throughput at
+`0.12562031407027266` and elapsed at `0.12612597436275325`. All raw checks
+passed, with a worst adverse log of `0.08726577409097398`, and the direct
+thread-manager maximum passed at `0.009711706704071954`. The validated cohort
+and policy check are pinned by SHA-256
+`37d224c3aa371d1ca200edcd71d6c81c3a5f7222d744bd9703e32c979c5ecd50` and
+`d998108694c17adf39811e8075205dd1b157f4f4b52ffb43623d3d49bbae352d`.
+No v16 observation is eligible for authoritative derivation.
+
+v16 scheduled complete position blocks but then discarded those blocks by
+taking one median across all 12 sample ratios. For the failing elapsed metric,
+the three four-position mean logs were `0.047788064348088674`,
+`0.026080639174108463`, and `0.11824774720694894`; their median was
+`0.047788064348088674`, while the unblocked sample median log was
+`0.12612597436275325`. A post-hoc replay using the median of each report's
+four-position geometric means produced no policy failures over v16; its worst
+adverse log was `0.08426327072781893`. This replay is diagnostic only. The
+revised estimator is predeclared by measurement-plan identity 20 and requires
+a wholly fresh cohort.
+
 Actual warmups and samples
 independently enforce the unchanged `99B < E_actual` and 1.25-second floor.
 There is no hidden retry or count increase if a later rate exceeds its
@@ -379,12 +403,18 @@ within a condition while independently alternating revision order every sample
 and condition-block order every two samples. Every revision/condition
 combination therefore occupies each absolute position in the four-invocation
 quartet exactly once per cycle. Warmups may have any count because any four
-consecutive measured indices cover the complete cycle. `report.json`
+consecutive measured indices cover the complete cycle. Candidate/baseline and
+ratio-of-ratios estimates take the geometric mean within each complete
+four-position block, then the median across block estimates. This preserves the
+experimental blocking that the unstructured v16 sample median discarded.
+Direct concurrent manager checks retain their ordinary sample median because
+they do not use the sequential four-position schedule. `report.json`
 follows `report.schema.json` and
 records raw warmups/samples, commands, host/CPU/compiler/runtime identities,
 fixture and source hashes, explicit pair and revision direction, guest and host
-timing, build cache keys, medians/ranges, immutable commit/platform/plan
-identities, and every correctness result. JSON replacement is an fsynced
+timing, build cache keys, raw descriptive statistics, position-block estimates,
+immutable commit/platform/plan identities, and every correctness result. JSON
+replacement is an fsynced
 same-directory atomic rename that preserves an existing report's mode.
 
 Each guest invocation has a fixed 90-second watchdog. Before evidence, the
@@ -397,7 +427,7 @@ deadline.
 
 Reports carry two plan identities. `plan_sha256` is the audit identity of the
 complete plan, including `comparison_purpose`.
-`measurement_plan_sha256` is version 19 of a purpose-independent portable
+`measurement_plan_sha256` is version 20 of a purpose-independent portable
 identity. It excludes only `comparison_purpose`, host-resolved evidence counts,
 pilot outcomes, and their projections. It includes the workload/scenario
 definitions, fixed pilot counts and order, sizing algorithm/version, target,
@@ -437,10 +467,10 @@ real runtime cost toward zero. The report retains monotonic host intervals and
 validation requires both processes to overlap on the declared CPU pair with
 commands that differ only by affinity and the manager toggle.
 All other paired measurements use condition-major ordering: baseline and
-candidate executions of the same condition are adjacent, and the complete
-four-execution order reverses on alternating samples. This minimizes host drift
-in the absolute revision comparison while preserving balanced revision and
-condition positions.
+candidate executions of the same condition are adjacent, revision order
+reverses every sample, and condition-block order reverses every two samples.
+This minimizes host drift in the absolute revision comparison while balancing
+every revision/condition combination across all four invocation positions.
 CPU-bound `hot` and `atomic` use
 `min(available logical CPUs, workers)`, avoiding an unused controller CPU and
 selecting physical cores before SMT siblings. Coordination/lifecycle
@@ -458,11 +488,12 @@ The report exposes four metric layers:
 2. `paired_summaries`: the internal right/left condition ratio for each
    revision.
 3. `comparison_summaries`: matched candidate/baseline elapsed and throughput
-   ratios for the same condition and sample index.
+   ratios for the same condition and sample index. Their reported median is the
+   median of complete four-position geometric-mean block estimates.
 4. `ratio_of_ratios_summaries`: candidate internal right/left ratio divided by
    the baseline internal right/left ratio. A throughput value below 1 means the
    candidate's internal-pair relationship regressed; an elapsed value above 1
-   means it regressed.
+   means it regressed. These use the same position-block estimator.
 
 Runner metadata separates the diagnostic, high-cardinality `runner_name` from
 `runner_environment` and the stable host fingerprint used as the performance
@@ -717,10 +748,10 @@ python3 scripts/wasi_thread_cohort.py derive \
   --evidence-markdown-output /d/wasi-thread-budget-evidence.md
 ```
 
-For each condition and internal pair, derivation first takes the median of that
-report's retained raw ratio samples, then works in natural-log ratio space on
-TRAINING reports only. The adverse one-sided noise bound is the more permissive
-of:
+For each condition and internal pair, derivation first takes the geometric mean
+inside each complete four-position block and then the median across that
+report's block estimates. It then works in natural-log ratio space on TRAINING
+reports only. The adverse one-sided noise bound is the more permissive of:
 
 1. the worst observed training deviation from ratio 1; and
 2. the adverse endpoint of `median ± 6 × 1.4826 × MAD`.
@@ -786,7 +817,7 @@ false until the proof/final PR explicitly enables it. A candidate-only source
 change never requires rebaselining.
 
 Schema-v3 fixed-plan reports and reports produced before measurement-plan
-identity version 19, including version-2 reports from #1013, version-3/4
+identity version 20, including version-2 reports from #1013, version-3/4
 #1016 attempts, version-5 #1020 evidence, and version-6/7 cell-envelope
 evidence, are invalid for a new authoritative cohort. Fresh
 evidence with the canonical one-shot sizing identity is mandatory for

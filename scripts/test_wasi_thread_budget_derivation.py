@@ -87,7 +87,7 @@ def synthetic_cohort() -> dict:
     plan = {
         "profile": "authoritative",
         "warmups": 2,
-        "samples": 10,
+        "samples": 12,
         "revision_mode": "paired-revisions",
         "comparison_purpose": "noise-calibration",
         "revision_roles": ["baseline", "candidate"],
@@ -138,7 +138,7 @@ def synthetic_cohort() -> dict:
         "profile": "authoritative",
         "comparison_purpose": "noise-calibration",
         "warmups": 2,
-        "samples": 10,
+        "samples": 12,
     }
     observations = []
     for index, run_id in enumerate(run_ids):
@@ -195,28 +195,20 @@ def synthetic_cohort() -> dict:
                                 "pair_key": "single-infrastructure/aot",
                                 "condition": "threads-disabled",
                                 "metric_kind": "steady-state-kernel",
-                                "elapsed_candidate_over_baseline": [
-                                    elapsed,
-                                    elapsed,
-                                ],
-                                "throughput_candidate_over_baseline": [
-                                    throughput,
-                                    throughput,
-                                ],
+                                "elapsed_candidate_over_baseline": [elapsed] * 12,
+                                "throughput_candidate_over_baseline": (
+                                    [throughput] * 12
+                                ),
                             },
                             {
                                 "pair_kind": "single-infrastructure",
                                 "pair_key": "single-infrastructure/aot",
                                 "condition": "threads-enabled",
                                 "metric_kind": "steady-state-kernel",
-                                "elapsed_candidate_over_baseline": [
-                                    elapsed,
-                                    elapsed,
-                                ],
-                                "throughput_candidate_over_baseline": [
-                                    throughput,
-                                    throughput,
-                                ],
+                                "elapsed_candidate_over_baseline": [elapsed] * 12,
+                                "throughput_candidate_over_baseline": (
+                                    [throughput] * 12
+                                ),
                             },
                         ],
                         "ratio_of_ratios": [
@@ -225,14 +217,12 @@ def synthetic_cohort() -> dict:
                                 "pair_key": "single-infrastructure/aot",
                                 "left": "threads-disabled",
                                 "right": "threads-enabled",
-                                "elapsed_ratio_of_ratios": [
-                                    ratio_elapsed,
-                                    ratio_elapsed,
-                                ],
-                                "throughput_ratio_of_ratios": [
-                                    ratio_throughput,
-                                    ratio_throughput,
-                                ],
+                                "elapsed_ratio_of_ratios": (
+                                    [ratio_elapsed] * 12
+                                ),
+                                "throughput_ratio_of_ratios": (
+                                    [ratio_throughput] * 12
+                                ),
                             }
                         ],
                         "direct_candidate_single_infrastructure": [
@@ -241,8 +231,8 @@ def synthetic_cohort() -> dict:
                                 "pair_key": "single-infrastructure/aot",
                                 "left": "threads-disabled",
                                 "right": "threads-enabled",
-                                "elapsed_right_over_left": [0.995, 0.995],
-                                "throughput_right_over_left": [1.005, 1.005],
+                                "elapsed_right_over_left": [0.995] * 12,
+                                "throughput_right_over_left": [1.005] * 12,
                             }
                         ],
                     },
@@ -437,6 +427,36 @@ class BudgetDerivationTests(unittest.TestCase):
             ):
                 cohort.derive_budget_documents(value, synthetic_policy())
 
+    def test_incomplete_position_block_fails(self) -> None:
+        value = synthetic_cohort()
+        value["observations"][0]["metrics"]["comparisons"][0][
+            "throughput_candidate_over_baseline"
+        ] = [1.0, 1.0]
+        with self.assertRaisesRegex(HarnessError, "complete four-position blocks"):
+            cohort.derive_budget_documents(value, synthetic_policy())
+
+    def test_derivation_uses_complete_position_blocks(self) -> None:
+        value = synthetic_cohort()
+        holdout = next(
+            item
+            for item in value["observations"]
+            if item["partition"] == "holdout"
+        )
+        elapsed_logs = [-0.6, 0.2, 0.2, 0.2] * 3
+        holdout["metrics"]["comparisons"][0][
+            "elapsed_candidate_over_baseline"
+        ] = [math.exp(item) for item in elapsed_logs]
+        holdout["metrics"]["comparisons"][0][
+            "throughput_candidate_over_baseline"
+        ] = [math.exp(-item) for item in elapsed_logs]
+
+        budget, evidence, _ = cohort.derive_budget_documents(
+            value, synthetic_policy()
+        )
+
+        self.assertTrue(budget["calibrated"])
+        self.assertEqual(evidence["holdout_status"], "passed")
+
     def test_holdout_failure_refuses_derivation(self) -> None:
         value = synthetic_cohort()
         holdout = next(
@@ -446,7 +466,7 @@ class BudgetDerivationTests(unittest.TestCase):
         )
         holdout["metrics"]["comparisons"][0][
             "throughput_candidate_over_baseline"
-        ] = [0.5, 0.5]
+        ] = [0.5] * 12
         with self.assertRaisesRegex(HarnessError, "untouched holdout"):
             cohort.derive_budget_documents(value, synthetic_policy())
 
@@ -496,7 +516,7 @@ class BudgetDerivationTests(unittest.TestCase):
         failed = synthetic_cohort()
         failed["observations"][0]["metrics"][
             "direct_candidate_single_infrastructure"
-        ][0]["throughput_right_over_left"] = [1.02, 1.02]
+        ][0]["throughput_right_over_left"] = [1.02] * 12
         with self.assertRaisesRegex(
             HarnessError, "direct candidate single-infrastructure policy failed"
         ):

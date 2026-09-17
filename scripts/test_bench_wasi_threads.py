@@ -5,8 +5,10 @@ from __future__ import annotations
 import copy
 import io
 import json
+import math
 import random
 import shutil
+import statistics
 import struct
 import sys
 import threading
@@ -956,7 +958,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(single_odd.samples, 3)
         with self.assertRaisesRegex(
-            BenchmarkDataError, "samples must be divisible by 4"
+            BenchmarkDataError, "complete four-position blocks"
         ):
             make_report(samples=3)
         with self.assertRaises(SystemExit):
@@ -2083,7 +2085,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(
             reserve_admission["algorithm_identity"],
             {
-                "measurement_plan_identity_version": 19,
+                "measurement_plan_identity_version": 20,
                 "sizing_algorithm_version": 13,
             },
         )
@@ -2158,6 +2160,26 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(
             position_evidence["authoritative_v16_profile"],
             {"warmups": 2, "samples": 12},
+        )
+        estimator_evidence = provenance["v16_quartet_estimator_evidence"]
+        self.assertEqual(estimator_evidence["failed_policy_checks"], 2)
+        self.assertEqual(
+            estimator_evidence["cohort_sha256"],
+            "37d224c3aa371d1ca200edcd71d6c81c3a5f7222d744bd9703e32c979c5ecd50",
+        )
+        self.assertEqual(
+            estimator_evidence["post_hoc_quartet_estimator"],
+            {
+                "estimator": "median-of-four-position-geometric-means",
+                "failed_policy_checks": 0,
+                "failing_report_block_log_means": [
+                    0.047788064348088674,
+                    0.026080639174108463,
+                    0.11824774720694894,
+                ],
+                "failing_report_estimate_log": 0.047788064348088674,
+                "worst_adverse_log": 0.08426327072781893,
+            },
         )
         self.assertAlmostEqual(
             (
@@ -3327,6 +3349,43 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertTrue(
             all(sorted(value) == [0, 1, 2, 3] for value in positions.values())
         )
+
+    def test_position_balanced_ratio_estimator_preserves_quartets(self) -> None:
+        logs = [
+            -0.16904,
+            0.44923,
+            -0.39437,
+            0.30533,
+            0.21673,
+            0.25774,
+            -0.24790,
+            -0.12224,
+            0.14836,
+            -0.22974,
+            0.10339,
+            0.45098,
+        ]
+        ratios = [math.exp(value) for value in logs]
+
+        stats = bench.position_balanced_ratio_stats(ratios)
+        expected_blocks = [
+            math.exp(math.fsum(logs[offset : offset + 4]) / 4)
+            for offset in range(0, len(logs), 4)
+        ]
+
+        self.assertEqual(
+            stats["estimator"], "median-of-four-position-geometric-means"
+        )
+        self.assertEqual(stats["position_block_size"], 4)
+        self.assertEqual(stats["position_block_estimates"], expected_blocks)
+        self.assertEqual(stats["median"], statistics.median(expected_blocks))
+        self.assertGreater(math.log(statistics.median(ratios)), 0.1)
+        self.assertLess(math.log(stats["median"]), 0.1)
+
+        with self.assertRaisesRegex(
+            BenchmarkDataError, "complete four-position blocks"
+        ):
+            bench.position_balanced_ratio_stats(ratios[:-1])
 
     def test_single_revision_cli_emits_candidate_only_report(self) -> None:
         output = self.scratch / "compat-report"
@@ -5810,7 +5869,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         paired_contract = schema["allOf"][0]["then"]["properties"]
         self.assertEqual(
             paired_contract["plan"]["properties"]["samples"]["multipleOf"],
-            2,
+            4,
         )
         self.assertEqual(
             paired_contract["plan"]["properties"]["revision_roles"]["const"],
