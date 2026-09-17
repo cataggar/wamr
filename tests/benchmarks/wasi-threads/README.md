@@ -235,9 +235,31 @@ from `0.03667492495956616` to `0.01517554723182872`. The complete probe and
 derived summary are pinned by SHA-256
 `35186dd10f94ede94bf05b3c7b7eaa0e429cbacc77843b02407ff884bc583b34` and
 `1dbb6bf77d9a32268781d98167a36419b7882b3f886baa572e3ad0f0570f9706`.
-Replaying the v14 policy against all eight retained pilot sets projects
-authoritative benchmark work between 104.81 and 109.29 minutes. The selectors
-contain no platform or architecture identity.
+Replaying the v16 policy and its 12 measured samples against all eight retained
+pilot sets projects authoritative benchmark work between 119.78 and 125.20
+minutes. The selectors contain no platform or architecture identity.
+
+Immutable v15 smoke cohort `2548fe146359446e87f8e41357c3a8d8`
+matched the then-authoritative estimator shape of two warmups and ten measured
+samples. All eight reports validated without retries, replacements, or
+exclusions, but 12 frozen-policy checks failed. The worst raw adverse log was
+Arm interpreter `atomic/8` elapsed at `0.12457979511108486`; the worst
+ratio-of-ratios was Arm interpreter:AOT `atomic/4` elapsed at
+`0.12041830674597341`. The direct-manager maximum still passed at
+`0.012736104758082956`.
+
+The v15 records isolate a deterministic ordering confound rather than an
+insufficient estimator count. Reversing the full four-invocation order each
+sample permanently placed left/candidate and right/baseline in the two
+interior positions, with left/baseline and right/candidate on the edges.
+Across all 40 Arm `atomic/4` measurements, the pooled elapsed
+ratio-of-ratios was `1.109101976807906` (log `0.10355065798014514`), so adding
+samples would reinforce rather than remove the bias. The cohort and policy
+check are pinned by SHA-256
+`f8e3f655b85fad59eeda4dfb682c366a1bd978d24c8e09263c25216b0743efd2`
+and
+`7fc85e837ab2fc817e014ffa17fecb6ec845389945cc532bfb07429aa28bea20`.
+No v15 observation is eligible for authoritative derivation.
 
 Actual warmups and samples
 independently enforce the unchanged `99B < E_actual` and 1.25-second floor.
@@ -256,12 +278,12 @@ watchdog.
 The workflow reserves 69 minutes for non-benchmark work, leaving a 261-minute
 benchmark limit. Before and during the full 88-pilot authoritative plan,
 admission uses the hard 48-minute-24-second pilot bound (`88 * 33s`), the
-166-minute minimum evidence bound
-(`54 * 12 * 5s + 4 * 12 * 20s + 8 * 12 * 40s + 4 * 12 * 20s`
-`+ 16 * 12 * 2.5s + 2 * 12 * 20s`), and the 10-minute auxiliary allowance.
-Their sum is 224 minutes 24 seconds; adding the 69-minute reserve is 293
-minutes 24 seconds, strictly below the 330-minute job timeout with 36 minutes
-36 seconds of headroom. The harness accumulates actual
+193-minute-40-second minimum evidence bound
+(`54 * 14 * 5s + 4 * 14 * 20s + 8 * 14 * 40s + 4 * 14 * 20s`
+`+ 16 * 14 * 2.5s + 2 * 14 * 20s`), and the 10-minute auxiliary allowance.
+Their sum is 252 minutes 4 seconds; adding the 69-minute reserve is 321
+minutes 4 seconds, strictly below the 330-minute job timeout with 8 minutes
+56 seconds of headroom. The harness accumulates actual
 pilot corrected and wall time after each one-shot pilot and aborts immediately
 when the remaining hard bound cannot fit.
 
@@ -350,13 +372,14 @@ role, sets `plan.revision_mode` and `plan.comparison_purpose` to
 It preserves current PR smoke coverage without doubling every measurement and
 is not regression evidence between two source revisions.
 
-The authoritative profile alternates each pair, discards two warmups, and keeps
-ten measured samples. The smoke default is four measured samples. Paired mode
-requires an even measured sample count: baseline and candidate each occupy the
-first revision position exactly half the time. Warmups may have any count
-because balance is enforced across the measured indices even when their
-starting parity is shifted by the warmups. Within every sample index, the
-left/right condition order continues to alternate independently. `report.json`
+The authoritative profile discards two warmups and keeps 12 measured samples.
+The smoke default is four measured samples. Paired mode requires a measured
+sample count divisible by four. Each four-sample cycle keeps revisions adjacent
+within a condition while independently alternating revision order every sample
+and condition-block order every two samples. Every revision/condition
+combination therefore occupies each absolute position in the four-invocation
+quartet exactly once per cycle. Warmups may have any count because any four
+consecutive measured indices cover the complete cycle. `report.json`
 follows `report.schema.json` and
 records raw warmups/samples, commands, host/CPU/compiler/runtime identities,
 fixture and source hashes, explicit pair and revision direction, guest and host
@@ -374,7 +397,7 @@ deadline.
 
 Reports carry two plan identities. `plan_sha256` is the audit identity of the
 complete plan, including `comparison_purpose`.
-`measurement_plan_sha256` is version 18 of a purpose-independent portable
+`measurement_plan_sha256` is version 19 of a purpose-independent portable
 identity. It excludes only `comparison_purpose`, host-resolved evidence counts,
 pilot outcomes, and their projections. It includes the workload/scenario
 definitions, fixed pilot counts and order, sizing algorithm/version, target,
@@ -459,7 +482,7 @@ python3 scripts/bench_wasi_threads.py \
   --baseline-repo /path/to/calibration-a \
   --candidate-repo /path/to/calibration-b \
   --comparison-purpose noise-calibration \
-  --samples 10 \
+  --samples 12 \
   --no-budget
 ```
 
@@ -627,7 +650,7 @@ python3 scripts/wasi_thread_cohort.py dispatch \
   --baseline-sha <40-char-tagged-main-commit> \
   --candidate-sha <same-40-char-tagged-main-commit> \
   --purpose noise-calibration \
-  --profile authoritative --warmups 2 --samples 10 \
+  --profile authoritative --warmups 2 --samples 12 \
   --runner-target trusted-calibration \
   --runs 20 --training-runs 16 --max-in-flight 2 \
   --timeout-seconds 432000 \
@@ -763,7 +786,7 @@ false until the proof/final PR explicitly enables it. A candidate-only source
 change never requires rebaselining.
 
 Schema-v3 fixed-plan reports and reports produced before measurement-plan
-identity version 8, including version-2 reports from #1013, version-3/4
+identity version 19, including version-2 reports from #1013, version-3/4
 #1016 attempts, version-5 #1020 evidence, and version-6/7 cell-envelope
 evidence, are invalid for a new authoritative cohort. Fresh
 evidence with the canonical one-shot sizing identity is mandatory for

@@ -312,8 +312,8 @@ def validate_dispatch_options(args: argparse.Namespace) -> tuple[str, str, int]:
         raise HarnessError("unsupported runner target")
     if args.warmups < 0 or args.samples <= 0:
         raise HarnessError("warmups must be non-negative and samples must be positive")
-    if args.samples % 2:
-        raise HarnessError("paired revision samples must be even")
+    if args.samples % 4:
+        raise HarnessError("paired revision samples must be divisible by 4")
     if args.purpose == "noise-calibration" and baseline_sha != candidate_sha:
         raise HarnessError("noise calibration requires identical target SHAs")
     if args.purpose == "candidate-evaluation" and baseline_sha == candidate_sha:
@@ -678,7 +678,7 @@ def validate_dispatch_state(
         or warmups < 0
         or not isinstance(samples, int)
         or samples <= 0
-        or samples % 2
+        or samples % 4
     ):
         raise HarnessError("dispatch manifest warmup/sample plan")
     if purpose == "noise-calibration" and baseline_sha != candidate_sha:
@@ -2401,8 +2401,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     dispatch_parser.add_argument(
         "--profile", choices=PROFILE_COUNTS, default="authoritative"
     )
-    dispatch_parser.add_argument("--warmups", type=int, default=2)
-    dispatch_parser.add_argument("--samples", type=int, default=10)
+    dispatch_parser.add_argument(
+        "--warmups", type=int, default=PROFILE_COUNTS["authoritative"][0]
+    )
+    dispatch_parser.add_argument(
+        "--samples", type=int, default=PROFILE_COUNTS["authoritative"][1]
+    )
     dispatch_parser.add_argument(
         "--runner-target", choices=RUNNER_TARGETS, default="trusted-calibration"
     )

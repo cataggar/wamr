@@ -207,7 +207,7 @@ def make_report(
     if revision_mode == "paired-revisions":
         revision_roles = bench.REVISION_ROLES
         comparison_purpose = comparison_purpose or "candidate-evaluation"
-        samples = 2 if samples is None else samples
+        samples = 4 if samples is None else samples
     else:
         revision_roles = bench.SINGLE_REVISION_ROLES
         comparison_purpose = "single-revision-compatibility"
@@ -716,7 +716,7 @@ def make_dispatch_state(
         "comparison_purpose": purpose,
         "profile": "authoritative",
         "warmups": 0,
-        "samples": 2,
+        "samples": 4,
         "runner_target": runner_target,
         "required_platforms": list(cohort.DEFAULT_PLATFORMS),
         "requested_runs": len(run_ids),
@@ -936,6 +936,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(paired.baseline_repo, Path("baseline"))
         self.assertEqual(paired.candidate_repo, Path("candidate"))
+        self.assertEqual((paired.warmups, paired.samples), (2, 12))
         with self.assertRaises(SystemExit):
             bench.parse_args(
                 [
@@ -955,7 +956,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(single_odd.samples, 3)
         with self.assertRaisesRegex(
-            BenchmarkDataError, "samples must be even"
+            BenchmarkDataError, "samples must be divisible by 4"
         ):
             make_report(samples=3)
         with self.assertRaises(SystemExit):
@@ -2082,7 +2083,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(
             reserve_admission["algorithm_identity"],
             {
-                "measurement_plan_identity_version": 18,
+                "measurement_plan_identity_version": 19,
                 "sizing_algorithm_version": 13,
             },
         )
@@ -2101,11 +2102,11 @@ class ThreadBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(
             reserve_admission["hard_preadmission_benchmark_ns"],
-            13_464_000_000_000,
+            15_124_000_000_000,
         )
         self.assertEqual(
             reserve_admission["timeout_headroom_ns"],
-            36 * 60 * 1_000_000_000 + 36 * 1_000_000_000,
+            8 * 60 * 1_000_000_000 + 56 * 1_000_000_000,
         )
         self.assertEqual(
             reserve_evidence["step_wall_elapsed_ns"]
@@ -2119,6 +2120,44 @@ class ThreadBenchmarkTests(unittest.TestCase):
             - 1,
             reserve_evidence["reserve_only_margin"],
             places=15,
+        )
+        position_evidence = provenance["v15_position_balance_evidence"]
+        self.assertEqual(position_evidence["failed_policy_checks"], 12)
+        self.assertEqual(
+            position_evidence["old_order_position_classes"],
+            {
+                "edge": ["left/baseline", "right/candidate"],
+                "interior": ["left/candidate", "right/baseline"],
+            },
+        )
+        self.assertEqual(
+            {
+                value: sorted(
+                    order.index(value)
+                    for order in position_evidence[
+                        "position_balanced_cycle"
+                    ]
+                )
+                for value in (
+                    "left/baseline",
+                    "left/candidate",
+                    "right/baseline",
+                    "right/candidate",
+                )
+            },
+            {
+                value: [0, 1, 2, 3]
+                for value in (
+                    "left/baseline",
+                    "left/candidate",
+                    "right/baseline",
+                    "right/candidate",
+                )
+            },
+        )
+        self.assertEqual(
+            position_evidence["authoritative_v16_profile"],
+            {"warmups": 2, "samples": 12},
         )
         self.assertAlmostEqual(
             (
@@ -2192,7 +2231,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 modes=("interpreter", "aot"),
                 thread_counts=thread_counts,
                 warmups=2,
-                samples=10,
+                samples=12,
                 timeout_seconds=90,
             )
             selected_by_rate[label] = {
@@ -2596,10 +2635,10 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(bench.JOB_NON_BENCHMARK_RESERVE_NS, 69 * 60 * 10**9)
         self.assertEqual(bench.WORKFLOW_JOB_TIMEOUT_NS, 330 * 60 * 10**9)
         self.assertEqual(bench.PROJECTED_BENCHMARK_LIMIT_NS, 261 * 60 * 10**9)
-        self.assertEqual(hard_bound, 17_604_000_000_000)
+        self.assertEqual(hard_bound, 19_264_000_000_000)
         self.assertEqual(
             bench.WORKFLOW_JOB_TIMEOUT_NS - hard_bound,
-            36 * 60 * 10**9 + 36 * 10**9,
+            8 * 60 * 10**9 + 56 * 10**9,
         )
         self.assertLess(hard_bound, bench.WORKFLOW_JOB_TIMEOUT_NS)
         with self.assertRaisesRegex(bench.HarnessError, "261-minute"):
@@ -2662,14 +2701,14 @@ class ThreadBenchmarkTests(unittest.TestCase):
             modes=("interpreter", "aot"),
             thread_counts=thread_counts,
             warmups=2,
-            samples=10,
+            samples=12,
             timeout_seconds=90,
         )
         self.assertEqual(len(order), 88)
         expected_actual_pilots = 88 * (
             bench.PROJECTED_EVIDENCE_MINIMUM_NS + 159_700_000
         )
-        expected_evidence = (2 + 10) * sum(
+        expected_evidence = (2 + 12) * sum(
             bench.ceil_div(
                 (bench.PROJECTED_EVIDENCE_MINIMUM_NS + 159_700_000)
                 * bench.sizing_candidates_for_cell(
@@ -2707,7 +2746,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             - bench.AUXILIARY_INVOCATION_BUDGET_NS,
         )
         self.assertEqual(resolved["projected_benchmark_ns"], expected_total)
-        self.assertAlmostEqual(expected_total / 60e9, 188.8741864, places=3)
+        self.assertAlmostEqual(expected_total / 60e9, 217.4252908, places=3)
         self.assertLess(
             resolved["projected_benchmark_ns"],
             bench.PROJECTED_BENCHMARK_LIMIT_NS,
@@ -2722,15 +2761,15 @@ class ThreadBenchmarkTests(unittest.TestCase):
             pilot_records=[],
             pilot_order=order,
             warmups=2,
-            samples=10,
+            samples=12,
         )
         expected_evidence = (
-            54 * 12 * bench.PROJECTED_EVIDENCE_MINIMUM_NS
-            + 4 * 12 * 20_000_000_000
-            + 8 * 12 * 40_000_000_000
-            + 4 * 12 * 20_000_000_000
-            + 16 * 12 * 2_500_000_000
-            + 2 * 12 * 20_000_000_000
+            54 * 14 * bench.PROJECTED_EVIDENCE_MINIMUM_NS
+            + 4 * 14 * 20_000_000_000
+            + 8 * 14 * 40_000_000_000
+            + 4 * 14 * 20_000_000_000
+            + 16 * 14 * 2_500_000_000
+            + 2 * 14 * 20_000_000_000
         )
         self.assertEqual(len(order), 88)
         self.assertEqual(bench.MAXIMUM_PILOT_HOST_WALL_NS, 33_000_000_000)
@@ -2744,7 +2783,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(
             progress["earliest_complete_bound_ns"],
-            13_464_000_000_000,
+            15_124_000_000_000,
         )
         self.assertLess(
             progress["earliest_complete_bound_ns"],
@@ -3171,6 +3210,8 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 section.index("Upload retained paired report"),
                 section.index("Clean run-scoped benchmark output"),
             )
+        self.assertIn('default: "12"', workflow)
+        self.assertIn("SAMPLES % 4 == 0", workflow)
 
     def test_pair_direction_never_depends_on_condition_sorting(self) -> None:
         records = []
@@ -3229,17 +3270,17 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(
             observed[4:],
             [
-                (1, "candidate", 0, "a-target", 0),
-                (1, "baseline", 1, "a-target", 0),
-                (1, "candidate", 0, "z-baseline", 1),
-                (1, "baseline", 1, "z-baseline", 1),
+                (1, "candidate", 0, "z-baseline", 0),
+                (1, "baseline", 1, "z-baseline", 0),
+                (1, "candidate", 0, "a-target", 1),
+                (1, "baseline", 1, "a-target", 1),
             ],
         )
         self.assertEqual(
             alternating_pair_order(1, "left", "right"), ("right", "left")
         )
 
-    def test_measured_revision_positions_balance_after_odd_warmup(self) -> None:
+    def test_measured_quartet_positions_balance_after_odd_warmup(self) -> None:
         records = []
 
         def measure(revision, condition, fields):
@@ -3260,22 +3301,32 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 left="left",
                 right="right",
                 warmups=1,
-                samples=2,
+                samples=4,
                 revision_roles=bench.REVISION_ROLES,
                 revision_fields={"baseline": {}, "candidate": {}},
                 measure=measure,
             )
-        first_positions = [
-            record["revision"]
-            for record in records
-            if record["phase"] == "measure"
-            and record["condition"]
-            == alternating_pair_order(
-                1 + record["pair_index"], "left", "right"
-            )[0]
-            and record["revision_order"] == 0
+        measured = [
+            record for record in records if record["phase"] == "measure"
         ]
-        self.assertEqual(first_positions, ["candidate", "baseline"])
+        positions = {
+            (revision, condition): []
+            for revision in bench.REVISION_ROLES
+            for condition in ("left", "right")
+        }
+        for pair_index in range(4):
+            cell = [
+                record
+                for record in measured
+                if record["pair_index"] == pair_index
+            ]
+            for position, record in enumerate(cell):
+                positions[(record["revision"], record["condition"])].append(
+                    position
+                )
+        self.assertTrue(
+            all(sorted(value) == [0, 1, 2, 3] for value in positions.values())
+        )
 
     def test_single_revision_cli_emits_candidate_only_report(self) -> None:
         output = self.scratch / "compat-report"
@@ -3779,7 +3830,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 "--comparison-purpose",
                 "candidate-evaluation",
                 "--samples",
-                "2",
+                "4",
                 "--no-budget",
             ]
         )
@@ -3861,7 +3912,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                     "--comparison-purpose",
                     "noise-calibration",
                     "--samples",
-                    "2",
+                    "4",
                 ]
             )
 
@@ -4354,7 +4405,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 baseline_source="c" * 64,
                 candidate_source="f" * 64,
                 comparison_purpose="candidate-evaluation",
-                samples=4,
+                samples=8,
             )
         )
         with self.assertRaisesRegex(
@@ -4894,7 +4945,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                     purpose="candidate-evaluation",
                     profile="authoritative",
                     warmups=2,
-                    samples=10,
+                    samples=12,
                     runner_target="github-hosted",
                     runs=2,
                     training_runs=1,
@@ -4935,7 +4986,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 "purpose=candidate-evaluation",
                 "profile=authoritative",
                 "warmups=2",
-                "samples=10",
+                "samples=12",
                 "runner_target=github-hosted",
                 f"cohort_id={'d' * 32}",
                 "cohort_sequence=1",
@@ -4980,7 +5031,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                     purpose="candidate-evaluation",
                     profile="authoritative",
                     warmups=2,
-                    samples=10,
+                    samples=12,
                     runner_target="github-hosted",
                     runs=2,
                     training_runs=1,
@@ -5003,7 +5054,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             "purpose": "candidate-evaluation",
             "profile": "authoritative",
             "warmups": 2,
-            "samples": 10,
+            "samples": 12,
             "runner_target": "github-hosted",
             "repository": "cataggar/wamr",
             "workflow": "wasi-thread-bench.yml",
@@ -5018,7 +5069,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
         }
         for field, value, message in (
             ("baseline_sha", "B" * 40, "lowercase"),
-            ("samples", 3, "even"),
+            ("samples", 6, "divisible by 4"),
             ("candidate_sha", "b" * 40, "distinct"),
             ("runner_target", "trusted-calibration", "noise calibration only"),
             ("timeout_seconds", 0, "timeout"),
@@ -5194,7 +5245,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             purpose="noise-calibration",
             profile="authoritative",
             warmups=2,
-            samples=10,
+            samples=12,
             runner_target="trusted-calibration",
             repository="cataggar/wamr",
             workflow="wasi-thread-bench.yml",
@@ -5227,7 +5278,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             purpose="noise-calibration",
             profile="authoritative",
             warmups=2,
-            samples=10,
+            samples=12,
             runner_target="trusted-calibration",
             repository="cataggar/wamr",
             workflow="wasi-thread-bench.yml",
@@ -5296,7 +5347,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                     purpose="candidate-evaluation",
                     profile="authoritative",
                     warmups=2,
-                    samples=10,
+                    samples=12,
                     runner_target="github-hosted",
                     runs=2,
                     training_runs=1,
