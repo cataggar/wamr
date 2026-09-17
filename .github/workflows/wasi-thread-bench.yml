@@ -44,8 +44,8 @@ on:
         description: "Discarded paired warmups"
         default: "2"
       samples:
-        description: "Measured paired samples (must be positive and even)"
-        default: "10"
+        description: "Measured paired samples (must be positive and divisible by 4)"
+        default: "12"
       runner_target:
         description: "Hosted runners, or the trusted temporary calibration route"
         type: choice
@@ -162,8 +162,8 @@ jobs:
             echo "warmups must be a non-negative integer" >&2
             exit 2
           }
-          [[ "$SAMPLES" =~ ^[1-9][0-9]*$ ]] && (( SAMPLES % 2 == 0 )) || {
-            echo "samples must be a positive even integer" >&2
+          [[ "$SAMPLES" =~ ^[1-9][0-9]*$ ]] && (( SAMPLES % 4 == 0 )) || {
+            echo "samples must be positive and divisible by 4" >&2
             exit 2
           }
           case "$PROFILE" in authoritative|smoke) ;; *)

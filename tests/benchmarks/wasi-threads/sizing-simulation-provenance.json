@@ -560,7 +560,7 @@
   },
   "job_reserve_admission": {
     "algorithm_identity": {
-      "measurement_plan_identity_version": 18,
+      "measurement_plan_identity_version": 19,
       "sizing_algorithm_version": 13
     },
     "auxiliary_invocation_budget_ns": 600000000000,
@@ -579,9 +579,9 @@
       "step_wall_elapsed_ns": 4701000000000,
       "unaccounted_step_wall_ns": 3442447686014
     },
-    "hard_preadmission_benchmark_ns": 13464000000000,
+    "hard_preadmission_benchmark_ns": 15124000000000,
     "job_non_benchmark_reserve_ns": 4140000000000,
-    "timeout_headroom_ns": 2196000000000,
+    "timeout_headroom_ns": 536000000000,
     "workflow_job_timeout_ns": 19800000000000
   },
   "v13_smoke_duration_evidence": {
@@ -595,11 +595,69 @@
       "summary_sha256": "1dbb6bf77d9a32268781d98167a36419b7882b3f886baa572e3ad0f0570f9706"
     },
     "policy_check_sha256": "9007cf73419042d436757c7662d65d0089c848c768bb604c75b6d05aaafb04bb",
-    "retained_pilot_v14_projection": {
-      "maximum_projected_authoritative_benchmark_ns": 6556955664436,
+    "retained_pilot_v16_projection": {
+      "maximum_projected_authoritative_benchmark_ns": 7511709586630,
+      "minimum_projected_authoritative_benchmark_ns": 7186703825185,
       "report_count": 8
     },
     "workflow_head_sha": "8b53af8209c660fa29beb4d145e6865df2745e31"
+  },
+  "v15_position_balance_evidence": {
+    "authoritative_v16_profile": {
+      "samples": 12,
+      "warmups": 2
+    },
+    "cohort_id": "2548fe146359446e87f8e41357c3a8d8",
+    "cohort_sha256": "f8e3f655b85fad59eeda4dfb682c366a1bd978d24c8e09263c25216b0743efd2",
+    "direct_manager_maximum_median_delta_fraction": 0.012736104758082956,
+    "failed_policy_checks": 12,
+    "old_order_position_classes": {
+      "edge": [
+        "left/baseline",
+        "right/candidate"
+      ],
+      "interior": [
+        "left/candidate",
+        "right/baseline"
+      ]
+    },
+    "policy_check_sha256": "7fc85e837ab2fc817e014ffa17fecb6ec845389945cc532bfb07429aa28bea20",
+    "position_balanced_cycle": [
+      [
+        "left/baseline",
+        "left/candidate",
+        "right/baseline",
+        "right/candidate"
+      ],
+      [
+        "left/candidate",
+        "left/baseline",
+        "right/candidate",
+        "right/baseline"
+      ],
+      [
+        "right/baseline",
+        "right/candidate",
+        "left/baseline",
+        "left/candidate"
+      ],
+      [
+        "right/candidate",
+        "right/baseline",
+        "left/candidate",
+        "left/baseline"
+      ]
+    ],
+    "profile": {
+      "samples": 10,
+      "warmups": 2
+    },
+    "report_count": 8,
+    "worst_adverse_log": 0.12457979511108486,
+    "worst_arm_atomic_4_ratio_of_ratios_elapsed_log": 0.12041830674597341,
+    "arm_atomic_4_pooled_elapsed_ratio_of_ratios": 1.109101976807906,
+    "arm_atomic_4_pooled_elapsed_ratio_of_ratios_log": 0.10355065798014514,
+    "workflow_head_sha": "1a66a67b11cbe30adf04d9594682a32fcc5d55fa"
   },
   "epyc_9v45_reference": {
     "relative_speedup": 1.7195,

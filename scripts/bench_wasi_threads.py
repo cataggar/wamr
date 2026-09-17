@@ -48,7 +48,7 @@ CANONICAL_PLATFORMS = {
 
 
 KIND = "wasi-thread-benchmark"
-REPORT_SCHEMA_VERSION = 13
+REPORT_SCHEMA_VERSION = 14
 WASI_MONOTONIC_CLOCK_ID = "wasi-monotonic"
 WASI_PROCESS_CPU_CLOCK_ID = "wasi-process-cputime"
 WASI_MONOTONIC_CLOCK_MODE = "monotonic"
@@ -56,7 +56,7 @@ WASI_PROCESS_CPU_CLOCK_MODE = "process-cpu"
 REVISION_ROLES = ("baseline", "candidate")
 SINGLE_REVISION_ROLES = ("candidate",)
 COMPARISON_PURPOSES = ("candidate-evaluation", "noise-calibration")
-MEASUREMENT_PLAN_IDENTITY_VERSION = 18
+MEASUREMENT_PLAN_IDENTITY_VERSION = 19
 MEASUREMENT_PLAN_IDENTITY_KIND = "wasi-thread-measurement-plan"
 CPU_PLACEMENT_VERSION = 3
 CPU_PLACEMENT_KIND = "fixed-linux-physical-core-affinity"
@@ -75,8 +75,11 @@ CPU_PLACEMENT_POLICY = {
     "failure_policy": "fail-closed",
 }
 PAIR_EXECUTION_POLICY = {
-    "default": "sequential-alternating",
-    "default_order": "condition-major-adjacent-revisions",
+    "default": "sequential-position-balanced",
+    "default_order": "condition-major-adjacent-revisions-four-position-cycle",
+    "default_balance": (
+        "each-revision-condition-occupies-each-quartet-position-once-per-cycle"
+    ),
     "single_infrastructure": "concurrent-topology-paired-cpus",
     "single_infrastructure_artifact": "same-enabled-runtime-binary",
     "single_infrastructure_condition": (
@@ -131,7 +134,7 @@ SIZING_CELL_SELECTION = (
     "max(general_rounded_iterations, applicable_envelope_rounded_iterations)"
 )
 PROFILE_COUNTS = {
-    "authoritative": (2, 10),
+    "authoritative": (2, 12),
     "smoke": (1, 4),
 }
 ATOMIC_WAIT_PREFLIGHT_RUNS = {
@@ -632,7 +635,7 @@ def paired_invocation_order(
         if revision_roles == REVISION_ROLES
         else SINGLE_REVISION_ROLES
     )
-    conditions = alternating_pair_order(global_index, left, right)
+    conditions = paired_condition_order(global_index, pair_kind, left, right)
     if pair_kind == "single-infrastructure":
         return tuple(
             (revision, condition)
@@ -644,6 +647,20 @@ def paired_invocation_order(
         for condition in conditions
         for revision in revisions
     )
+
+
+def paired_condition_order(
+    global_index: int,
+    pair_kind: str,
+    left: str,
+    right: str,
+) -> tuple[str, str]:
+    order_index = (
+        global_index
+        if pair_kind == "single-infrastructure"
+        else global_index // 2
+    )
+    return alternating_pair_order(order_index, left, right)
 
 
 def validate_cpu_placement(
@@ -1735,8 +1752,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--comparison-purpose is required for paired revisions")
     if not paired and args.comparison_purpose is not None:
         parser.error("--comparison-purpose requires paired revisions")
-    if paired and args.samples % 2 != 0:
-        parser.error("paired revision measurements require an even --samples count")
+    if paired and args.samples % 4 != 0:
+        parser.error(
+            "paired revision measurements require --samples divisible by 4"
+        )
     if args.comparison_purpose == "noise-calibration" and not args.no_budget:
         parser.error("noise calibration requires --no-budget")
     if args.budget and args.comparison_purpose != "candidate-evaluation":
@@ -2964,7 +2983,9 @@ def collect_revision_pair(
     for index in range(total):
         phase = "warmup" if index < warmups else "measure"
         phase_index = index if phase == "warmup" else index - warmups
-        condition_order = alternating_pair_order(index, left, right)
+        condition_order = paired_condition_order(
+            index, pair_kind, left, right
+        )
         revision_order = (
             alternating_pair_order(index, *REVISION_ROLES)
             if revision_roles == REVISION_ROLES
@@ -3030,7 +3051,9 @@ def collect_concurrent_revision_pair(
     for index in range(total):
         phase = "warmup" if index < warmups else "measure"
         phase_index = index if phase == "warmup" else index - warmups
-        condition_order = alternating_pair_order(index, left, right)
+        condition_order = paired_condition_order(
+            index, pair_kind, left, right
+        )
         revision_order = (
             alternating_pair_order(index, *REVISION_ROLES)
             if revision_roles == REVISION_ROLES
@@ -3508,8 +3531,8 @@ def validate_report(document: dict[str, Any]) -> None:
             "plan.comparison_purpose",
         )
         require(
-            plan["samples"] % 2 == 0,
-            "paired revision samples must be even",
+            plan["samples"] % 4 == 0,
+            "paired revision samples must be divisible by 4",
         )
     else:
         require(
@@ -4095,8 +4118,11 @@ def validate_report(document: dict[str, Any]) -> None:
             if revision_roles == REVISION_ROLES
             else SINGLE_REVISION_ROLES
         )
-        expected_conditions = alternating_pair_order(
-            global_index, pair["left"], pair["right"]
+        expected_conditions = paired_condition_order(
+            global_index,
+            pair["pair_kind"],
+            pair["left"],
+            pair["right"],
         )
         require(
             record.get("revision_order")
@@ -4884,8 +4910,10 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         candidate_repo = args.candidate_repo.resolve()
         if args.comparison_purpose not in COMPARISON_PURPOSES:
             raise HarnessError("paired revisions require an explicit comparison purpose")
-        if args.samples % 2 != 0:
-            raise HarnessError("paired revision measurements require even samples")
+        if args.samples % 4 != 0:
+            raise HarnessError(
+                "paired revision measurements require samples divisible by 4"
+            )
         if args.comparison_purpose == "noise-calibration" and not args.no_budget:
             raise HarnessError("noise calibration must be non-enforcing")
         if baseline_repo == candidate_repo:
