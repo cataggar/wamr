@@ -48,7 +48,7 @@ CANONICAL_PLATFORMS = {
 
 
 KIND = "wasi-thread-benchmark"
-REPORT_SCHEMA_VERSION = 14
+REPORT_SCHEMA_VERSION = 15
 WASI_MONOTONIC_CLOCK_ID = "wasi-monotonic"
 WASI_PROCESS_CPU_CLOCK_ID = "wasi-process-cputime"
 WASI_MONOTONIC_CLOCK_MODE = "monotonic"
@@ -56,7 +56,7 @@ WASI_PROCESS_CPU_CLOCK_MODE = "process-cpu"
 REVISION_ROLES = ("baseline", "candidate")
 SINGLE_REVISION_ROLES = ("candidate",)
 COMPARISON_PURPOSES = ("candidate-evaluation", "noise-calibration")
-MEASUREMENT_PLAN_IDENTITY_VERSION = 19
+MEASUREMENT_PLAN_IDENTITY_VERSION = 20
 MEASUREMENT_PLAN_IDENTITY_KIND = "wasi-thread-measurement-plan"
 CPU_PLACEMENT_VERSION = 3
 CPU_PLACEMENT_KIND = "fixed-linux-physical-core-affinity"
@@ -80,6 +80,8 @@ PAIR_EXECUTION_POLICY = {
     "default_balance": (
         "each-revision-condition-occupies-each-quartet-position-once-per-cycle"
     ),
+    "default_estimator": "median-of-four-position-geometric-means",
+    "default_estimator_block_size": 4,
     "single_infrastructure": "concurrent-topology-paired-cpus",
     "single_infrastructure_artifact": "same-enabled-runtime-binary",
     "single_infrastructure_condition": (
@@ -661,6 +663,47 @@ def paired_condition_order(
         else global_index // 2
     )
     return alternating_pair_order(order_index, left, right)
+
+
+def position_balanced_ratio_stats(
+    values: list[float], sample_key: str = "samples"
+) -> dict[str, Any]:
+    samples = list(values)
+    normalized = []
+    for index, value in enumerate(samples):
+        require(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and value > 0,
+            f"{sample_key}[{index}] must be a finite positive ratio",
+        )
+        normalized.append(float(value))
+    block_size = PAIR_EXECUTION_POLICY["default_estimator_block_size"]
+    require(
+        bool(normalized) and len(normalized) % block_size == 0,
+        f"{sample_key} must contain complete four-position blocks",
+    )
+    block_estimates = [
+        math.exp(
+            math.fsum(
+                math.log(value)
+                for value in normalized[offset : offset + block_size]
+            )
+            / block_size
+        )
+        for offset in range(0, len(normalized), block_size)
+    ]
+    result = sample_stats(normalized, sample_key)
+    result.update(
+        {
+            "median": statistics.median(block_estimates),
+            "estimator": PAIR_EXECUTION_POLICY["default_estimator"],
+            "position_block_size": block_size,
+            "position_block_estimates": block_estimates,
+        }
+    )
+    return result
 
 
 def validate_cpu_placement(
@@ -3284,6 +3327,8 @@ def comparison_summaries(
         condition,
         metric_kind,
     ), ratios in sorted(grouped.items()):
+        elapsed_stats = position_balanced_ratio_stats(ratios["elapsed"])
+        throughput_stats = position_balanced_ratio_stats(ratios["throughput"])
         result.append(
             {
                 "pair_kind": pair_kind,
@@ -3292,18 +3337,11 @@ def comparison_summaries(
                 "metric_kind": metric_kind,
                 "baseline": "baseline",
                 "candidate": "candidate",
-                "elapsed_candidate_over_baseline": sample_stats(
-                    ratios["elapsed"], "samples"
-                ),
-                "throughput_candidate_over_baseline": sample_stats(
-                    ratios["throughput"], "samples"
-                ),
-                "median_elapsed_delta_pct": (
-                    statistics.median(ratios["elapsed"]) - 1
-                )
-                * 100,
+                "elapsed_candidate_over_baseline": elapsed_stats,
+                "throughput_candidate_over_baseline": throughput_stats,
+                "median_elapsed_delta_pct": (elapsed_stats["median"] - 1) * 100,
                 "median_throughput_delta_pct": (
-                    statistics.median(ratios["throughput"]) - 1
+                    throughput_stats["median"] - 1
                 )
                 * 100,
             }
@@ -3378,6 +3416,8 @@ def ratio_of_ratios_summaries(
         )
     result = []
     for (pair_kind, pair_key, left, right), ratios in sorted(grouped.items()):
+        elapsed_stats = position_balanced_ratio_stats(ratios["elapsed"])
+        throughput_stats = position_balanced_ratio_stats(ratios["throughput"])
         result.append(
             {
                 "pair_kind": pair_kind,
@@ -3386,18 +3426,11 @@ def ratio_of_ratios_summaries(
                 "right": right,
                 "baseline": "baseline",
                 "candidate": "candidate",
-                "elapsed_ratio_of_ratios": sample_stats(
-                    ratios["elapsed"], "samples"
-                ),
-                "throughput_ratio_of_ratios": sample_stats(
-                    ratios["throughput"], "samples"
-                ),
-                "median_elapsed_delta_pct": (
-                    statistics.median(ratios["elapsed"]) - 1
-                )
-                * 100,
+                "elapsed_ratio_of_ratios": elapsed_stats,
+                "throughput_ratio_of_ratios": throughput_stats,
+                "median_elapsed_delta_pct": (elapsed_stats["median"] - 1) * 100,
                 "median_throughput_delta_pct": (
-                    statistics.median(ratios["throughput"]) - 1
+                    throughput_stats["median"] - 1
                 )
                 * 100,
             }

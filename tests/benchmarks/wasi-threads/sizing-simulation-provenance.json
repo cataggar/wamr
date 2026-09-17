@@ -560,7 +560,7 @@
   },
   "job_reserve_admission": {
     "algorithm_identity": {
-      "measurement_plan_identity_version": 19,
+      "measurement_plan_identity_version": 20,
       "sizing_algorithm_version": 13
     },
     "auxiliary_invocation_budget_ns": 600000000000,
@@ -658,6 +658,28 @@
     "arm_atomic_4_pooled_elapsed_ratio_of_ratios": 1.109101976807906,
     "arm_atomic_4_pooled_elapsed_ratio_of_ratios_log": 0.10355065798014514,
     "workflow_head_sha": "1a66a67b11cbe30adf04d9594682a32fcc5d55fa"
+  },
+  "v16_quartet_estimator_evidence": {
+    "cohort_id": "61a39f7ff4f441269726df6bd16a8687",
+    "cohort_sha256": "37d224c3aa371d1ca200edcd71d6c81c3a5f7222d744bd9703e32c979c5ecd50",
+    "direct_manager_maximum_median_delta_fraction": 0.009711706704071954,
+    "failed_policy_checks": 2,
+    "failing_arm_atomic_4_ratio_of_ratios_elapsed_log": 0.12612597436275325,
+    "failing_arm_atomic_4_ratio_of_ratios_throughput_log": 0.12562031407027266,
+    "policy_check_sha256": "d998108694c17adf39811e8075205dd1b157f4f4b52ffb43623d3d49bbae352d",
+    "post_hoc_quartet_estimator": {
+      "estimator": "median-of-four-position-geometric-means",
+      "failed_policy_checks": 0,
+      "failing_report_block_log_means": [
+        0.047788064348088674,
+        0.026080639174108463,
+        0.11824774720694894
+      ],
+      "failing_report_estimate_log": 0.047788064348088674,
+      "worst_adverse_log": 0.08426327072781893
+    },
+    "report_count": 8,
+    "workflow_head_sha": "24fbc241bc84e5da5129d848e7984dac1d979d9f"
   },
   "epyc_9v45_reference": {
     "relative_speedup": 1.7195,
