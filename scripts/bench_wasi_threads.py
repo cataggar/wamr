@@ -48,7 +48,7 @@ CANONICAL_PLATFORMS = {
 
 
 KIND = "wasi-thread-benchmark"
-REPORT_SCHEMA_VERSION = 15
+REPORT_SCHEMA_VERSION = 16
 WASI_MONOTONIC_CLOCK_ID = "wasi-monotonic"
 WASI_PROCESS_CPU_CLOCK_ID = "wasi-process-cputime"
 WASI_MONOTONIC_CLOCK_MODE = "monotonic"
@@ -4462,12 +4462,22 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
         requirements,
         {
             "minimum_reports_per_platform",
+            "minimum_reports_per_cpu_class",
+            "minimum_training_reports_per_cpu_class",
+            "minimum_holdout_reports_per_cpu_class",
             "required_profile",
             "required_platforms",
         },
         "calibration_requirements",
     )
     minimum_reports = requirements["minimum_reports_per_platform"]
+    minimum_class_reports = requirements["minimum_reports_per_cpu_class"]
+    minimum_class_training = requirements[
+        "minimum_training_reports_per_cpu_class"
+    ]
+    minimum_class_holdout = requirements[
+        "minimum_holdout_reports_per_cpu_class"
+    ]
     required_platforms = requirements["required_platforms"]
     if (
         not isinstance(minimum_reports, int)
@@ -4475,6 +4485,20 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
         or minimum_reports < 20
     ):
         raise HarnessError("budget minimum_reports_per_platform must be >= 20")
+    if (
+        not isinstance(minimum_class_reports, int)
+        or isinstance(minimum_class_reports, bool)
+        or not isinstance(minimum_class_training, int)
+        or isinstance(minimum_class_training, bool)
+        or not isinstance(minimum_class_holdout, int)
+        or isinstance(minimum_class_holdout, bool)
+        or minimum_class_reports != minimum_reports
+        or minimum_class_training < 16
+        or minimum_class_holdout < 4
+        or minimum_class_training + minimum_class_holdout
+        > minimum_class_reports
+    ):
+        raise HarnessError("budget CPU-class calibration minima are invalid")
     if requirements["required_profile"] != "authoritative":
         raise HarnessError("budget required_profile must be authoritative")
     if (
@@ -4497,6 +4521,9 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
             "measurement_plan_sha256",
             "profile",
             "report_count_by_platform",
+            "accepted_cpu_classes",
+            "report_count_by_cpu_class",
+            "partition_report_count_by_cpu_class",
         },
         "calibration_provenance",
     )
@@ -4564,6 +4591,69 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
         raise HarnessError(
             "budget calibration has insufficient retained reports"
         )
+    accepted_cpu_classes = calibration["accepted_cpu_classes"]
+    class_counts = calibration["report_count_by_cpu_class"]
+    partition_counts = calibration["partition_report_count_by_cpu_class"]
+    if any(
+        not isinstance(value, dict)
+        or set(value) != set(required_platforms)
+        for value in (
+            accepted_cpu_classes,
+            class_counts,
+            partition_counts,
+        )
+    ):
+        raise HarnessError(
+            "budget CPU-class provenance does not cover platforms"
+        )
+    for platform in required_platforms:
+        classes = accepted_cpu_classes[platform]
+        if (
+            not isinstance(classes, list)
+            or not classes
+            or classes != sorted(classes)
+            or len(classes) != len(set(classes))
+            or any(
+                not isinstance(cpu_class, str)
+                or not cpu_class
+                or cpu_class != cpu_class.strip()
+                for cpu_class in classes
+            )
+            or not isinstance(class_counts[platform], dict)
+            or not isinstance(partition_counts[platform], dict)
+            or set(class_counts[platform]) != set(classes)
+            or set(partition_counts[platform]) != set(classes)
+        ):
+            raise HarnessError(
+                f"budget CPU-class provenance is invalid for {platform}"
+            )
+        total = 0
+        for cpu_class in classes:
+            count = class_counts[platform][cpu_class]
+            split = partition_counts[platform][cpu_class]
+            if (
+                not isinstance(count, int)
+                or isinstance(count, bool)
+                or count < minimum_class_reports
+                or not isinstance(split, dict)
+                or set(split) != {"training", "holdout"}
+                or not isinstance(split["training"], int)
+                or isinstance(split["training"], bool)
+                or split["training"] < minimum_class_training
+                or not isinstance(split["holdout"], int)
+                or isinstance(split["holdout"], bool)
+                or split["holdout"] < minimum_class_holdout
+                or split["training"] + split["holdout"] != count
+            ):
+                raise HarnessError(
+                    f"budget CPU class {cpu_class!r} for {platform} "
+                    "is undersampled"
+                )
+            total += count
+        if total != counts[platform]:
+            raise HarnessError(
+                f"budget CPU-class counts do not sum for {platform}"
+            )
     if set(platforms) != set(required_platforms):
         raise HarnessError("budget platforms are incomplete or unknown")
 
@@ -4602,6 +4692,7 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
             "host_system",
             "host_machine",
             "runner_environment",
+            "accepted_cpu_classes",
             "comparisons",
             "ratio_of_ratios",
         },
@@ -4615,6 +4706,17 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
         raise HarnessError("budget/report host platform mismatch")
     if platform_budget["runner_environment"] != host["runner_environment"]:
         raise HarnessError("budget/report runner environment mismatch")
+    if (
+        platform_budget["accepted_cpu_classes"]
+        != accepted_cpu_classes[platform_id]
+    ):
+        raise HarnessError("budget platform CPU classes differ from provenance")
+    report_cpu_class = host["host_fingerprint"]["fields"]["cpu"]
+    if report_cpu_class not in platform_budget["accepted_cpu_classes"]:
+        raise HarnessError(
+            f"report CPU class {report_cpu_class!r} is not calibrated for "
+            f"{platform_id}"
+        )
 
     expected_comparisons = {
         (item["pair_key"], item["condition"]): item
