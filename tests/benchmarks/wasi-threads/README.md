@@ -496,8 +496,8 @@ The report exposes four metric layers:
    means it regressed. These use the same position-block estimator.
 
 Runner metadata separates the diagnostic, high-cardinality `runner_name` from
-`runner_environment` and the stable host fingerprint used as the performance
-class. The fingerprint includes system, machine, CPU, logical CPU count, runner
+`runner_environment` and the stable host fingerprint used as the exact host
+identity. The fingerprint includes system, machine, CPU, logical CPU count, runner
 image/OS/architecture, and runner environment. It deliberately excludes runner
 name, workflow run ID, attempt, and workflow name. `host_pair.id` identifies
 the particular matched baseline/candidate run without becoming a performance
@@ -669,8 +669,9 @@ be online and idle. Missing or duplicate label matches, offline or busy state,
 and name or label drift abort with a contextual error before workflow dispatch.
 The GitHub-hosted target does not query runner inventory. This exact name/label
 pair is operational identity for the temporary registration, not a portable
-performance class; report host fingerprints remain the relevant performance
-identity. The x86 job also requires at least 80 GiB available on its `/d`
+performance class; the exact reported CPU model is the predeclared derivation
+class, while the host fingerprint remains exact host identity. The x86 job
+also requires at least 80 GiB available on its `/d`
 filesystem before checkout or compilation. This catches deleted run caches
 that remain held open by a cancelled compiler process even when directory
 inspection appears clean.
@@ -683,6 +684,9 @@ python3 scripts/wasi_thread_cohort.py dispatch \
   --purpose noise-calibration \
   --profile authoritative --warmups 2 --samples 12 \
   --runner-target trusted-calibration \
+  --accepted-cpu-class \
+    'ubuntu-22.04-x86_64=Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz' \
+  --accepted-cpu-class 'ubuntu-24.04-aarch64=Neoverse-N2' \
   --runs 20 --training-runs 16 --max-in-flight 2 \
   --timeout-seconds 432000 \
   --output /d/wasi-thread-cohort-dispatch.json
@@ -712,6 +716,13 @@ legacy, or cherry-picked report is accepted. It verifies the immutable workflow
 head and target SHAs, purpose/profile/warmup/sample plan, fixture and plan
 identity, balanced sample ordering, the shared baseline/candidate host identity
 inside each report, and stable baseline/candidate build identities. Trusted
+and GitHub-hosted dispatches must predeclare at least one exact CPU-model string
+for each canonical platform with repeatable `--accepted-cpu-class
+PLATFORM=EXACT_CPU_MODEL` arguments. Unknown CPU models fail immediately, and
+validation also fails if any predeclared class is absent; accepted classes
+cannot be silently added, removed, or left unused after results are seen. Each
+validated observation retains its exact CPU class rather than relying only on
+an aggregate distribution. Trusted
 calibration additionally requires every x86 report to identify runner
 `vm31e-wamr-temp-20260906` and one exact host fingerprint across the cohort.
 GitHub-hosted x86 and AArch64 reports may have heterogeneous hosts across runs;
@@ -751,7 +762,12 @@ python3 scripts/wasi_thread_cohort.py derive \
 For each condition and internal pair, derivation first takes the geometric mean
 inside each complete four-position block and then the median across that
 report's block estimates. It then works in natural-log ratio space on TRAINING
-reports only. The adverse one-sided noise bound is the more permissive of:
+reports only. Observations are partitioned by exact `(platform, CPU model)`
+before any statistics are computed: classes are never pooled. Every accepted
+class must independently contain at least 20 reports, including at least 16
+TRAINING and four HOLDOUT reports. Unknown, absent, or undersampled classes
+fail closed. The adverse one-sided noise bound within each class is the more
+permissive of:
 
 1. the worst observed training deviation from ratio 1; and
 2. the adverse endpoint of `median ± 6 × 1.4826 × MAD`.
@@ -761,6 +777,11 @@ fails if the result exceeds the separately declared engineering-policy ceiling.
 No observation is removed: points outside the robust interval are listed only
 as diagnostic outliers. Every untouched HOLDOUT report must satisfy every
 candidate threshold or no output is written.
+Each class is validated against its own derived thresholds. The release budget
+then selects the worst accepted class independently for every metric: the
+lowest throughput minimum and the highest elapsed maximum. Budget provenance
+pins the accepted classes and total/training/holdout counts, and runtime
+candidate evaluation rejects a report whose exact CPU model is not calibrated.
 
 Every report on both architectures must also contain the direct candidate
 `threads-enabled / threads-disabled` single-infrastructure raw ratios. Both the

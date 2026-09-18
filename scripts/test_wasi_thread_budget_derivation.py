@@ -81,7 +81,7 @@ def attach_synthetic_sizing(plan: dict) -> None:
     }
 
 
-def synthetic_cohort() -> dict:
+def synthetic_cohort(cpu_classes_per_platform: int = 1) -> dict:
     """Build an explicitly synthetic 20-run calibration cohort."""
 
     plan = {
@@ -115,14 +115,25 @@ def synthetic_cohort() -> dict:
     attach_synthetic_sizing(plan)
     plan_sha256 = cache_key(plan)
     measurement_plan_sha256 = bench.measurement_plan_sha256(plan)
-    run_ids = [str(10_000 + index) for index in range(20)]
+    run_count = 20 * cpu_classes_per_platform
+    training_count = 16 * cpu_classes_per_platform
+    run_ids = [str(10_000 + index) for index in range(run_count)]
     assignments = [
         {
             "sequence": index + 1,
-            "partition": "training" if index < 10 else "holdout",
+            "partition": (
+                "training" if index < training_count else "holdout"
+            ),
         }
-        for index in range(20)
+        for index in range(run_count)
     ]
+    accepted_cpu_classes = {
+        platform: [
+            f"synthetic-{platform}-cpu-{class_index}"
+            for class_index in range(cpu_classes_per_platform)
+        ]
+        for platform in cohort.DEFAULT_PLATFORMS
+    }
     revision = {
         "commit": "a" * 40,
         "tracked_diff_sha256": "b" * 64,
@@ -132,7 +143,7 @@ def synthetic_cohort() -> dict:
         "baseline": dict(revision),
         "candidate": dict(revision),
         "fixture_set_sha256": "d" * 64,
-        "plan_sha256_distribution": {plan_sha256: 40},
+        "plan_sha256_distribution": {plan_sha256: run_count * 2},
         "measurement_plan_version": bench.MEASUREMENT_PLAN_IDENTITY_VERSION,
         "measurement_plan_sha256": measurement_plan_sha256,
         "profile": "authoritative",
@@ -143,6 +154,10 @@ def synthetic_cohort() -> dict:
     observations = []
     for index, run_id in enumerate(run_ids):
         partition = assignments[index]["partition"]
+        partition_index = (
+            index if partition == "training" else index - training_count
+        )
+        class_index = partition_index % cpu_classes_per_platform
         # Small deterministic synthetic noise; holdout remains untouched.
         offset = ((index % 5) - 2) * 0.0005
         for platform_index, platform in enumerate(cohort.DEFAULT_PLATFORMS):
@@ -180,8 +195,9 @@ def synthetic_cohort() -> dict:
                     "path": f"synthetic/{platform}/{run_id}/report.json",
                     "host_pair_id": f"synthetic-{platform}-{run_id}",
                     "host_fingerprint_sha256": (
-                        str(platform_index + 1) * 64
+                        f"{platform_index + 1}{class_index}" * 32
                     ),
+                    "cpu_class": accepted_cpu_classes[platform][class_index],
                     "records": 1,
                     "report_sha256": cache_key(
                         {"synthetic": True, "platform": platform, "run_id": run_id}
@@ -240,16 +256,18 @@ def synthetic_cohort() -> dict:
             )
     platforms = {
         platform: {
-            "reports": 20,
+            "reports": run_count,
             "run_ids": list(run_ids),
             "host_fingerprint_distribution": {
-                str(index + 1) * 64: 20
+                f"{index + 1}{class_index}" * 32: 20
+                for class_index in range(cpu_classes_per_platform)
             },
             "cpu_distribution": {
-                f"synthetic-{platform}-cpu": 20
+                cpu_class: 20
+                for cpu_class in accepted_cpu_classes[platform]
             },
             "runner_image_distribution": {
-                f"synthetic-{platform}-image": 20
+                f"synthetic-{platform}-image": run_count
             },
         }
         for index, platform in enumerate(cohort.DEFAULT_PLATFORMS)
@@ -266,18 +284,19 @@ def synthetic_cohort() -> dict:
             "workflow_head_sha": "f" * 40,
             "cohort_id": "1" * 32,
             "runner_target": "github-hosted",
-            "requested_runs": 20,
-            "requested_reports": 40,
+            "accepted_cpu_classes": accepted_cpu_classes,
+            "requested_runs": run_count,
+            "requested_reports": run_count * 2,
         },
         "identity": identity,
         "split": {
             "method": "predeclared-sequence",
-            "training_runs": 10,
-            "holdout_runs": 10,
+            "training_runs": training_count,
+            "holdout_runs": run_count - training_count,
             "assignments": assignments,
             "run_ids": {
-                "training": run_ids[:10],
-                "holdout": run_ids[10:],
+                "training": run_ids[:training_count],
+                "holdout": run_ids[training_count:],
             },
         },
         "platforms": platforms,
@@ -482,6 +501,101 @@ class BudgetDerivationTests(unittest.TestCase):
         changed["observations"][0]["partition"] = "holdout"
         with self.assertRaisesRegex(HarnessError, "changed predeclared membership"):
             cohort.derive_budget_documents(changed, synthetic_policy())
+
+    def test_cpu_class_admission_rejects_unknown_missing_and_undersampled(
+        self,
+    ) -> None:
+        unknown = synthetic_cohort()
+        unknown["observations"][0]["cpu_class"] = "unseen CPU"
+        with self.assertRaisesRegex(HarnessError, "identity is invalid"):
+            cohort.derive_budget_documents(unknown, synthetic_policy())
+
+        missing = synthetic_cohort()
+        platform = cohort.DEFAULT_PLATFORMS[0]
+        missing["dispatch"]["accepted_cpu_classes"][platform].append(
+            "synthetic-missing-cpu"
+        )
+        missing["dispatch"]["accepted_cpu_classes"][platform].sort()
+        with self.assertRaisesRegex(HarnessError, "differ from admission"):
+            cohort.derive_budget_documents(missing, synthetic_policy())
+
+        undersampled = synthetic_cohort(cpu_classes_per_platform=2)
+        classes = undersampled["dispatch"]["accepted_cpu_classes"][platform]
+        moved = next(
+            item
+            for item in undersampled["observations"]
+            if item["platform"] == platform
+            and item["partition"] == "holdout"
+            and item["cpu_class"] == classes[1]
+        )
+        moved["cpu_class"] = classes[0]
+        undersampled["platforms"][platform]["cpu_distribution"] = {
+            classes[0]: 21,
+            classes[1]: 19,
+        }
+        with self.assertRaisesRegex(HarnessError, "undersampled"):
+            cohort.derive_budget_documents(undersampled, synthetic_policy())
+
+    def test_cpu_class_requires_sixteen_training_and_four_holdout(self) -> None:
+        value = synthetic_cohort()
+        moved_run_id = value["split"]["run_ids"]["training"].pop()
+        value["split"]["run_ids"]["holdout"].insert(0, moved_run_id)
+        value["split"]["training_runs"] = 15
+        value["split"]["holdout_runs"] = 5
+        assignment = next(
+            item
+            for item in value["split"]["assignments"]
+            if item["sequence"] == 16
+        )
+        assignment["partition"] = "holdout"
+        for observation in value["observations"]:
+            if observation["run_id"] == moved_run_id:
+                observation["partition"] = "holdout"
+        with self.assertRaisesRegex(HarnessError, "training=15"):
+            cohort.derive_budget_documents(value, synthetic_policy())
+
+    def test_multiple_cpu_classes_are_derived_separately_and_select_worst(
+        self,
+    ) -> None:
+        value = synthetic_cohort(cpu_classes_per_platform=2)
+        for observation in value["observations"]:
+            if observation["cpu_class"].endswith("-1"):
+                for item in observation["metrics"]["comparisons"]:
+                    item["throughput_candidate_over_baseline"] = [0.95] * 12
+                    item["elapsed_candidate_over_baseline"] = [1.05] * 12
+                for item in observation["metrics"]["ratio_of_ratios"]:
+                    item["throughput_ratio_of_ratios"] = [0.96] * 12
+                    item["elapsed_ratio_of_ratios"] = [1.04] * 12
+
+        budget, evidence, _ = cohort.derive_budget_documents(
+            value, synthetic_policy()
+        )
+
+        for platform in cohort.DEFAULT_PLATFORMS:
+            classes = value["dispatch"]["accepted_cpu_classes"][platform]
+            self.assertEqual(
+                budget["platforms"][platform]["accepted_cpu_classes"],
+                classes,
+            )
+            comparison = evidence["platforms"][platform]["comparisons"][0]
+            class_thresholds = [
+                comparison["cpu_classes"][cpu_class]["throughput_rule"][
+                    "threshold_ratio"
+                ]
+                for cpu_class in classes
+            ]
+            self.assertEqual(
+                budget["platforms"][platform]["comparisons"][0][
+                    "min_candidate_over_baseline_throughput_ratio"
+                ],
+                min(class_thresholds),
+            )
+            self.assertEqual(
+                budget["calibration_provenance"][
+                    "report_count_by_cpu_class"
+                ][platform],
+                {cpu_class: 20 for cpu_class in classes},
+            )
 
     def test_rejects_wrong_shape_identity_purpose_and_metrics(self) -> None:
         cases = []

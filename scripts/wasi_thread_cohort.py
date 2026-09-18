@@ -61,6 +61,8 @@ RUNNER_ENVIRONMENTS = {
 DERIVATION_POLICY_KIND = "wasi-thread-budget-derivation-policy"
 DERIVATION_EVIDENCE_KIND = "wasi-thread-budget-derivation-evidence"
 DIRECT_THREAD_DELTA_POLICY_LIMIT = 0.02
+MINIMUM_TRAINING_REPORTS_PER_CPU_CLASS = 16
+MINIMUM_HOLDOUT_REPORTS_PER_CPU_CLASS = 4
 MAD_SCALE = 1.4826
 ROBUST_MAD_MULTIPLIER = 6.0
 
@@ -299,7 +301,68 @@ def preflight_runner_inventory(
         )
 
 
-def validate_dispatch_options(args: argparse.Namespace) -> tuple[str, str, int]:
+def validate_cpu_class_mapping(
+    value: Any, context: str
+) -> dict[str, list[str]]:
+    if not isinstance(value, dict) or set(value) != set(DEFAULT_PLATFORMS):
+        raise HarnessError(
+            f"{context} must cover exactly the canonical platforms"
+        )
+    normalized: dict[str, list[str]] = {}
+    for platform in DEFAULT_PLATFORMS:
+        classes = value[platform]
+        if (
+            not isinstance(classes, list)
+            or not classes
+            or any(
+                not isinstance(cpu_class, str)
+                or not cpu_class
+                or cpu_class != cpu_class.strip()
+                for cpu_class in classes
+            )
+            or len(classes) != len(set(classes))
+            or classes != sorted(classes)
+        ):
+            raise HarnessError(
+                f"{context} has invalid CPU classes for {platform}"
+            )
+        normalized[platform] = list(classes)
+    return normalized
+
+
+def parse_cpu_class_assignments(values: Any) -> dict[str, list[str]]:
+    mapping: dict[str, list[str]] = {
+        platform: [] for platform in DEFAULT_PLATFORMS
+    }
+    if not isinstance(values, list):
+        raise HarnessError(
+            "--accepted-cpu-class must be supplied for every platform"
+        )
+    for value in values:
+        if not isinstance(value, str) or "=" not in value:
+            raise HarnessError(
+                "--accepted-cpu-class must use PLATFORM=EXACT_CPU_MODEL"
+            )
+        platform, cpu_class = value.split("=", 1)
+        if (
+            platform not in mapping
+            or not cpu_class
+            or cpu_class != cpu_class.strip()
+        ):
+            raise HarnessError(
+                "--accepted-cpu-class must use a canonical platform and exact "
+                "non-empty CPU model"
+            )
+        mapping[platform].append(cpu_class)
+    return validate_cpu_class_mapping(
+        {platform: sorted(classes) for platform, classes in mapping.items()},
+        "--accepted-cpu-class",
+    )
+
+
+def validate_dispatch_options(
+    args: argparse.Namespace,
+) -> tuple[str, str, int, dict[str, list[str]]]:
     for name in ("repository", "workflow", "workflow_ref"):
         if not isinstance(getattr(args, name, None), str) or not getattr(args, name):
             raise HarnessError(f"--{name.replace('_', '-')} must not be empty")
@@ -358,7 +421,10 @@ def validate_dispatch_options(args: argparse.Namespace) -> tuple[str, str, int]:
     )
     if training_runs <= 0 or training_runs >= args.runs:
         raise HarnessError("--training-runs must be between one and runs minus one")
-    return baseline_sha, candidate_sha, training_runs
+    accepted_cpu_classes = parse_cpu_class_assignments(
+        getattr(args, "accepted_cpu_class", None)
+    )
+    return baseline_sha, candidate_sha, training_runs, accepted_cpu_classes
 
 
 def find_dispatched_run(
@@ -423,7 +489,12 @@ def find_dispatched_run(
 
 
 def dispatch(args: argparse.Namespace) -> int:
-    baseline_sha, candidate_sha, training_runs = validate_dispatch_options(args)
+    (
+        baseline_sha,
+        candidate_sha,
+        training_runs,
+        accepted_cpu_classes,
+    ) = validate_dispatch_options(args)
     deadline = time.monotonic() + args.timeout_seconds
     if args.runner_target == "trusted-calibration":
         preflight_runner_inventory(
@@ -465,6 +536,7 @@ def dispatch(args: argparse.Namespace) -> int:
         "samples": args.samples,
         "runner_target": args.runner_target,
         "required_platforms": list(DEFAULT_PLATFORMS),
+        "accepted_cpu_classes": accepted_cpu_classes,
         "requested_runs": args.runs,
         "requested_reports": args.runs * len(DEFAULT_PLATFORMS),
         "max_in_flight": args.max_in_flight,
@@ -672,6 +744,10 @@ def validate_dispatch_state(
         raise HarnessError("dispatch manifest profile")
     if runner_target not in RUNNER_TARGETS:
         raise HarnessError("dispatch manifest runner target")
+    accepted_cpu_classes = validate_cpu_class_mapping(
+        state.get("accepted_cpu_classes"),
+        "dispatch manifest accepted_cpu_classes",
+    )
     warmups = state.get("warmups")
     samples = state.get("samples")
     if (
@@ -776,6 +852,7 @@ def validate_dispatch_state(
         "warmups": warmups,
         "samples": samples,
         "runner_target": runner_target,
+        "accepted_cpu_classes": accepted_cpu_classes,
         "requested_runs": requested_runs,
         "requested_reports": requested_reports,
         "timeout_seconds": timeout_seconds,
@@ -1023,6 +1100,10 @@ def validate_paired_documents(
             raise HarnessError(f"{path}: mixed host fingerprint within report")
         fingerprint_fields = host["host_fingerprint"]["fields"]
         cpu = fingerprint_fields["cpu"]
+        if cpu not in expected["accepted_cpu_classes"][platform_id]:
+            raise HarnessError(
+                f"{path}: unseen CPU class {cpu!r} for {platform_id}"
+            )
         runner_image = fingerprint_fields["runner_image"]
         runner_name = host.get("runner_name", "")
         host_fingerprints[platform_id][fingerprint] += 1
@@ -1075,6 +1156,7 @@ def validate_paired_documents(
                 "path": str(path),
                 "host_pair_id": host_pair_id,
                 "host_fingerprint_sha256": fingerprint,
+                "cpu_class": cpu,
                 "records": len(document["records"]),
                 "report_sha256": cache_key(document),
                 "identity": {
@@ -1120,6 +1202,15 @@ def validate_paired_documents(
                 f"trusted x86 reports have mixed "
                 f"{TRUSTED_X86_RUNNER_NAME} host fingerprints"
             )
+    for platform_id in required_platforms:
+        observed_classes = set(host_cpus[platform_id])
+        accepted_classes = set(expected["accepted_cpu_classes"][platform_id])
+        if observed_classes != accepted_classes:
+            raise HarnessError(
+                f"{platform_id}: accepted CPU classes were not all observed; "
+                f"accepted={sorted(accepted_classes)!r}, "
+                f"observed={sorted(observed_classes)!r}"
+            )
     observations.sort(key=lambda item: (item["sequence"], item["platform"]))
     if len(observations) != len(documents):
         raise HarnessError("cohort observation exclusion is forbidden")
@@ -1138,6 +1229,7 @@ def validate_paired_documents(
             "workflow_head_sha": expected["workflow_head_sha"],
             "cohort_id": expected["cohort_id"],
             "runner_target": expected["runner_target"],
+            "accepted_cpu_classes": expected["accepted_cpu_classes"],
             "requested_runs": expected["requested_runs"],
             "requested_reports": expected["requested_reports"],
         },
@@ -1529,6 +1621,10 @@ def validate_calibration_cohort(
         str(dispatch.get("workflow_head_sha", "")),
         "validated cohort workflow head SHA",
     )
+    accepted_cpu_classes = validate_cpu_class_mapping(
+        dispatch.get("accepted_cpu_classes"),
+        "validated cohort accepted_cpu_classes",
+    )
     if re.fullmatch(r"[0-9a-f]{32}", dispatch["cohort_id"]) is None:
         raise HarnessError("validated cohort dispatch cohort_id is invalid")
 
@@ -1601,6 +1697,10 @@ def validate_calibration_cohort(
     normalized_observations: list[dict[str, Any]] = []
     expected_metric_keys: dict[str, set[tuple[str, ...]]] = {}
     platform_counts: Counter[str] = Counter()
+    cpu_class_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    cpu_class_partition_counts: dict[
+        str, dict[str, Counter[str]]
+    ] = defaultdict(lambda: defaultdict(Counter))
     run_platforms: dict[str, set[str]] = defaultdict(set)
     run_sequences: dict[str, int] = {}
     sequence_runs: dict[int, str] = {}
@@ -1612,12 +1712,15 @@ def validate_calibration_cohort(
         platform = observation.get("platform")
         sequence = observation.get("sequence")
         partition = observation.get("partition")
+        cpu_class = observation.get("cpu_class")
         if (
             not isinstance(run_id, str)
             or not run_id.isdigit()
             or platform not in DEFAULT_PLATFORMS
             or not isinstance(sequence, int)
             or partition not in ("training", "holdout")
+            or not isinstance(cpu_class, str)
+            or cpu_class not in accepted_cpu_classes.get(platform, [])
         ):
             raise HarnessError(f"cohort observation {index} identity is invalid")
         if (run_id, platform) in seen:
@@ -1745,6 +1848,8 @@ def validate_calibration_cohort(
         seen.add((run_id, platform))
         observed_by_partition[partition].add(run_id)
         platform_counts[platform] += 1
+        cpu_class_counts[platform][cpu_class] += 1
+        cpu_class_partition_counts[platform][cpu_class][partition] += 1
         run_platforms[run_id].add(platform)
         normalized_observations.append(
             {
@@ -1766,10 +1871,35 @@ def validate_calibration_cohort(
     if any(run_platforms[run_id] != set(DEFAULT_PLATFORMS) for run_id in all_run_ids):
         raise HarnessError("validated cohort has partial cross-platform run pairing")
     minimum = policy["minimum_reports_per_platform"]
-    if any(platform_counts[platform] < minimum for platform in DEFAULT_PLATFORMS):
-        raise HarnessError(
-            f"validated cohort needs at least {minimum} reports per platform"
-        )
+    for platform in DEFAULT_PLATFORMS:
+        if set(cpu_class_counts[platform]) != set(
+            accepted_cpu_classes[platform]
+        ):
+            raise HarnessError(
+                f"validated cohort {platform} CPU classes differ from admission"
+            )
+        for cpu_class in accepted_cpu_classes[platform]:
+            total = cpu_class_counts[platform][cpu_class]
+            training = cpu_class_partition_counts[platform][cpu_class][
+                "training"
+            ]
+            holdout = cpu_class_partition_counts[platform][cpu_class][
+                "holdout"
+            ]
+            if (
+                total < minimum
+                or training < MINIMUM_TRAINING_REPORTS_PER_CPU_CLASS
+                or holdout < MINIMUM_HOLDOUT_REPORTS_PER_CPU_CLASS
+            ):
+                raise HarnessError(
+                    f"validated cohort {platform} CPU class {cpu_class!r} is "
+                    "undersampled: "
+                    f"reports={total} (required >= {minimum}), "
+                    f"training={training} "
+                    f"(required >= {MINIMUM_TRAINING_REPORTS_PER_CPU_CLASS}), "
+                    f"holdout={holdout} "
+                    f"(required >= {MINIMUM_HOLDOUT_REPORTS_PER_CPU_CLASS})"
+                )
     if any(
         platforms[platform].get("reports") != platform_counts[platform]
         for platform in DEFAULT_PLATFORMS
@@ -1797,6 +1927,12 @@ def validate_calibration_cohort(
                 raise HarnessError(
                     f"validated cohort {platform} {key} is incomplete"
                 )
+        if platforms[platform]["cpu_distribution"] != dict(
+            sorted(cpu_class_counts[platform].items())
+        ):
+            raise HarnessError(
+                f"validated cohort {platform} CPU distribution changed"
+            )
         runner_images = platforms[platform].get("runner_image_distribution")
         self_hosted_x86 = (
             runner_target == "trusted-calibration"
@@ -1848,6 +1984,23 @@ def validate_calibration_cohort(
         "platforms": platforms,
         "observations": normalized_observations,
         "platform_counts": dict(platform_counts),
+        "accepted_cpu_classes": accepted_cpu_classes,
+        "cpu_class_counts": {
+            platform: dict(sorted(cpu_class_counts[platform].items()))
+            for platform in DEFAULT_PLATFORMS
+        },
+        "cpu_class_partition_counts": {
+            platform: {
+                cpu_class: {
+                    partition: cpu_class_partition_counts[platform][
+                        cpu_class
+                    ][partition]
+                    for partition in ("training", "holdout")
+                }
+                for cpu_class in accepted_cpu_classes[platform]
+            }
+            for platform in DEFAULT_PLATFORMS
+        },
         "metric_keys": expected_metric_keys,
     }
 
@@ -1937,6 +2090,95 @@ def _observation_metric_estimate(
     return _position_balanced_sample_estimate(values, label)
 
 
+def _derive_cpu_class_metric(
+    *,
+    platform: str,
+    cpu_class: str,
+    observations: list[dict[str, Any]],
+    collection: str,
+    key: tuple[str, ...],
+    throughput_field: str,
+    elapsed_field: str,
+    throughput_ceiling: float,
+    elapsed_ceiling: float,
+    cushion: float,
+    throughput_threshold_name: str,
+    elapsed_threshold_name: str,
+) -> tuple[dict[str, float], dict[str, Any], list[str]]:
+    training = [
+        item for item in observations if item["partition"] == "training"
+    ]
+    holdout = [
+        item for item in observations if item["partition"] == "holdout"
+    ]
+    label = f"{platform} CPU class {cpu_class!r} {collection} {key}"
+    throughput_rule = derive_one_sided_threshold(
+        [
+            _observation_metric_estimate(
+                item, collection, key, throughput_field
+            )
+            for item in training
+        ],
+        "lower",
+        cushion,
+        throughput_ceiling,
+        f"{label} throughput",
+    )
+    elapsed_rule = derive_one_sided_threshold(
+        [
+            _observation_metric_estimate(item, collection, key, elapsed_field)
+            for item in training
+        ],
+        "upper",
+        cushion,
+        elapsed_ceiling,
+        f"{label} elapsed",
+    )
+    threshold = {
+        throughput_threshold_name: throughput_rule["threshold_ratio"],
+        elapsed_threshold_name: elapsed_rule["threshold_ratio"],
+    }
+    holdout_results = []
+    failures = []
+    for item in holdout:
+        throughput = _observation_metric_estimate(
+            item, collection, key, throughput_field
+        )
+        elapsed = _observation_metric_estimate(
+            item, collection, key, elapsed_field
+        )
+        passed = (
+            throughput >= threshold[throughput_threshold_name]
+            and elapsed <= threshold[elapsed_threshold_name]
+        )
+        holdout_results.append(
+            {
+                "run_id": item["run_id"],
+                "throughput_ratio": throughput,
+                "elapsed_ratio": elapsed,
+                "passed": passed,
+            }
+        )
+        if not passed:
+            failures.append(
+                f"{label} run {item['run_id']} failed: "
+                f"throughput={throughput:.17g} "
+                f"(min={threshold[throughput_threshold_name]:.17g}), "
+                f"elapsed={elapsed:.17g} "
+                f"(max={threshold[elapsed_threshold_name]:.17g})"
+            )
+    return (
+        threshold,
+        {
+            "training_run_ids": [item["run_id"] for item in training],
+            "throughput_rule": throughput_rule,
+            "elapsed_rule": elapsed_rule,
+            "holdout": holdout_results,
+        },
+        failures,
+    )
+
+
 def derive_budget_documents(
     cohort: dict[str, Any],
     policy_document: dict[str, Any],
@@ -1956,205 +2198,134 @@ def derive_budget_documents(
 
     for platform in DEFAULT_PLATFORMS:
         selected = [item for item in observations if item["platform"] == platform]
-        training = [item for item in selected if item["partition"] == "training"]
-        holdout = [item for item in selected if item["partition"] == "holdout"]
+        accepted_classes = validated["accepted_cpu_classes"][platform]
+        class_observations = {
+            cpu_class: [
+                item
+                for item in selected
+                if item["cpu_class"] == cpu_class
+            ]
+            for cpu_class in accepted_classes
+        }
         comparison_budget = []
         comparison_evidence = []
         for key in sorted(validated["metric_keys"]["comparisons"]):
-            throughput_values = [
-                _observation_metric_estimate(
-                    item,
-                    "comparisons",
-                    key,
-                    "throughput_candidate_over_baseline",
+            class_results = {
+                cpu_class: _derive_cpu_class_metric(
+                    platform=platform,
+                    cpu_class=cpu_class,
+                    observations=class_observations[cpu_class],
+                    collection="comparisons",
+                    key=key,
+                    throughput_field="throughput_candidate_over_baseline",
+                    elapsed_field="elapsed_candidate_over_baseline",
+                    throughput_ceiling=ceilings[
+                        "comparison_throughput_lower"
+                    ],
+                    elapsed_ceiling=ceilings["comparison_elapsed_upper"],
+                    cushion=cushion,
+                    throughput_threshold_name=(
+                        "min_candidate_over_baseline_throughput_ratio"
+                    ),
+                    elapsed_threshold_name=(
+                        "max_candidate_over_baseline_elapsed_ratio"
+                    ),
                 )
-                for item in training
-            ]
-            elapsed_values = [
-                _observation_metric_estimate(
-                    item,
-                    "comparisons",
-                    key,
-                    "elapsed_candidate_over_baseline",
-                )
-                for item in training
-            ]
-            throughput_rule = derive_one_sided_threshold(
-                throughput_values,
-                "lower",
-                cushion,
-                ceilings["comparison_throughput_lower"],
-                f"{platform} comparison {key} throughput",
-            )
-            elapsed_rule = derive_one_sided_threshold(
-                elapsed_values,
-                "upper",
-                cushion,
-                ceilings["comparison_elapsed_upper"],
-                f"{platform} comparison {key} elapsed",
-            )
+                for cpu_class in accepted_classes
+            }
             threshold = {
                 "pair_key": key[0],
                 "condition": key[1],
                 "metric_kind": key[2],
-                "min_candidate_over_baseline_throughput_ratio": throughput_rule[
-                    "threshold_ratio"
-                ],
-                "max_candidate_over_baseline_elapsed_ratio": elapsed_rule[
-                    "threshold_ratio"
-                ],
-            }
-            holdout_results = []
-            for item in holdout:
-                throughput = _observation_metric_estimate(
-                    item,
-                    "comparisons",
-                    key,
-                    "throughput_candidate_over_baseline",
-                )
-                elapsed = _observation_metric_estimate(
-                    item,
-                    "comparisons",
-                    key,
-                    "elapsed_candidate_over_baseline",
-                )
-                passed = (
-                    throughput
-                    >= threshold[
+                "min_candidate_over_baseline_throughput_ratio": min(
+                    result[0][
                         "min_candidate_over_baseline_throughput_ratio"
                     ]
-                    and elapsed
-                    <= threshold["max_candidate_over_baseline_elapsed_ratio"]
-                )
-                holdout_results.append(
-                    {
-                        "run_id": item["run_id"],
-                        "throughput_ratio": throughput,
-                        "elapsed_ratio": elapsed,
-                        "passed": passed,
-                    }
-                )
-                if not passed:
-                    holdout_failures.append(
-                        f"{platform} run {item['run_id']} comparison "
-                        f"{key[0]}/{key[1]} failed: throughput={throughput:.17g} "
-                        "(min="
-                        f"{threshold['min_candidate_over_baseline_throughput_ratio']:.17g}), "
-                        f"elapsed={elapsed:.17g} "
-                        "(max="
-                        f"{threshold['max_candidate_over_baseline_elapsed_ratio']:.17g})"
-                    )
+                    for result in class_results.values()
+                ),
+                "max_candidate_over_baseline_elapsed_ratio": max(
+                    result[0]["max_candidate_over_baseline_elapsed_ratio"]
+                    for result in class_results.values()
+                ),
+            }
+            for result in class_results.values():
+                holdout_failures.extend(result[2])
             comparison_budget.append(threshold)
             comparison_evidence.append(
                 {
                     "pair_key": key[0],
                     "condition": key[1],
                     "metric_kind": key[2],
-                    "training_run_ids": [item["run_id"] for item in training],
-                    "throughput_rule": throughput_rule,
-                    "elapsed_rule": elapsed_rule,
-                    "holdout": holdout_results,
+                    "release_threshold": threshold,
+                    "cpu_classes": {
+                        cpu_class: result[1]
+                        for cpu_class, result in class_results.items()
+                    },
                 }
             )
 
         ratio_budget = []
         ratio_evidence = []
         for key in sorted(validated["metric_keys"]["ratio_of_ratios"]):
-            throughput_values = [
-                _observation_metric_estimate(
-                    item,
-                    "ratio_of_ratios",
-                    key,
-                    "throughput_ratio_of_ratios",
+            class_results = {
+                cpu_class: _derive_cpu_class_metric(
+                    platform=platform,
+                    cpu_class=cpu_class,
+                    observations=class_observations[cpu_class],
+                    collection="ratio_of_ratios",
+                    key=key,
+                    throughput_field="throughput_ratio_of_ratios",
+                    elapsed_field="elapsed_ratio_of_ratios",
+                    throughput_ceiling=ceilings[
+                        "ratio_of_ratios_throughput_lower"
+                    ],
+                    elapsed_ceiling=ceilings[
+                        "ratio_of_ratios_elapsed_upper"
+                    ],
+                    cushion=cushion,
+                    throughput_threshold_name=(
+                        "min_candidate_over_baseline_throughput_ratio_of_ratios"
+                    ),
+                    elapsed_threshold_name=(
+                        "max_candidate_over_baseline_elapsed_ratio_of_ratios"
+                    ),
                 )
-                for item in training
-            ]
-            elapsed_values = [
-                _observation_metric_estimate(
-                    item,
-                    "ratio_of_ratios",
-                    key,
-                    "elapsed_ratio_of_ratios",
-                )
-                for item in training
-            ]
-            throughput_rule = derive_one_sided_threshold(
-                throughput_values,
-                "lower",
-                cushion,
-                ceilings["ratio_of_ratios_throughput_lower"],
-                f"{platform} ratio-of-ratios {key} throughput",
-            )
-            elapsed_rule = derive_one_sided_threshold(
-                elapsed_values,
-                "upper",
-                cushion,
-                ceilings["ratio_of_ratios_elapsed_upper"],
-                f"{platform} ratio-of-ratios {key} elapsed",
-            )
+                for cpu_class in accepted_classes
+            }
             threshold = {
                 "pair_key": key[0],
                 "left": key[1],
                 "right": key[2],
                 "min_candidate_over_baseline_throughput_ratio_of_ratios": (
-                    throughput_rule["threshold_ratio"]
+                    min(
+                        result[0][
+                            "min_candidate_over_baseline_throughput_ratio_of_ratios"
+                        ]
+                        for result in class_results.values()
+                    )
                 ),
                 "max_candidate_over_baseline_elapsed_ratio_of_ratios": (
-                    elapsed_rule["threshold_ratio"]
+                    max(
+                        result[0][
+                            "max_candidate_over_baseline_elapsed_ratio_of_ratios"
+                        ]
+                        for result in class_results.values()
+                    )
                 ),
             }
-            holdout_results = []
-            for item in holdout:
-                throughput = _observation_metric_estimate(
-                    item,
-                    "ratio_of_ratios",
-                    key,
-                    "throughput_ratio_of_ratios",
-                )
-                elapsed = _observation_metric_estimate(
-                    item,
-                    "ratio_of_ratios",
-                    key,
-                    "elapsed_ratio_of_ratios",
-                )
-                passed = (
-                    throughput
-                    >= threshold[
-                        "min_candidate_over_baseline_throughput_ratio_of_ratios"
-                    ]
-                    and elapsed
-                    <= threshold[
-                        "max_candidate_over_baseline_elapsed_ratio_of_ratios"
-                    ]
-                )
-                holdout_results.append(
-                    {
-                        "run_id": item["run_id"],
-                        "throughput_ratio_of_ratios": throughput,
-                        "elapsed_ratio_of_ratios": elapsed,
-                        "passed": passed,
-                    }
-                )
-                if not passed:
-                    holdout_failures.append(
-                        f"{platform} run {item['run_id']} ratio-of-ratios "
-                        f"{key[0]} failed: throughput={throughput:.17g} "
-                        "(min="
-                        f"{threshold['min_candidate_over_baseline_throughput_ratio_of_ratios']:.17g}), "
-                        f"elapsed={elapsed:.17g} "
-                        "(max="
-                        f"{threshold['max_candidate_over_baseline_elapsed_ratio_of_ratios']:.17g})"
-                    )
+            for result in class_results.values():
+                holdout_failures.extend(result[2])
             ratio_budget.append(threshold)
             ratio_evidence.append(
                 {
                     "pair_key": key[0],
                     "left": key[1],
                     "right": key[2],
-                    "training_run_ids": [item["run_id"] for item in training],
-                    "throughput_rule": throughput_rule,
-                    "elapsed_rule": elapsed_rule,
-                    "holdout": holdout_results,
+                    "release_threshold": threshold,
+                    "cpu_classes": {
+                        cpu_class: result[1]
+                        for cpu_class, result in class_results.items()
+                    },
                 }
             )
 
@@ -2178,6 +2349,7 @@ def derive_budget_documents(
                     {
                         "run_id": item["run_id"],
                         "partition": item["partition"],
+                        "cpu_class": item["cpu_class"],
                         "throughput_ratio": throughput,
                         "elapsed_ratio": elapsed,
                         "absolute_throughput_delta_fraction": throughput_delta,
@@ -2212,13 +2384,24 @@ def derive_budget_documents(
             "host_system": system,
             "host_machine": machine,
             "runner_environment": RUNNER_ENVIRONMENTS[runner_target][platform],
+            "accepted_cpu_classes": accepted_classes,
             "comparisons": comparison_budget,
             "ratio_of_ratios": ratio_budget,
         }
         platform_evidence[platform] = {
             "report_count": len(selected),
-            "training_report_count": len(training),
-            "holdout_report_count": len(holdout),
+            "training_report_count": sum(
+                item["partition"] == "training" for item in selected
+            ),
+            "holdout_report_count": sum(
+                item["partition"] == "holdout" for item in selected
+            ),
+            "cpu_class_report_counts": validated["cpu_class_counts"][
+                platform
+            ],
+            "cpu_class_partition_counts": validated[
+                "cpu_class_partition_counts"
+            ][platform],
             "host_fingerprint_distribution": validated["platforms"][platform].get(
                 "host_fingerprint_distribution", {}
             ),
@@ -2263,6 +2446,15 @@ def derive_budget_documents(
             "minimum_reports_per_platform": policy[
                 "minimum_reports_per_platform"
             ],
+            "minimum_reports_per_cpu_class": policy[
+                "minimum_reports_per_platform"
+            ],
+            "minimum_training_reports_per_cpu_class": (
+                MINIMUM_TRAINING_REPORTS_PER_CPU_CLASS
+            ),
+            "minimum_holdout_reports_per_cpu_class": (
+                MINIMUM_HOLDOUT_REPORTS_PER_CPU_CLASS
+            ),
             "required_profile": "authoritative",
             "required_platforms": list(DEFAULT_PLATFORMS),
         },
@@ -2279,6 +2471,11 @@ def derive_budget_documents(
             ],
             "profile": "authoritative",
             "report_count_by_platform": validated["platform_counts"],
+            "accepted_cpu_classes": validated["accepted_cpu_classes"],
+            "report_count_by_cpu_class": validated["cpu_class_counts"],
+            "partition_report_count_by_cpu_class": validated[
+                "cpu_class_partition_counts"
+            ],
         },
         "platforms": platform_budgets,
     }
@@ -2289,7 +2486,10 @@ def derive_budget_documents(
         "candidate_budget_sha256": cache_key(budget),
         "enforcement_enabled": False,
         "method": {
-            "domain": "natural log of each per-report median raw ratio",
+            "domain": (
+                "natural log of each per-report position-balanced estimate, "
+                "derived independently within each exact CPU-model class"
+            ),
             "robust_rule": (
                 "For each one-sided metric, select the larger of the worst "
                 "observed training deviation and median +/- "
@@ -2300,8 +2500,13 @@ def derive_budget_documents(
                 "separately declared engineering policy ceiling."
             ),
             "holdout_rule": (
-                "Every untouched holdout report must satisfy every derived "
-                "one-sided threshold."
+                "Every untouched holdout report must satisfy every threshold "
+                "derived for its exact CPU-model class."
+            ),
+            "release_rule": (
+                "Release throughput minima use the lowest class threshold; "
+                "release elapsed maxima use the highest class threshold. "
+                "Observations from different CPU classes are never pooled."
             ),
             "outlier_rule": "Outliers are diagnostic only; no observation is dropped.",
         },
@@ -2313,6 +2518,11 @@ def derive_budget_documents(
             "workflow_head_sha": validated["dispatch"].get("workflow_head_sha"),
             "cohort_id": validated["dispatch"].get("cohort_id"),
             "runner_target": validated["dispatch"].get("runner_target"),
+            "accepted_cpu_classes": validated["accepted_cpu_classes"],
+            "report_count_by_cpu_class": validated["cpu_class_counts"],
+            "partition_report_count_by_cpu_class": validated[
+                "cpu_class_partition_counts"
+            ],
             "workflow_run_ids": sorted(
                 {
                     item["run_id"]
@@ -2430,6 +2640,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     dispatch_parser.add_argument(
         "--runner-target", choices=RUNNER_TARGETS, default="trusted-calibration"
+    )
+    dispatch_parser.add_argument(
+        "--accepted-cpu-class",
+        action="append",
+        default=[],
+        metavar="PLATFORM=EXACT_CPU_MODEL",
+        help=(
+            "predeclare an accepted exact CPU model; repeat for every platform "
+            "and accepted class"
+        ),
     )
     dispatch_parser.add_argument("--runs", type=int, default=20)
     dispatch_parser.add_argument("--training-runs", type=int)

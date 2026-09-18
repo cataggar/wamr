@@ -18,7 +18,7 @@
     "budget"
   ],
   "properties": {
-    "schema_version": { "const": 15 },
+    "schema_version": { "const": 16 },
     "kind": { "const": "wasi-thread-benchmark" },
     "metadata": {
       "type": "object",

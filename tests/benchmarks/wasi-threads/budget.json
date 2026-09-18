@@ -1,10 +1,13 @@
 {
-  "schema_version": 15,
+  "schema_version": 16,
   "kind": "wasi-thread-benchmark-budget",
   "calibrated": false,
   "enforcement": false,
   "calibration_requirements": {
     "minimum_reports_per_platform": 20,
+    "minimum_reports_per_cpu_class": 20,
+    "minimum_training_reports_per_cpu_class": 16,
+    "minimum_holdout_reports_per_cpu_class": 4,
     "required_profile": "authoritative",
     "required_platforms": [
       "ubuntu-22.04-x86_64",

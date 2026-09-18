@@ -31,6 +31,10 @@ from benchmark_schema import (  # noqa: E402
 )
 
 SCHEMA_VERSION = bench.REPORT_SCHEMA_VERSION
+TEST_ACCEPTED_CPU_CLASS_ARGS = [
+    "ubuntu-22.04-x86_64=test cpu",
+    "ubuntu-24.04-aarch64=test cpu",
+]
 
 
 def test_cpu_placement(
@@ -609,6 +613,9 @@ def complete_budget(report: dict) -> dict:
         "runner_environment": report["metadata"]["host"][
             "runner_environment"
         ],
+        "accepted_cpu_classes": [
+            report["metadata"]["host"]["host_fingerprint"]["fields"]["cpu"]
+        ],
         "comparisons": [
             {
                 "pair_key": item["pair_key"],
@@ -637,6 +644,9 @@ def complete_budget(report: dict) -> dict:
         "enforcement": True,
         "calibration_requirements": {
             "minimum_reports_per_platform": 20,
+            "minimum_reports_per_cpu_class": 20,
+            "minimum_training_reports_per_cpu_class": 16,
+            "minimum_holdout_reports_per_cpu_class": 4,
             "required_profile": "authoritative",
             "required_platforms": list(bench.CANONICAL_PLATFORMS),
         },
@@ -669,6 +679,33 @@ def complete_budget(report: dict) -> dict:
             "report_count_by_platform": {
                 item: 20 for item in bench.CANONICAL_PLATFORMS
             },
+            "accepted_cpu_classes": {
+                item: [
+                    report["metadata"]["host"]["host_fingerprint"]["fields"][
+                        "cpu"
+                    ]
+                ]
+                for item in bench.CANONICAL_PLATFORMS
+            },
+            "report_count_by_cpu_class": {
+                item: {
+                    report["metadata"]["host"]["host_fingerprint"]["fields"][
+                        "cpu"
+                    ]: 20
+                }
+                for item in bench.CANONICAL_PLATFORMS
+            },
+            "partition_report_count_by_cpu_class": {
+                item: {
+                    report["metadata"]["host"]["host_fingerprint"]["fields"][
+                        "cpu"
+                    ]: {
+                        "training": 16,
+                        "holdout": 4,
+                    }
+                }
+                for item in bench.CANONICAL_PLATFORMS
+            },
         },
         "platforms": {
             platform_id: platform_budget,
@@ -694,9 +731,10 @@ def make_dispatch_state(
     candidate_sha: str = "a" * 40,
     purpose: str = "candidate-evaluation",
     runner_target: str = "github-hosted",
+    accepted_cpu_classes: dict[str, list[str]] | None = None,
 ) -> dict:
     cohort_id = "d" * 32
-    training_runs = len(run_ids) // 2
+    training_runs = 16 if len(run_ids) >= 20 else len(run_ids) // 2
     assignments = [
         {
             "sequence": sequence,
@@ -721,6 +759,14 @@ def make_dispatch_state(
         "samples": 4,
         "runner_target": runner_target,
         "required_platforms": list(cohort.DEFAULT_PLATFORMS),
+        "accepted_cpu_classes": (
+            accepted_cpu_classes
+            if accepted_cpu_classes is not None
+            else {
+                platform: ["test cpu"]
+                for platform in cohort.DEFAULT_PLATFORMS
+            }
+        ),
         "requested_runs": len(run_ids),
         "requested_reports": len(run_ids) * len(cohort.DEFAULT_PLATFORMS),
         "max_in_flight": 2,
@@ -4504,6 +4550,15 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 ):
                     bench.load_budget(self.write_budget(corrupt), report)
 
+    def test_budget_rejects_unseen_cpu_class(self) -> None:
+        calibrated_report = make_report(cpu="calibrated CPU")
+        budget = complete_budget(calibrated_report)
+        unseen_report = make_report(cpu="unseen CPU")
+        with self.assertRaisesRegex(
+            bench.HarnessError, "is not calibrated"
+        ):
+            bench.load_budget(self.write_budget(budget), unseen_report)
+
     def test_paired_cohort_preserves_exact_runs_and_predeclared_split(self) -> None:
         dispatch_state = make_dispatch_state()
         reports = make_paired_cohort_reports()
@@ -4540,6 +4595,13 @@ class ThreadBenchmarkTests(unittest.TestCase):
             candidate_sha="a" * 40,
             purpose="noise-calibration",
             runner_target="trusted-calibration",
+            accepted_cpu_classes={
+                "ubuntu-22.04-x86_64": ["test cpu"],
+                "ubuntu-24.04-aarch64": [
+                    "hosted arm 100",
+                    "hosted arm 101",
+                ],
+            },
         )
         reports = []
         for run_id in ("100", "101"):
@@ -4665,7 +4727,15 @@ class ThreadBenchmarkTests(unittest.TestCase):
             reports,
             cohort.DEFAULT_PLATFORMS,
             1,
-            make_dispatch_state(),
+            make_dispatch_state(
+                accepted_cpu_classes={
+                    "ubuntu-22.04-x86_64": [
+                        "different cpu",
+                        "test cpu",
+                    ],
+                    "ubuntu-24.04-aarch64": ["test cpu"],
+                }
+            ),
         )
         x86 = result["platforms"]["ubuntu-22.04-x86_64"]
         self.assertEqual(len(x86["host_fingerprint_distribution"]), 2)
@@ -4679,12 +4749,39 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(len(result["observations"]), len(reports))
         self.assertEqual(result["excluded_observations"], [])
 
+        missing = make_dispatch_state(
+            accepted_cpu_classes={
+                "ubuntu-22.04-x86_64": [
+                    "different cpu",
+                    "missing cpu",
+                    "test cpu",
+                ],
+                "ubuntu-24.04-aarch64": ["test cpu"],
+            }
+        )
+        with self.assertRaisesRegex(
+            bench.HarnessError, "were not all observed"
+        ):
+            cohort.validate_documents(
+                reports,
+                cohort.DEFAULT_PLATFORMS,
+                1,
+                missing,
+            )
+
     def test_trusted_cohort_rejects_x86_drift_and_wrong_runner(self) -> None:
         state = make_dispatch_state(
             baseline_sha="a" * 40,
             candidate_sha="a" * 40,
             purpose="noise-calibration",
             runner_target="trusted-calibration",
+            accepted_cpu_classes={
+                "ubuntu-22.04-x86_64": [
+                    "different cpu",
+                    "test cpu",
+                ],
+                "ubuntu-24.04-aarch64": ["test cpu"],
+            },
         )
 
         def reports(
@@ -5006,6 +5103,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                     warmups=2,
                     samples=12,
                     runner_target="github-hosted",
+                    accepted_cpu_class=TEST_ACCEPTED_CPU_CLASS_ARGS,
                     runs=2,
                     training_runs=1,
                     max_in_flight=1,
@@ -5092,6 +5190,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                     warmups=2,
                     samples=12,
                     runner_target="github-hosted",
+                    accepted_cpu_class=TEST_ACCEPTED_CPU_CLASS_ARGS,
                     runs=2,
                     training_runs=1,
                     max_in_flight=1,
@@ -5115,6 +5214,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             "warmups": 2,
             "samples": 12,
             "runner_target": "github-hosted",
+            "accepted_cpu_class": TEST_ACCEPTED_CPU_CLASS_ARGS,
             "repository": "cataggar/wamr",
             "workflow": "wasi-thread-bench.yml",
             "workflow_ref": "main",
@@ -5175,6 +5275,38 @@ class ThreadBenchmarkTests(unittest.TestCase):
                         )
                     )
                 )
+
+        invalid_cpu_classes = (
+            ([], "invalid CPU classes"),
+            (
+                ["unknown-platform=test cpu"],
+                "canonical platform",
+            ),
+            (
+                ["ubuntu-22.04-x86_64=test cpu"],
+                "invalid CPU classes",
+            ),
+            (
+                [
+                    "ubuntu-22.04-x86_64=",
+                    "ubuntu-24.04-aarch64=test cpu",
+                ],
+                "non-empty",
+            ),
+            (
+                [
+                    "ubuntu-22.04-x86_64=test cpu",
+                    "ubuntu-22.04-x86_64=test cpu",
+                    "ubuntu-24.04-aarch64=test cpu",
+                ],
+                "invalid CPU classes",
+            ),
+        )
+        for values, message in invalid_cpu_classes:
+            with self.subTest(values=values), self.assertRaisesRegex(
+                bench.HarnessError, message
+            ):
+                cohort.parse_cpu_class_assignments(values)
 
     def test_cohort_trusted_runner_inventory_preflight_succeeds(self) -> None:
         inventory = {
@@ -5306,6 +5438,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             warmups=2,
             samples=12,
             runner_target="trusted-calibration",
+            accepted_cpu_class=TEST_ACCEPTED_CPU_CLASS_ARGS,
             repository="cataggar/wamr",
             workflow="wasi-thread-bench.yml",
             workflow_ref="wasi-thread-calibration-966-v1",
@@ -5339,6 +5472,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
             warmups=2,
             samples=12,
             runner_target="trusted-calibration",
+            accepted_cpu_class=TEST_ACCEPTED_CPU_CLASS_ARGS,
             repository="cataggar/wamr",
             workflow="wasi-thread-bench.yml",
             workflow_ref="wasi-thread-calibration-966-v1",
@@ -5408,6 +5542,7 @@ class ThreadBenchmarkTests(unittest.TestCase):
                     warmups=2,
                     samples=12,
                     runner_target="github-hosted",
+                    accepted_cpu_class=TEST_ACCEPTED_CPU_CLASS_ARGS,
                     runs=2,
                     training_runs=1,
                     max_in_flight=1,
