@@ -86,6 +86,12 @@ run core WebAssembly modules inside a WASI runtime such as Wasmtime. Native
 AOT/JIT execution, `wamrc`, Component Model execution, `serve`, shared
 memory, and host threads are intentionally excluded from this target.
 
+Native Unikraft integration is documented separately:
+**[`docs/unikraft-aot.md`](docs/unikraft-aot.md)** defines the compiler-free
+library boundary, while **[`docs/unikraft-images.md`](docs/unikraft-images.md)**
+documents the source-pinned raw/QCOW2/fixed-VHD image workflow, six local
+acceptance modes, evidence records, and Azure authority boundary.
+
 ## Running tests
 
 Unit tests:
