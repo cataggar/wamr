@@ -12,11 +12,15 @@ import tarfile
 import tempfile
 import unittest
 import zipfile
+from base64 import urlsafe_b64encode
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import build_wamrc_wheels
+import build_wheels
 import release_artifacts as release
+import wheel_artifacts
 
 
 VERSION = "3.0.0-dev.14"
@@ -372,6 +376,192 @@ class ReleaseArtifactTests(unittest.TestCase):
             build = follower.split("  publish:", 1)[0]
             self.assertIn("github.event.workflow_run.event == 'push'", build)
             self.assertIn("startsWith(github.event.workflow_run.head_branch, 'v')", build)
+
+
+class WheelBuilderTests(unittest.TestCase):
+    BUILDERS = (
+        (build_wheels, "wamr_bin", "wamr_cli", "wamr"),
+        (build_wamrc_wheels, "wamrc_bin", "wamrc_cli", "wamrc"),
+    )
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def release_archive(self, platform_key):
+        root = f"wamr-{VERSION}-{platform_key}"
+        ext = ".exe" if platform_key.startswith("windows-") else ""
+        entries = [
+            (f"{root}/LICENSE", b"license\n"),
+            (f"{root}/README.md", b"readme\n"),
+            (f"{root}/bin/wamr{ext}", b"wamr-" + platform_key.encode()),
+            (f"{root}/bin/wamrc{ext}", b"wamrc-" + platform_key.encode()),
+        ]
+        stream = io.BytesIO()
+        if platform_key.startswith("windows-"):
+            mixed = platform_key == "windows-arm64"
+            with zipfile.ZipFile(stream, "w") as package:
+                for name in (root + "\\", root + "\\bin\\"):
+                    info = zipfile.ZipInfo(name)
+                    info.create_system = 3 if mixed else 0
+                    info.external_attr = (
+                        (stat.S_IFDIR | 0o755) << 16 if mixed else 0x10
+                    )
+                    package.writestr(info, b"")
+                for name, data in entries:
+                    raw = name.replace("/", "\\", 1) if mixed else name.replace("/", "\\")
+                    info = zipfile.ZipInfo(raw)
+                    info.create_system = 0
+                    info.external_attr = 0x20
+                    package.writestr(info, data)
+        else:
+            with tarfile.open(fileobj=stream, mode="w:gz") as package:
+                for name, data in entries:
+                    info = tarfile.TarInfo(name)
+                    info.size = len(data)
+                    info.mode = 0o755 if "/bin/" in name else 0o644
+                    package.addfile(info, io.BytesIO(data))
+        return stream.getvalue()
+
+    def assert_wheel(self, builder, dist_name, import_name, tool, platform_key):
+        info = builder.PLATFORMS[platform_key]
+        dist = self.root / f"{dist_name}-{platform_key}"
+        dist.mkdir()
+        response = mock.Mock(content=self.release_archive(platform_key))
+        response.raise_for_status.return_value = None
+        with mock.patch.object(builder.requests, "get", return_value=response) as get:
+            wheel = builder.build_wheel(
+                release.to_pep440(VERSION), platform_key, info["tag"], info["ext"],
+                dist, VERSION,
+            )
+
+        suffix = ".zip" if platform_key.startswith("windows-") else ".tar.gz"
+        asset = f"wamr-{VERSION}-{platform_key}{suffix}"
+        self.assertEqual(
+            get.call_args.args[0],
+            f"https://github.com/cataggar/wamr/releases/download/v{VERSION}/{asset}",
+        )
+        self.assertEqual(
+            get.call_args.kwargs,
+            {"allow_redirects": True, "timeout": 300},
+        )
+
+        version = release.to_pep440(VERSION)
+        data_dir = f"{dist_name}-{version}.data/scripts"
+        metadata_dir = f"{dist_name}-{version}.dist-info"
+        executable = f"{tool}{info['ext']}"
+        expected = {
+            f"{import_name}/__init__.py",
+            f"{data_dir}/{executable}",
+            f"{metadata_dir}/METADATA",
+            f"{metadata_dir}/WHEEL",
+            f"{metadata_dir}/RECORD",
+        }
+        with zipfile.ZipFile(wheel) as package:
+            self.assertEqual(set(package.namelist()), expected)
+            self.assertEqual(
+                package.read(f"{data_dir}/{executable}"),
+                f"{tool}-{platform_key}".encode(),
+            )
+            metadata = package.read(f"{metadata_dir}/METADATA").decode()
+            self.assertIn(f"Name: {dist_name.replace('_', '-')}\n", metadata)
+            self.assertIn(f"Version: {version}\n", metadata)
+            wheel_metadata = package.read(f"{metadata_dir}/WHEEL").decode()
+            self.assertIn(f"Tag: py3-none-{info['tag']}\n", wheel_metadata)
+
+            records = {}
+            for line in package.read(f"{metadata_dir}/RECORD").decode().splitlines():
+                name, digest, size = line.split(",")
+                records[name] = (digest, size)
+            self.assertEqual(set(records), expected)
+            self.assertEqual(records[f"{metadata_dir}/RECORD"], ("", ""))
+            for name in expected - {f"{metadata_dir}/RECORD"}:
+                contents = package.read(name)
+                digest = urlsafe_b64encode(hashlib.sha256(contents).digest())
+                self.assertEqual(records[name], (
+                    "sha256=" + digest.rstrip(b"=").decode(), str(len(contents)),
+                ))
+                mode = package.getinfo(name).external_attr >> 16
+                self.assertEqual(stat.S_IFMT(mode), stat.S_IFREG)
+                self.assertEqual(bool(mode & 0o111), name == f"{data_dir}/{executable}")
+
+    def test_windows_x64_and_arm64_wheels_are_built_offline(self):
+        for builder, dist_name, import_name, tool in self.BUILDERS:
+            for platform_key in ("windows-x64", "windows-arm64"):
+                with self.subTest(distribution=dist_name, platform=platform_key):
+                    self.assert_wheel(
+                        builder, dist_name, import_name, tool, platform_key
+                    )
+
+    def test_unix_tar_wheels_are_unchanged(self):
+        for builder, dist_name, import_name, tool in self.BUILDERS:
+            with self.subTest(distribution=dist_name):
+                self.assert_wheel(
+                    builder, dist_name, import_name, tool, "linux-x64"
+                )
+
+    def test_windows_archives_reject_unsafe_and_duplicate_members(self):
+        root = f"wamr-{VERSION}-windows-x64"
+        cases = (
+            (root + "\\bin\\wamr.exe", root + "/bin/wamr.exe"),
+            ("..\\outside",),
+            (root + "\\..\\outside",),
+            ("\\absolute",),
+            ("\\\\server\\share",),
+            ("C:\\outside",),
+        )
+        for names in cases:
+            with self.subTest(names=names):
+                stream = io.BytesIO()
+                with zipfile.ZipFile(stream, "w") as package:
+                    for name in names:
+                        info = zipfile.ZipInfo(name)
+                        info.create_system = 0
+                        info.external_attr = 0x20
+                        package.writestr(info, b"data")
+                with self.assertRaises(ValueError):
+                    wheel_artifacts.read_archive_files(
+                        stream.getvalue(), "windows-x64"
+                    )
+
+        for kind in (stat.S_IFLNK, stat.S_IFIFO):
+            with self.subTest(kind=kind):
+                stream = io.BytesIO()
+                with zipfile.ZipFile(stream, "w") as package:
+                    info = zipfile.ZipInfo(root + "/bin/wamr.exe")
+                    info.external_attr = (kind | 0o777) << 16
+                    package.writestr(info, b"data")
+                with self.assertRaisesRegex(ValueError, "non-file"):
+                    wheel_artifacts.read_archive_files(
+                        stream.getvalue(), "windows-x64"
+                    )
+
+    def test_unix_archives_reject_traversal_links_and_duplicates(self):
+        root = f"wamr-{VERSION}-linux-x64"
+        for malformed in ("traversal", "link", "duplicate"):
+            with self.subTest(malformed=malformed):
+                stream = io.BytesIO()
+                with tarfile.open(fileobj=stream, mode="w:gz") as package:
+                    names = (
+                        [root + "/bin/wamr", root + "/bin/./wamr"]
+                        if malformed == "duplicate" else
+                        ["../outside" if malformed == "traversal"
+                         else root + "/bin/wamr"]
+                    )
+                    for name in names:
+                        info = tarfile.TarInfo(name)
+                        if malformed == "link":
+                            info.type = tarfile.SYMTYPE
+                            info.linkname = "/outside"
+                            package.addfile(info)
+                        else:
+                            info.size = 4
+                            package.addfile(info, io.BytesIO(b"data"))
+                with self.assertRaises(ValueError):
+                    wheel_artifacts.read_archive_files(
+                        stream.getvalue(), "linux-x64"
+                    )
 
 
 if __name__ == "__main__":
