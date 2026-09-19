@@ -1275,6 +1275,10 @@ pub fn build(b: *std.Build) void {
         "python3",
         "scripts/test_bench_wasi_threads.py",
     });
+    const leaf_cancel_cost_harness_tests = b.addSystemCommand(&.{
+        "python3",
+        "scripts/test_bench_leaf_cancel_cost.py",
+    });
     const native_benchmark_harness_tests = b.addSystemCommand(&.{
         "python3",
         "scripts/test_bench_coremark.py",
@@ -1301,6 +1305,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(wasi_threads_test_step);
     test_step.dependOn(&keyvault_harness_tests.step);
     test_step.dependOn(&thread_benchmark_harness_tests.step);
+    test_step.dependOn(&leaf_cancel_cost_harness_tests.step);
     test_step.dependOn(&native_benchmark_harness_tests.step);
     test_step.dependOn(&thread_budget_derivation_tests.step);
     test_step.dependOn(&frame_attribution_tests.step);

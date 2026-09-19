@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/cataggar/wamr/tests/benchmarks/leaf-cancel-cost/report.schema.json",
+  "title": "WAMR issue 963 leaf-call cancel-poll cost report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "metadata",
+    "plan",
+    "pilot",
+    "warmups",
+    "records",
+    "summaries",
+    "comparison",
+    "quality"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "kind": { "const": "leaf-cancel-cost" },
+    "metadata": {
+      "type": "object",
+      "required": [
+        "collected_at",
+        "platform_id",
+        "source",
+        "fixture",
+        "host",
+        "tools",
+        "artifacts",
+        "execution"
+      ]
+    },
+    "plan": {
+      "type": "object",
+      "required": [
+        "identity",
+        "scope",
+        "leaf_calls",
+        "leaf_unroll",
+        "batches",
+        "leaf_entry_poll_opportunities_per_enabled_sample",
+        "warmups",
+        "samples",
+        "minimum_interval_ns",
+        "target_interval_ns",
+        "pair_order",
+        "clock_id",
+        "sizing"
+      ],
+      "properties": {
+        "identity": { "const": "issue-963-leaf-cancel-cost-v1" },
+        "scope": { "const": "isolated-from-wasi-thread-benchmark-966" },
+        "leaf_calls": { "type": "integer", "minimum": 64 },
+        "leaf_unroll": { "const": 64 },
+        "batches": { "type": "integer", "minimum": 1 },
+        "leaf_entry_poll_opportunities_per_enabled_sample": {
+          "type": "integer",
+          "minimum": 64
+        },
+        "warmups": { "type": "integer", "minimum": 0 },
+        "samples": { "type": "integer", "minimum": 2, "multipleOf": 2 },
+        "minimum_interval_ns": { "type": "integer", "minimum": 1 },
+        "target_interval_ns": { "type": "integer", "minimum": 1 },
+        "pair_order": { "const": "alternating-off-on/on-off" },
+        "clock_id": { "const": "wasi-process-cputime" },
+        "sizing": { "type": "object" }
+      }
+    },
+    "pilot": { "type": ["object", "null"] },
+    "warmups": { "type": "array" },
+    "records": {
+      "type": "array",
+      "minItems": 4,
+      "items": { "$ref": "#/$defs/record" }
+    },
+    "summaries": { "type": "array", "minItems": 2, "maxItems": 2 },
+    "comparison": { "type": "object" },
+    "quality": {
+      "type": "object",
+      "required": [
+        "equivalent_guest_work",
+        "equivalent_checksums",
+        "all_intervals_passed",
+        "all_timing_overhead_below_one_percent"
+      ],
+      "properties": {
+        "equivalent_guest_work": { "const": true },
+        "equivalent_checksums": { "const": true },
+        "all_intervals_passed": { "const": true },
+        "all_timing_overhead_below_one_percent": { "const": true }
+      }
+    }
+  },
+  "$defs": {
+    "record": {
+      "type": "object",
+      "required": [
+        "phase",
+        "pair_index",
+        "position",
+        "condition",
+        "command",
+        "leaf_calls",
+        "leaf_entry_poll_opportunities",
+        "batches",
+        "guest_elapsed_ns",
+        "raw_guest_elapsed_ns",
+        "timing_overhead_ns",
+        "timing_overhead_ppm",
+        "host_wall_elapsed_ns",
+        "leaf_calls_per_second",
+        "guest",
+        "correct"
+      ],
+      "properties": {
+        "phase": { "const": "sample" },
+        "pair_index": { "type": "integer", "minimum": 0 },
+        "position": { "type": "integer", "minimum": 0, "maximum": 1 },
+        "condition": {
+          "enum": ["cancel-points-off", "cancel-points-on"]
+        },
+        "correct": { "const": true }
+      }
+    }
+  }
+}

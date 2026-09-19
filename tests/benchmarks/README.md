@@ -7,6 +7,8 @@ Benchmark inputs and harnesses for wamr.
 - [`coremark/`](coremark/) — EEMBC CoreMark via `zig build` (native, wasm,
   AOT). See [`coremark/README.md`](coremark/README.md) and the
   `coremark-aot` step exposed by the repo's root `build.zig`.
+- [`leaf-cancel-cost/`](leaf-cancel-cost/) — isolated #963 AOT function-entry
+  cancel-poll cost evidence using a leaf-call-heavy worker pthread.
 - `coremark/coremark_wasi*.wasm` — prebuilt CoreMark wasm modules used
   by the `coremark-aot` step in the root build to gate the Zig AOT
   backend on real CoreMark workloads.

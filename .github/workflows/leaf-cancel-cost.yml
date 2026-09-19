@@ -1,0 +1,126 @@
+name: Leaf cancel-poll cost
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Immutable commit SHA to measure"
+        required: true
+      calls:
+        description: "Optional fixed leaf-call count; blank uses the isolated pilot"
+        required: false
+        default: ""
+      warmups:
+        description: "Discarded balanced pair count"
+        required: true
+        default: "2"
+      samples:
+        description: "Measured balanced pair count (positive and even)"
+        required: true
+        default: "12"
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-22.04-x86_64
+            runner: ubuntu-22.04
+          - platform: ubuntu-24.04-aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Validate immutable input
+        env:
+          REF: ${{ inputs.ref }}
+          CALLS: ${{ inputs.calls }}
+          WARMUPS: ${{ inputs.warmups }}
+          SAMPLES: ${{ inputs.samples }}
+        run: |
+          set -euo pipefail
+          [[ "$REF" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "ref must be a 40-character lowercase commit SHA" >&2
+            exit 2
+          }
+          [[ -z "$CALLS" || "$CALLS" =~ ^[1-9][0-9]*$ ]] || {
+            echo "calls must be blank or a positive integer" >&2
+            exit 2
+          }
+          [[ "$WARMUPS" =~ ^[0-9]+$ ]] || exit 2
+          [[ "$SAMPLES" =~ ^[1-9][0-9]*$ ]] && (( SAMPLES % 2 == 0 )) || {
+            echo "samples must be positive and even" >&2
+            exit 2
+          }
+
+      - name: Check out immutable source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Verify checkout
+        env:
+          REF: ${{ inputs.ref }}
+        run: test "$(git rev-parse HEAD)" = "$REF"
+
+      - name: Configure run-local storage
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/leaf-cancel-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.platform }}"
+          mkdir -p "$ROOT"/{tmp,xdg-cache,zig-global-cache,zig-local-cache,output}
+          {
+            echo "LEAF_CANCEL_ROOT=$ROOT"
+            echo "TMPDIR=$ROOT/tmp"
+            echo "XDG_CACHE_HOME=$ROOT/xdg-cache"
+            echo "ZIG_GLOBAL_CACHE_DIR=$ROOT/zig-global-cache"
+            echo "ZIG_LOCAL_CACHE_DIR=$ROOT/zig-local-cache"
+          } >> "$GITHUB_ENV"
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Test isolated harness
+        run: python3 scripts/test_bench_leaf_cancel_cost.py
+
+      - name: Run leaf-call comparison
+        env:
+          CALLS: ${{ inputs.calls }}
+          WARMUPS: ${{ inputs.warmups }}
+          SAMPLES: ${{ inputs.samples }}
+        run: |
+          set -euo pipefail
+          ARGS=()
+          if [ -n "$CALLS" ]; then
+            (( CALLS % 64 == 0 )) || {
+              echo "calls must be a multiple of 64" >&2
+              exit 2
+            }
+            ARGS+=(--calls "$CALLS")
+          fi
+          python3 scripts/bench_leaf_cancel_cost.py \
+            --platform-id '${{ matrix.platform }}' \
+            --runner-environment github-hosted \
+            --warmups "$WARMUPS" \
+            --samples "$SAMPLES" \
+            --output-dir "$LEAF_CANCEL_ROOT/output" \
+            "${ARGS[@]}"
+          cat "$LEAF_CANCEL_ROOT/output/report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload retained report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: leaf-cancel-cost-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.LEAF_CANCEL_ROOT }}/output/report.json
+            ${{ env.LEAF_CANCEL_ROOT }}/output/report.md
+          if-no-files-found: warn
+          retention-days: 90
