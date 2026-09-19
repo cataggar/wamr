@@ -51,9 +51,17 @@ jobs:
             echo "calls must be blank or a positive integer" >&2
             exit 2
           }
-          [[ "$WARMUPS" =~ ^[0-9]+$ ]] || exit 2
-          [[ "$SAMPLES" =~ ^[1-9][0-9]*$ ]] && (( SAMPLES % 2 == 0 )) || {
-            echo "samples must be positive and even" >&2
+          [[ -z "$CALLS" ]] || (( CALLS <= 10000000000 )) || {
+            echo "calls must not exceed 10000000000" >&2
+            exit 2
+          }
+          [[ "$WARMUPS" =~ ^(0|[1-9][0-9]*)$ ]] && (( WARMUPS <= 2 )) || {
+            echo "warmups must be between 0 and 2" >&2
+            exit 2
+          }
+          [[ "$SAMPLES" =~ ^[1-9][0-9]*$ ]] &&
+            (( SAMPLES % 2 == 0 && SAMPLES <= 12 )) || {
+            echo "samples must be positive, even, and at most 12" >&2
             exit 2
           }
 
@@ -120,7 +128,19 @@ jobs:
         with:
           name: leaf-cancel-cost-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ env.LEAF_CANCEL_ROOT }}/output/report.json
-            ${{ env.LEAF_CANCEL_ROOT }}/output/report.md
+            ${{ runner.temp }}/leaf-cancel-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.platform }}/output/report.json
+            ${{ runner.temp }}/leaf-cancel-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.platform }}/output/report.md
           if-no-files-found: warn
           retention-days: 90
+
+      - name: Clean run-local storage
+        if: always()
+        run: |
+          set -euo pipefail
+          : "${RUNNER_TEMP:?}" "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}"
+          ROOT="$RUNNER_TEMP/leaf-cancel-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.platform }}"
+          case "$ROOT" in
+            "$RUNNER_TEMP/leaf-cancel-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.platform }}") ;;
+            *) exit 2 ;;
+          esac
+          rm -rf -- "$ROOT"

@@ -38,13 +38,17 @@ LEAF_UNROLL = 64
 LEAF_SEED = 0x243F6A8885A308D3
 LEAF_STEP = 0x9E3779B97F4A7C15
 MASK64 = (1 << 64) - 1
+MAX_LEAF_CALLS = 10_000_000_000
 FIXTURE = Path("tests/benchmarks/leaf-cancel-cost/leaf_calls.wasm")
 SOURCE_PATHS = (
+    ".github/workflows/leaf-cancel-cost.yml",
+    "tests/benchmarks/leaf-cancel-cost/README.md",
     "tests/benchmarks/leaf-cancel-cost/leaf_calls.c",
     "tests/benchmarks/leaf-cancel-cost/build-fixture.sh",
     "tests/benchmarks/leaf-cancel-cost/fixtures.sha256",
     "tests/benchmarks/leaf-cancel-cost/report.schema.json",
     "scripts/bench_leaf_cancel_cost.py",
+    "scripts/test_bench_leaf_cancel_cost.py",
     "scripts/benchmark_schema.py",
 )
 CANCEL_POLL_SIGNATURES = {
@@ -169,8 +173,10 @@ def select_calls(
     if pilot_elapsed_ns <= 0 or target_interval_ns <= 0:
         raise HarnessError("pilot and target intervals must be positive")
     selected = math.ceil(pilot_calls * target_interval_ns / pilot_elapsed_ns)
-    if selected > MASK64:
-        raise HarnessError("selected leaf call count exceeds uint64")
+    if selected > MAX_LEAF_CALLS:
+        raise HarnessError(
+            f"selected leaf call count exceeds safety limit {MAX_LEAF_CALLS}"
+        )
     return round_calls(max(selected, LEAF_UNROLL))
 
 
@@ -283,8 +289,13 @@ def build_one(
     marker = prefix / "leaf-cancel-build.json"
     expected = [wamr] + ([wamrc] if wamrc else [])
     if not rebuild and marker.is_file() and all(path.is_file() for path in expected):
-        stored = json.loads(marker.read_text(encoding="UTF-8"))
-        if stored.get("cache_key") == key:
+        try:
+            stored = json.loads(marker.read_text(encoding="UTF-8"))
+        except json.JSONDecodeError:
+            stored = {}
+        if stored.get("cache_key") == key and isinstance(
+            stored.get("command"), list
+        ):
             return Build(name, prefix, wamr, wamrc, stored["command"], key)
     command = [
         "zig",
@@ -570,6 +581,47 @@ def summarize(records: list[dict[str, Any]], calls: int) -> tuple[list[dict], di
     }
 
 
+def validate_invocations(
+    invocations: list[dict[str, Any]],
+    *,
+    phase: str,
+    pairs: int,
+    calls: int,
+) -> None:
+    if len(invocations) != pairs * 2:
+        raise HarnessError(f"{phase} invocation count mismatch")
+    expected_guest = expected_result(calls)
+    for pair_index in range(pairs):
+        pair = invocations[pair_index * 2 : pair_index * 2 + 2]
+        for position, (item, condition) in enumerate(
+            zip(pair, condition_order(pair_index), strict=True)
+        ):
+            if (
+                item.get("phase") != phase
+                or item.get("pair_index") != pair_index
+                or item.get("position") != position
+                or item.get("condition") != condition
+            ):
+                raise HarnessError(f"{phase} invocation ordering mismatch")
+            if item.get("leaf_calls") != calls or item.get("batches") != (
+                calls // LEAF_UNROLL
+            ):
+                raise HarnessError(f"{phase} invocation work mismatch")
+            expected_opportunities = calls if condition == "cancel-points-on" else 0
+            if (
+                item.get("leaf_entry_poll_opportunities")
+                != expected_opportunities
+            ):
+                raise HarnessError(f"{phase} poll opportunity mismatch")
+            guest = item.get("guest")
+            if not isinstance(guest, dict) or any(
+                guest.get(key) != value for key, value in expected_guest.items()
+            ):
+                raise HarnessError(f"{phase} guest work mismatch")
+            if item.get("correct") is not True:
+                raise HarnessError(f"{phase} correctness marker mismatch")
+
+
 def validate_report(report: dict[str, Any]) -> None:
     if report.get("schema_version") != SCHEMA_VERSION or report.get("kind") != KIND:
         raise HarnessError("report identity mismatch")
@@ -578,46 +630,164 @@ def validate_report(report: dict[str, Any]) -> None:
     if not isinstance(plan, dict) or not isinstance(records, list) or not records:
         raise HarnessError("report plan or records missing")
     calls = plan.get("leaf_calls")
-    expected = expected_result(calls)
+    if not isinstance(calls, int) or isinstance(calls, bool):
+        raise HarnessError("report leaf call count is invalid")
+    expected_result(calls)
     samples = plan.get("samples")
-    if len(records) != samples * 2:
-        raise HarnessError("report record count mismatch")
-    for pair_index in range(samples):
-        pair = [item for item in records if item["pair_index"] == pair_index]
-        if len(pair) != 2 or tuple(
-            item["condition"] for item in sorted(pair, key=lambda item: item["position"])
-        ) != condition_order(pair_index):
-            raise HarnessError("report pair ordering mismatch")
-        if any(item["guest"] | expected != item["guest"] for item in pair):
-            raise HarnessError("report guest work mismatch")
-        if pair[0]["guest"]["checksum"] != pair[1]["guest"]["checksum"]:
-            raise HarnessError("on/off checksum mismatch")
+    warmup_pairs = plan.get("warmups")
+    if (
+        not isinstance(samples, int)
+        or isinstance(samples, bool)
+        or not isinstance(warmup_pairs, int)
+        or isinstance(warmup_pairs, bool)
+    ):
+        raise HarnessError("report sample counts are invalid")
+    validate_invocations(records, phase="sample", pairs=samples, calls=calls)
+    warmups = report.get("warmups")
+    if not isinstance(warmups, list):
+        raise HarnessError("report warmups missing")
+    validate_invocations(
+        warmups, phase="warmup", pairs=warmup_pairs, calls=calls
+    )
+    pilot = report.get("pilot")
+    sizing = plan.get("sizing")
+    if not isinstance(sizing, dict):
+        raise HarnessError("report sizing missing")
+    if pilot is None:
+        if sizing.get("kind") != "explicit-call-count":
+            raise HarnessError("explicit sizing identity mismatch")
+    else:
+        pilot_calls = sizing.get("pilot_calls")
+        if (
+            sizing.get("kind") != "single-enabled-pilot-linear-scale"
+            or not isinstance(pilot_calls, int)
+            or isinstance(pilot_calls, bool)
+        ):
+            raise HarnessError("pilot sizing identity mismatch")
+        if (
+            pilot.get("phase") != "pilot"
+            or pilot.get("pair_index") != 0
+            or pilot.get("position") != 0
+            or pilot.get("condition") != "cancel-points-on"
+            or pilot.get("leaf_calls") != pilot_calls
+            or pilot.get("correct") is not True
+        ):
+            raise HarnessError("pilot invocation mismatch")
+        pilot_guest = pilot.get("guest")
+        if not isinstance(pilot_guest, dict):
+            raise HarnessError("pilot guest result missing")
+        for key, value in expected_result(pilot_calls).items():
+            if pilot_guest.get(key) != value:
+                raise HarnessError("pilot guest work mismatch")
+    expected_non_leaf_bound = calls // LEAF_UNROLL + 1
+    expected_leaf_share = calls / (calls + expected_non_leaf_bound)
+    if (
+        plan.get("non_leaf_poll_opportunities_upper_bound_per_enabled_sample")
+        != expected_non_leaf_bound
+        or not math.isclose(
+            plan.get("minimum_leaf_entry_poll_share", -1),
+            expected_leaf_share,
+        )
+        or sizing.get("selected_calls") != calls
+    ):
+        raise HarnessError("report poll-opportunity or sizing bound mismatch")
     artifacts = report["metadata"]["artifacts"]
     if artifacts["cancel_poll_sites_enabled"] <= 0:
         raise HarnessError("enabled artifact has no cancel polls")
     if artifacts["cancel_poll_sites_disabled"] != 0:
         raise HarnessError("disabled artifact retains cancel polls")
+    quality_invocations = warmups + records
+    checksums = {item["guest"]["checksum"] for item in quality_invocations}
+    minimum_interval_ns = plan["minimum_interval_ns"]
+    expected_quality = {
+        "equivalent_guest_work": True,
+        "equivalent_checksums": len(checksums) == 1,
+        "all_intervals_passed": all(
+            item["guest_elapsed_ns"] >= minimum_interval_ns
+            for item in quality_invocations
+        ),
+        "all_timing_overhead_below_one_percent": all(
+            99 * item["timing_overhead_ns"] < item["guest_elapsed_ns"]
+            for item in quality_invocations
+        ),
+    }
+    if report.get("quality") != expected_quality:
+        raise HarnessError("report quality summary mismatch")
 
 
 def render_markdown(report: dict[str, Any]) -> str:
     metadata = report["metadata"]
     comparison = report["comparison"]
+    source = metadata["source"]
+    host = metadata["host"]
+    tools = metadata["tools"]
+    artifacts = metadata["artifacts"]
+    plan = report["plan"]
     lines = [
         "# Leaf-call AOT cancel-poll cost",
         "",
-        f"- Source commit: `{metadata['source']['commit']}`",
+        "## Immutable identities",
+        "",
+        f"- Source commit: `{source['commit']}`",
+        f"- Tracked diff SHA-256: `{source['tracked_diff_sha256']}`",
+        f"- Build-source SHA-256: `{source['build_source_sha256']}`",
         f"- Platform: `{metadata['platform_id']}`",
-        f"- Host fingerprint: `{metadata['host']['host_fingerprint']['sha256']}`",
-        f"- AOT architecture: `{metadata['artifacts']['architecture']}`",
+        f"- Host fingerprint: `{host['host_fingerprint']['sha256']}`",
+        f"- Host: `{host['system']} {host['release']}` · `{host['machine']}` · "
+        f"`{host['cpu']}` · {host['logical_cpus']} logical CPUs · "
+        f"`{host['runner_environment']}`",
+        f"- AOT architecture: `{artifacts['architecture']}`",
         f"- Fixture: `{metadata['fixture']['sha256']}`",
-        f"- Polls on/off artifacts: "
-        f"`{metadata['artifacts']['conditions']['cancel-points-on']['sha256']}` / "
-        f"`{metadata['artifacts']['conditions']['cancel-points-off']['sha256']}`",
-        f"- Work: `{report['plan']['leaf_calls']}` noinline leaf calls per sample; "
-        f"`{report['plan']['samples']}` balanced pairs",
+        f"- Zig: `{tools['zig']}`; Python: `{tools['python']}`",
+        f"- wamrc: `{tools['compiler']['wamrc_sha256']}` · "
+        f"`{tools['compiler']['wamrc_version']}`",
+        f"- wamr: `{tools['runtime']['wamr_sha256']}` · "
+        f"`{tools['runtime']['wamr_version']}`",
+        "",
+        "| AOT condition | SHA-256 | File bytes | Text bytes |",
+        "|---|---|---:|---:|",
+    ]
+    for condition in ("cancel-points-off", "cancel-points-on"):
+        artifact = artifacts["conditions"][condition]
+        lines.append(
+            f"| `{condition}` | `{artifact['sha256']}` | "
+            f"{artifact['file_bytes']} | {artifact['text_bytes']} |"
+        )
+    lines += [
+        "",
+        "## Measurement plan and validation",
+        "",
+        f"- Work: `{plan['leaf_calls']}` noinline leaf calls "
+        f"(`{plan['batches']}` batches of `{plan['leaf_unroll']}`).",
+        f"- Invocations: `{plan['warmups']}` discarded balanced warmup pairs; "
+        f"`{plan['samples']}` retained balanced sample pairs.",
+        f"- Order: `{plan['pair_order']}`; raw rows below retain execution order.",
+        f"- Sizing: `{plan['sizing']['kind']}`; target "
+        f"`{plan['target_interval_ns']}` ns; minimum "
+        f"`{plan['minimum_interval_ns']}` ns.",
+        "- Validation covers every warmup and retained sample; the optional "
+        "sizing pilot intentionally does not enforce the minimum interval.",
+        f"- CPU affinity: `{metadata['execution']['host_cpu_affinity']}`; "
+        f"target `{metadata['execution']['target']}`; "
+        f"runner `{metadata['execution']['runner']}`.",
+        f"- Timed enabled-path leaf-entry poll opportunities: "
+        f"`{plan['leaf_entry_poll_opportunities_per_enabled_sample']}`; "
+        "non-leaf timed poll opportunities are bounded by "
+        f"`{plan['non_leaf_poll_opportunities_upper_bound_per_enabled_sample']}` "
+        f"({plan['minimum_leaf_entry_poll_share']:.6%} minimum leaf-entry share).",
         f"- Static poll sites on/off: "
-        f"`{metadata['artifacts']['cancel_poll_sites_enabled']}` / "
-        f"`{metadata['artifacts']['cancel_poll_sites_disabled']}`",
+        f"`{artifacts['cancel_poll_sites_enabled']}` / "
+        f"`{artifacts['cancel_poll_sites_disabled']}`; "
+        f"`{artifacts['bytes_per_poll_site']}` bytes/site.",
+        "",
+        "| Validation | Result |",
+        "|---|---|",
+    ]
+    for key, value in report["quality"].items():
+        lines.append(f"| `{key}` | `{str(value).lower()}` |")
+    lines += [
+        "",
+        "## Summary",
         "",
         "| Condition | Guest median ms | Median leaf calls/s | Host-wall median ms |",
         "|---|---:|---:|---:|",
@@ -639,11 +809,39 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- Median polls-on / polls-off throughput: "
         f"`{comparison['median_on_over_off_throughput_ratio']:.9f}`.",
         "",
+        "The per-leaf-call delta is an amortized enabled-path measurement. "
+        "The timed driver has at most one loop-header poll per 64 leaf calls "
+        "plus one driver entry poll; the bound and leaf-entry share are retained "
+        "above rather than presenting the delta as an uncontaminated single-poll "
+        "latency.",
+        "",
         "Both conditions use the same wasm fixture, runtime, call count, worker-thread "
         "path, and expected checksum. Only wamrc's benchmark-only cancel-point "
         "suppression flag differs.",
         "",
+        "## Raw invocation order",
+        "",
+        "| Phase | Pair | Position | Condition | Calls | Leaf polls | Checksum | "
+        "Raw guest ns | Timer overhead ns | Guest ns | Host-wall ns | Correct | Command |",
+        "|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---|---|",
     ]
+    invocations = []
+    if report["pilot"] is not None:
+        invocations.append(report["pilot"])
+    invocations.extend(report["warmups"])
+    invocations.extend(report["records"])
+    for item in invocations:
+        command = shlex.join(item["command"]).replace("|", "\\|")
+        lines.append(
+            f"| `{item['phase']}` | {item['pair_index']} | {item['position']} | "
+            f"`{item['condition']}` | {item['leaf_calls']} | "
+            f"{item['leaf_entry_poll_opportunities']} | "
+            f"{item['guest']['checksum']} | {item['raw_guest_elapsed_ns']} | "
+            f"{item['timing_overhead_ns']} | {item['guest_elapsed_ns']} | "
+            f"{item['host_wall_elapsed_ns']} | "
+            f"`{str(item['correct']).lower()}` | `{command}` |"
+        )
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -675,10 +873,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         value = getattr(args, name)
         if value is not None and (value <= 0 or value % LEAF_UNROLL != 0):
             parser.error(f"--{name.replace('_', '-')} must be a positive multiple of 64")
+        if value is not None and value > MAX_LEAF_CALLS:
+            parser.error(
+                f"--{name.replace('_', '-')} must not exceed {MAX_LEAF_CALLS}"
+            )
     if args.target_interval_ms < args.min_interval_ms or args.min_interval_ms <= 0:
         parser.error("--target-interval-ms must be >= positive --min-interval-ms")
-    if args.warmups < 0 or args.samples <= 0 or args.samples % 2:
-        parser.error("--warmups must be non-negative and --samples positive and even")
+    if (
+        args.warmups < 0
+        or args.warmups > 2
+        or args.samples <= 0
+        or args.samples > 12
+        or args.samples % 2
+    ):
+        parser.error(
+            "--warmups must be between 0 and 2 and --samples positive, "
+            "even, and at most 12"
+        )
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
     return args
@@ -697,6 +908,8 @@ def main(argv: list[str] | None = None) -> int:
     repo = args.repo.resolve()
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
+    for stale_report in (output / "report.json", output / "report.md"):
+        stale_report.unlink(missing_ok=True)
     source = source_identity(repo)
     fixture = fixture_identity(repo)
     compiler, runtime = build_tools(
@@ -791,6 +1004,7 @@ def main(argv: list[str] | None = None) -> int:
             "wamr_version": command_identity([*runner, str(runtime.wamr), "version"]),
         },
     }
+    quality_invocations = warmups + records
     report = {
         "schema_version": SCHEMA_VERSION,
         "kind": KIND,
@@ -817,6 +1031,11 @@ def main(argv: list[str] | None = None) -> int:
             "leaf_unroll": LEAF_UNROLL,
             "batches": calls // LEAF_UNROLL,
             "leaf_entry_poll_opportunities_per_enabled_sample": calls,
+            "non_leaf_poll_opportunities_upper_bound_per_enabled_sample": (
+                calls // LEAF_UNROLL + 1
+            ),
+            "minimum_leaf_entry_poll_share": calls
+            / (calls + calls // LEAF_UNROLL + 1),
             "warmups": args.warmups,
             "samples": args.samples,
             "minimum_interval_ns": minimum_interval_ns,
@@ -839,15 +1058,16 @@ def main(argv: list[str] | None = None) -> int:
         "quality": {
             "equivalent_guest_work": True,
             "equivalent_checksums": len(
-                {item["guest"]["checksum"] for item in records}
+                {item["guest"]["checksum"] for item in quality_invocations}
             )
             == 1,
             "all_intervals_passed": all(
-                item["guest_elapsed_ns"] >= minimum_interval_ns for item in records
+                item["guest_elapsed_ns"] >= minimum_interval_ns
+                for item in quality_invocations
             ),
             "all_timing_overhead_below_one_percent": all(
                 99 * item["timing_overhead_ns"] < item["guest_elapsed_ns"]
-                for item in records
+                for item in quality_invocations
             ),
         },
     }

@@ -53,6 +53,12 @@ class LeafCancelCostTests(unittest.TestCase):
         )
         self.assertEqual(selected, 192)
         self.assertEqual(selected % bench.LEAF_UNROLL, 0)
+        with self.assertRaisesRegex(bench.HarnessError, "safety limit"):
+            bench.select_calls(
+                pilot_calls=bench.MAX_LEAF_CALLS,
+                pilot_elapsed_ns=1,
+                target_interval_ns=2,
+            )
 
     def test_balanced_pair_summary_reports_on_minus_off(self) -> None:
         records = [
@@ -93,25 +99,77 @@ class LeafCancelCostTests(unittest.TestCase):
             comparison["median_on_minus_off_ns_per_leaf_call"], 21 / 64
         )
 
+    def test_invocation_validation_rejects_reordered_pair(self) -> None:
+        expected = bench.expected_result(64)
+        pair = []
+        for position, condition in enumerate(bench.condition_order(0)):
+            pair.append(
+                {
+                    "phase": "sample",
+                    "pair_index": 0,
+                    "position": position,
+                    "condition": condition,
+                    "leaf_calls": 64,
+                    "leaf_entry_poll_opportunities": (
+                        64 if condition == "cancel-points-on" else 0
+                    ),
+                    "batches": 1,
+                    "guest": expected,
+                    "correct": True,
+                }
+            )
+        bench.validate_invocations(pair, phase="sample", pairs=1, calls=64)
+        with self.assertRaisesRegex(bench.HarnessError, "ordering"):
+            bench.validate_invocations(
+                list(reversed(pair)), phase="sample", pairs=1, calls=64
+            )
+
     def test_artifact_identity_requires_signature_only_when_enabled(self) -> None:
         directory = ROOT / "zig-out/leaf-cancel-cost-test"
         directory.mkdir(parents=True, exist_ok=True)
-        signature = bench.CANCEL_POLL_SIGNATURES["x86_64"]
-        off = directory / "off.cwasm"
-        on = directory / "on.cwasm"
-        off.write_bytes(self.aot(b"\x90" * 16))
-        on.write_bytes(self.aot(b"\x90" * 16 + signature + b"\x90" * 3))
         try:
-            identity = bench.artifact_identity(
-                {"cancel-points-off": off, "cancel-points-on": on}, "x86_64"
-            )
-            self.assertEqual(identity["cancel_poll_sites_enabled"], 1)
-            self.assertEqual(identity["cancel_poll_sites_disabled"], 0)
-            self.assertEqual(identity["text_delta_bytes"], len(signature) + 3)
+            for arch, signature in bench.CANCEL_POLL_SIGNATURES.items():
+                with self.subTest(arch=arch):
+                    off = directory / f"{arch}-off.cwasm"
+                    on = directory / f"{arch}-on.cwasm"
+                    off.write_bytes(self.aot(b"\x90" * 16))
+                    on.write_bytes(
+                        self.aot(b"\x90" * 16 + signature + b"\x90" * 3)
+                    )
+                    identity = bench.artifact_identity(
+                        {"cancel-points-off": off, "cancel-points-on": on}, arch
+                    )
+                    self.assertEqual(identity["cancel_poll_sites_enabled"], 1)
+                    self.assertEqual(identity["cancel_poll_sites_disabled"], 0)
+                    self.assertEqual(
+                        identity["text_delta_bytes"], len(signature) + 3
+                    )
+                    off.unlink()
+                    on.unlink()
         finally:
-            off.unlink(missing_ok=True)
-            on.unlink(missing_ok=True)
+            for path in directory.glob("*.cwasm"):
+                path.unlink()
             directory.rmdir()
+
+    def test_schema_requires_retained_evidence(self) -> None:
+        schema = json.loads(
+            (
+                ROOT
+                / "tests/benchmarks/leaf-cancel-cost/report.schema.json"
+            ).read_text(encoding="UTF-8")
+        )
+        self.assertEqual(schema["properties"]["schema_version"]["const"], 1)
+        plan_required = schema["$defs"]["plan"]["required"]
+        self.assertIn(
+            "non_leaf_poll_opportunities_upper_bound_per_enabled_sample",
+            plan_required,
+        )
+        metadata_required = schema["$defs"]["metadata"]["required"]
+        for field in ("source", "fixture", "host", "tools", "artifacts", "execution"):
+            self.assertIn(field, metadata_required)
+        invocation_required = schema["$defs"]["invocation"]["required"]
+        for field in ("command", "guest", "host_wall_elapsed_ns", "correct"):
+            self.assertIn(field, invocation_required)
 
     @staticmethod
     def aot(text: bytes) -> bytes:

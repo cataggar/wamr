@@ -31,9 +31,12 @@ commands, source/tool/fixture/AOT hashes, host fingerprint, raw records, and
 paired cost per leaf call in both `report.json` and `report.md`.
 
 The timed outer loop contributes at most one loop-header poll opportunity per
-64 leaf calls. The report therefore labels only the exact leaf-entry
-opportunities (`leaf_calls`); it does not mislabel every static libc poll site
-as dynamically executed.
+64 leaf calls, plus one entry poll for the noinline driver. The leaf-entry
+share therefore approaches 98.46% for sized runs. The report computes and
+retains the exact per-run lower bound and labels only the exact leaf-entry
+opportunities (`leaf_calls`); it does not present the amortized delta as an
+uncontaminated single-poll latency or mislabel every static libc poll site as
+dynamically executed.
 
 ## Rebuild the fixture
 
@@ -76,8 +79,9 @@ Use `--calls` to freeze an already reviewed call count and skip the pilot.
 
 The separate manual workflow `.github/workflows/leaf-cancel-cost.yml` runs the
 same harness natively on GitHub's x86_64 and AArch64 Linux runners and uploads
-both report formats. It is dispatch-only so preparation changes do not start
-remote measurement automatically.
+both report formats. It accepts only an immutable commit SHA, bounds fixed work
+and pair counts, uses pinned actions and run-local caches, and is dispatch-only
+so preparation changes do not start remote measurement automatically.
 
 For the repository's qemu route on an x86_64 host with `qemu-aarch64`:
 
