@@ -7,17 +7,16 @@
 # ///
 
 import hashlib
-import io
 import stat
 import sys
-import tarfile
 import zipfile
 from base64 import urlsafe_b64encode
 from pathlib import Path
 
 import requests  # type: ignore[import-untyped]
 
-from release_artifacts import to_pep440
+from release_artifacts import archive_name, to_pep440
+from wheel_artifacts import read_archive_files
 
 IMPORT_NAME = "wamrc_cli"
 DIST_NAME = "wamrc_bin"
@@ -45,7 +44,7 @@ def sha256_digest(data: bytes) -> str:
 
 
 def download_asset(release_version: str, platform_key: str) -> bytes:
-    asset_name = f"wamr-{release_version}-{platform_key}.tar.gz"
+    asset_name = archive_name(release_version, platform_key)
     url = f"https://github.com/{WAMR_REPO}/releases/download/v{release_version}/{asset_name}"
     print(f"  Downloading {asset_name} ...")
     resp = requests.get(url, allow_redirects=True, timeout=300)
@@ -62,13 +61,10 @@ def build_wheel(
 
     exe_name = f"wamrc{ext}"
     binary_data: bytes | None = None
-    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
-        for m in tf.getmembers():
-            if m.isfile() and m.name.endswith(f"/bin/{exe_name}"):
-                f = tf.extractfile(m)
-                if f is not None:
-                    binary_data = f.read()
-                break
+    for name, contents in read_archive_files(data, platform_key).items():
+        if name.endswith(f"/bin/{exe_name}"):
+            binary_data = contents
+            break
 
     if binary_data is None:
         raise RuntimeError(f"Binary {exe_name} not found in archive for {platform_key}")

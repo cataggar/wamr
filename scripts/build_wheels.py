@@ -7,17 +7,16 @@
 # ///
 
 import hashlib
-import io
 import stat
 import sys
-import tarfile
 import zipfile
 from base64 import urlsafe_b64encode
 from pathlib import Path
 
 import requests  # type: ignore[import-untyped]
 
-from release_artifacts import to_pep440
+from release_artifacts import archive_name, to_pep440
+from wheel_artifacts import read_archive_files
 
 IMPORT_NAME = "wamr_cli"
 DIST_NAME = "wamr_bin"
@@ -75,7 +74,7 @@ def sha256_digest(data: bytes) -> str:
 
 def download_asset(release_version: str, platform_key: str) -> bytes:
     """Download a wamr release asset."""
-    asset_name = f"wamr-{release_version}-{platform_key}.tar.gz"
+    asset_name = archive_name(release_version, platform_key)
     url = f"https://github.com/{WAMR_REPO}/releases/download/v{release_version}/{asset_name}"
     print(f"  Downloading {asset_name} ...")
     resp = requests.get(url, allow_redirects=True, timeout=300)
@@ -90,21 +89,18 @@ def build_wheel(
     """Build a single platform wheel with native binaries in data/scripts/."""
     data = download_asset(release_version or version, platform_key)
 
-    # Extract tool binaries from the tarball (exclude wamrc — distributed separately)
+    # Extract tool binaries (exclude wamrc — distributed separately)
     tool_binaries: dict[str, bytes] = {}
-    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
-        for m in tf.getmembers():
-            if not m.isfile() or "/bin/" not in m.name:
-                continue
-            basename = m.name.rsplit("/", 1)[-1]
-            if basename.startswith("wamrc"):
-                continue
-            for tool in TOOLS:
-                if basename == f"{tool}{ext}":
-                    f = tf.extractfile(m)
-                    if f is not None:
-                        tool_binaries[basename] = f.read()
-                    break
+    for name, binary_data in read_archive_files(data, platform_key).items():
+        if "/bin/" not in name:
+            continue
+        basename = name.rsplit("/", 1)[-1]
+        if basename.startswith("wamrc"):
+            continue
+        for tool in TOOLS:
+            if basename == f"{tool}{ext}":
+                tool_binaries[basename] = binary_data
+                break
 
     if not tool_binaries:
         raise RuntimeError(f"No tool binaries found in archive for {platform_key}")
