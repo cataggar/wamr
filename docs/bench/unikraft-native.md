@@ -7,7 +7,8 @@ completed the initial source-pinned, compiler-free tiny-AOT image integration,
 direct Azure Gen2 execution and ownership-checked cleanup, and supplies
 [baseline image and memory observations](https://github.com/cataggar/unikraft/issues/156#issuecomment-5722701992).
 That baseline does not satisfy #1046's matched workloads, phase timing,
-peak-memory coverage or paired Linux/Unikraft comparison. The earlier #88
+peak-memory coverage or paired Linux/Unikraft comparison. The earlier
+[cataggar/unikraft#88](https://github.com/cataggar/unikraft/issues/88)
 pipeline may be reused externally; these commands do not create cloud
 resources, dispatch jobs, download serial logs, or publish evidence.
 

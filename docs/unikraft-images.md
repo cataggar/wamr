@@ -147,7 +147,7 @@ recorded GitHub source identity, an ordinary user, x86_64, and real KVM. It
 executes `run.py boot --runtime "$RUNTIME"` inside the restricted process
 tree. Do not call conversion leaves by hand to bypass sequencing.
 
-### Private handoff and non-authorizing plan
+### Private handoff diagnostics
 
 After all six boots and final custody checks succeed:
 
@@ -157,14 +157,14 @@ python3 support/build/wamr-native-ci/handoff.py export \
   --output "$PRIVATE_PARENT/FRESH-image-handoff"
 "$VALIDATOR" handoff \
   "$PRIVATE_PARENT/FRESH-image-handoff/bundle.json"
-python3 support/build/wamr-native-ci/handoff.py plan \
-  --bundle "$PRIVATE_PARENT/FRESH-image-handoff/bundle.json" \
-  --output "$PRIVATE_PARENT/FRESH-unapproved-plan.json"
 ```
 
-`export` and `plan` never invoke Azure. The bundle and plan remain
-`authority=not_admitted`; failed or partial export state is not resumable
-success.
+`export` never invokes Azure. It produces a private diagnostic handoff with
+`bundle.json`, but it does not create the sibling `transport.json` required to
+plan a version-2 candidate. Do not run `plan` against this private export;
+`import-public-source-bundle` is the only command that creates the required
+transport record. The private bundle remains `authority=not_admitted`; failed
+or partial export state is not resumable success.
 
 ### Public-source bundle
 
@@ -254,6 +254,20 @@ python3 support/build/wamr-native-ci/handoff.py \
   --supervisor "$SUPERVISOR" \
   --artifact-id "$ARTIFACT_ID" \
   --container-digest "$CONTAINER_DIGEST"
+```
+
+The successful import creates the two sibling records consumed by version-2
+planning:
+
+```text
+$PRIVATE_PARENT/FRESH-imported-image/bundle.json
+$PRIVATE_PARENT/FRESH-imported-image/transport.json
+```
+
+`plan` takes the imported `bundle.json` and automatically reads
+`transport.json` beside it; there is no separate transport option:
+
+```sh
 "$VALIDATOR" handoff \
   "$PRIVATE_PARENT/FRESH-imported-image/bundle.json"
 python3 support/build/wamr-native-ci/handoff.py plan \
