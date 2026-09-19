@@ -1,10 +1,14 @@
 # Matched Linux / native Unikraft AOT evidence
 
-This is the **host-side software portion** of [#1046](https://github.com/cataggar/wamr/issues/1046),
-not a performance result or completion claim. Native image qualification, deployed-image
-receipts, guest integration and paired real measurements remain
-[cataggar/unikraft#156](https://github.com/cataggar/unikraft/issues/156).
-The earlier #88 pipeline may be reused externally; these commands do not create cloud
+This is the **host-side software portion** of
+[#1046](https://github.com/cataggar/wamr/issues/1046), not a performance
+result or completion claim. [cataggar/unikraft#156](https://github.com/cataggar/unikraft/issues/156)
+completed the initial source-pinned, compiler-free tiny-AOT image integration,
+direct Azure Gen2 execution and ownership-checked cleanup, and supplies
+[baseline image and memory observations](https://github.com/cataggar/unikraft/issues/156#issuecomment-5722701992).
+That baseline does not satisfy #1046's matched workloads, phase timing,
+peak-memory coverage or paired Linux/Unikraft comparison. The earlier #88
+pipeline may be reused externally; these commands do not create cloud
 resources, dispatch jobs, download serial logs, or publish evidence.
 
 The existing `scripts/bench_coremark.py` entry point provides `native-plan`,

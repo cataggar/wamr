@@ -1,10 +1,11 @@
 # Native x86_64 AOT embedding
 
 This is a **library-only, compiler-free embedding boundary**, not an Unikraft
-image/application. Native boot and exact-image qualification remain external in
-[cataggar/unikraft#156](https://github.com/cataggar/unikraft/issues/156).
-Do not treat a Linux test run or a successful freestanding link as native boot
-acceptance. No Azure resources are created by this build.
+image/application. The implemented source-pinned tiny-AOT image, raw/QCOW2/
+derived-fixed-VHD lineage and six-mode QEMU workflow are documented separately
+in [unikraft-images.md](unikraft-images.md). Do not treat a Linux test run or a
+successful freestanding link as native boot acceptance. No Azure resources are
+created by this build.
 
 ## Build boundaries
 
@@ -388,9 +389,7 @@ Linux x86_64 runs directly. A non-x86 build host needs an already-provisioned
 not install it. The existing x86_64 CI job runs both real API tests and the
 freestanding compile/link boundary. Linux/QEMU tests are not Unikraft boots.
 
-Remaining external acceptance: implement and compile the concrete native
-Unikraft allocator/page/clock adapter, integrate the library and embedded pinned
-fixture into the separate native app/image, verify real W^X/PTEs and stable
-growth under native allocation pressure, boot the exact image and retain its
-typed terminal evidence. Real image boot and cloud execution are **pending**;
-this work references rather than closes #1047.
+The source-pinned tiny fixture now has a concrete Unikraft adapter and qualified
+image workflow at fixed revisions; see [unikraft-images.md](unikraft-images.md).
+That result does not turn this library profile into an arbitrary-module image
+builder or make Linux/QEMU tests native acceptance for other embeddings.
