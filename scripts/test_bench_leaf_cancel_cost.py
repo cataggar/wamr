@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import shutil
 import struct
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -124,32 +126,191 @@ class LeafCancelCostTests(unittest.TestCase):
                 list(reversed(pair)), phase="sample", pairs=1, calls=64
             )
 
-    def test_artifact_identity_requires_signature_only_when_enabled(self) -> None:
+    def test_measurement_requires_leaf_entry_artifact_proof(self) -> None:
+        dummy = ROOT / "zig-out/leaf-cancel-proof-test"
+        build = bench.Build(
+            "dummy", dummy, dummy / "wamr", None, [], "0" * 64
+        )
+        with self.assertRaisesRegex(bench.HarnessError, "artifact proof"):
+            bench.measure(
+                repo=ROOT,
+                runner=[],
+                runtime=build,
+                artifact=dummy / "leaf.cwasm",
+                condition="cancel-points-on",
+                calls=64,
+                timeout=1,
+                minimum_interval_ns=1,
+                enforce_quality=True,
+                phase="sample",
+                pair_index=0,
+                position=0,
+                leaf_entry_poll_proven=False,
+            )
+
+    def test_artifact_identity_proves_commands_layout_and_leaf_entry(self) -> None:
         directory = ROOT / "zig-out/leaf-cancel-cost-test"
         directory.mkdir(parents=True, exist_ok=True)
         try:
-            for arch, signature in bench.CANCEL_POLL_SIGNATURES.items():
+            for arch, sequence in self.artifact_test_architectures():
                 with self.subTest(arch=arch):
                     off = directory / f"{arch}-off.cwasm"
                     on = directory / f"{arch}-on.cwasm"
-                    off.write_bytes(self.aot(b"\x90" * 16))
+                    body = self.entry_body(arch)
+                    off.write_bytes(self.aot([body], leaf_local=0))
                     on.write_bytes(
-                        self.aot(b"\x90" * 16 + signature + b"\x90" * 3)
+                        self.aot(
+                            [
+                                bench.CANCEL_POLL_ENTRY_PREFIX_SUFFIXES[arch]
+                                + sequence
+                                + self.return_instruction(arch)
+                            ],
+                            leaf_local=0,
+                        )
                     )
+                    commands = self.compile_commands(arch, off, on)
                     identity = bench.artifact_identity(
-                        {"cancel-points-off": off, "cancel-points-on": on}, arch
+                        {"cancel-points-off": off, "cancel-points-on": on},
+                        commands,
+                        arch,
+                        directory / f"{arch}-normalization",
                     )
                     self.assertEqual(identity["cancel_poll_sites_enabled"], 1)
                     self.assertEqual(identity["cancel_poll_sites_disabled"], 0)
                     self.assertEqual(
-                        identity["text_delta_bytes"], len(signature) + 3
+                        identity["text_delta_bytes"], len(sequence)
+                    )
+                    self.assertEqual(
+                        identity["leaf_step"]["local_function_index"], 0
+                    )
+                    self.assertTrue(
+                        identity["leaf_step"]["normalized_body_identical"]
                     )
                     off.unlink()
                     on.unlink()
         finally:
-            for path in directory.glob("*.cwasm"):
-                path.unlink()
-            directory.rmdir()
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def test_global_poll_sequence_without_leaf_entry_is_rejected(self) -> None:
+        directory = ROOT / "zig-out/leaf-cancel-cost-global-test"
+        directory.mkdir(parents=True, exist_ok=True)
+        arch = "aarch64"
+        sequence = bench.CANCEL_POLL_SEQUENCES[arch]
+        body = self.entry_body(arch)
+        other = self.return_instruction(arch)
+        off = directory / "off.cwasm"
+        on = directory / "on.cwasm"
+        off.write_bytes(self.aot([body, other], leaf_local=0))
+        on.write_bytes(self.aot([body, sequence + other], leaf_local=0))
+        try:
+            with self.assertRaisesRegex(bench.HarnessError, "leaf_step"):
+                bench.artifact_identity(
+                    {"cancel-points-off": off, "cancel-points-on": on},
+                    self.compile_commands(arch, off, on),
+                    arch,
+                    directory / "normalization",
+                )
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def test_unrelated_function_difference_is_rejected(self) -> None:
+        directory = ROOT / "zig-out/leaf-cancel-cost-difference-test"
+        directory.mkdir(parents=True, exist_ok=True)
+        for arch, sequence in self.artifact_test_architectures():
+            with self.subTest(arch=arch):
+                body = self.entry_body(arch)
+                changed = (
+                    b"\x90"
+                    if arch == "x86_64"
+                    else struct.pack("<I", 0xD503201F)
+                )
+                off = directory / f"{arch}-off.cwasm"
+                on = directory / f"{arch}-on.cwasm"
+                off.write_bytes(self.aot([body], leaf_local=0))
+                on.write_bytes(
+                    self.aot(
+                        [
+                            bench.CANCEL_POLL_ENTRY_PREFIX_SUFFIXES[arch]
+                            + sequence
+                            + changed
+                        ],
+                        leaf_local=0,
+                    )
+                )
+                with self.assertRaisesRegex(
+                    bench.HarnessError, "unrelated|layout"
+                ):
+                    bench.artifact_identity(
+                        {"cancel-points-off": off, "cancel-points-on": on},
+                        self.compile_commands(arch, off, on),
+                        arch,
+                        directory / f"{arch}-normalization",
+                    )
+        shutil.rmtree(directory, ignore_errors=True)
+
+    def test_compile_command_extra_option_is_rejected(self) -> None:
+        directory = ROOT / "zig-out/leaf-cancel-cost-command-test"
+        directory.mkdir(parents=True, exist_ok=True)
+        arch = "aarch64"
+        sequence = bench.CANCEL_POLL_SEQUENCES[arch]
+        body = self.entry_body(arch)
+        off = directory / "off.cwasm"
+        on = directory / "on.cwasm"
+        off.write_bytes(self.aot([body], leaf_local=0))
+        on.write_bytes(
+            self.aot(
+                [
+                    bench.CANCEL_POLL_ENTRY_PREFIX_SUFFIXES[arch]
+                    + sequence
+                    + self.return_instruction(arch)
+                ],
+                leaf_local=0,
+            )
+        )
+        commands = self.compile_commands(arch, off, on)
+        commands["cancel-points-on"].insert(4, "-O0")
+        try:
+            with self.assertRaisesRegex(bench.HarnessError, "commands differ"):
+                bench.artifact_identity(
+                    {"cancel-points-off": off, "cancel-points-on": on},
+                    commands,
+                    arch,
+                    directory / "normalization",
+                )
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def test_unrelated_aot_metadata_difference_is_rejected(self) -> None:
+        directory = ROOT / "zig-out/leaf-cancel-cost-metadata-test"
+        directory.mkdir(parents=True, exist_ok=True)
+        arch = "aarch64"
+        sequence = bench.CANCEL_POLL_SEQUENCES[arch]
+        body = self.entry_body(arch)
+        off = directory / "off.cwasm"
+        on = directory / "on.cwasm"
+        off.write_bytes(self.aot([body], leaf_local=0))
+        enabled = bytearray(
+            self.aot(
+                [
+                    bench.CANCEL_POLL_ENTRY_PREFIX_SUFFIXES[arch]
+                    + sequence
+                    + self.return_instruction(arch)
+                ],
+                leaf_local=0,
+            )
+        )
+        enabled[16] = 1
+        on.write_bytes(enabled)
+        try:
+            with self.assertRaisesRegex(bench.HarnessError, "section 0"):
+                bench.artifact_identity(
+                    {"cancel-points-off": off, "cancel-points-on": on},
+                    self.compile_commands(arch, off, on),
+                    arch,
+                    directory / "normalization",
+                )
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
 
     def test_schema_requires_retained_evidence(self) -> None:
         schema = json.loads(
@@ -170,15 +331,90 @@ class LeafCancelCostTests(unittest.TestCase):
         invocation_required = schema["$defs"]["invocation"]["required"]
         for field in ("command", "guest", "host_wall_elapsed_ns", "correct"):
             self.assertIn(field, invocation_required)
+        artifact_required = schema["$defs"]["artifacts"]["required"]
+        for field in (
+            "compile_commands",
+            "compile_command_comparison",
+            "normalized_comparison",
+            "leaf_step",
+        ):
+            self.assertIn(field, artifact_required)
 
     @staticmethod
-    def aot(text: bytes) -> bytes:
+    def return_instruction(arch: str) -> bytes:
+        return b"\xc3" if arch == "x86_64" else struct.pack("<I", 0xD65F03C0)
+
+    @staticmethod
+    def artifact_test_architectures() -> list[tuple[str, bytes]]:
+        result = subprocess.run(
+            ["objdump", "-i"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        supports_x86 = (
+            result.returncode == 0 and "i386:x86-64" in result.stdout
+        )
+        return [
+            (arch, sequence)
+            for arch, sequence in bench.CANCEL_POLL_SEQUENCES.items()
+            if arch != "x86_64" or supports_x86
+        ]
+
+    @classmethod
+    def entry_body(cls, arch: str) -> bytes:
+        return (
+            bench.CANCEL_POLL_ENTRY_PREFIX_SUFFIXES[arch]
+            + cls.return_instruction(arch)
+        )
+
+    @staticmethod
+    def section(section_type: int, payload: bytes) -> bytes:
+        return struct.pack("<II", section_type, len(payload)) + payload
+
+    @classmethod
+    def aot(cls, functions: list[bytes], *, leaf_local: int) -> bytes:
+        offsets = []
+        text = bytearray()
+        for function in functions:
+            offsets.append(len(text))
+            text.extend(function)
+        function_payload = bytearray(struct.pack("<I", len(functions)))
+        for offset in offsets:
+            function_payload.extend(struct.pack("<II", offset, 0))
+        name = b"leaf_step"
+        export_payload = (
+            struct.pack("<II", 1, len(name))
+            + name
+            + b"\x00"
+            + struct.pack("<I", leaf_local)
+        )
         return (
             b"\x00aot"
             + struct.pack("<I", bench.AOT_VERSION)
-            + struct.pack("<II", 2, len(text))
-            + text
+            + cls.section(0, b"\x00" * 40)
+            + cls.section(2, bytes(text))
+            + cls.section(3, bytes(function_payload))
+            + cls.section(4, export_payload)
+            + cls.section(8, struct.pack("<I", 0))
         )
+
+    @staticmethod
+    def compile_commands(
+        arch: str, off: Path, on: Path
+    ) -> dict[str, list[str]]:
+        base = ["wamrc", "compile", "--target", arch]
+        fixture = str(ROOT / bench.FIXTURE)
+        return {
+            "cancel-points-off": [
+                *base,
+                "--benchmark-disable-cancel-points",
+                fixture,
+                "-o",
+                str(off),
+            ],
+            "cancel-points-on": [*base, fixture, "-o", str(on)],
+        }
 
 
 if __name__ == "__main__":

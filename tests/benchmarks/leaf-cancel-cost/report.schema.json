@@ -240,10 +240,11 @@
     "tools": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["zig", "python", "compiler", "runtime"],
+      "required": ["zig", "python", "objdump", "compiler", "runtime"],
       "properties": {
         "zig": { "type": "string", "minLength": 1 },
         "python": { "type": "string", "minLength": 1 },
+        "objdump": { "type": "string", "minLength": 1 },
         "compiler": { "$ref": "#/$defs/build_tool" },
         "runtime": { "$ref": "#/$defs/runtime_tool" }
       }
@@ -264,16 +265,20 @@
       "additionalProperties": false,
       "required": [
         "architecture",
-        "cancel_poll_signature_hex",
+        "cancel_poll_sequence_hex",
         "cancel_poll_sites_enabled",
         "cancel_poll_sites_disabled",
         "text_delta_bytes",
         "bytes_per_poll_site",
+        "compile_commands",
+        "compile_command_comparison",
+        "normalized_comparison",
+        "leaf_step",
         "conditions"
       ],
       "properties": {
         "architecture": { "enum": ["x86_64", "aarch64"] },
-        "cancel_poll_signature_hex": {
+        "cancel_poll_sequence_hex": {
           "type": "string",
           "pattern": "^[0-9a-f]+$"
         },
@@ -281,6 +286,116 @@
         "cancel_poll_sites_disabled": { "const": 0 },
         "text_delta_bytes": { "type": "integer", "minimum": 1 },
         "bytes_per_poll_site": { "type": "integer", "minimum": 1 },
+        "compile_commands": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cancel-points-off", "cancel-points-on"],
+          "properties": {
+            "cancel-points-off": {
+              "type": "array",
+              "minItems": 8,
+              "items": { "type": "string" }
+            },
+            "cancel-points-on": {
+              "type": "array",
+              "minItems": 7,
+              "items": { "type": "string" }
+            }
+          }
+        },
+        "compile_command_comparison": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "differing_flag",
+            "output_paths_condition_bound",
+            "normalized_command",
+            "normalized_command_sha256"
+          ],
+          "properties": {
+            "differing_flag": {
+              "const": "--benchmark-disable-cancel-points"
+            },
+            "output_paths_condition_bound": { "const": true },
+            "normalized_command": {
+              "type": "array",
+              "minItems": 7,
+              "items": { "type": "string" },
+              "contains": { "const": "<OUTPUT>" }
+            },
+            "normalized_command_sha256": { "$ref": "#/$defs/sha256" }
+          }
+        },
+        "normalized_comparison": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "method",
+            "other_sections_byte_identical",
+            "function_count",
+            "function_type_indices_identical",
+            "normalized_functions_identical",
+            "poll_sequences_removed",
+            "relative_control_flow_fields_normalized",
+            "jump_table_entries_normalized"
+          ],
+          "properties": {
+            "method": {
+              "const": "complete-poll-and-layout-normalization-v1"
+            },
+            "other_sections_byte_identical": { "const": true },
+            "function_count": { "type": "integer", "minimum": 1 },
+            "function_type_indices_identical": { "const": true },
+            "normalized_functions_identical": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "poll_sequences_removed": { "type": "integer", "minimum": 1 },
+            "relative_control_flow_fields_normalized": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "jump_table_entries_normalized": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "leaf_step": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "export_function_index",
+            "imported_function_count",
+            "local_function_index",
+            "enabled_function_offset",
+            "disabled_function_offset",
+            "enabled_code_sha256",
+            "disabled_code_sha256",
+            "enabled_entry_poll_offset",
+            "entry_prefix_suffix_hex",
+            "enabled_poll_sequences",
+            "disabled_poll_sequences",
+            "normalized_body_identical"
+          ],
+          "properties": {
+            "export_function_index": { "type": "integer", "minimum": 0 },
+            "imported_function_count": { "type": "integer", "minimum": 0 },
+            "local_function_index": { "type": "integer", "minimum": 0 },
+            "enabled_function_offset": { "type": "integer", "minimum": 0 },
+            "disabled_function_offset": { "type": "integer", "minimum": 0 },
+            "enabled_code_sha256": { "$ref": "#/$defs/sha256" },
+            "disabled_code_sha256": { "$ref": "#/$defs/sha256" },
+            "enabled_entry_poll_offset": { "type": "integer", "minimum": 0 },
+            "entry_prefix_suffix_hex": {
+              "type": "string",
+              "pattern": "^[0-9a-f]+$"
+            },
+            "enabled_poll_sequences": { "const": 1 },
+            "disabled_poll_sequences": { "const": 0 },
+            "normalized_body_identical": { "const": true }
+          }
+        },
         "conditions": {
           "type": "object",
           "additionalProperties": false,

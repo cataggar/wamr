@@ -30,10 +30,19 @@ from benchmark_schema import (
     sha256_bytes,
     sha256_file,
 )
+from compare_hot_function import (
+    ComparisonError,
+    find_wamr_jump_tables,
+    parse_disassembly,
+)
 
 KIND = "leaf-cancel-cost"
 SCHEMA_VERSION = 1
 AOT_VERSION = 11
+AOT_TEXT_SECTION = 2
+AOT_FUNCTION_SECTION = 3
+AOT_EXPORT_SECTION = 4
+AOT_IMPORT_SECTION = 8
 LEAF_UNROLL = 64
 LEAF_SEED = 0x243F6A8885A308D3
 LEAF_STEP = 0x9E3779B97F4A7C15
@@ -50,10 +59,24 @@ SOURCE_PATHS = (
     "scripts/bench_leaf_cancel_cost.py",
     "scripts/test_bench_leaf_cancel_cost.py",
     "scripts/benchmark_schema.py",
+    "scripts/compare_hot_function.py",
 )
-CANCEL_POLL_SIGNATURES = {
-    "x86_64": bytes.fromhex("83bbb001000000740c"),
-    "aarch64": struct.pack("<II", 0xB941B270, 0x34000090),
+CANCEL_POLL_SEQUENCES = {
+    "x86_64": bytes.fromhex(
+        "83bbb001000000740c4889df488b87b8010000ffd0"
+    ),
+    "aarch64": struct.pack(
+        "<IIIII",
+        0xB941B270,
+        0x34000090,
+        0xAA1303E0,
+        0xF940DE70,
+        0xD63F0200,
+    ),
+}
+CANCEL_POLL_ENTRY_PREFIX_SUFFIXES = {
+    "x86_64": bytes.fromhex("4889fb4c8bbb00000000"),
+    "aarch64": struct.pack("<III", 0xAA0003F3, 0xF9400274, 0xF9000FA1),
 }
 FIXTURE_TOOLCHAIN = {
     "wasi_sdk_version": "25.0",
@@ -88,6 +111,38 @@ class Build:
     wamrc: Path | None
     command: list[str]
     cache_key: str
+
+
+@dataclass(frozen=True)
+class AotExport:
+    name: str
+    kind: int
+    index: int
+
+
+@dataclass(frozen=True)
+class AotImage:
+    path: Path
+    data: bytes
+    sections: tuple[tuple[int, bytes], ...]
+    text: bytes
+    function_offsets: tuple[int, ...]
+    function_type_indices: tuple[int, ...]
+    exports: tuple[AotExport, ...]
+    imported_function_count: int
+
+    def function_code(self, local_index: int) -> bytes:
+        if not 0 <= local_index < len(self.function_offsets):
+            raise HarnessError(
+                f"{self.path}: local function {local_index} is out of range"
+            )
+        start = self.function_offsets[local_index]
+        end = (
+            self.function_offsets[local_index + 1]
+            if local_index + 1 < len(self.function_offsets)
+            else len(self.text)
+        )
+        return self.text[start:end]
 
 
 def expected_result(calls: int) -> dict[str, int | str]:
@@ -352,7 +407,7 @@ def compile_artifacts(
     output: Path,
     compiler: Build,
     arch: str,
-) -> dict[str, Path]:
+) -> tuple[dict[str, Path], dict[str, list[str]]]:
     if compiler.wamrc is None:
         raise HarnessError("host compiler is missing wamrc")
     directory = output / "aot"
@@ -361,11 +416,13 @@ def compile_artifacts(
         "cancel-points-off": directory / "leaf-calls-polls-off.cwasm",
         "cancel-points-on": directory / "leaf-calls-polls-on.cwasm",
     }
+    commands = {}
     for condition, path in artifacts.items():
         command = [str(compiler.wamrc), "compile", "--target", arch]
         if condition == "cancel-points-off":
             command.append("--benchmark-disable-cancel-points")
         command += [str(repo / FIXTURE), "-o", str(path)]
+        commands[condition] = command
         try:
             subprocess.run(
                 command,
@@ -375,10 +432,103 @@ def compile_artifacts(
             )
         except subprocess.CalledProcessError as exc:
             raise HarnessError(f"AOT compilation failed for {condition}") from exc
-    return artifacts
+    return artifacts, commands
 
 
-def aot_text(path: Path) -> bytes:
+def _read_u32(payload: bytes, offset: int, label: str) -> tuple[int, int]:
+    if offset + 4 > len(payload):
+        raise HarnessError(f"{label}: truncated u32")
+    return struct.unpack_from("<I", payload, offset)[0], offset + 4
+
+
+def _read_bytes(
+    payload: bytes, offset: int, size: int, label: str
+) -> tuple[bytes, int]:
+    if size < 0 or offset + size > len(payload):
+        raise HarnessError(f"{label}: truncated byte range")
+    return payload[offset : offset + size], offset + size
+
+
+def _read_name(payload: bytes, offset: int, label: str) -> tuple[str, int]:
+    size, offset = _read_u32(payload, offset, label)
+    raw, offset = _read_bytes(payload, offset, size, label)
+    try:
+        return raw.decode("UTF-8"), offset
+    except UnicodeDecodeError as exc:
+        raise HarnessError(f"{label}: name is not UTF-8") from exc
+
+
+def _parse_function_section(
+    payload: bytes, label: str
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    count, offset = _read_u32(payload, 0, label)
+    expected_size = 4 + count * 8
+    if len(payload) != expected_size:
+        raise HarnessError(
+            f"{label}: function section size {len(payload)} != {expected_size}"
+        )
+    offsets = []
+    type_indices = []
+    for _ in range(count):
+        function_offset, offset = _read_u32(payload, offset, label)
+        type_index, offset = _read_u32(payload, offset, label)
+        offsets.append(function_offset)
+        type_indices.append(type_index)
+    return tuple(offsets), tuple(type_indices)
+
+
+def _parse_exports(payload: bytes, label: str) -> tuple[AotExport, ...]:
+    count, offset = _read_u32(payload, 0, label)
+    exports = []
+    for _ in range(count):
+        name, offset = _read_name(payload, offset, label)
+        raw_kind, offset = _read_bytes(payload, offset, 1, label)
+        index, offset = _read_u32(payload, offset, label)
+        exports.append(AotExport(name, raw_kind[0], index))
+    if offset != len(payload):
+        raise HarnessError(f"{label}: trailing export bytes")
+    return tuple(exports)
+
+
+def _parse_imported_function_count(payload: bytes, label: str) -> int:
+    count, offset = _read_u32(payload, 0, label)
+    functions = 0
+    for _ in range(count):
+        _, offset = _read_name(payload, offset, label)
+        _, offset = _read_name(payload, offset, label)
+        raw_kind, offset = _read_bytes(payload, offset, 1, label)
+        kind = raw_kind[0]
+        if kind == 0:
+            functions += 1
+            _, offset = _read_u32(payload, offset, label)
+        elif kind == 1:
+            _, offset = _read_bytes(payload, offset, 1, label)
+            _, offset = _read_u32(payload, offset, label)
+            has_max, offset = _read_bytes(payload, offset, 1, label)
+            if has_max[0] not in (0, 1):
+                raise HarnessError(f"{label}: invalid table maximum marker")
+            if has_max[0]:
+                _, offset = _read_u32(payload, offset, label)
+        elif kind == 2:
+            _, offset = _read_u32(payload, offset, label)
+            has_max, offset = _read_bytes(payload, offset, 1, label)
+            if has_max[0] not in (0, 1):
+                raise HarnessError(f"{label}: invalid memory maximum marker")
+            if has_max[0]:
+                _, offset = _read_u32(payload, offset, label)
+            _, offset = _read_bytes(payload, offset, 2, label)
+        elif kind == 3:
+            _, offset = _read_bytes(payload, offset, 2, label)
+        elif kind == 4:
+            _, offset = _read_u32(payload, offset, label)
+        else:
+            raise HarnessError(f"{label}: unsupported import kind {kind}")
+    if offset != len(payload):
+        raise HarnessError(f"{label}: trailing import bytes")
+    return functions
+
+
+def parse_aot(path: Path) -> AotImage:
     data = path.read_bytes()
     if len(data) < 8 or data[:4] != b"\x00aot":
         raise HarnessError(f"not a WAMR AOT artifact: {path}")
@@ -386,46 +536,634 @@ def aot_text(path: Path) -> bytes:
     if version != AOT_VERSION:
         raise HarnessError(f"unsupported AOT version {version}")
     offset = 8
+    sections = []
+    by_type = {}
     while offset + 8 <= len(data):
         section_type, size = struct.unpack_from("<II", data, offset)
         offset += 8
         if offset + size > len(data):
             raise HarnessError(f"truncated AOT artifact: {path}")
-        if section_type == 2:
-            return data[offset : offset + size]
+        if section_type in by_type:
+            raise HarnessError(f"{path}: duplicate AOT section {section_type}")
+        payload = data[offset : offset + size]
+        sections.append((section_type, payload))
+        by_type[section_type] = payload
         offset += size
-    raise HarnessError(f"AOT text section missing: {path}")
+    if offset != len(data):
+        raise HarnessError(f"{path}: trailing truncated AOT header")
+    for section_type in (
+        AOT_TEXT_SECTION,
+        AOT_FUNCTION_SECTION,
+        AOT_EXPORT_SECTION,
+        AOT_IMPORT_SECTION,
+    ):
+        if section_type not in by_type:
+            raise HarnessError(f"{path}: missing AOT section {section_type}")
+    function_offsets, type_indices = _parse_function_section(
+        by_type[AOT_FUNCTION_SECTION], f"{path} function section"
+    )
+    text = by_type[AOT_TEXT_SECTION]
+    if (
+        not function_offsets
+        or function_offsets[0] != 0
+        or tuple(sorted(set(function_offsets))) != function_offsets
+        or function_offsets[-1] >= len(text)
+    ):
+        raise HarnessError(f"{path}: invalid AOT function offsets")
+    return AotImage(
+        path=path,
+        data=data,
+        sections=tuple(sections),
+        text=text,
+        function_offsets=function_offsets,
+        function_type_indices=type_indices,
+        exports=_parse_exports(
+            by_type[AOT_EXPORT_SECTION], f"{path} export section"
+        ),
+        imported_function_count=_parse_imported_function_count(
+            by_type[AOT_IMPORT_SECTION], f"{path} import section"
+        ),
+    )
 
 
-def artifact_identity(artifacts: dict[str, Path], arch: str) -> dict[str, Any]:
-    if arch not in CANCEL_POLL_SIGNATURES:
-        raise HarnessError(f"unsupported AOT architecture: {arch}")
-    signature = CANCEL_POLL_SIGNATURES[arch]
-    texts = {name: aot_text(path) for name, path in artifacts.items()}
-    enabled = texts["cancel-points-on"].count(signature)
-    disabled = texts["cancel-points-off"].count(signature)
-    delta = len(texts["cancel-points-on"]) - len(texts["cancel-points-off"])
-    if enabled <= 0 or disabled != 0:
-        raise HarnessError(
-            f"cancel-poll signatures invalid: enabled={enabled}, disabled={disabled}"
+def _poll_ranges(code: bytes, sequence: bytes) -> list[tuple[int, int]]:
+    ranges = []
+    offset = 0
+    while True:
+        start = code.find(sequence, offset)
+        if start < 0:
+            return ranges
+        ranges.append((start, start + len(sequence)))
+        offset = start + len(sequence)
+
+
+def _normalize_local_offset(
+    offset: int, poll_ranges: list[tuple[int, int]], label: str
+) -> int:
+    removed = 0
+    for start, end in poll_ranges:
+        if start < offset < end:
+            raise HarnessError(f"{label}: control-flow target enters a cancel poll")
+        if end <= offset:
+            removed += end - start
+    return offset - removed
+
+
+def _function_index_for_offset(image: AotImage, offset: int) -> int:
+    if offset == len(image.text):
+        return len(image.function_offsets)
+    for index, start in enumerate(image.function_offsets):
+        end = (
+            image.function_offsets[index + 1]
+            if index + 1 < len(image.function_offsets)
+            else len(image.text)
         )
-    if delta <= 0 or delta % enabled != 0:
+        if start <= offset < end:
+            return index
+    raise HarnessError(f"{image.path}: text target {offset} is out of range")
+
+
+def _normalize_on_text_offset(
+    enabled: AotImage,
+    disabled: AotImage,
+    poll_ranges: list[list[tuple[int, int]]],
+    offset: int,
+) -> int:
+    function_index = _function_index_for_offset(enabled, offset)
+    if function_index == len(enabled.function_offsets):
+        return len(disabled.text)
+    local = offset - enabled.function_offsets[function_index]
+    return disabled.function_offsets[function_index] + _normalize_local_offset(
+        local,
+        poll_ranges[function_index],
+        f"{enabled.path} function {function_index}",
+    )
+
+
+def _x86_relative_instruction(raw: bytes) -> tuple[bytes, int] | None:
+    if len(raw) == 5 and raw[0] in (0xE8, 0xE9):
+        return raw[:1], struct.unpack_from("<i", raw, 1)[0]
+    if len(raw) == 2 and (
+        raw[0] == 0xEB or 0x70 <= raw[0] <= 0x7F
+    ):
+        return raw[:1], struct.unpack_from("<b", raw, 1)[0]
+    if len(raw) == 6 and raw[0] == 0x0F and 0x80 <= raw[1] <= 0x8F:
+        return raw[:2], struct.unpack_from("<i", raw, 2)[0]
+    return None
+
+
+def _disassemble_x86_function(
+    code: bytes, work_dir: Path, label: str
+) -> tuple[list[Any], list[dict[str, int]]]:
+    try:
+        tables = find_wamr_jump_tables(code)
+    except ComparisonError as exc:
+        raise HarnessError(f"{label}: {exc}") from exc
+    disassembly = bytearray(code)
+    for table in tables:
+        disassembly[table["start"] : table["end"]] = b"\x90" * (
+            table["end"] - table["start"]
+        )
+    work_dir.mkdir(parents=True, exist_ok=True)
+    scratch = work_dir / f"{label}.bin"
+    scratch.write_bytes(disassembly)
+    command = [
+        "objdump",
+        "-D",
+        "-b",
+        "binary",
+        "-m",
+        "i386:x86-64",
+        "-M",
+        "intel",
+        "--adjust-vma=0",
+        str(scratch),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+    finally:
+        scratch.unlink(missing_ok=True)
+    if result.returncode != 0:
         raise HarnessError(
-            f"AOT text delta {delta} is not attributable to {enabled} poll sites"
+            f"{label}: objdump failed with exit {result.returncode}: "
+            f"{result.stderr.strip()}"
+        )
+    try:
+        instructions = parse_disassembly(result.stdout)
+    except ComparisonError as exc:
+        raise HarnessError(f"{label}: {exc}") from exc
+    if max(item.offset + item.size for item in instructions) != len(code):
+        raise HarnessError(f"{label}: disassembly did not cover the function")
+    if any(item.mnemonic in ("(bad)", ".byte") for item in instructions):
+        raise HarnessError(f"{label}: undecodable x86 instruction")
+    return (
+        [
+            item
+            for item in instructions
+            if not any(
+                table["start"] <= item.offset < table["end"]
+                for table in tables
+            )
+        ],
+        tables,
+    )
+
+
+def _compare_x86_function(
+    *,
+    function_index: int,
+    enabled: AotImage,
+    disabled: AotImage,
+    enabled_code: bytes,
+    disabled_code: bytes,
+    all_poll_ranges: list[list[tuple[int, int]]],
+    work_dir: Path,
+) -> tuple[int, int]:
+    on_instructions, on_tables = _disassemble_x86_function(
+        enabled_code, work_dir, f"on-{function_index}"
+    )
+    off_instructions, off_tables = _disassemble_x86_function(
+        disabled_code, work_dir, f"off-{function_index}"
+    )
+    function_polls = all_poll_ranges[function_index]
+    poll_instruction_offsets = set()
+    for start, end in function_polls:
+        selected = [
+            item
+            for item in on_instructions
+            if start <= item.offset < end
+        ]
+        if (
+            not selected
+            or selected[0].offset != start
+            or selected[-1].offset + selected[-1].size != end
+            or b"".join(item.raw_bytes for item in selected)
+            != CANCEL_POLL_SEQUENCES["x86_64"]
+        ):
+            raise HarnessError(
+                f"enabled function {function_index}: malformed cancel poll"
+            )
+        poll_instruction_offsets.update(item.offset for item in selected)
+    on_retained = [
+        item
+        for item in on_instructions
+        if item.offset not in poll_instruction_offsets
+    ]
+    if len(on_retained) != len(off_instructions):
+        raise HarnessError(
+            f"function {function_index}: normalized instruction count differs"
+        )
+    layout_fields = 0
+    for on_item, off_item in zip(on_retained, off_instructions, strict=True):
+        normalized_offset = _normalize_local_offset(
+            on_item.offset,
+            function_polls,
+            f"enabled function {function_index}",
+        )
+        if (
+            normalized_offset != off_item.offset
+            or on_item.size != off_item.size
+            or on_item.mnemonic != off_item.mnemonic
+        ):
+            raise HarnessError(
+                f"function {function_index}: normalized instruction layout differs"
+            )
+        if on_item.raw_bytes == off_item.raw_bytes:
+            continue
+        on_relative = _x86_relative_instruction(on_item.raw_bytes)
+        off_relative = _x86_relative_instruction(off_item.raw_bytes)
+        if (
+            on_relative is None
+            or off_relative is None
+            or on_relative[0] != off_relative[0]
+        ):
+            raise HarnessError(
+                f"function {function_index}: unrelated x86 instruction difference "
+                f"at normalized offset {off_item.offset}"
+            )
+        on_target = (
+            enabled.function_offsets[function_index]
+            + on_item.offset
+            + on_item.size
+            + on_relative[1]
+        )
+        off_target = (
+            disabled.function_offsets[function_index]
+            + off_item.offset
+            + off_item.size
+            + off_relative[1]
+        )
+        if (
+            _normalize_on_text_offset(
+                enabled, disabled, all_poll_ranges, on_target
+            )
+            != off_target
+        ):
+            raise HarnessError(
+                f"function {function_index}: x86 control-flow target differs"
+            )
+        layout_fields += 1
+    if len(on_tables) != len(off_tables):
+        raise HarnessError(f"function {function_index}: jump-table count differs")
+    table_entries = 0
+    for on_table, off_table in zip(on_tables, off_tables, strict=True):
+        if (
+            on_table["entries"] != off_table["entries"]
+            or _normalize_local_offset(
+                on_table["start"],
+                function_polls,
+                f"enabled function {function_index}",
+            )
+            != off_table["start"]
+        ):
+            raise HarnessError(
+                f"function {function_index}: jump-table layout differs"
+            )
+        for entry_index in range(on_table["entries"]):
+            on_entry = on_table["start"] + entry_index * 4
+            off_entry = off_table["start"] + entry_index * 4
+            on_relative = struct.unpack_from("<i", enabled_code, on_entry)[0]
+            off_relative = struct.unpack_from("<i", disabled_code, off_entry)[0]
+            on_target = on_table["start"] + on_relative
+            off_target = off_table["start"] + off_relative
+            if (
+                _normalize_local_offset(
+                    on_target,
+                    function_polls,
+                    f"enabled function {function_index}",
+                )
+                != off_target
+            ):
+                raise HarnessError(
+                    f"function {function_index}: jump-table target differs"
+                )
+            table_entries += 1
+    return layout_fields, table_entries
+
+
+def _sign_extend(value: int, bits: int) -> int:
+    sign = 1 << (bits - 1)
+    return (value ^ sign) - sign
+
+
+def _aarch64_relative_instruction(word: int) -> tuple[int, int] | None:
+    if word & 0xFC000000 in (0x14000000, 0x94000000):
+        return word & 0xFC000000, _sign_extend(word & 0x03FFFFFF, 26) << 2
+    if word & 0xFF000010 == 0x54000000:
+        return word & ~0x00FFFFE0, _sign_extend(
+            (word >> 5) & 0x7FFFF, 19
+        ) << 2
+    if word & 0x7E000000 == 0x34000000:
+        return word & ~0x00FFFFE0, _sign_extend(
+            (word >> 5) & 0x7FFFF, 19
+        ) << 2
+    if word & 0x7E000000 == 0x36000000:
+        return word & ~0x0007FFE0, _sign_extend(
+            (word >> 5) & 0x3FFF, 14
+        ) << 2
+    return None
+
+
+def _compare_aarch64_function(
+    *,
+    function_index: int,
+    enabled: AotImage,
+    disabled: AotImage,
+    enabled_code: bytes,
+    disabled_code: bytes,
+    all_poll_ranges: list[list[tuple[int, int]]],
+) -> int:
+    if len(enabled_code) % 4 or len(disabled_code) % 4:
+        raise HarnessError(f"function {function_index}: unaligned AArch64 code")
+    sequence = CANCEL_POLL_SEQUENCES["aarch64"]
+    function_polls = all_poll_ranges[function_index]
+    for start, end in function_polls:
+        if start % 4 or enabled_code[start:end] != sequence:
+            raise HarnessError(
+                f"enabled function {function_index}: malformed cancel poll"
+            )
+    stripped = bytearray()
+    cursor = 0
+    for start, end in function_polls:
+        stripped.extend(enabled_code[cursor:start])
+        cursor = end
+    stripped.extend(enabled_code[cursor:])
+    if len(stripped) != len(disabled_code):
+        raise HarnessError(
+            f"function {function_index}: normalized AArch64 size differs"
+        )
+    layout_fields = 0
+    for offset in range(0, len(disabled_code), 4):
+        on_word = struct.unpack_from("<I", stripped, offset)[0]
+        off_word = struct.unpack_from("<I", disabled_code, offset)[0]
+        if on_word == off_word:
+            continue
+        on_relative = _aarch64_relative_instruction(on_word)
+        off_relative = _aarch64_relative_instruction(off_word)
+        if (
+            on_relative is None
+            or off_relative is None
+            or on_relative[0] != off_relative[0]
+        ):
+            raise HarnessError(
+                f"function {function_index}: unrelated AArch64 word difference "
+                f"at normalized offset {offset}"
+            )
+        on_original_offset = offset
+        for start, end in function_polls:
+            if start <= on_original_offset:
+                on_original_offset += end - start
+        on_target = (
+            enabled.function_offsets[function_index]
+            + on_original_offset
+            + on_relative[1]
+        )
+        off_target = (
+            disabled.function_offsets[function_index]
+            + offset
+            + off_relative[1]
+        )
+        if (
+            _normalize_on_text_offset(
+                enabled, disabled, all_poll_ranges, on_target
+            )
+            != off_target
+        ):
+            raise HarnessError(
+                f"function {function_index}: AArch64 control-flow target differs"
+            )
+        layout_fields += 1
+    return layout_fields
+
+
+def _compile_command_identity(
+    artifacts: dict[str, Path],
+    commands: dict[str, list[str]],
+) -> dict[str, Any]:
+    normalized = {}
+    flag = "--benchmark-disable-cancel-points"
+    for condition in ("cancel-points-off", "cancel-points-on"):
+        command = commands.get(condition)
+        if not isinstance(command, list) or not all(
+            isinstance(item, str) for item in command
+        ):
+            raise HarnessError(f"missing compile command for {condition}")
+        expected_flags = 1 if condition == "cancel-points-off" else 0
+        if command.count(flag) != expected_flags or command.count("-o") != 1:
+            raise HarnessError(f"invalid compile command for {condition}")
+        output_index = command.index("-o") + 1
+        if output_index >= len(command) or command[output_index] != str(
+            artifacts[condition]
+        ):
+            raise HarnessError(f"compile output path mismatch for {condition}")
+        normalized_command = []
+        index = 0
+        while index < len(command):
+            item = command[index]
+            if item == flag:
+                index += 1
+                continue
+            if item == "-o":
+                normalized_command += ["-o", "<OUTPUT>"]
+                index += 2
+                continue
+            normalized_command.append(item)
+            index += 1
+        normalized[condition] = normalized_command
+    if normalized["cancel-points-off"] != normalized["cancel-points-on"]:
+        raise HarnessError(
+            "AOT compile commands differ beyond the cancel-point flag and output"
+        )
+    return {
+        "differing_flag": flag,
+        "output_paths_condition_bound": True,
+        "normalized_command": normalized["cancel-points-on"],
+        "normalized_command_sha256": sha256_bytes(
+            json.dumps(
+                normalized["cancel-points-on"],
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("UTF-8")
+        ),
+    }
+
+
+def artifact_identity(
+    artifacts: dict[str, Path],
+    commands: dict[str, list[str]],
+    arch: str,
+    work_dir: Path,
+) -> dict[str, Any]:
+    if arch not in CANCEL_POLL_SEQUENCES:
+        raise HarnessError(f"unsupported AOT architecture: {arch}")
+    command_comparison = _compile_command_identity(artifacts, commands)
+    images = {name: parse_aot(path) for name, path in artifacts.items()}
+    enabled_image = images["cancel-points-on"]
+    disabled_image = images["cancel-points-off"]
+    if [item[0] for item in enabled_image.sections] != [
+        item[0] for item in disabled_image.sections
+    ]:
+        raise HarnessError("AOT section ordering differs")
+    for (on_type, on_payload), (off_type, off_payload) in zip(
+        enabled_image.sections, disabled_image.sections, strict=True
+    ):
+        if (
+            on_type not in (AOT_TEXT_SECTION, AOT_FUNCTION_SECTION)
+            and on_payload != off_payload
+        ):
+            raise HarnessError(f"unrelated AOT section {on_type} differs")
+    if (
+        len(enabled_image.function_offsets)
+        != len(disabled_image.function_offsets)
+        or enabled_image.function_type_indices
+        != disabled_image.function_type_indices
+    ):
+        raise HarnessError("AOT function identity metadata differs")
+
+    sequence = CANCEL_POLL_SEQUENCES[arch]
+    enabled_prefix = sequence[:9] if arch == "x86_64" else sequence[:8]
+    enabled = enabled_image.text.count(sequence)
+    disabled = disabled_image.text.count(sequence)
+    if (
+        enabled <= 0
+        or disabled != 0
+        or enabled_image.text.count(enabled_prefix) != enabled
+        or disabled_image.text.count(enabled_prefix) != 0
+    ):
+        raise HarnessError(
+            f"complete cancel-poll sequences invalid: "
+            f"enabled={enabled}, disabled={disabled}"
+        )
+    all_poll_ranges = [
+        _poll_ranges(enabled_image.function_code(index), sequence)
+        for index in range(len(enabled_image.function_offsets))
+    ]
+    if sum(len(ranges) for ranges in all_poll_ranges) != enabled:
+        raise HarnessError("cancel-poll sequence crosses a function boundary")
+    cumulative_removed = 0
+    layout_fields = 0
+    jump_table_entries = 0
+    for function_index, function_polls in enumerate(all_poll_ranges):
+        if (
+            enabled_image.function_offsets[function_index]
+            != disabled_image.function_offsets[function_index]
+            + cumulative_removed
+        ):
+            raise HarnessError("AOT function offsets have unrelated differences")
+        enabled_code = enabled_image.function_code(function_index)
+        disabled_code = disabled_image.function_code(function_index)
+        removed = len(function_polls) * len(sequence)
+        if len(enabled_code) != len(disabled_code) + removed:
+            raise HarnessError(
+                f"function {function_index}: size delta is not cancel polls"
+            )
+        if arch == "x86_64":
+            fields, entries = _compare_x86_function(
+                function_index=function_index,
+                enabled=enabled_image,
+                disabled=disabled_image,
+                enabled_code=enabled_code,
+                disabled_code=disabled_code,
+                all_poll_ranges=all_poll_ranges,
+                work_dir=work_dir,
+            )
+            layout_fields += fields
+            jump_table_entries += entries
+        else:
+            layout_fields += _compare_aarch64_function(
+                function_index=function_index,
+                enabled=enabled_image,
+                disabled=disabled_image,
+                enabled_code=enabled_code,
+                disabled_code=disabled_code,
+                all_poll_ranges=all_poll_ranges,
+            )
+        cumulative_removed += removed
+    delta = len(enabled_image.text) - len(disabled_image.text)
+    if delta != enabled * len(sequence):
+        raise HarnessError(
+            f"AOT text delta {delta} is not exactly {enabled} complete polls"
+        )
+
+    leaf_exports = [
+        item
+        for item in enabled_image.exports
+        if item.name == "leaf_step" and item.kind == 0
+    ]
+    if len(leaf_exports) != 1:
+        raise HarnessError("enabled AOT does not have one leaf_step function export")
+    leaf_export = leaf_exports[0]
+    leaf_local = leaf_export.index - enabled_image.imported_function_count
+    if (
+        leaf_export.index < enabled_image.imported_function_count
+        or not 0 <= leaf_local < len(enabled_image.function_offsets)
+        or enabled_image.exports != disabled_image.exports
+        or enabled_image.imported_function_count
+        != disabled_image.imported_function_count
+    ):
+        raise HarnessError("leaf_step AOT function mapping is invalid")
+    leaf_ranges = all_poll_ranges[leaf_local]
+    leaf_disabled_code = disabled_image.function_code(leaf_local)
+    leaf_enabled_code = enabled_image.function_code(leaf_local)
+    entry_prefix_suffix = CANCEL_POLL_ENTRY_PREFIX_SUFFIXES[arch]
+    if (
+        len(leaf_ranges) != 1
+        or sequence in leaf_disabled_code
+        or not leaf_enabled_code[: leaf_ranges[0][0]].endswith(
+            entry_prefix_suffix
+        )
+    ):
+        raise HarnessError(
+            "leaf_step does not have exactly one enabled entry poll after "
+            "the architecture ABI prefix and none disabled"
         )
     return {
         "architecture": arch,
-        "cancel_poll_signature_hex": signature.hex(),
+        "cancel_poll_sequence_hex": sequence.hex(),
         "cancel_poll_sites_enabled": enabled,
         "cancel_poll_sites_disabled": disabled,
         "text_delta_bytes": delta,
-        "bytes_per_poll_site": delta // enabled,
+        "bytes_per_poll_site": len(sequence),
+        "compile_commands": commands,
+        "compile_command_comparison": command_comparison,
+        "normalized_comparison": {
+            "method": "complete-poll-and-layout-normalization-v1",
+            "other_sections_byte_identical": True,
+            "function_count": len(enabled_image.function_offsets),
+            "function_type_indices_identical": True,
+            "normalized_functions_identical": len(
+                enabled_image.function_offsets
+            ),
+            "poll_sequences_removed": enabled,
+            "relative_control_flow_fields_normalized": layout_fields,
+            "jump_table_entries_normalized": jump_table_entries,
+        },
+        "leaf_step": {
+            "export_function_index": leaf_export.index,
+            "imported_function_count": enabled_image.imported_function_count,
+            "local_function_index": leaf_local,
+            "enabled_function_offset": enabled_image.function_offsets[leaf_local],
+            "disabled_function_offset": disabled_image.function_offsets[leaf_local],
+            "enabled_code_sha256": sha256_bytes(leaf_enabled_code),
+            "disabled_code_sha256": sha256_bytes(leaf_disabled_code),
+            "enabled_entry_poll_offset": leaf_ranges[0][0],
+            "entry_prefix_suffix_hex": entry_prefix_suffix.hex(),
+            "enabled_poll_sequences": 1,
+            "disabled_poll_sequences": 0,
+            "normalized_body_identical": True,
+        },
         "conditions": {
             name: {
                 "path": str(path),
                 "sha256": sha256_file(path),
                 "file_bytes": path.stat().st_size,
-                "text_bytes": len(texts[name]),
+                "text_bytes": len(images[name].text),
             }
             for name, path in sorted(artifacts.items())
         },
@@ -478,7 +1216,10 @@ def measure(
     phase: str,
     pair_index: int,
     position: int,
+    leaf_entry_poll_proven: bool,
 ) -> dict[str, Any]:
+    if not leaf_entry_poll_proven:
+        raise HarnessError("leaf-entry poll opportunities lack artifact proof")
     affinity = selected_cpu_affinity()
     command = []
     if affinity:
@@ -502,7 +1243,9 @@ def measure(
         "condition": condition,
         "command": command,
         "leaf_calls": calls,
-        "leaf_entry_poll_opportunities": calls if condition == "cancel-points-on" else 0,
+        "leaf_entry_poll_opportunities": (
+            calls if condition == "cancel-points-on" else 0
+        ),
         "batches": calls // LEAF_UNROLL,
         "guest_elapsed_ns": elapsed,
         "raw_guest_elapsed_ns": int(guest["raw_elapsed_ns"]),
@@ -633,6 +1376,44 @@ def validate_report(report: dict[str, Any]) -> None:
     if not isinstance(calls, int) or isinstance(calls, bool):
         raise HarnessError("report leaf call count is invalid")
     expected_result(calls)
+    artifacts = report.get("metadata", {}).get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise HarnessError("report artifact proof missing")
+    leaf_proof = artifacts.get("leaf_step")
+    normalized = artifacts.get("normalized_comparison")
+    if (
+        artifacts.get("cancel_poll_sites_enabled", 0) <= 0
+        or artifacts.get("cancel_poll_sites_disabled") != 0
+        or not isinstance(leaf_proof, dict)
+        or leaf_proof.get("enabled_poll_sequences") != 1
+        or leaf_proof.get("disabled_poll_sequences") != 0
+        or leaf_proof.get("normalized_body_identical") is not True
+        or not isinstance(normalized, dict)
+        or normalized.get("method")
+        != "complete-poll-and-layout-normalization-v1"
+        or normalized.get("other_sections_byte_identical") is not True
+        or normalized.get("function_type_indices_identical") is not True
+        or normalized.get("normalized_functions_identical")
+        != normalized.get("function_count")
+        or normalized.get("poll_sequences_removed")
+        != artifacts.get("cancel_poll_sites_enabled")
+        or artifacts.get("cancel_poll_sequence_hex")
+        != CANCEL_POLL_SEQUENCES.get(artifacts.get("architecture"), b"").hex()
+        or leaf_proof.get("entry_prefix_suffix_hex")
+        != CANCEL_POLL_ENTRY_PREFIX_SUFFIXES.get(
+            artifacts.get("architecture"), b""
+        ).hex()
+    ):
+        raise HarnessError("report artifact or leaf-entry proof mismatch")
+    command_paths = {
+        condition: Path(details["path"])
+        for condition, details in artifacts.get("conditions", {}).items()
+    }
+    command_comparison = _compile_command_identity(
+        command_paths, artifacts.get("compile_commands", {})
+    )
+    if artifacts.get("compile_command_comparison") != command_comparison:
+        raise HarnessError("report compile command identity mismatch")
     samples = plan.get("samples")
     warmup_pairs = plan.get("warmups")
     if (
@@ -670,6 +1451,7 @@ def validate_report(report: dict[str, Any]) -> None:
             or pilot.get("position") != 0
             or pilot.get("condition") != "cancel-points-on"
             or pilot.get("leaf_calls") != pilot_calls
+            or pilot.get("leaf_entry_poll_opportunities") != pilot_calls
             or pilot.get("correct") is not True
         ):
             raise HarnessError("pilot invocation mismatch")
@@ -691,11 +1473,6 @@ def validate_report(report: dict[str, Any]) -> None:
         or sizing.get("selected_calls") != calls
     ):
         raise HarnessError("report poll-opportunity or sizing bound mismatch")
-    artifacts = report["metadata"]["artifacts"]
-    if artifacts["cancel_poll_sites_enabled"] <= 0:
-        raise HarnessError("enabled artifact has no cancel polls")
-    if artifacts["cancel_poll_sites_disabled"] != 0:
-        raise HarnessError("disabled artifact retains cancel polls")
     quality_invocations = warmups + records
     checksums = {item["guest"]["checksum"] for item in quality_invocations}
     minimum_interval_ns = plan["minimum_interval_ns"]
@@ -739,6 +1516,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- AOT architecture: `{artifacts['architecture']}`",
         f"- Fixture: `{metadata['fixture']['sha256']}`",
         f"- Zig: `{tools['zig']}`; Python: `{tools['python']}`",
+        f"- Objdump: `{tools['objdump']}`",
         f"- wamrc: `{tools['compiler']['wamrc_sha256']}` · "
         f"`{tools['compiler']['wamrc_version']}`",
         f"- wamr: `{tools['runtime']['wamr_sha256']}` · "
@@ -753,6 +1531,40 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"| `{condition}` | `{artifact['sha256']}` | "
             f"{artifact['file_bytes']} | {artifact['text_bytes']} |"
         )
+    lines += [
+        "",
+        "## AOT single-variable proof",
+        "",
+        f"- Normalization: "
+        f"`{artifacts['normalized_comparison']['method']}`; "
+        f"{artifacts['normalized_comparison']['normalized_functions_identical']} "
+        "functions identical after removing "
+        f"{artifacts['normalized_comparison']['poll_sequences_removed']} complete "
+        "poll sequences and normalizing "
+        f"{artifacts['normalized_comparison']['relative_control_flow_fields_normalized']} "
+        "control-flow layout fields and "
+        f"{artifacts['normalized_comparison']['jump_table_entries_normalized']} "
+        "jump-table entries.",
+        f"- Normalized compile command SHA-256: "
+        f"`{artifacts['compile_command_comparison']['normalized_command_sha256']}`; "
+        "the only semantic option difference is "
+        f"`{artifacts['compile_command_comparison']['differing_flag']}`.",
+        f"- `leaf_step`: wasm function "
+        f"`{artifacts['leaf_step']['export_function_index']}`, local function "
+        f"`{artifacts['leaf_step']['local_function_index']}`, enabled entry-poll "
+        f"offset `{artifacts['leaf_step']['enabled_entry_poll_offset']}`; complete "
+        "poll sequences on/off `1 / 0`; compiler ABI entry-prefix tail "
+        f"`{artifacts['leaf_step']['entry_prefix_suffix_hex']}`; "
+        "normalized body identical.",
+        "",
+        "| AOT condition | Exact compile command |",
+        "|---|---|",
+    ]
+    for condition in ("cancel-points-off", "cancel-points-on"):
+        command = shlex.join(artifacts["compile_commands"][condition]).replace(
+            "|", "\\|"
+        )
+        lines.append(f"| `{condition}` | `{command}` |")
     lines += [
         "",
         "## Measurement plan and validation",
@@ -816,8 +1628,10 @@ def render_markdown(report: dict[str, Any]) -> str:
         "latency.",
         "",
         "Both conditions use the same wasm fixture, runtime, call count, worker-thread "
-        "path, and expected checksum. Only wamrc's benchmark-only cancel-point "
-        "suppression flag differs.",
+        "path, and expected checksum. The retained compile commands are identical "
+        "apart from condition-bound output paths and wamrc's benchmark-only "
+        "cancel-point suppression flag; complete AOT normalization rejects every "
+        "other section, function, instruction, or layout difference.",
         "",
         "## Raw invocation order",
         "",
@@ -916,8 +1730,18 @@ def main(argv: list[str] | None = None) -> int:
         repo, output, source, args.optimize, args.target, args.rebuild
     )
     arch = execution_arch(args)
-    artifacts = compile_artifacts(repo, output, compiler, arch)
-    artifact_report = artifact_identity(artifacts, arch)
+    artifacts, compile_commands = compile_artifacts(repo, output, compiler, arch)
+    artifact_report = artifact_identity(
+        artifacts,
+        compile_commands,
+        arch,
+        output / "cache/artifact-normalization",
+    )
+    leaf_entry_poll_proven = (
+        artifact_report["leaf_step"]["enabled_poll_sequences"] == 1
+        and artifact_report["leaf_step"]["disabled_poll_sequences"] == 0
+        and artifact_report["leaf_step"]["normalized_body_identical"] is True
+    )
     runner = shlex.split(args.runner)
     minimum_interval_ns = int(args.min_interval_ms * 1_000_000)
     target_interval_ns = int(args.target_interval_ms * 1_000_000)
@@ -938,6 +1762,7 @@ def main(argv: list[str] | None = None) -> int:
             phase="pilot",
             pair_index=0,
             position=0,
+            leaf_entry_poll_proven=leaf_entry_poll_proven,
         )
         calls = select_calls(
             args.pilot_calls,
@@ -962,6 +1787,7 @@ def main(argv: list[str] | None = None) -> int:
                     phase="warmup",
                     pair_index=pair_index,
                     position=position,
+                    leaf_entry_poll_proven=leaf_entry_poll_proven,
                 )
             )
 
@@ -982,6 +1808,7 @@ def main(argv: list[str] | None = None) -> int:
                     phase="sample",
                     pair_index=pair_index,
                     position=position,
+                    leaf_entry_poll_proven=leaf_entry_poll_proven,
                 )
             )
     summaries, comparison = summarize(records, calls)
@@ -989,6 +1816,7 @@ def main(argv: list[str] | None = None) -> int:
     tool_report = {
         "zig": command_identity(["zig", "version"]),
         "python": platform.python_version(),
+        "objdump": command_identity(["objdump", "--version"]),
         "compiler": {
             "build_command": compiler.command,
             "cache_key": compiler.cache_key,

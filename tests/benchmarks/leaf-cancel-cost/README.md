@@ -23,12 +23,27 @@ fixture twice with the same `wamrc`:
 - `cancel-points-off`: adds the existing benchmark-only
   `--benchmark-disable-cancel-points` flag.
 
-It rejects an enabled artifact without the architecture's cancel-poll machine
-signature or a disabled artifact that retains the signature. Sample order
+The report retains both exact compile commands and verifies their normalized
+forms are identical apart from the condition-bound output path and
+`--benchmark-disable-cancel-points`. It parses every cwasm section, function
+offset/type entry, import, and export. All non-code sections must be
+byte-identical. For every function, the enabled artifact is normalized by
+removing only the complete architecture-specific poll sequence and adjusting
+only control-flow displacements, function offsets, and inline jump-table
+targets that are directly changed by those insertions; the resulting function
+must exactly match the disabled artifact. Any unrelated instruction, data, or
+metadata difference fails closed.
+
+The AOT export/import mapping must resolve `leaf_step` to one local function.
+That exact function must contain one complete enabled poll sequence, none in
+the disabled artifact, immediately follow the architecture's compiler ABI
+entry-prefix tail, and have an otherwise identical normalized body. Only
+after that proof does the harness report one leaf-entry opportunity per call.
+A synthetic signature elsewhere in the artifact is insufficient. Sample order
 alternates off/on then on/off. Guest process-CPU time excludes process startup,
-module loading, pthread creation/join, and JSON output. The report retains all
-commands, source/tool/fixture/AOT hashes, host fingerprint, raw records, and
-paired cost per leaf call in both `report.json` and `report.md`.
+module loading, pthread creation/join, and JSON output. Both report formats
+retain commands, normalization proof, source/tool/fixture/AOT hashes, host
+identity, raw records, and paired cost per leaf call.
 
 The timed outer loop contributes at most one loop-header poll opportunity per
 64 leaf calls, plus one entry poll for the noinline driver. The leaf-entry
