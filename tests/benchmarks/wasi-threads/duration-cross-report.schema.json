@@ -49,7 +49,7 @@
         "partition": { "enum": ["training", "holdout"] },
         "cohort_id": { "type": "string", "minLength": 1 },
         "workflow_run_id": { "type": "string" },
-        "workflow_run_attempt": { "type": "string" },
+        "workflow_run_attempt": { "enum": ["", "1"] },
         "plan_sha256": { "$ref": "#/$defs/sha256" },
         "plan_identity_sha256": { "$ref": "#/$defs/sha256" },
         "source_revision": { "$ref": "#/$defs/source" },
@@ -81,9 +81,13 @@
         "version",
         "diagnostic_only",
         "production_budget_eligible",
+        "reviewed_design",
         "profile",
+        "invocation_timeout_seconds",
+        "minimum_interval_ns",
         "duration_arms",
         "cells",
+        "acceptance_checks",
         "resolved_counts",
         "pilots",
         "runtime_admission"
@@ -93,9 +97,21 @@
         "version": { "const": 21 },
         "diagnostic_only": { "const": true },
         "production_budget_eligible": { "const": false },
+        "reviewed_design": {
+          "const": {
+            "issue": 966,
+            "comment_id": 5761582333,
+            "original_analysis_json_sha256": "8189a60fbe5d5bfa678c4c62261ea4e56a1480e99bc7d89f0857822120149ad1",
+            "original_analysis_markdown_sha256": "f9fc56a1625a6c6455a4c28c41b7505c43aac9e54057c9442070a37f4a60256c",
+            "independent_review_json_sha256": "46e6459e2b45441759aaa25a9cbb1a01d5bd37984f78b5d16dd068df930f7340",
+            "independent_review_markdown_sha256": "2401118a44b6a9aa64aa7508f647051cdd9b3ec8512a331483583da3d5bbadcf"
+          }
+        },
         "profile": {
           "const": { "warmups": 2, "samples": 12, "blocks": 3, "block_size": 4 }
         },
+        "invocation_timeout_seconds": { "const": 180.0 },
+        "minimum_interval_ns": { "const": 1250000000 },
         "duration_arms": {
           "type": "object",
           "required": ["current", "doubled"],
@@ -110,6 +126,28 @@
           }
         },
         "cells": { "type": "array", "minItems": 3, "uniqueItems": true },
+        "acceptance_checks": {
+          "type": "array",
+          "minItems": 9,
+          "maxItems": 19,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "required": ["collection", "key"],
+            "additionalProperties": false,
+            "properties": {
+              "collection": {
+                "enum": ["comparisons", "ratio_of_ratios"]
+              },
+              "key": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 3,
+                "items": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        },
         "resolved_counts": { "type": "object", "minProperties": 3 },
         "pilots": { "type": "array", "minItems": 6 },
         "runtime_admission": { "type": "object" }
@@ -159,10 +197,15 @@
     },
     "telemetry_sidecar": {
       "type": "object",
-      "required": ["requested", "available", "cpu", "interval_seconds", "reason", "samples"],
+      "required": ["requested", "available", "cpu", "observed_cpus", "interval_seconds", "reason", "samples"],
       "properties": {
         "requested": { "const": true },
         "available": { "type": "boolean" },
+        "observed_cpus": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 },
+          "uniqueItems": true
+        },
         "interval_seconds": { "const": 1 },
         "samples": { "type": "array", "maxItems": 50000 }
       },

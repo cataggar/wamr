@@ -39,9 +39,10 @@ Sequences 1–16 are training and 17–20 are untouched holdout. Selected cells 
   `runtime/atomic/8` 20s→40s.
 
 Each invocation retains bounded pre/post `/proc/stat` (including steal and
-context-switch totals), PSI, load, and frequency snapshots. When a logical CPU
-outside all benchmark assignments exists, a 1 Hz frequency, temperature, and
-package-power sidecar (derived from package energy counters) is pinned there.
+context-switch totals), PSI, load, and assigned-CPU frequency snapshots. When a
+logical CPU outside all benchmark assignments exists, a 1 Hz benchmark-CPU
+frequency, temperature, and package-power sidecar (derived from package energy
+counters) is pinned there.
 Missing sensors are recorded as
 unavailable and never cause retry, replacement, or exclusion.
 
@@ -54,19 +55,26 @@ python3 scripts/wasi_thread_duration_cross_cohort.py plan \
   --output /d/wasi-thread-duration-cross-dispatch.json
 ```
 
-After review, `dispatch` runs exactly one manual workflow at a time and never
-retries or replaces a failed workflow. Validate downloaded reports and analyze
-them offline:
+After review, `dispatch` runs exactly one manual workflow at a time; the x86
+and Arm jobs within each workflow are also serialized. It never retries or
+replaces a failed workflow. Download the two predeclared artifacts from every
+successful first-attempt run, then validate and analyze them offline:
 
 ```sh
+python3 scripts/wasi_thread_duration_cross_cohort.py download \
+  --dispatch /d/wasi-thread-duration-cross-dispatch.completed.json \
+  --output-dir /d/wasi-thread-duration-cross-reports \
+  --manifest /d/wasi-thread-duration-cross-download-manifest.json
+
 python3 scripts/wasi_thread_duration_cross_cohort.py validate \
   --input-dir /d/wasi-thread-duration-cross-reports \
   --dispatch /d/wasi-thread-duration-cross-dispatch.completed.json \
+  --manifest /d/wasi-thread-duration-cross-download-manifest.json \
   --output /d/wasi-thread-duration-cross-cohort.json
 
 python3 scripts/wasi_thread_duration_cross_cohort.py analyze \
   --cohort /d/wasi-thread-duration-cross-cohort.json \
-  --policy tests/benchmarks/wasi-threads/derivation-policy.synthetic.json \
+  --policy tests/benchmarks/wasi-threads/derivation-policy.production.json \
   --output /d/wasi-thread-duration-cross-conclusion.json
 ```
 
@@ -75,7 +83,9 @@ policy rule diagnostically. Only the doubled arm selects conclusions: every
 training final log bound represented by the selected v20 failure surface must
 be at most `0.10`, and all four holdouts must pass their derived thresholds.
 The current arm remains in evidence but selects nothing. The conclusion kind is
-diagnostic-only and has a null production budget.
+diagnostic-only and has a null production budget. Validation and analysis each
+write matching Markdown beside their JSON output, including the retained file,
+cohort, and policy hashes.
 
 ## Workloads
 

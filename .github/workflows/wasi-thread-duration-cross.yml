@@ -42,7 +42,6 @@ jobs:
       XDG_CACHE_HOME: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86/xdg-cache
       ZIG_GLOBAL_CACHE_DIR: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86/zig-global-cache
       ZIG_LOCAL_CACHE_DIR: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86/zig-local-cache
-      RUNNER_TOOL_CACHE: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86/tool-cache
     steps:
       - name: Validate runner and create run-scoped paths
         env:
@@ -52,8 +51,8 @@ jobs:
           PARTITION: ${{ inputs.partition }}
         run: |
           set -euo pipefail
-          case "$ROOT:$HOME:$TMPDIR:$XDG_CACHE_HOME:$ZIG_GLOBAL_CACHE_DIR:$ZIG_LOCAL_CACHE_DIR:$RUNNER_TOOL_CACHE" in
-            /d/*:/d/*:/d/*:/d/*:/d/*:/d/*:/d/*) ;;
+          case "$ROOT:$HOME:$TMPDIR:$XDG_CACHE_HOME:$ZIG_GLOBAL_CACHE_DIR:$ZIG_LOCAL_CACHE_DIR" in
+            /d/*:/d/*:/d/*:/d/*:/d/*:/d/*) ;;
             *) echo "all diagnostic paths must remain under /d" >&2; exit 2 ;;
           esac
           test "$RUNNER_NAME" = vm31e-wamr-temp-20260906
@@ -66,7 +65,7 @@ jobs:
           test "$PARTITION" = "$EXPECTED_PARTITION"
           [[ "$GITHUB_REF" =~ ^refs/tags/wasi-thread-duration-cross-[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          mkdir -p "$ROOT"/{home,tmp,xdg-cache,zig-global-cache,zig-local-cache,tool-cache,output,source}
+          mkdir -p "$ROOT"/{home,tmp,xdg-cache,zig-global-cache,zig-local-cache,zig,output,source}
           AVAILABLE_KIB="$(df --output=avail -k /d | tail -n 1 | tr -d ' ')"
           [[ "$AVAILABLE_KIB" =~ ^[0-9]+$ ]]
           (( AVAILABLE_KIB >= 80 * 1024 * 1024 ))
@@ -85,11 +84,21 @@ jobs:
           git -C "$ROOT/source" merge-base --is-ancestor "$SOURCE_SHA" origin/main
           test -z "$(git -C "$ROOT/source" status --porcelain)"
 
-      - name: Install Zig 0.16.0 without shared cache
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: 0.16.0
-          use-cache: false
+      - name: Install pinned Zig 0.16.0 under /d
+        run: |
+          set -euo pipefail
+          ARCHIVE="$ROOT/tmp/zig-x86_64-linux-0.16.0.tar.xz"
+          curl --fail --location --silent --show-error \
+            --connect-timeout 30 --max-time 300 \
+            https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz \
+            --output "$ARCHIVE"
+          echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  $ARCHIVE" \
+            | sha256sum --check --strict
+          tar --extract --xz --file "$ARCHIVE" --directory "$ROOT/zig" \
+            --strip-components=1
+          test "$("$ROOT/zig/zig" version)" = 0.16.0
+          echo "$ROOT/zig" >> "$GITHUB_PATH"
+          rm -- "$ARCHIVE"
 
       - name: Test diagnostic harness
         run: >-
@@ -119,7 +128,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: wasi-thread-duration-cross-ubuntu-22.04-x86_64-${{ github.run_id }}
+          name: wasi-thread-duration-cross-ubuntu-22.04-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86/output/report.json
             /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86/output/report.md
@@ -138,6 +147,7 @@ jobs:
 
   arm:
     name: Neoverse-N2 duration-cross
+    needs: x86
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 720
     permissions:
@@ -149,7 +159,6 @@ jobs:
       XDG_CACHE_HOME: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-arm/xdg-cache
       ZIG_GLOBAL_CACHE_DIR: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-arm/zig-global-cache
       ZIG_LOCAL_CACHE_DIR: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-arm/zig-local-cache
-      RUNNER_TOOL_CACHE: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-arm/tool-cache
     steps:
       - name: Validate runner and create run-scoped paths
         env:
@@ -161,8 +170,8 @@ jobs:
           set -euo pipefail
           sudo mkdir -p /d/wamr-duration-cross
           sudo chown "$USER":"$(id -gn)" /d /d/wamr-duration-cross
-          case "$ROOT:$HOME:$TMPDIR:$XDG_CACHE_HOME:$ZIG_GLOBAL_CACHE_DIR:$ZIG_LOCAL_CACHE_DIR:$RUNNER_TOOL_CACHE" in
-            /d/*:/d/*:/d/*:/d/*:/d/*:/d/*:/d/*) ;;
+          case "$ROOT:$HOME:$TMPDIR:$XDG_CACHE_HOME:$ZIG_GLOBAL_CACHE_DIR:$ZIG_LOCAL_CACHE_DIR" in
+            /d/*:/d/*:/d/*:/d/*:/d/*:/d/*) ;;
             *) echo "all diagnostic paths must remain under /d" >&2; exit 2 ;;
           esac
           lscpu | grep -F 'Neoverse-N2'
@@ -175,7 +184,7 @@ jobs:
           test "$PARTITION" = "$EXPECTED_PARTITION"
           [[ "$GITHUB_REF" =~ ^refs/tags/wasi-thread-duration-cross-[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          mkdir -p "$ROOT"/{home,tmp,xdg-cache,zig-global-cache,zig-local-cache,tool-cache,output,source}
+          mkdir -p "$ROOT"/{home,tmp,xdg-cache,zig-global-cache,zig-local-cache,zig,output,source}
 
       - name: Fetch and validate immutable trusted source
         env:
@@ -191,11 +200,21 @@ jobs:
           git -C "$ROOT/source" merge-base --is-ancestor "$SOURCE_SHA" origin/main
           test -z "$(git -C "$ROOT/source" status --porcelain)"
 
-      - name: Install Zig 0.16.0 without shared cache
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: 0.16.0
-          use-cache: false
+      - name: Install pinned Zig 0.16.0 under /d
+        run: |
+          set -euo pipefail
+          ARCHIVE="$ROOT/tmp/zig-aarch64-linux-0.16.0.tar.xz"
+          curl --fail --location --silent --show-error \
+            --connect-timeout 30 --max-time 300 \
+            https://ziglang.org/download/0.16.0/zig-aarch64-linux-0.16.0.tar.xz \
+            --output "$ARCHIVE"
+          echo "ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17  $ARCHIVE" \
+            | sha256sum --check --strict
+          tar --extract --xz --file "$ARCHIVE" --directory "$ROOT/zig" \
+            --strip-components=1
+          test "$("$ROOT/zig/zig" version)" = 0.16.0
+          echo "$ROOT/zig" >> "$GITHUB_PATH"
+          rm -- "$ARCHIVE"
 
       - name: Run Arm duration-cross report
         env:
@@ -220,7 +239,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: wasi-thread-duration-cross-ubuntu-24.04-aarch64-${{ github.run_id }}
+          name: wasi-thread-duration-cross-ubuntu-24.04-aarch64-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-arm/output/report.json
             /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-arm/output/report.md

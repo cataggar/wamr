@@ -15,8 +15,17 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from benchmark_schema import BenchmarkDataError, cache_key  # noqa: E402
-from bench_wasi_threads import HarnessError, paired_invocation_order  # noqa: E402
+from benchmark_schema import BenchmarkDataError, cache_key, sha256_file  # noqa: E402
+from bench_wasi_threads import (  # noqa: E402
+    HarnessError,
+    cpu_affinity_for,
+    cpu_placement_from_topology,
+    expected_guest_clock_id,
+    expected_result,
+    paired_invocation_order,
+    projected_duration_floor_for_cell,
+    WASI_MONOTONIC_CLOCK_ID,
+)
 import wasi_thread_duration_cross as duration  # noqa: E402
 import wasi_thread_duration_cross_cohort as cohort  # noqa: E402
 
@@ -32,7 +41,16 @@ def telemetry() -> dict:
         "monotonic_ns": 1,
         "proc_stat": {
             "available": True,
-            "cpu": {"user": 1, "steal": 0},
+            "cpu": {
+                "user": 1,
+                "nice": 0,
+                "system": 1,
+                "idle": 1,
+                "iowait": 0,
+                "irq": 0,
+                "softirq": 0,
+                "steal": 0,
+            },
             "ctxt": 1,
             "processes": 1,
             "procs_running": 1,
@@ -69,17 +87,58 @@ def synthetic_report(
         "build_source_sha256": DIGEST,
     }
     plan = duration.build_plan(platform, sequence, source)
-    plan["pilots"] = [{"pilot_index": index} for index in range(len(plan["cells"]) * 2)]
-    plan["runtime_admission"] = {
-        "projected_host_wall_ns": 1,
-        "limit_ns": duration.DIAGNOSTIC_JOB_LIMIT_NS,
-    }
-    counts = {}
+    pilots = []
     for cell in plan["cells"]:
-        counts[cell["pair_key"]] = {
-            cell["left"]: 100,
-            cell["right"]: 100,
-        }
+        for condition in (cell["left"], cell["right"]):
+            spec = duration.leg_spec(cell, condition)
+            iterations = duration.pilot_iterations(spec, cell["threads"])
+            elapsed = projected_duration_floor_for_cell(
+                spec["mode"],
+                spec["sizing_policy_workload"],
+                cell["threads"],
+            )
+            guest_workload = spec["guest_workload"]
+            host_wall = (
+                elapsed
+                if expected_guest_clock_id(guest_workload)
+                == WASI_MONOTONIC_CLOCK_ID
+                else max(1_000_000_000, elapsed // cell["threads"])
+            )
+            pilots.append(
+                {
+                    "pilot_index": len(pilots),
+                    "revision": "baseline",
+                    "pair_kind": cell["pair_kind"],
+                    "pair_key": cell["pair_key"],
+                    "condition": condition,
+                    "mode": spec["mode"],
+                    "workload": spec["sizing_workload"],
+                    "sizing_policy_workload": spec["sizing_policy_workload"],
+                    "threads": cell["threads"],
+                    "iterations": iterations,
+                    "guest_elapsed_ns": elapsed,
+                    "raw_guest_elapsed_ns": elapsed,
+                    "timing_overhead_ns": 0,
+                    "host_wall_elapsed_ns": host_wall,
+                    "operations": expected_result(
+                        guest_workload, cell["threads"], iterations
+                    )["operations"],
+                    "correct": True,
+                    "telemetry": telemetry(),
+                }
+            )
+    counts, admission = duration.resolve_counts(
+        plan, pilots, duration.INVOCATION_TIMEOUT_SECONDS
+    )
+    plan["pilots"] = pilots
+    plan["resolved_counts"] = counts
+    plan["runtime_admission"] = admission
+    cpu_placement = cpu_placement_from_topology(
+        list(range(16)),
+        {cpu: (0, cpu) for cpu in range(16)},
+        tuple(sorted({cell["threads"] for cell in plan["cells"]})),
+        "taskset synthetic",
+    )
     plan["resolved_counts"] = counts
     records = []
     for cell in plan["cells"]:
@@ -102,6 +161,7 @@ def synthetic_report(
                             condition,
                             counts,
                             ratio,
+                            cpu_placement,
                         )
                     )
         for block in range(duration.PROFILE["blocks"]):
@@ -125,9 +185,22 @@ def synthetic_report(
                                 condition,
                                 counts,
                                 ratio,
+                                cpu_placement,
                             )
                         )
-    artifact = {"runtime/enabled-aot": DIGEST, "fixture/threaded": DIGEST}
+    artifact = {
+        name: DIGEST
+        for name in (
+            "runtime/enabled-aot",
+            "compiler/enabled-aot",
+            "runtime/enabled-interpreter",
+            "aot/single",
+            "aot/threaded-polls-off",
+            "aot/threaded-polls-on",
+            "fixture/single",
+            "fixture/threaded",
+        )
+    }
     report = {
         "schema_version": duration.REPORT_SCHEMA_VERSION,
         "kind": duration.KIND,
@@ -169,7 +242,7 @@ def synthetic_report(
             },
             "host_pair": {"host_fingerprint_sha256": DIGEST},
             "host_quiescence_at_start": {"runner_worker_process_count": 1},
-            "cpu_placement": {},
+            "cpu_placement": cpu_placement,
             "tools": {},
             "fixtures": {},
             "aot_artifacts": {},
@@ -181,9 +254,16 @@ def synthetic_report(
         "telemetry_sidecar": {
             "requested": True,
             "available": False,
-            "cpu": None,
+            "cpu": duration.telemetry_cpu(
+                cpu_placement, duration.cells_for_platform(platform)
+            ),
+            "observed_cpus": sorted(
+                duration.benchmark_cpus(
+                    cpu_placement, duration.cells_for_platform(platform)
+                )
+            ),
             "interval_seconds": 1,
-            "reason": "no CPU outside benchmark assignments",
+            "reason": "affinity failed: synthetic",
             "samples": [],
         },
     }
@@ -199,12 +279,20 @@ def synthetic_record(
     condition: str,
     counts: dict,
     ratio: float,
+    cpu_placement: dict,
 ) -> dict:
-    elapsed = 1_000_000_000
-    throughput = 1000.0
+    elapsed = 2_000_000_000
+    operations = 2_000
     if revision == "candidate":
         elapsed = round(elapsed * ratio)
-        throughput *= ratio
+    throughput = operations / (elapsed / 1_000_000_000)
+    guest = {
+        "metric_kind": (
+            "spawn-join-lifecycle"
+            if cell["workload"] == "spawn-join"
+            else "steady-state-kernel"
+        )
+    }
     return {
         "revision": revision,
         "pair_kind": cell["pair_kind"],
@@ -222,16 +310,25 @@ def synthetic_record(
         "mode": duration.leg_spec(cell, condition)["mode"],
         "workload": cell["workload"],
         "threads": cell["threads"],
+        "cancel_points": duration.leg_spec(cell, condition)["cancel_points"],
+        "cpu_affinity": cpu_affinity_for(
+            cpu_placement, cell["workload"], cell["threads"]
+        ),
         "iterations": counts[cell["pair_key"]][condition]
         * (2 if arm == "doubled" else 1),
         "elapsed_ns": elapsed,
+        "guest_elapsed_ns": elapsed,
+        "raw_guest_elapsed_ns": elapsed,
+        "timing_overhead_ns": 0,
+        "host_started_ns": 1,
+        "host_finished_ns": elapsed + 1,
+        "host_wall_elapsed_ns": elapsed,
+        "operations": operations,
         "throughput_ops_per_second": throughput,
-        "metric_kind": (
-            "guest-lifecycle"
-            if cell["workload"] == "spawn-join"
-            else "guest-throughput"
-        ),
+        "metric_kind": guest["metric_kind"],
+        "guest": guest,
         "correct": True,
+        "correctness": {"passed": True, "expected": {}, "actual": guest},
         "telemetry": telemetry(),
     }
 
@@ -264,7 +361,11 @@ def synthetic_summaries(platform: str, value: float = 1.0) -> dict:
                         "pair_kind": cell["pair_kind"],
                         "pair_key": cell["pair_key"],
                         "condition": condition,
-                        "metric_kind": "guest-throughput",
+                        "metric_kind": (
+                            "spawn-join-lifecycle"
+                            if cell["workload"] == "spawn-join"
+                            else "steady-state-kernel"
+                        ),
                         "elapsed_candidate_over_baseline": metric_stats(value),
                         "throughput_candidate_over_baseline": metric_stats(value),
                     }
@@ -311,6 +412,19 @@ def completed_dispatch() -> dict:
             "url": f"https://example.invalid/{sequence}",
             "status": "completed",
             "conclusion": "success",
+            "attempt": 1,
+            "artifacts": [
+                {
+                    "id": sequence * 10 + index,
+                    "name": (
+                        f"wasi-thread-duration-cross-{platform}-"
+                        f"{10_000 + sequence}-1"
+                    ),
+                    "size_in_bytes": 1000,
+                    "expired": False,
+                }
+                for index, platform in enumerate(duration.PLATFORM_CELLS, 1)
+            ],
         }
         for sequence in range(1, 21)
     ]
@@ -321,13 +435,34 @@ def synthetic_cohort(value: float = 1.0) -> dict:
     observations = []
     for sequence in range(1, 21):
         for platform in duration.PLATFORM_CELLS:
+            report_digest = cache_key(
+                {"sequence": sequence, "platform": platform, "kind": "canonical"}
+            )
             observations.append(
                 {
-                    "report_sha256": DIGEST,
+                    "report_sha256": report_digest,
+                    "report_file_sha256": cache_key(
+                        {"sequence": sequence, "platform": platform, "kind": "json"}
+                    ),
+                    "report_markdown_sha256": cache_key(
+                        {"sequence": sequence, "platform": platform, "kind": "markdown"}
+                    ),
+                    "artifact_identity_sha256": cache_key(
+                        {
+                            "sequence": sequence,
+                            "platform": platform,
+                            "kind": "artifacts",
+                        }
+                    ),
                     "run_id": str(10_000 + sequence),
+                    "workflow_run_attempt": "1",
                     "sequence": sequence,
                     "partition": duration.PARTITIONS[sequence],
                     "platform": platform,
+                    "artifact_name": (
+                        f"wasi-thread-duration-cross-{platform}-"
+                        f"{10_000 + sequence}-1"
+                    ),
                     "cpu_class": (
                         cohort.X86_CPU_CLASS
                         if platform == "ubuntu-22.04-x86_64"
@@ -336,7 +471,15 @@ def synthetic_cohort(value: float = 1.0) -> dict:
                     "host_fingerprint_sha256": DIGEST,
                     "plan_sha256": DIGEST,
                     "plan_identity_sha256": DIGEST,
-                    "telemetry_sidecar": {"available": False, "reason": "unavailable"},
+                    "telemetry_sidecar": {
+                        "requested": True,
+                        "available": False,
+                        "cpu": None,
+                        "observed_cpus": [],
+                        "interval_seconds": 1,
+                        "reason": "unavailable",
+                        "sample_count": 0,
+                    },
                     "summaries": synthetic_summaries(platform, value),
                 }
             )
@@ -347,13 +490,17 @@ def synthetic_cohort(value: float = 1.0) -> dict:
         "production_budget": None,
         "validated_at": "2026-09-21T00:00:00+00:00",
         "dispatch": completed_dispatch(),
+        "download_manifest_sha256": DIGEST,
         "identity": {
             "source_revision": {
                 "commit": SHA,
                 "tracked_diff_sha256": DIGEST,
                 "build_source_sha256": DIGEST,
             },
-            "platforms": {},
+            "platforms": {
+                platform: {"plan_kind": duration.PLAN_KIND}
+                for platform in duration.PLATFORM_CELLS
+            },
         },
         "platform_counts": {platform: 20 for platform in duration.PLATFORM_CELLS},
         "partition_counts": {
@@ -365,10 +512,122 @@ def synthetic_cohort(value: float = 1.0) -> dict:
     }
 
 
+def synthetic_download_manifest(root: Path) -> tuple[dict, dict]:
+    dispatch = completed_dispatch()
+    entries = []
+    for run in dispatch["runs"]:
+        for artifact in run["artifacts"]:
+            artifact_dir = root / artifact["name"]
+            artifact_dir.mkdir(parents=True)
+            json_path = artifact_dir / "report.json"
+            markdown_path = artifact_dir / "report.md"
+            json_path.write_text("{}\n", encoding="UTF-8")
+            markdown_path.write_text("# synthetic\n", encoding="UTF-8")
+            platform = artifact["name"].removeprefix(
+                "wasi-thread-duration-cross-"
+            ).removesuffix(f"-{run['run_id']}-1")
+            entries.append(
+                {
+                    "sequence": run["sequence"],
+                    "partition": run["partition"],
+                    "run_id": run["run_id"],
+                    "workflow_run_attempt": 1,
+                    "platform": platform,
+                    "artifact_id": artifact["id"],
+                    "artifact_name": artifact["name"],
+                    "artifact_size_in_bytes": artifact["size_in_bytes"],
+                    "report_json": {
+                        "path": f"{artifact['name']}/report.json",
+                        "sha256": sha256_file(json_path),
+                    },
+                    "report_markdown": {
+                        "path": f"{artifact['name']}/report.md",
+                        "sha256": sha256_file(markdown_path),
+                    },
+                }
+            )
+    return dispatch, {
+        "schema_version": 1,
+        "kind": cohort.DOWNLOAD_MANIFEST_KIND,
+        "downloaded_at": "2026-09-21T00:00:00+00:00",
+        "dispatch_sha256": cache_key(dispatch),
+        "cohort_id": COHORT_ID,
+        "source_sha": SHA,
+        "entries": sorted(
+            entries, key=lambda item: (item["sequence"], item["platform"])
+        ),
+    }
+
+
 class DurationCrossReportTests(unittest.TestCase):
     def test_exact_cells_targets_and_identity_are_isolated(self) -> None:
         self.assertEqual(len(duration.X86_CELLS), 11)
         self.assertEqual(len(duration.ARM_CELLS), 3)
+        self.assertEqual(
+            {
+                (platform, cell["pair_key"]): cell["current_target_seconds"]
+                for platform, cells in duration.PLATFORM_CELLS.items()
+                for cell in cells
+            },
+            {
+                ("ubuntu-22.04-x86_64", "cancel-points/hot/8"): {
+                    "cancel-points-off": 20.0,
+                    "cancel-points-on": 20.0,
+                },
+                ("ubuntu-22.04-x86_64", "runtime/atomic/1"): {
+                    "interpreter": 5.0,
+                    "aot": 5.0,
+                },
+                ("ubuntu-22.04-x86_64", "runtime/atomic/2"): {
+                    "interpreter": 40.0,
+                    "aot": 40.0,
+                },
+                ("ubuntu-22.04-x86_64", "runtime/atomic/4"): {
+                    "interpreter": 40.0,
+                    "aot": 40.0,
+                },
+                ("ubuntu-22.04-x86_64", "runtime/atomic/8"): {
+                    "interpreter": 20.0,
+                    "aot": 20.0,
+                },
+                ("ubuntu-22.04-x86_64", "runtime/hot/1"): {
+                    "interpreter": 5.0,
+                    "aot": 5.0,
+                },
+                ("ubuntu-22.04-x86_64", "runtime/hot/8"): {
+                    "interpreter": 20.0,
+                    "aot": 20.0,
+                },
+                ("ubuntu-22.04-x86_64", "runtime/spawn-join/1"): {
+                    "interpreter": 2.5,
+                    "aot": 2.5,
+                },
+                ("ubuntu-22.04-x86_64", "runtime/spawn-join/2"): {
+                    "interpreter": 2.5,
+                    "aot": 2.5,
+                },
+                ("ubuntu-22.04-x86_64", "runtime/spawn-join/8"): {
+                    "interpreter": 2.5,
+                    "aot": 2.5,
+                },
+                ("ubuntu-22.04-x86_64", "runtime/wait-notify/1"): {
+                    "interpreter": 5.0,
+                    "aot": 20.0,
+                },
+                ("ubuntu-24.04-aarch64", "runtime/atomic/2"): {
+                    "interpreter": 40.0,
+                    "aot": 40.0,
+                },
+                ("ubuntu-24.04-aarch64", "runtime/atomic/4"): {
+                    "interpreter": 40.0,
+                    "aot": 40.0,
+                },
+                ("ubuntu-24.04-aarch64", "runtime/atomic/8"): {
+                    "interpreter": 20.0,
+                    "aot": 20.0,
+                },
+            },
+        )
         hot = next(
             cell
             for cell in duration.X86_CELLS
@@ -377,6 +636,12 @@ class DurationCrossReportTests(unittest.TestCase):
         self.assertEqual(
             hot["current_target_seconds"],
             {"cancel-points-off": 20.0, "cancel-points-on": 20.0},
+        )
+        self.assertEqual(
+            duration.leg_spec(hot, "cancel-points-on")[
+                "sizing_policy_workload"
+            ],
+            "hot",
         )
         wait = next(
             cell
@@ -392,7 +657,24 @@ class DurationCrossReportTests(unittest.TestCase):
         self.assertEqual(report["kind"], duration.KIND)
         self.assertNotEqual(report["kind"], "wasi-thread-benchmark")
         self.assertEqual(report["plan"]["version"], 21)
+        self.assertEqual(
+            len(duration.acceptance_checks_for_platform("ubuntu-22.04-x86_64")),
+            19,
+        )
+        self.assertEqual(
+            len(duration.acceptance_checks_for_platform("ubuntu-24.04-aarch64")),
+            9,
+        )
         self.assertIsNone(report["production_budget"])
+        independently_built = copy.deepcopy(report)
+        for role in duration.REVISION_ROLES:
+            independently_built["metadata"]["artifact_identity"][role][
+                "runtime/enabled-aot"
+            ] = "4" * 64
+        self.assertEqual(
+            cohort.report_identity(report),
+            cohort.report_identity(independently_built),
+        )
 
     def test_arm_order_alternates_by_sequence_and_block(self) -> None:
         self.assertEqual(duration.arm_order(1, 0), ("current", "doubled"))
@@ -435,7 +717,7 @@ class DurationCrossReportTests(unittest.TestCase):
         absent = copy.deepcopy(report)
         absent["telemetry_sidecar"]["available"] = False
         absent["telemetry_sidecar"]["reason"] = ""
-        with self.assertRaisesRegex(BenchmarkDataError, "availability"):
+        with self.assertRaisesRegex(BenchmarkDataError, "unavailable reason"):
             duration.validate_report(absent)
         missing = copy.deepcopy(report)
         del missing["records"][0]["telemetry"]["before"]["proc_stat"]
@@ -457,7 +739,7 @@ class DurationCrossReportTests(unittest.TestCase):
         report["metadata"]["plan_identity_sha256"] = duration.plan_identity(
             report["plan"]
         )
-        with self.assertRaisesRegex(BenchmarkDataError, "count admission"):
+        with self.assertRaisesRegex(BenchmarkDataError, "pilot-derived|count admission"):
             duration.validate_report(report)
 
     def test_schema_files_pin_diagnostic_identity(self) -> None:
@@ -487,6 +769,20 @@ class DurationCrossReportTests(unittest.TestCase):
             report_schema["properties"]["production_budget"]["type"], "null"
         )
 
+    def test_validate_report_mode_needs_no_execution_arguments(self) -> None:
+        scratch = REPO_ROOT / "zig-out" / f"duration-report-{uuid.uuid4().hex}"
+        scratch.mkdir(parents=True)
+        try:
+            report_path = scratch / "report.json"
+            report_path.write_text(
+                json.dumps(synthetic_report()), encoding="UTF-8"
+            )
+            self.assertEqual(
+                duration.main(["--validate-report", str(report_path)]), 0
+            )
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
 
 class DurationCrossCohortTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -515,6 +811,21 @@ class DurationCrossCohortTests(unittest.TestCase):
         with self.assertRaisesRegex(HarnessError, "exactly 20"):
             cohort.validate_dispatch_plan(partial, completed=True)
 
+    def test_download_manifest_rejects_partial_or_unexpected_files(self) -> None:
+        download_dir = self.scratch / "download"
+        dispatch, manifest = synthetic_download_manifest(download_dir)
+        self.assertEqual(
+            len(
+                cohort.validate_download_manifest(
+                    manifest, dispatch, download_dir
+                )
+            ),
+            40,
+        )
+        (download_dir / "unexpected.txt").write_text("unexpected", encoding="UTF-8")
+        with self.assertRaisesRegex(HarnessError, "unexpected files"):
+            cohort.validate_download_manifest(manifest, dispatch, download_dir)
+
     def test_synthetic_pass_accepts_all_doubled_gates(self) -> None:
         cohort_document = synthetic_cohort()
         cohort_path = self.scratch / "cohort.json"
@@ -522,17 +833,23 @@ class DurationCrossCohortTests(unittest.TestCase):
         cohort_path.write_text(json.dumps(cohort_document), encoding="UTF-8")
         policy = (
             REPO_ROOT
-            / "tests/benchmarks/wasi-threads/derivation-policy.synthetic.json"
+            / "tests/benchmarks/wasi-threads/derivation-policy.production.json"
         )
         self.assertEqual(cohort.analyze(cohort_path, policy, output), 0)
         conclusion = json.loads(output.read_text(encoding="UTF-8"))
         self.assertTrue(conclusion["passed"])
+        self.assertTrue(output.with_suffix(".md").is_file())
         self.assertIsNone(conclusion["production_budget"])
         for platform in duration.PLATFORM_CELLS:
             doubled = conclusion["evidence"][platform]["doubled"]
             current = conclusion["evidence"][platform]["current"]
             self.assertTrue(
                 all(item["selected"] for item in doubled["comparisons"])
+            )
+            self.assertEqual(
+                len(doubled["comparisons"])
+                + len(doubled["ratio_of_ratios"]),
+                len(duration.acceptance_checks_for_platform(platform)),
             )
             self.assertTrue(
                 all(not item["selected"] for item in current["comparisons"])
@@ -556,6 +873,8 @@ class DurationCrossCohortTests(unittest.TestCase):
                     metric
                     for metric in observation["summaries"]["comparisons"]
                     if metric["arm"] == "doubled"
+                    and metric["pair_key"] == "cancel-points/hot/8"
+                    and metric["condition"] == "cancel-points-on"
                 )
                 item["throughput_candidate_over_baseline"] = metric_stats(
                     math.exp(-0.20)
@@ -568,11 +887,23 @@ class DurationCrossCohortTests(unittest.TestCase):
             cohort.analyze(
                 cohort_path,
                 REPO_ROOT
-                / "tests/benchmarks/wasi-threads/derivation-policy.synthetic.json",
+                / "tests/benchmarks/wasi-threads/derivation-policy.production.json",
                 output,
             )
         conclusion = json.loads(output.read_text(encoding="UTF-8"))
         self.assertFalse(conclusion["passed"])
+        self.assertTrue(output.with_suffix(".md").is_file())
+
+    def test_nonproduction_policy_is_rejected(self) -> None:
+        cohort_path = self.scratch / "cohort.json"
+        cohort_path.write_text(json.dumps(synthetic_cohort()), encoding="UTF-8")
+        with self.assertRaisesRegex(HarnessError, "unchanged production"):
+            cohort.analyze(
+                cohort_path,
+                REPO_ROOT
+                / "tests/benchmarks/wasi-threads/derivation-policy.synthetic.json",
+                self.scratch / "conclusion.json",
+            )
 
     def test_holdout_failure_is_rejected(self) -> None:
         document = synthetic_cohort()
@@ -594,7 +925,7 @@ class DurationCrossCohortTests(unittest.TestCase):
             cohort.analyze(
                 cohort_path,
                 REPO_ROOT
-                / "tests/benchmarks/wasi-threads/derivation-policy.synthetic.json",
+                / "tests/benchmarks/wasi-threads/derivation-policy.production.json",
                 self.scratch / "conclusion.json",
             )
 
@@ -623,11 +954,17 @@ class DurationCrossCohortTests(unittest.TestCase):
         self.assertIn("permissions:\n  contents: read", workflow)
         self.assertIn("group: wasi-thread-duration-cross-diagnostic", workflow)
         self.assertIn("cancel-in-progress: false", workflow)
+        self.assertIn("needs: x86", workflow)
         self.assertIn("runs-on: wamr-temp-20260906", workflow)
         self.assertIn("Neoverse-N2", workflow)
+        self.assertNotIn("mlugg/setup-zig", workflow)
+        self.assertIn("zig-x86_64-linux-0.16.0.tar.xz", workflow)
+        self.assertIn("zig-aarch64-linux-0.16.0.tar.xz", workflow)
+        self.assertIn("${{ github.run_attempt }}", workflow)
         self.assertIn("/d/wamr-duration-cross/", workflow)
         self.assertNotIn("~/.cache", workflow)
-        self.assertNotIn("/tmp/", workflow)
+        self.assertNotIn("TMPDIR: /tmp", workflow)
+        self.assertNotIn("/var/tmp", workflow)
 
 
 if __name__ == "__main__":

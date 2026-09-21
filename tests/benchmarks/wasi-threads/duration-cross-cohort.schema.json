@@ -10,6 +10,7 @@
     "production_budget",
     "validated_at",
     "dispatch",
+    "download_manifest_sha256",
     "identity",
     "platform_counts",
     "partition_counts",
@@ -23,6 +24,7 @@
     "authoritative": { "const": false },
     "production_budget": { "type": "null" },
     "validated_at": { "type": "string" },
+    "download_manifest_sha256": { "$ref": "#/$defs/sha256" },
     "dispatch": {
       "type": "object",
       "required": [
@@ -62,7 +64,12 @@
         "type": "object",
         "required": [
           "report_sha256",
+          "report_file_sha256",
+          "report_markdown_sha256",
+          "artifact_identity_sha256",
           "run_id",
+          "workflow_run_attempt",
+          "artifact_name",
           "sequence",
           "partition",
           "platform",
@@ -72,8 +79,30 @@
           "plan_identity_sha256",
           "telemetry_sidecar",
           "summaries"
-        ]
+        ],
+        "properties": {
+          "report_sha256": { "$ref": "#/$defs/sha256" },
+          "report_file_sha256": { "$ref": "#/$defs/sha256" },
+          "report_markdown_sha256": { "$ref": "#/$defs/sha256" },
+          "artifact_identity_sha256": { "$ref": "#/$defs/sha256" },
+          "workflow_run_attempt": { "const": "1" },
+          "artifact_name": { "type": "string", "minLength": 1 },
+          "sequence": { "type": "integer", "minimum": 1, "maximum": 20 },
+          "partition": { "enum": ["training", "holdout"] },
+          "platform": {
+            "enum": ["ubuntu-22.04-x86_64", "ubuntu-24.04-aarch64"]
+          },
+          "host_fingerprint_sha256": { "$ref": "#/$defs/sha256" },
+          "plan_sha256": { "$ref": "#/$defs/sha256" },
+          "plan_identity_sha256": { "$ref": "#/$defs/sha256" }
+        }
       }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
     }
   }
 }

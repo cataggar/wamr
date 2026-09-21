@@ -10,7 +10,6 @@ import math
 import os
 import re
 import shlex
-import statistics
 import subprocess
 import sys
 import threading
@@ -31,7 +30,6 @@ from benchmark_schema import (
 from bench_wasi_threads import (
     ATOMIC_WAIT_PREFLIGHT_ITERATIONS,
     ATOMIC_WAIT_PREFLIGHT_RUNS,
-    CANONICAL_PLATFORMS,
     DEFAULT_PILOT_ITERATION_PLAN,
     FIXTURE_SOURCE_POLICY,
     HarnessError,
@@ -41,7 +39,6 @@ from bench_wasi_threads import (
     REVISION_ARTIFACT_POLICY,
     REVISION_ROLES,
     SIZING_SIGNIFICANT_DIGITS,
-    WASI_MONOTONIC_CLOCK_ID,
     aot_artifact_report,
     build_tool_report,
     build_variant,
@@ -50,7 +47,6 @@ from bench_wasi_threads import (
     discover_cpu_placement,
     effective_sizing_cap,
     execution_arch,
-    expected_guest_clock_id,
     host_pair_identity,
     host_quiescence_diagnostics,
     measure_once,
@@ -62,6 +58,7 @@ from bench_wasi_threads import (
     sample_stats,
     sizing_candidates_for_cell,
     source_identity,
+    validate_cpu_placement,
     validate_sizing_pilot,
 )
 
@@ -77,6 +74,7 @@ TRUSTED_X86_RUNNER_NAME = "vm31e-wamr-temp-20260906"
 X86_CPU_CLASS = "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz"
 ARM_CPU_CLASS = "Neoverse-N2"
 INVOCATION_TIMEOUT_SECONDS = 180.0
+MINIMUM_INTERVAL_NS = 1_250_000_000
 DIAGNOSTIC_JOB_LIMIT_NS = 660 * 60 * 1_000_000_000
 SIDECAR_MAX_SAMPLES = 50_000
 TELEMETRY_POLICY = {
@@ -91,10 +89,27 @@ TELEMETRY_POLICY = {
         "cpu_frequency",
     ],
     "sidecar": (
-        "optional 1Hz frequency/temperature/package-power samples pinned to a "
-        "logical CPU outside every benchmark assignment"
+        "optional 1Hz benchmark-CPU frequency plus temperature/package-power "
+        "samples, with the collector pinned to a logical CPU outside every "
+        "benchmark assignment"
     ),
     "sensor_absence": "record-unavailable-never-retry-or-exclude",
+}
+DESIGN_PROVENANCE = {
+    "issue": 966,
+    "comment_id": 5761582333,
+    "original_analysis_json_sha256": (
+        "8189a60fbe5d5bfa678c4c62261ea4e56a1480e99bc7d89f0857822120149ad1"
+    ),
+    "original_analysis_markdown_sha256": (
+        "f9fc56a1625a6c6455a4c28c41b7505c43aac9e54057c9442070a37f4a60256c"
+    ),
+    "independent_review_json_sha256": (
+        "46e6459e2b45441759aaa25a9cbb1a01d5bd37984f78b5d16dd068df930f7340"
+    ),
+    "independent_review_markdown_sha256": (
+        "2401118a44b6a9aa64aa7508f647051cdd9b3ec8512a331483583da3d5bbadcf"
+    ),
 }
 
 
@@ -205,6 +220,48 @@ PLATFORM_CELLS = {
     "ubuntu-22.04-x86_64": X86_CELLS,
     "ubuntu-24.04-aarch64": ARM_CELLS,
 }
+ACCEPTANCE_SURFACE = {
+    "ubuntu-22.04-x86_64": {
+        "comparisons": (
+            ("cancel-points/hot/8", "cancel-points-on", "steady-state-kernel"),
+            ("runtime/atomic/2", "interpreter", "steady-state-kernel"),
+            ("runtime/atomic/4", "aot", "steady-state-kernel"),
+            ("runtime/atomic/4", "interpreter", "steady-state-kernel"),
+            ("runtime/atomic/8", "aot", "steady-state-kernel"),
+            ("runtime/atomic/8", "interpreter", "steady-state-kernel"),
+            ("runtime/hot/1", "interpreter", "steady-state-kernel"),
+            ("runtime/spawn-join/2", "interpreter", "spawn-join-lifecycle"),
+            ("runtime/wait-notify/1", "interpreter", "steady-state-kernel"),
+        ),
+        "ratio_of_ratios": (
+            ("cancel-points/hot/8", "cancel-points-off", "cancel-points-on"),
+            ("runtime/atomic/1", "interpreter", "aot"),
+            ("runtime/atomic/2", "interpreter", "aot"),
+            ("runtime/atomic/4", "interpreter", "aot"),
+            ("runtime/atomic/8", "interpreter", "aot"),
+            ("runtime/hot/1", "interpreter", "aot"),
+            ("runtime/hot/8", "interpreter", "aot"),
+            ("runtime/spawn-join/1", "interpreter", "aot"),
+            ("runtime/spawn-join/2", "interpreter", "aot"),
+            ("runtime/spawn-join/8", "interpreter", "aot"),
+        ),
+    },
+    "ubuntu-24.04-aarch64": {
+        "comparisons": (
+            ("runtime/atomic/2", "aot", "steady-state-kernel"),
+            ("runtime/atomic/2", "interpreter", "steady-state-kernel"),
+            ("runtime/atomic/4", "aot", "steady-state-kernel"),
+            ("runtime/atomic/4", "interpreter", "steady-state-kernel"),
+            ("runtime/atomic/8", "aot", "steady-state-kernel"),
+            ("runtime/atomic/8", "interpreter", "steady-state-kernel"),
+        ),
+        "ratio_of_ratios": (
+            ("runtime/atomic/2", "interpreter", "aot"),
+            ("runtime/atomic/4", "interpreter", "aot"),
+            ("runtime/atomic/8", "interpreter", "aot"),
+        ),
+    },
+}
 
 
 def cells_for_platform(platform_id: str) -> tuple[dict[str, Any], ...]:
@@ -214,6 +271,15 @@ def cells_for_platform(platform_id: str) -> tuple[dict[str, Any], ...]:
         raise HarnessError(
             f"duration-cross requires one of {sorted(PLATFORM_CELLS)}"
         ) from exc
+
+
+def acceptance_checks_for_platform(platform_id: str) -> list[dict[str, Any]]:
+    surface = ACCEPTANCE_SURFACE[platform_id]
+    return [
+        {"collection": collection, "key": list(key)}
+        for collection in ("comparisons", "ratio_of_ratios")
+        for key in surface[collection]
+    ]
 
 
 def arm_order(sequence: int, block_index: int) -> tuple[str, str]:
@@ -251,6 +317,7 @@ def leg_spec(cell: dict[str, Any], condition: str) -> dict[str, Any]:
         return {
             "mode": "aot",
             "sizing_workload": "cancel-hot",
+            "sizing_policy_workload": "hot",
             "guest_workload": "hot",
             "cancel_points": (
                 "off" if condition == "cancel-points-off" else "on"
@@ -259,6 +326,7 @@ def leg_spec(cell: dict[str, Any], condition: str) -> dict[str, Any]:
     return {
         "mode": condition,
         "sizing_workload": cell["workload"],
+        "sizing_policy_workload": cell["workload"],
         "guest_workload": cell["workload"],
         "cancel_points": "on" if condition == "aot" else "interpreter-dispatch",
     }
@@ -278,6 +346,7 @@ def build_plan(platform_id: str, sequence: int, source: dict[str, str]) -> dict[
         "production_budget_eligible": False,
         "production_report_kind": "wasi-thread-benchmark",
         "production_measurement_plan_version": 20,
+        "reviewed_design": copy.deepcopy(DESIGN_PROVENANCE),
         "platform_id": platform_id,
         "report_sequence": sequence,
         "partition": PARTITIONS[sequence],
@@ -292,6 +361,8 @@ def build_plan(platform_id: str, sequence: int, source: dict[str, str]) -> dict[
             ),
         },
         "profile": copy.deepcopy(PROFILE),
+        "invocation_timeout_seconds": INVOCATION_TIMEOUT_SECONDS,
+        "minimum_interval_ns": MINIMUM_INTERVAL_NS,
         "duration_arms": {
             "current": {"iteration_multiplier": 1, "selects_thresholds": False},
             "doubled": {"iteration_multiplier": 2, "selects_thresholds": True},
@@ -321,6 +392,7 @@ def build_plan(platform_id: str, sequence: int, source: dict[str, str]) -> dict[
         },
         "telemetry": copy.deepcopy(TELEMETRY_POLICY),
         "cells": cells,
+        "acceptance_checks": acceptance_checks_for_platform(platform_id),
         "prohibitions": [
             "retry",
             "replacement",
@@ -383,7 +455,7 @@ def read_proc_stat() -> dict[str, Any]:
     return result
 
 
-def frequency_snapshot() -> dict[str, Any]:
+def frequency_snapshot(cpus: set[int] | None = None) -> dict[str, Any]:
     paths = sorted(
         Path("/sys/devices/system/cpu").glob("cpu[0-9]*/cpufreq/scaling_cur_freq")
     )
@@ -391,9 +463,12 @@ def frequency_snapshot() -> dict[str, Any]:
     errors = []
     for path in paths:
         try:
+            cpu = int(path.parts[-3].removeprefix("cpu"))
+            if cpus is not None and cpu not in cpus:
+                continue
             values.append(
                 {
-                    "cpu": int(path.parts[-3].removeprefix("cpu")),
+                    "cpu": cpu,
                     "khz": int(path.read_text(encoding="UTF-8").strip()),
                 }
             )
@@ -427,7 +502,7 @@ def sensor_snapshot(pattern: str, label: str) -> dict[str, Any]:
     }
 
 
-def telemetry_snapshot() -> dict[str, Any]:
+def telemetry_snapshot(frequency_cpus: set[int]) -> dict[str, Any]:
     return {
         "collected_at": collected_at(),
         "monotonic_ns": time.monotonic_ns(),
@@ -437,18 +512,20 @@ def telemetry_snapshot() -> dict[str, Any]:
             for name in ("cpu", "io", "memory")
         },
         "loadavg": read_text(Path("/proc/loadavg")),
-        "frequency": frequency_snapshot(),
+        "frequency": frequency_snapshot(frequency_cpus),
     }
 
 
 class TelemetrySidecar:
-    def __init__(self, cpu: int | None) -> None:
+    def __init__(self, cpu: int | None, observed_cpus: set[int]) -> None:
         self.cpu = cpu
+        self.observed_cpus = set(observed_cpus)
         self.samples: list[dict[str, Any]] = []
         self.status: dict[str, Any] = {
             "requested": True,
             "available": cpu is not None,
             "cpu": cpu,
+            "observed_cpus": sorted(observed_cpus),
             "interval_seconds": 1,
             "reason": None if cpu is not None else "no CPU outside benchmark assignments",
         }
@@ -468,6 +545,14 @@ class TelemetrySidecar:
         except OSError as exc:
             self.status.update({"available": False, "reason": f"affinity failed: {exc}"})
             return
+        try:
+            self._collect()
+        except Exception as exc:
+            self.status.update(
+                {"available": False, "reason": f"collector failed: {exc}"}
+            )
+
+    def _collect(self) -> None:
         previous_energy: dict[str, int] | None = None
         previous_ns: int | None = None
         while not self._stop.is_set():
@@ -507,7 +592,7 @@ class TelemetrySidecar:
                 {
                     "collected_at": collected_at(),
                     "monotonic_ns": sampled_ns,
-                    "frequency": frequency_snapshot(),
+                    "frequency": frequency_snapshot(self.observed_cpus),
                     "temperature": sensor_snapshot(
                         "class/thermal/thermal_zone*/temp", "temperature"
                     ),
@@ -542,17 +627,24 @@ class TelemetrySidecar:
         return {**self.status, "samples": self.samples}
 
 
-def telemetry_cpu(cpu_placement: dict[str, Any], cells: tuple[dict[str, Any], ...]) -> int | None:
-    benchmark_cpus: set[int] = set()
+def benchmark_cpus(
+    cpu_placement: dict[str, Any], cells: tuple[dict[str, Any], ...]
+) -> set[int]:
+    result: set[int] = set()
     for cell in cells:
-        benchmark_cpus.update(
+        result.update(
             cpu_affinity_for(cpu_placement, cell["workload"], cell["threads"])
         )
+    return result
+
+
+def telemetry_cpu(cpu_placement: dict[str, Any], cells: tuple[dict[str, Any], ...]) -> int | None:
+    assigned = benchmark_cpus(cpu_placement, cells)
     return next(
         (
             cpu
             for cpu in reversed(cpu_placement["ordered_logical_cpus"])
-            if cpu not in benchmark_cpus
+            if cpu not in assigned
         ),
         None,
     )
@@ -610,9 +702,13 @@ def measured_with_telemetry(
     timeout: float,
     minimum_interval_ns: int,
     fields: dict[str, Any],
+    enforce_timing_quality: bool = True,
 ) -> dict[str, Any]:
     build, module, runtime_args, leg_fields = module_for(context, cell, condition)
-    before = telemetry_snapshot()
+    frequency_cpus = set(
+        cpu_affinity_for(cpu_placement, cell["workload"], cell["threads"])
+    )
+    before = telemetry_snapshot(frequency_cpus)
     record = measure_once(
         repo=context["repo"],
         runner=runner,
@@ -624,10 +720,11 @@ def measured_with_telemetry(
         iterations=iterations,
         timeout=timeout,
         min_interval_ns=minimum_interval_ns,
+        enforce_timing_quality=enforce_timing_quality,
         runtime_args=runtime_args,
-        record_fields={**fields, **leg_fields, "iterations": iterations},
+        record_fields={**leg_fields, **fields, "iterations": iterations},
     )
-    after = telemetry_snapshot()
+    after = telemetry_snapshot(frequency_cpus)
     record["telemetry"] = {
         "collection": TELEMETRY_POLICY["pre_post"],
         "before": before,
@@ -654,31 +751,46 @@ def resolve_counts(
                     "condition": condition,
                     "mode": spec["mode"],
                     "workload": spec["sizing_workload"],
+                    "sizing_policy_workload": spec["sizing_policy_workload"],
                     "threads": cell["threads"],
                     "iterations": pilot_iterations(spec, cell["threads"]),
                 }
             )
     if len(pilots) != len(expected_specs):
         raise HarnessError("duration-cross sizing pilot set is incomplete")
-    grouped: dict[tuple[str, str, int], list[dict[str, Any]]] = defaultdict(list)
+    grouped: dict[tuple[str, str, str, int], list[dict[str, Any]]] = defaultdict(list)
     for expected, pilot in zip(expected_specs, pilots, strict=True):
         validate_sizing_pilot(pilot, expected)
-        grouped[(expected["mode"], expected["workload"], expected["threads"])].append(
-            pilot
-        )
+        if (
+            pilot.get("sizing_policy_workload")
+            != expected["sizing_policy_workload"]
+        ):
+            raise HarnessError("sizing pilot policy workload mismatch")
+        grouped[
+            (
+                expected["mode"],
+                expected["workload"],
+                expected["sizing_policy_workload"],
+                expected["threads"],
+            )
+        ].append(pilot)
 
     cell_counts: dict[str, dict[str, int]] = {}
     sizing_cells: list[dict[str, Any]] = []
-    selected_by_sizing_key: dict[tuple[str, str, int], int] = {}
+    selected_by_sizing_key: dict[tuple[str, str, str, int], int] = {}
     for key, values in sorted(grouped.items()):
         fastest = min(values, key=lambda item: item["guest_elapsed_ns"])
         candidates = sizing_candidates_for_cell(
-            *key, fastest["iterations"], fastest["guest_elapsed_ns"]
+            key[0],
+            key[2],
+            key[3],
+            fastest["iterations"],
+            fastest["guest_elapsed_ns"],
         )
         current = candidates["selected_iterations"]
         doubled = current * 2
-        cap = effective_sizing_cap(key[1], key[2])
-        if doubled > cap or doubled > MASK64 // key[2]:
+        cap = effective_sizing_cap(key[1], key[3])
+        if doubled > cap or doubled > MASK64 // key[3]:
             raise HarnessError(
                 f"duration-cross {key} doubled count {doubled} cannot be admitted "
                 f"under frozen cap {cap}; counts must not be shortened"
@@ -686,10 +798,11 @@ def resolve_counts(
         selected_by_sizing_key[key] = current
         sizing_cells.append(
             {
-                "key": f"{key[0]}/{key[1]}/{key[2]}",
+                "key": f"{key[0]}/{key[1]}/{key[3]}",
                 "mode": key[0],
                 "workload": key[1],
-                "threads": key[2],
+                "sizing_policy_workload": key[2],
+                "threads": key[3],
                 "pilot_observations": len(values),
                 "fastest_pilot_index": fastest["pilot_index"],
                 "fastest_elapsed_ns": fastest["guest_elapsed_ns"],
@@ -704,7 +817,12 @@ def resolve_counts(
     projections = []
     timeout_ns = int(timeout_seconds * 1_000_000_000)
     for pilot in pilots:
-        key = (pilot["mode"], pilot["workload"], pilot["threads"])
+        key = (
+            pilot["mode"],
+            pilot["workload"],
+            pilot["sizing_policy_workload"],
+            pilot["threads"],
+        )
         current = selected_by_sizing_key[key]
         for arm, multiplier in (("current", 1), ("doubled", 2)):
             selected = current * multiplier
@@ -715,7 +833,9 @@ def resolve_counts(
                 pilot["host_wall_elapsed_ns"] * selected / pilot["iterations"]
             )
             if (
-                guest < projected_duration_floor_for_cell(*key) * multiplier
+                guest
+                < projected_duration_floor_for_cell(key[0], key[2], key[3])
+                * multiplier
                 or 99 * pilot["timing_overhead_ns"] >= guest
                 or guest >= timeout_ns
                 or host >= timeout_ns
@@ -748,7 +868,26 @@ def resolve_counts(
         counts = {}
         for condition in (cell["left"], cell["right"]):
             spec = leg_spec(cell, condition)
-            key = (spec["mode"], spec["sizing_workload"], cell["threads"])
+            expected_target = (
+                projected_duration_floor_for_cell(
+                    spec["mode"],
+                    spec["sizing_policy_workload"],
+                    cell["threads"],
+                )
+                / 1_000_000_000
+            )
+            if cell["current_target_seconds"][condition] != expected_target:
+                raise HarnessError(
+                    f"{cell['pair_key']}/{condition} current target "
+                    f"{cell['current_target_seconds'][condition]} does not match "
+                    f"the frozen sizing target {expected_target}"
+                )
+            key = (
+                spec["mode"],
+                spec["sizing_workload"],
+                spec["sizing_policy_workload"],
+                cell["threads"],
+            )
             counts[condition] = selected_by_sizing_key[key]
         cell_counts[cell["pair_key"]] = counts
     return cell_counts, {
@@ -905,6 +1044,206 @@ def _required_hash(value: Any, label: str) -> None:
     )
 
 
+def _validate_availability(
+    value: Any, label: str, *, require_samples: bool = False
+) -> dict[str, Any]:
+    require(isinstance(value, dict), label)
+    available = value.get("available")
+    require(isinstance(available, bool), f"{label}.available")
+    if available and require_samples:
+        require(
+            isinstance(value.get("samples"), list) and bool(value["samples"]),
+            f"{label}.samples",
+        )
+    if not available:
+        require(
+            isinstance(value.get("reason"), str) and bool(value["reason"]),
+            f"{label}.reason",
+        )
+    return value
+
+
+def _validate_telemetry_snapshot(
+    value: Any, label: str, expected_frequency_cpus: set[int]
+) -> None:
+    require(isinstance(value, dict), label)
+    require(
+        isinstance(value.get("collected_at"), str)
+        and isinstance(value.get("monotonic_ns"), int)
+        and not isinstance(value["monotonic_ns"], bool)
+        and value["monotonic_ns"] > 0,
+        f"{label} timestamps",
+    )
+    proc = _validate_availability(value.get("proc_stat"), f"{label}.proc_stat")
+    if proc["available"]:
+        cpu = proc.get("cpu")
+        require(
+            isinstance(cpu, dict)
+            and all(
+                isinstance(cpu.get(name), int)
+                and not isinstance(cpu[name], bool)
+                and cpu[name] >= 0
+                for name in (
+                    "user",
+                    "nice",
+                    "system",
+                    "idle",
+                    "iowait",
+                    "irq",
+                    "softirq",
+                    "steal",
+                )
+            )
+            and isinstance(proc.get("ctxt"), int)
+            and not isinstance(proc["ctxt"], bool)
+            and proc["ctxt"] >= 0,
+            f"{label}.proc_stat counters",
+        )
+    pressure = value.get("pressure")
+    require(
+        isinstance(pressure, dict)
+        and set(pressure) == {"cpu", "io", "memory"},
+        f"{label}.pressure",
+    )
+    for name in ("cpu", "io", "memory"):
+        status = _validate_availability(
+            pressure[name], f"{label}.pressure.{name}"
+        )
+        if status["available"]:
+            require(
+                isinstance(status.get("value"), str) and bool(status["value"]),
+                f"{label}.pressure.{name}.value",
+            )
+    loadavg = _validate_availability(value.get("loadavg"), f"{label}.loadavg")
+    if loadavg["available"]:
+        require(
+            isinstance(loadavg.get("value"), str) and bool(loadavg["value"]),
+            f"{label}.loadavg.value",
+        )
+    frequency = _validate_availability(
+        value.get("frequency"), f"{label}.frequency", require_samples=True
+    )
+    require(
+        isinstance(frequency.get("samples"), list)
+        and isinstance(frequency.get("unavailable"), list),
+        f"{label}.frequency samples",
+    )
+    for sample in frequency["samples"]:
+        require(
+            isinstance(sample, dict)
+            and isinstance(sample.get("cpu"), int)
+            and not isinstance(sample["cpu"], bool)
+            and sample["cpu"] >= 0
+            and isinstance(sample.get("khz"), int)
+            and not isinstance(sample["khz"], bool)
+            and sample["khz"] > 0,
+            f"{label}.frequency sample",
+        )
+    require(
+        {
+            sample["cpu"] for sample in frequency["samples"]
+        }
+        <= expected_frequency_cpus,
+        f"{label}.frequency CPU scope",
+    )
+
+
+def _validate_record_telemetry(
+    value: Any, label: str, expected_frequency_cpus: set[int]
+) -> None:
+    require(
+        isinstance(value, dict)
+        and value.get("collection") == TELEMETRY_POLICY["pre_post"],
+        f"{label}.collection",
+    )
+    _validate_telemetry_snapshot(
+        value.get("before"), f"{label}.before", expected_frequency_cpus
+    )
+    _validate_telemetry_snapshot(
+        value.get("after"), f"{label}.after", expected_frequency_cpus
+    )
+    require(
+        value["after"]["monotonic_ns"] >= value["before"]["monotonic_ns"],
+        f"{label} monotonic ordering",
+    )
+
+
+def _validate_sidecar(value: Any, expected_observed_cpus: set[int]) -> None:
+    require(
+        isinstance(value, dict)
+        and value.get("requested") is True
+        and value.get("interval_seconds") == 1
+        and isinstance(value.get("available"), bool)
+        and value.get("observed_cpus") == sorted(expected_observed_cpus)
+        and isinstance(value.get("samples"), list)
+        and len(value["samples"]) <= SIDECAR_MAX_SAMPLES,
+        "telemetry sidecar identity",
+    )
+    if value["available"]:
+        require(
+            isinstance(value.get("cpu"), int)
+            and not isinstance(value["cpu"], bool)
+            and value["cpu"] >= 0
+            and bool(value["samples"]),
+            "telemetry sidecar available state",
+        )
+    else:
+        require(
+            isinstance(value.get("reason"), str) and bool(value["reason"]),
+            "telemetry sidecar unavailable reason",
+        )
+    for index, sample in enumerate(value["samples"]):
+        require(
+            isinstance(sample, dict)
+            and isinstance(sample.get("collected_at"), str)
+            and isinstance(sample.get("monotonic_ns"), int)
+            and not isinstance(sample["monotonic_ns"], bool)
+            and sample["monotonic_ns"] > 0,
+            f"telemetry sidecar sample {index} timestamps",
+        )
+        frequency = _validate_availability(
+            sample.get("frequency"),
+            f"telemetry sidecar sample {index}.frequency",
+            require_samples=True,
+        )
+        require(
+            isinstance(frequency.get("samples"), list),
+            f"telemetry sidecar sample {index}.frequency samples",
+        )
+        require(
+            {
+                item["cpu"]
+                for item in frequency["samples"]
+                if isinstance(item, dict) and isinstance(item.get("cpu"), int)
+            }
+            <= expected_observed_cpus,
+            f"telemetry sidecar sample {index}.frequency CPU scope",
+        )
+        temperature = _validate_availability(
+            sample.get("temperature"),
+            f"telemetry sidecar sample {index}.temperature",
+            require_samples=True,
+        )
+        require(
+            isinstance(temperature.get("samples"), list),
+            f"telemetry sidecar sample {index}.temperature samples",
+        )
+        power = _validate_availability(
+            sample.get("package_power"),
+            f"telemetry sidecar sample {index}.package_power",
+        )
+        require(
+            isinstance(power.get("watts"), list)
+            and isinstance(power.get("energy_counters"), dict),
+            f"telemetry sidecar sample {index}.package_power samples",
+        )
+        if power["available"]:
+            require(
+                bool(power["watts"]),
+                f"telemetry sidecar sample {index}.package_power watts",
+            )
+
+
 def validate_report(document: dict[str, Any]) -> None:
     require(isinstance(document, dict), "report must be an object")
     require(document.get("schema_version") == REPORT_SCHEMA_VERSION, "schema_version")
@@ -939,7 +1278,17 @@ def validate_report(document: dict[str, Any]) -> None:
     require(plan.get("report_sequence") == sequence, "plan.report_sequence")
     require(plan.get("partition") == PARTITIONS[sequence], "plan.partition")
     require(plan.get("profile") == PROFILE, "plan.profile")
+    require(
+        plan.get("invocation_timeout_seconds") == INVOCATION_TIMEOUT_SECONDS
+        and plan.get("minimum_interval_ns") == MINIMUM_INTERVAL_NS,
+        "plan timing bounds",
+    )
     require(plan.get("cells") == list(cells_for_platform(platform_id)), "plan.cells")
+    require(
+        plan.get("acceptance_checks")
+        == acceptance_checks_for_platform(platform_id),
+        "plan acceptance checks",
+    )
     require(
         plan.get("duration_arms", {}).get("current", {}).get("selects_thresholds")
         is False
@@ -958,6 +1307,17 @@ def validate_report(document: dict[str, Any]) -> None:
         for block in range(3)
     ]
     require(plan.get("arm_order_by_block") == expected_blocks, "plan arm ordering")
+    require(
+        plan.get("warmup_arm_order")
+        == [
+            {
+                "warmup_index": index,
+                "arm_order": list(warmup_arm_order(sequence, index)),
+            }
+            for index in range(PROFILE["warmups"])
+        ],
+        "plan warmup arm ordering",
+    )
     _required_hash(metadata.get("plan_sha256"), "metadata.plan_sha256")
     _required_hash(metadata.get("plan_identity_sha256"), "metadata.plan_identity_sha256")
     require(metadata["plan_sha256"] == cache_key(plan), "metadata plan hash")
@@ -966,10 +1326,31 @@ def validate_report(document: dict[str, Any]) -> None:
     revisions = metadata.get("logical_revisions")
     require(
         isinstance(source, dict)
+        and set(source) == {"commit", "tracked_diff_sha256", "build_source_sha256"}
         and isinstance(revisions, dict)
         and set(revisions) == set(REVISION_ROLES),
         "artifact A/A identities",
     )
+    require(
+        isinstance(source["commit"], str)
+        and re.fullmatch(r"[0-9a-f]{40}", source["commit"]) is not None,
+        "source commit",
+    )
+    _required_hash(source["tracked_diff_sha256"], "source tracked diff hash")
+    _required_hash(source["build_source_sha256"], "source build hash")
+    _required_hash(metadata.get("fixture_set_sha256"), "fixture set hash")
+    require(
+        metadata.get("fixture_source_policy") == FIXTURE_SOURCE_POLICY
+        and metadata.get("revision_artifact_policy")
+        == REVISION_ARTIFACT_POLICY,
+        "fixture and revision artifact policies",
+    )
+    expected_plan = build_plan(platform_id, sequence, source)
+    static_plan = copy.deepcopy(plan)
+    for field in ("resolved_counts", "pilots", "runtime_admission"):
+        static_plan.pop(field, None)
+        expected_plan.pop(field, None)
+    require(static_plan == expected_plan, "predeclared diagnostic plan")
     for revision in REVISION_ROLES:
         require(revisions[revision] == source, f"{revision} source identity")
     artifacts = metadata.get("artifact_identity")
@@ -979,6 +1360,20 @@ def validate_report(document: dict[str, Any]) -> None:
         and isinstance(artifacts.get("baseline"), dict)
         and bool(artifacts["baseline"]),
         "artifact-identical A/A hashes",
+    )
+    expected_artifact_names = {
+        "runtime/enabled-aot",
+        "compiler/enabled-aot",
+        "runtime/enabled-interpreter",
+        "aot/single",
+        "aot/threaded-polls-off",
+        "aot/threaded-polls-on",
+        "fixture/single",
+        "fixture/threaded",
+    }
+    require(
+        set(artifacts["baseline"]) == expected_artifact_names,
+        "complete artifact identity",
     )
     for label, digest in artifacts["baseline"].items():
         _required_hash(digest, f"artifact hash {label}")
@@ -997,6 +1392,62 @@ def validate_report(document: dict[str, Any]) -> None:
     )
     expected_pilot_count = len(cells_for_platform(platform_id)) * 2
     require(len(pilots) == expected_pilot_count, "plan pilot count")
+    recomputed_counts, recomputed_admission = resolve_counts(
+        plan, pilots, INVOCATION_TIMEOUT_SECONDS
+    )
+    require(resolved == recomputed_counts, "pilot-derived resolved counts")
+    require(admission == recomputed_admission, "pilot-derived runtime admission")
+    thread_counts = tuple(
+        sorted({cell["threads"] for cell in cells_for_platform(platform_id)})
+    )
+    cpu_placement = metadata.get("cpu_placement")
+    validate_cpu_placement(cpu_placement, thread_counts)
+    for index, pilot in enumerate(pilots):
+        _validate_record_telemetry(
+            pilot.get("telemetry"),
+            f"plan.pilots[{index}].telemetry",
+            set(
+                cpu_affinity_for(
+                    cpu_placement,
+                    (
+                        "hot"
+                        if pilot["workload"] == "cancel-hot"
+                        else pilot["workload"]
+                    ),
+                    pilot["threads"],
+                )
+            ),
+        )
+    host = metadata.get("host")
+    require(isinstance(host, dict), "metadata.host")
+    if platform_id == "ubuntu-22.04-x86_64":
+        require(
+            host.get("runner_name") == TRUSTED_X86_RUNNER_NAME
+            and host.get("cpu") == X86_CPU_CLASS,
+            "trusted x86 runner identity",
+        )
+    else:
+        require(
+            isinstance(host.get("cpu"), str) and ARM_CPU_CLASS in host["cpu"],
+            "trusted Arm CPU class",
+        )
+    require(
+        metadata.get("host_quiescence_at_start", {}).get(
+            "runner_worker_process_count"
+        )
+        == 1,
+        "single runner worker",
+    )
+    require(
+        metadata.get("workflow_run_attempt") in ("", "1"),
+        "workflow reruns are forbidden",
+    )
+    quality_preflight = document.get("quality_preflight")
+    require(
+        isinstance(quality_preflight, dict)
+        and quality_preflight.get("status") == "passed",
+        "quality preflight",
+    )
     expected_coordinates = set()
     expected_record_order = []
     for cell in cells_for_platform(platform_id):
@@ -1102,24 +1553,89 @@ def validate_report(document: dict[str, Any]) -> None:
         )
         require(arm in ARMS and revision in REVISION_ROLES, f"record {index} identity")
         require(condition in (cell["left"], cell["right"]), f"record {index} condition")
+        spec = leg_spec(cell, condition)
+        require(
+            record.get("pair_kind") == cell["pair_kind"]
+            and record.get("pair_left") == cell["left"]
+            and record.get("pair_right") == cell["right"]
+            and record.get("mode") == spec["mode"]
+            and record.get("workload") == spec["guest_workload"]
+            and record.get("threads") == cell["threads"]
+            and record.get("cancel_points") == spec["cancel_points"]
+            and record.get("pair_execution") == PAIR_EXECUTION_POLICY["default"],
+            f"record {index} cell identity",
+        )
+        require(
+            record.get("sample_index")
+            == (phase_index if phase == "measure" else None)
+            and record.get("block_index")
+            == (phase_index // PROFILE["block_size"] if phase == "measure" else None)
+            and record.get("sample_in_block")
+            == (phase_index % PROFILE["block_size"] if phase == "measure" else None),
+            f"record {index} block coordinates",
+        )
         expected_iterations = resolved[pair_key][condition] * (
             2 if arm == "doubled" else 1
         )
         require(record.get("iterations") == expected_iterations, f"record {index} count")
         require(record.get("correct") is True, f"record {index} correctness")
-        telemetry = record.get("telemetry")
+        elapsed_ns = record.get("elapsed_ns")
+        overhead_ns = record.get("timing_overhead_ns")
+        raw_elapsed_ns = record.get("raw_guest_elapsed_ns")
+        operations = record.get("operations")
+        throughput = record.get("throughput_ops_per_second")
         require(
-            isinstance(telemetry, dict)
-            and telemetry.get("collection") == TELEMETRY_POLICY["pre_post"]
-            and all(
-                isinstance(telemetry.get(side), dict)
-                and "proc_stat" in telemetry[side]
-                and "pressure" in telemetry[side]
-                and "loadavg" in telemetry[side]
-                and "frequency" in telemetry[side]
-                for side in ("before", "after")
+            isinstance(elapsed_ns, int)
+            and not isinstance(elapsed_ns, bool)
+            and elapsed_ns >= MINIMUM_INTERVAL_NS
+            and record.get("guest_elapsed_ns") == elapsed_ns
+            and isinstance(overhead_ns, int)
+            and not isinstance(overhead_ns, bool)
+            and overhead_ns >= 0
+            and raw_elapsed_ns == elapsed_ns + overhead_ns
+            and 99 * overhead_ns < elapsed_ns
+            and isinstance(operations, int)
+            and not isinstance(operations, bool)
+            and operations > 0
+            and isinstance(throughput, (int, float))
+            and not isinstance(throughput, bool)
+            and math.isfinite(throughput)
+            and math.isclose(
+                throughput,
+                operations / (elapsed_ns / 1_000_000_000),
+                rel_tol=1e-12,
             ),
-            f"record {index} telemetry",
+            f"record {index} timing quality",
+        )
+        require(
+            isinstance(record.get("host_wall_elapsed_ns"), int)
+            and record["host_wall_elapsed_ns"] > 0
+            and isinstance(record.get("host_started_ns"), int)
+            and isinstance(record.get("host_finished_ns"), int)
+            and record["host_finished_ns"] >= record["host_started_ns"]
+            and record["host_finished_ns"] - record["host_started_ns"]
+            == record["host_wall_elapsed_ns"],
+            f"record {index} host timing",
+        )
+        correctness = record.get("correctness")
+        require(
+            isinstance(correctness, dict)
+            and correctness.get("passed") is True
+            and correctness.get("actual") == record.get("guest")
+            and isinstance(correctness.get("expected"), dict),
+            f"record {index} correctness evidence",
+        )
+        require(
+            record.get("cpu_affinity")
+            == cpu_affinity_for(
+                cpu_placement, spec["guest_workload"], cell["threads"]
+            ),
+            f"record {index} CPU affinity",
+        )
+        _validate_record_telemetry(
+            record.get("telemetry"),
+            f"record {index}.telemetry",
+            set(record["cpu_affinity"]),
         )
     require(
         observed_coordinates == expected_coordinates,
@@ -1140,17 +1656,16 @@ def validate_report(document: dict[str, Any]) -> None:
         == expected_record_order,
         "report arm/invocation ordering differs from the predeclared sequence and block plan",
     )
+    observed_sidecar_cpus = benchmark_cpus(
+        cpu_placement, cells_for_platform(platform_id)
+    )
+    _validate_sidecar(
+        document.get("telemetry_sidecar"), observed_sidecar_cpus
+    )
     require(
-        isinstance(document.get("telemetry_sidecar"), dict)
-        and isinstance(document["telemetry_sidecar"].get("available"), bool)
-        and isinstance(document["telemetry_sidecar"].get("samples"), list)
-        and len(document["telemetry_sidecar"].get("samples", []))
-        <= SIDECAR_MAX_SAMPLES
-        and (
-            document["telemetry_sidecar"]["available"]
-            or bool(document["telemetry_sidecar"].get("reason"))
-        ),
-        "telemetry sidecar availability",
+        document["telemetry_sidecar"].get("cpu")
+        == telemetry_cpu(cpu_placement, cells_for_platform(platform_id)),
+        "telemetry sidecar CPU placement",
     )
     recomputed = summarize_report(records)
     require(summaries == recomputed, "summary recomputation")
@@ -1210,8 +1725,31 @@ def render_markdown(document: dict[str, Any]) -> str:
 
 
 def execute(args: argparse.Namespace) -> dict[str, Any]:
+    missing = [
+        name
+        for name in (
+            "output_dir",
+            "platform_id",
+            "report_sequence",
+            "runner_environment",
+            "host_pair_id",
+        )
+        if getattr(args, name) is None
+    ]
+    if missing:
+        raise HarnessError(
+            "duration-cross execution requires " + ", ".join(missing)
+        )
     repo = args.repo.resolve()
     output = args.output_dir.resolve()
+    if args.timeout != INVOCATION_TIMEOUT_SECONDS:
+        raise HarnessError(
+            f"duration-cross timeout is frozen at {INVOCATION_TIMEOUT_SECONDS:g} seconds"
+        )
+    if int(args.min_interval_ms * 1_000_000) != MINIMUM_INTERVAL_NS:
+        raise HarnessError(
+            "duration-cross minimum timed interval is frozen at 1250 milliseconds"
+        )
     if not str(output).startswith("/d/") and os.getenv("GITHUB_ACTIONS") == "true":
         raise HarnessError("GitHub duration-cross output must remain under /d")
     output.mkdir(parents=True, exist_ok=True)
@@ -1308,29 +1846,22 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 "condition": condition,
                 "mode": spec["mode"],
                 "workload": spec["sizing_workload"],
+                "sizing_policy_workload": spec["sizing_policy_workload"],
                 "threads": cell["threads"],
                 "iterations": iterations,
                 "phase": "pilot",
             }
-            build, module, runtime_args, leg_fields = module_for(context, cell, condition)
-            pilot = measure_once(
-                repo=repo,
-                runner=runner,
+            pilot = measured_with_telemetry(
+                context=context,
                 cpu_placement=cpu_placement,
-                build=build,
-                module=module,
-                workload=leg_fields["workload"],
-                threads=cell["threads"],
+                runner=runner,
+                cell=cell,
+                condition=condition,
                 iterations=iterations,
                 timeout=args.timeout,
-                min_interval_ns=PILOT_CLOCK_RESOLUTION_MINIMUM_NS,
+                minimum_interval_ns=PILOT_CLOCK_RESOLUTION_MINIMUM_NS,
                 enforce_timing_quality=False,
-                runtime_args=runtime_args,
-                record_fields={
-                    **leg_fields,
-                    **fields,
-                    "guest_workload": leg_fields["workload"],
-                },
+                fields=fields,
             )
             validate_sizing_pilot(pilot, fields)
             pilot_records.append(pilot)
@@ -1394,8 +1925,10 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             },
         )
 
+    platform_cells = cells_for_platform(args.platform_id)
     sidecar = TelemetrySidecar(
-        telemetry_cpu(cpu_placement, cells_for_platform(args.platform_id))
+        telemetry_cpu(cpu_placement, platform_cells),
+        benchmark_cpus(cpu_placement, platform_cells),
     )
     sidecar.start()
     records: list[dict[str, Any]] = []
@@ -1530,13 +2063,13 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--source-sha")
-    parser.add_argument("--platform-id", choices=tuple(PLATFORM_CELLS), required=True)
-    parser.add_argument("--report-sequence", type=int, choices=range(1, 21), required=True)
+    parser.add_argument("--platform-id", choices=tuple(PLATFORM_CELLS))
+    parser.add_argument("--report-sequence", type=int, choices=range(1, 21))
     parser.add_argument("--cohort-id", default="manual")
-    parser.add_argument("--runner-environment", required=True)
-    parser.add_argument("--host-pair-id", required=True)
+    parser.add_argument("--runner-environment")
+    parser.add_argument("--host-pair-id")
     parser.add_argument("--timeout", type=float, default=INVOCATION_TIMEOUT_SECONDS)
     parser.add_argument("--min-interval-ms", type=float, default=1250.0)
     parser.add_argument("--optimize", default="ReleaseFast")
