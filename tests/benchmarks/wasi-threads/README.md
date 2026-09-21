@@ -4,6 +4,97 @@ This harness supplies the threaded performance evidence required before #963
 adds more AOT cancellation polls. It runs checked-in, deterministic core-Wasm
 fixtures through the interpreter and AOT on x86_64 and AArch64.
 
+## v21 duration-cross diagnostic
+
+The v21 duration-cross path is a separate, non-authoritative diagnostic for
+issue #966. It does not change the `wasi-thread-benchmark` report, its schema,
+measurement-plan v20 identity, the production budget schema, or the frozen
+production policy. Its independent identities are:
+
+- report kind `wasi-thread-duration-cross-diagnostic`, schema
+  `duration-cross-report.schema.json`;
+- plan kind `wasi-thread-duration-cross-plan`, version 21;
+- cohort kind `wasi-thread-duration-cross-cohort`, schema
+  `duration-cross-cohort.schema.json`;
+- manual-only workflow `.github/workflows/wasi-thread-duration-cross.yml`.
+
+Each report uses one source revision and one exact build/artifact set for both
+logical A/A revisions. Every selected cell retains both production conditions.
+For each `current` and `doubled` duration arm it discards two warmups and records
+12 samples in three complete four-position blocks, with four invocations per
+arm/sample. The current count comes from retained one-shot pilots and the
+doubled count is exactly twice it. Both counts are frozen before evidence
+collection; a doubled count that exceeds a cap, watchdog, timing-quality bound,
+or report runtime bound fails rather than adapting.
+
+The current-first/doubled-first arm order is fixed by report sequence and block.
+Sequences 1–16 are training and 17–20 are untouched holdout. Selected cells are:
+
+- x86: `cancel-points/hot/8` 20s→40s; `runtime/atomic/1` 5s→10s;
+  `runtime/atomic/{2,4}` 40s→80s; `runtime/atomic/8` 20s→40s;
+  `runtime/hot/1` 5s→10s; `runtime/hot/8` 20s→40s;
+  `runtime/spawn-join/{1,2,8}` 2.5s→5s; and
+  `runtime/wait-notify/1` interpreter 5s→10s, AOT 20s→40s.
+- Arm Neoverse-N2: `runtime/atomic/{2,4}` 40s→80s and
+  `runtime/atomic/8` 20s→40s.
+
+Each invocation retains bounded pre/post `/proc/stat` (including steal and
+context-switch totals), PSI, load, and assigned-CPU frequency snapshots. When a
+logical CPU outside all benchmark assignments exists, a 1 Hz benchmark-CPU
+frequency, temperature, and package-power sidecar (derived from package energy
+counters) is pinned there.
+Missing sensors are recorded as
+unavailable and never cause retry, replacement, or exclusion.
+
+Create the immutable 20-workflow/40-report plan without dispatching:
+
+```sh
+python3 scripts/wasi_thread_duration_cross_cohort.py plan \
+  --source-sha "$SOURCE_SHA" \
+  --workflow-ref wasi-thread-duration-cross-966-v21 \
+  --output /d/wasi-thread-duration-cross-dispatch.json
+```
+
+After review, `dispatch` runs exactly one manual workflow at a time; the x86
+and Arm jobs within each workflow are also serialized. It never retries or
+replaces a failed workflow. Download the two predeclared artifacts from every
+successful first-attempt run, retain each original artifact ZIP, and require
+its bytes to match the immutable SHA-256 digest recorded by GitHub in the
+completed dispatch state before validating and analyzing it. Download and
+analysis requery GitHub and fail if any matching workflow was added or changed,
+or if any run's exact artifact ID, name, size, ZIP digest, availability, or run
+association differs from the completed dispatch:
+
+```sh
+python3 scripts/wasi_thread_duration_cross_cohort.py download \
+  --dispatch /d/wasi-thread-duration-cross-dispatch.completed.json \
+  --output-dir /d/wasi-thread-duration-cross-reports \
+  --manifest /d/wasi-thread-duration-cross-download-manifest.json
+
+python3 scripts/wasi_thread_duration_cross_cohort.py validate \
+  --input-dir /d/wasi-thread-duration-cross-reports \
+  --dispatch /d/wasi-thread-duration-cross-dispatch.completed.json \
+  --manifest /d/wasi-thread-duration-cross-download-manifest.json \
+  --output /d/wasi-thread-duration-cross-cohort.json
+
+python3 scripts/wasi_thread_duration_cross_cohort.py analyze \
+  --cohort /d/wasi-thread-duration-cross-cohort.json \
+  --input-dir /d/wasi-thread-duration-cross-reports \
+  --dispatch /d/wasi-thread-duration-cross-dispatch.completed.json \
+  --manifest /d/wasi-thread-duration-cross-download-manifest.json \
+  --policy tests/benchmarks/wasi-threads/derivation-policy.production.json \
+  --output /d/wasi-thread-duration-cross-conclusion.json
+```
+
+Analysis uses the existing block-preserving estimator and one-sided frozen
+policy rule diagnostically. Only the doubled arm selects conclusions: every
+training final log bound represented by the selected v20 failure surface must
+be at most `0.10`, and all four holdouts must pass their derived thresholds.
+The current arm remains in evidence but selects nothing. The conclusion kind is
+diagnostic-only and has a null production budget. Validation and analysis each
+write matching Markdown beside their JSON output, including the retained file,
+cohort, and policy hashes.
+
 ## Workloads
 
 `threaded.wasm` is a real wasi-libc pthread program. It is built with the

@@ -1,0 +1,257 @@
+name: WASI thread duration-cross diagnostic
+run-name: >-
+  WASI thread duration-cross ${{ inputs.cohort_id }}-${{
+  inputs.report_sequence }}-${{ inputs.partition }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: "Immutable diagnostic source/tag commit"
+        required: true
+      cohort_id:
+        description: "Predeclared 32-character cohort identifier"
+        required: true
+      report_sequence:
+        description: "Predeclared report sequence 1-20"
+        required: true
+      partition:
+        description: "Predeclared training or holdout membership"
+        type: choice
+        options: [training, holdout]
+        required: true
+
+concurrency:
+  group: wasi-thread-duration-cross-diagnostic
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  x86:
+    name: Trusted x86 duration-cross
+    runs-on: wamr-temp-20260906
+    timeout-minutes: 720
+    permissions:
+      contents: read
+    env:
+      ROOT: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86
+      HOME: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86/home
+      TMPDIR: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86/tmp
+      XDG_CACHE_HOME: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86/xdg-cache
+      ZIG_GLOBAL_CACHE_DIR: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86/zig-global-cache
+      ZIG_LOCAL_CACHE_DIR: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86/zig-local-cache
+    steps:
+      - name: Validate runner and create run-scoped paths
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          COHORT_ID: ${{ inputs.cohort_id }}
+          REPORT_SEQUENCE: ${{ inputs.report_sequence }}
+          PARTITION: ${{ inputs.partition }}
+        run: |
+          set -euo pipefail
+          case "$ROOT:$HOME:$TMPDIR:$XDG_CACHE_HOME:$ZIG_GLOBAL_CACHE_DIR:$ZIG_LOCAL_CACHE_DIR" in
+            /d/*:/d/*:/d/*:/d/*:/d/*:/d/*) ;;
+            *) echo "all diagnostic paths must remain under /d" >&2; exit 2 ;;
+          esac
+          test "$RUNNER_NAME" = vm31e-wamr-temp-20260906
+          test "$(find /proc/[0-9]*/comm -type f -exec cat {} \; 2>/dev/null | grep -c '^Runner.Worker$')" = 1
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$COHORT_ID" =~ ^[0-9a-f]{32}$ ]]
+          [[ "$REPORT_SEQUENCE" =~ ^([1-9]|1[0-9]|20)$ ]]
+          EXPECTED_PARTITION=training
+          (( REPORT_SEQUENCE >= 17 )) && EXPECTED_PARTITION=holdout
+          test "$PARTITION" = "$EXPECTED_PARTITION"
+          [[ "$GITHUB_REF" =~ ^refs/tags/wasi-thread-duration-cross-[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+          test "$GITHUB_SHA" = "$SOURCE_SHA"
+          mkdir -p "$ROOT"/{home,tmp,xdg-cache,zig-global-cache,zig-local-cache,zig,output,source}
+          AVAILABLE_KIB="$(df --output=avail -k /d | tail -n 1 | tr -d ' ')"
+          [[ "$AVAILABLE_KIB" =~ ^[0-9]+$ ]]
+          (( AVAILABLE_KIB >= 80 * 1024 * 1024 ))
+
+      - name: Fetch and validate immutable trusted source
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          git -C "$ROOT/source" init
+          git -C "$ROOT/source" remote add origin https://github.com/cataggar/wamr.git
+          git -C "$ROOT/source" fetch --depth=1 origin "$SOURCE_SHA"
+          git -C "$ROOT/source" checkout --detach FETCH_HEAD
+          test "$(git -C "$ROOT/source" rev-parse HEAD)" = "$SOURCE_SHA"
+          git -C "$ROOT/source" fetch --depth=256 origin main
+          git -C "$ROOT/source" merge-base --is-ancestor "$SOURCE_SHA" origin/main
+          test -z "$(git -C "$ROOT/source" status --porcelain)"
+
+      - name: Install pinned Zig 0.16.0 under /d
+        run: |
+          set -euo pipefail
+          ARCHIVE="$ROOT/tmp/zig-x86_64-linux-0.16.0.tar.xz"
+          curl --fail --location --silent --show-error \
+            --connect-timeout 30 --max-time 300 \
+            https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz \
+            --output "$ARCHIVE"
+          echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  $ARCHIVE" \
+            | sha256sum --check --strict
+          tar --extract --xz --file "$ARCHIVE" --directory "$ROOT/zig" \
+            --strip-components=1
+          test "$("$ROOT/zig/zig" version)" = 0.16.0
+          echo "$ROOT/zig" >> "$GITHUB_PATH"
+          rm -- "$ARCHIVE"
+
+      - name: Test diagnostic harness
+        run: >-
+          python3 -m unittest
+          "$ROOT/source/scripts/test_wasi_thread_duration_cross.py"
+
+      - name: Run x86 duration-cross report
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          COHORT_ID: ${{ inputs.cohort_id }}
+          REPORT_SEQUENCE: ${{ inputs.report_sequence }}
+        run: |
+          set -euo pipefail
+          python3 "$ROOT/source/scripts/wasi_thread_duration_cross.py" \
+            --repo "$ROOT/source" \
+            --output-dir "$ROOT/output" \
+            --source-sha "$SOURCE_SHA" \
+            --platform-id ubuntu-22.04-x86_64 \
+            --report-sequence "$REPORT_SEQUENCE" \
+            --cohort-id "$COHORT_ID" \
+            --runner-environment self-hosted \
+            --host-pair-id "github:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}:ubuntu-22.04-x86_64" \
+            --timeout 180
+          cat "$ROOT/output/report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload x86 diagnostic report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wasi-thread-duration-cross-ubuntu-22.04-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86/output/report.json
+            /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86/output/report.md
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Clean run-scoped files
+        if: always()
+        run: |
+          set -euo pipefail
+          case "$ROOT" in
+            "/d/wamr-duration-cross/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-x86") ;;
+            *) exit 2 ;;
+          esac
+          rm -rf -- "$ROOT"
+
+  arm:
+    name: Neoverse-N2 duration-cross
+    needs: x86
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 720
+    permissions:
+      contents: read
+    env:
+      ROOT: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-arm
+      HOME: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-arm/home
+      TMPDIR: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-arm/tmp
+      XDG_CACHE_HOME: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-arm/xdg-cache
+      ZIG_GLOBAL_CACHE_DIR: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-arm/zig-global-cache
+      ZIG_LOCAL_CACHE_DIR: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-arm/zig-local-cache
+    steps:
+      - name: Validate runner and create run-scoped paths
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          COHORT_ID: ${{ inputs.cohort_id }}
+          REPORT_SEQUENCE: ${{ inputs.report_sequence }}
+          PARTITION: ${{ inputs.partition }}
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /d/wamr-duration-cross
+          sudo chown "$USER":"$(id -gn)" /d /d/wamr-duration-cross
+          case "$ROOT:$HOME:$TMPDIR:$XDG_CACHE_HOME:$ZIG_GLOBAL_CACHE_DIR:$ZIG_LOCAL_CACHE_DIR" in
+            /d/*:/d/*:/d/*:/d/*:/d/*:/d/*) ;;
+            *) echo "all diagnostic paths must remain under /d" >&2; exit 2 ;;
+          esac
+          lscpu | grep -F 'Neoverse-N2'
+          test "$(find /proc/[0-9]*/comm -type f -exec cat {} \; 2>/dev/null | grep -c '^Runner.Worker$')" = 1
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$COHORT_ID" =~ ^[0-9a-f]{32}$ ]]
+          [[ "$REPORT_SEQUENCE" =~ ^([1-9]|1[0-9]|20)$ ]]
+          EXPECTED_PARTITION=training
+          (( REPORT_SEQUENCE >= 17 )) && EXPECTED_PARTITION=holdout
+          test "$PARTITION" = "$EXPECTED_PARTITION"
+          [[ "$GITHUB_REF" =~ ^refs/tags/wasi-thread-duration-cross-[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+          test "$GITHUB_SHA" = "$SOURCE_SHA"
+          mkdir -p "$ROOT"/{home,tmp,xdg-cache,zig-global-cache,zig-local-cache,zig,output,source}
+
+      - name: Fetch and validate immutable trusted source
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          git -C "$ROOT/source" init
+          git -C "$ROOT/source" remote add origin https://github.com/cataggar/wamr.git
+          git -C "$ROOT/source" fetch --depth=1 origin "$SOURCE_SHA"
+          git -C "$ROOT/source" checkout --detach FETCH_HEAD
+          test "$(git -C "$ROOT/source" rev-parse HEAD)" = "$SOURCE_SHA"
+          git -C "$ROOT/source" fetch --depth=256 origin main
+          git -C "$ROOT/source" merge-base --is-ancestor "$SOURCE_SHA" origin/main
+          test -z "$(git -C "$ROOT/source" status --porcelain)"
+
+      - name: Install pinned Zig 0.16.0 under /d
+        run: |
+          set -euo pipefail
+          ARCHIVE="$ROOT/tmp/zig-aarch64-linux-0.16.0.tar.xz"
+          curl --fail --location --silent --show-error \
+            --connect-timeout 30 --max-time 300 \
+            https://ziglang.org/download/0.16.0/zig-aarch64-linux-0.16.0.tar.xz \
+            --output "$ARCHIVE"
+          echo "ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17  $ARCHIVE" \
+            | sha256sum --check --strict
+          tar --extract --xz --file "$ARCHIVE" --directory "$ROOT/zig" \
+            --strip-components=1
+          test "$("$ROOT/zig/zig" version)" = 0.16.0
+          echo "$ROOT/zig" >> "$GITHUB_PATH"
+          rm -- "$ARCHIVE"
+
+      - name: Run Arm duration-cross report
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          COHORT_ID: ${{ inputs.cohort_id }}
+          REPORT_SEQUENCE: ${{ inputs.report_sequence }}
+        run: |
+          set -euo pipefail
+          python3 "$ROOT/source/scripts/wasi_thread_duration_cross.py" \
+            --repo "$ROOT/source" \
+            --output-dir "$ROOT/output" \
+            --source-sha "$SOURCE_SHA" \
+            --platform-id ubuntu-24.04-aarch64 \
+            --report-sequence "$REPORT_SEQUENCE" \
+            --cohort-id "$COHORT_ID" \
+            --runner-environment github-hosted \
+            --host-pair-id "github:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}:ubuntu-24.04-aarch64" \
+            --timeout 180
+          cat "$ROOT/output/report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Arm diagnostic report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wasi-thread-duration-cross-ubuntu-24.04-aarch64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-arm/output/report.json
+            /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-arm/output/report.md
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Clean run-scoped files
+        if: always()
+        run: |
+          set -euo pipefail
+          case "$ROOT" in
+            "/d/wamr-duration-cross/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-arm") ;;
+            *) exit 2 ;;
+          esac
+          rm -rf -- "$ROOT"

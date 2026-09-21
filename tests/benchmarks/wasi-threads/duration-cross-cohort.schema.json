@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/cataggar/wamr/tests/benchmarks/wasi-threads/duration-cross-cohort.schema.json",
+  "title": "WASI thread duration-cross validated cohort",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "kind",
+    "authoritative",
+    "production_budget",
+    "validated_at",
+    "dispatch",
+    "download_manifest_sha256",
+    "identity",
+    "platform_counts",
+    "partition_counts",
+    "excluded_observations",
+    "observations"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "kind": { "const": "wasi-thread-duration-cross-cohort" },
+    "authoritative": { "const": false },
+    "production_budget": { "type": "null" },
+    "validated_at": { "type": "string" },
+    "download_manifest_sha256": { "$ref": "#/$defs/sha256" },
+    "dispatch": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "kind",
+        "workflow",
+        "workflow_ref",
+        "workflow_head_sha",
+        "source_sha",
+        "cohort_id",
+        "requested_workflows",
+        "requested_reports",
+        "split",
+        "retry_policy",
+        "runs"
+      ]
+    },
+    "identity": { "type": "object" },
+    "platform_counts": {
+      "const": {
+        "ubuntu-22.04-x86_64": 20,
+        "ubuntu-24.04-aarch64": 20
+      }
+    },
+    "partition_counts": {
+      "const": {
+        "ubuntu-22.04-x86_64": { "training": 16, "holdout": 4 },
+        "ubuntu-24.04-aarch64": { "training": 16, "holdout": 4 }
+      }
+    },
+    "excluded_observations": { "const": [] },
+    "observations": {
+      "type": "array",
+      "minItems": 40,
+      "maxItems": 40,
+      "items": {
+        "type": "object",
+        "required": [
+          "report_sha256",
+          "report_file_sha256",
+          "report_markdown_sha256",
+          "artifact_zip_sha256",
+          "artifact_identity_sha256",
+          "run_id",
+          "workflow_run_attempt",
+          "artifact_id",
+          "artifact_name",
+          "sequence",
+          "partition",
+          "platform",
+          "cpu_class",
+          "host_fingerprint_sha256",
+          "plan_sha256",
+          "plan_identity_sha256",
+          "telemetry_sidecar",
+          "summaries"
+        ],
+        "properties": {
+          "report_sha256": { "$ref": "#/$defs/sha256" },
+          "report_file_sha256": { "$ref": "#/$defs/sha256" },
+          "report_markdown_sha256": { "$ref": "#/$defs/sha256" },
+          "artifact_zip_sha256": { "$ref": "#/$defs/sha256" },
+          "artifact_identity_sha256": { "$ref": "#/$defs/sha256" },
+          "workflow_run_attempt": { "const": "1" },
+          "artifact_id": { "type": "integer", "minimum": 1 },
+          "artifact_name": { "type": "string", "minLength": 1 },
+          "sequence": { "type": "integer", "minimum": 1, "maximum": 20 },
+          "partition": { "enum": ["training", "holdout"] },
+          "platform": {
+            "enum": ["ubuntu-22.04-x86_64", "ubuntu-24.04-aarch64"]
+          },
+          "host_fingerprint_sha256": { "$ref": "#/$defs/sha256" },
+          "plan_sha256": { "$ref": "#/$defs/sha256" },
+          "plan_identity_sha256": { "$ref": "#/$defs/sha256" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}
