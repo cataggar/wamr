@@ -1,0 +1,193 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/cataggar/wamr/tests/benchmarks/wasi-threads/duration-cross-report.schema.json",
+  "title": "WASI thread duration-cross diagnostic report",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "kind",
+    "authoritative",
+    "production_budget",
+    "metadata",
+    "plan",
+    "quality_preflight",
+    "records",
+    "summaries",
+    "telemetry_sidecar"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "kind": { "const": "wasi-thread-duration-cross-diagnostic" },
+    "authoritative": { "const": false },
+    "production_budget": { "type": "null" },
+    "metadata": {
+      "type": "object",
+      "required": [
+        "collected_at",
+        "platform_id",
+        "report_sequence",
+        "partition",
+        "cohort_id",
+        "workflow_run_id",
+        "workflow_run_attempt",
+        "source_revision",
+        "logical_revisions",
+        "artifact_identity",
+        "fixture_set_sha256",
+        "plan_sha256",
+        "plan_identity_sha256",
+        "host",
+        "host_pair",
+        "cpu_placement"
+      ],
+      "properties": {
+        "platform_id": {
+          "enum": ["ubuntu-22.04-x86_64", "ubuntu-24.04-aarch64"]
+        },
+        "report_sequence": { "type": "integer", "minimum": 1, "maximum": 20 },
+        "partition": { "enum": ["training", "holdout"] },
+        "cohort_id": { "type": "string", "minLength": 1 },
+        "workflow_run_id": { "type": "string" },
+        "workflow_run_attempt": { "type": "string" },
+        "plan_sha256": { "$ref": "#/$defs/sha256" },
+        "plan_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "source_revision": { "$ref": "#/$defs/source" },
+        "logical_revisions": {
+          "type": "object",
+          "required": ["baseline", "candidate"],
+          "additionalProperties": false,
+          "properties": {
+            "baseline": { "$ref": "#/$defs/source" },
+            "candidate": { "$ref": "#/$defs/source" }
+          }
+        },
+        "artifact_identity": {
+          "type": "object",
+          "required": ["baseline", "candidate"],
+          "additionalProperties": false,
+          "properties": {
+            "baseline": { "$ref": "#/$defs/artifacts" },
+            "candidate": { "$ref": "#/$defs/artifacts" }
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "plan": {
+      "type": "object",
+      "required": [
+        "kind",
+        "version",
+        "diagnostic_only",
+        "production_budget_eligible",
+        "profile",
+        "duration_arms",
+        "cells",
+        "resolved_counts",
+        "pilots",
+        "runtime_admission"
+      ],
+      "properties": {
+        "kind": { "const": "wasi-thread-duration-cross-plan" },
+        "version": { "const": 21 },
+        "diagnostic_only": { "const": true },
+        "production_budget_eligible": { "const": false },
+        "profile": {
+          "const": { "warmups": 2, "samples": 12, "blocks": 3, "block_size": 4 }
+        },
+        "duration_arms": {
+          "type": "object",
+          "required": ["current", "doubled"],
+          "additionalProperties": false,
+          "properties": {
+            "current": {
+              "const": { "iteration_multiplier": 1, "selects_thresholds": false }
+            },
+            "doubled": {
+              "const": { "iteration_multiplier": 2, "selects_thresholds": true }
+            }
+          }
+        },
+        "cells": { "type": "array", "minItems": 3, "uniqueItems": true },
+        "resolved_counts": { "type": "object", "minProperties": 3 },
+        "pilots": { "type": "array", "minItems": 6 },
+        "runtime_admission": { "type": "object" }
+      },
+      "additionalProperties": true
+    },
+    "quality_preflight": { "type": "object" },
+    "records": {
+      "type": "array",
+      "minItems": 336,
+      "items": {
+        "type": "object",
+        "required": [
+          "revision",
+          "pair_kind",
+          "pair_key",
+          "phase",
+          "phase_index",
+          "arm",
+          "condition",
+          "iterations",
+          "correct",
+          "telemetry"
+        ],
+        "properties": {
+          "revision": { "enum": ["baseline", "candidate"] },
+          "phase": { "enum": ["warmup", "measure"] },
+          "arm": { "enum": ["current", "doubled"] },
+          "correct": { "const": true },
+          "telemetry": {
+            "type": "object",
+            "required": ["collection", "before", "after"]
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "summaries": {
+      "type": "object",
+      "required": ["comparisons", "ratio_of_ratios", "internal_pairs"],
+      "additionalProperties": false,
+      "properties": {
+        "comparisons": { "type": "array", "minItems": 12 },
+        "ratio_of_ratios": { "type": "array", "minItems": 6 },
+        "internal_pairs": { "type": "array", "minItems": 12 }
+      }
+    },
+    "telemetry_sidecar": {
+      "type": "object",
+      "required": ["requested", "available", "cpu", "interval_seconds", "reason", "samples"],
+      "properties": {
+        "requested": { "const": true },
+        "available": { "type": "boolean" },
+        "interval_seconds": { "const": 1 },
+        "samples": { "type": "array", "maxItems": 50000 }
+      },
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "source": {
+      "type": "object",
+      "required": ["commit", "tracked_diff_sha256", "build_source_sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "tracked_diff_sha256": { "$ref": "#/$defs/sha256" },
+        "build_source_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "$ref": "#/$defs/sha256" }
+    }
+  }
+}
