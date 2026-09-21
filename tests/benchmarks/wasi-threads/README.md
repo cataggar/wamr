@@ -61,7 +61,9 @@ replaces a failed workflow. Download the two predeclared artifacts from every
 successful first-attempt run, retain each original artifact ZIP, and require
 its bytes to match the immutable SHA-256 digest recorded by GitHub in the
 completed dispatch state before validating and analyzing it. Download and
-analysis requery GitHub and fail if any matching workflow was added or changed:
+analysis requery GitHub and fail if any matching workflow was added or changed,
+or if any run's exact artifact ID, name, size, ZIP digest, availability, or run
+association differs from the completed dispatch:
 
 ```sh
 python3 scripts/wasi_thread_duration_cross_cohort.py download \

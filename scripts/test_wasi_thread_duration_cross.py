@@ -431,6 +431,8 @@ def completed_dispatch() -> dict:
                         }
                     ),
                     "expired": False,
+                    "run_id": 10_000 + sequence,
+                    "platform": platform,
                 }
                 for index, platform in enumerate(duration.PLATFORM_CELLS, 1)
             ],
@@ -688,6 +690,86 @@ def retained_fixture(
         "manifest": manifest_path,
         "cohort": cohort_path,
     }
+
+
+def remote_artifact_response(run: dict) -> dict:
+    artifacts = [
+            {
+                "id": artifact["id"],
+                "name": artifact["name"],
+                "size_in_bytes": artifact["size_in_bytes"],
+                "digest": f"sha256:{artifact['digest_sha256']}",
+                "expired": artifact["expired"],
+                "workflow_run": {"id": run["run_id"]},
+            }
+            for artifact in run["artifacts"]
+        ]
+    return {"total_count": len(artifacts), "artifacts": artifacts}
+
+
+def replace_retained_report(
+    fixture: dict[str, Path],
+    *,
+    sequence: int,
+    platform: str,
+    ratio: float,
+) -> None:
+    dispatch = json.loads(fixture["dispatch"].read_text(encoding="UTF-8"))
+    manifest = json.loads(fixture["manifest"].read_text(encoding="UTF-8"))
+    run = dispatch["runs"][sequence - 1]
+    artifact = next(
+        item for item in run["artifacts"] if item["platform"] == platform
+    )
+    entry = next(
+        item
+        for item in manifest["entries"]
+        if item["sequence"] == sequence and item["platform"] == platform
+    )
+    artifact_dir = fixture["input_dir"] / artifact["name"]
+    report_path = artifact_dir / "report.json"
+    markdown_path = artifact_dir / "report.md"
+    zip_path = artifact_dir / "artifact.zip"
+    report = synthetic_report(
+        sequence=sequence,
+        platform=platform,
+        ratio=ratio,
+    )
+    report_path.write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n",
+        encoding="UTF-8",
+    )
+    markdown_path.write_text(
+        duration.render_markdown(report) + "\n",
+        encoding="UTF-8",
+    )
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.write(report_path, "report.json")
+        archive.write(markdown_path, "report.md")
+    artifact["size_in_bytes"] = zip_path.stat().st_size
+    artifact["digest_sha256"] = sha256_file(zip_path)
+    entry["artifact_size_in_bytes"] = artifact["size_in_bytes"]
+    entry["artifact_zip"] = {
+        "path": f"{artifact['name']}/artifact.zip",
+        "sha256": artifact["digest_sha256"],
+        "size_in_bytes": artifact["size_in_bytes"],
+    }
+    entry["report_json"]["sha256"] = sha256_file(report_path)
+    entry["report_markdown"]["sha256"] = sha256_file(markdown_path)
+    manifest["dispatch_sha256"] = cache_key(dispatch)
+    fixture["dispatch"].write_text(
+        json.dumps(dispatch, indent=2, sort_keys=True) + "\n",
+        encoding="UTF-8",
+    )
+    fixture["manifest"].write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="UTF-8",
+    )
+    cohort.validate_cohort(
+        fixture["input_dir"],
+        fixture["dispatch"],
+        fixture["manifest"],
+        fixture["cohort"],
+    )
 
 
 class DurationCrossReportTests(unittest.TestCase):
@@ -951,8 +1033,13 @@ class DurationCrossCohortTests(unittest.TestCase):
         *,
         policy: str = "derivation-policy.production.json",
     ) -> int:
-        with mock.patch.object(
-            cohort, "require_live_dispatch_membership", return_value=None
+        with (
+            mock.patch.object(
+                cohort, "require_live_dispatch_membership", return_value=None
+            ),
+            mock.patch.object(
+                cohort, "require_remote_dispatch_artifacts", return_value=None
+            ),
         ):
             return cohort.analyze(
                 fixture["cohort"],
@@ -1022,6 +1109,63 @@ class DurationCrossCohortTests(unittest.TestCase):
         ]["sha256"]
         with self.assertRaisesRegex(HarnessError, "differs from dispatch identity"):
             cohort.validate_download_manifest(manifest, dispatch, download_dir)
+
+    def test_remote_artifact_inventory_is_exact_and_fail_closed(self) -> None:
+        dispatch = completed_dispatch()
+        run = dispatch["runs"][0]
+        exact = remote_artifact_response(run)
+        with mock.patch.object(
+            cohort,
+            "gh_json",
+            side_effect=[
+                remote_artifact_response(item) for item in dispatch["runs"]
+            ],
+        ):
+            cohort.require_remote_dispatch_artifacts(dispatch, 1)
+
+        variants = {}
+        missing = copy.deepcopy(exact)
+        missing["artifacts"].pop()
+        missing["total_count"] = len(missing["artifacts"])
+        variants["missing"] = missing
+        extra = copy.deepcopy(exact)
+        extra["artifacts"].append(
+            {
+                **copy.deepcopy(extra["artifacts"][0]),
+                "id": 99_999,
+                "name": "unexpected-artifact",
+            }
+        )
+        extra["total_count"] = len(extra["artifacts"])
+        variants["extra"] = extra
+        renamed = copy.deepcopy(exact)
+        renamed["artifacts"][0]["name"] = "renamed-artifact"
+        variants["renamed"] = renamed
+        redigested = copy.deepcopy(exact)
+        redigested["artifacts"][0]["digest"] = f"sha256:{'f' * 64}"
+        variants["redigested"] = redigested
+        resized = copy.deepcopy(exact)
+        resized["artifacts"][0]["size_in_bytes"] += 1
+        variants["resized"] = resized
+        expired = copy.deepcopy(exact)
+        expired["artifacts"][0]["expired"] = True
+        variants["expired"] = expired
+        duplicate = copy.deepcopy(exact)
+        duplicate["artifacts"].append(copy.deepcopy(duplicate["artifacts"][0]))
+        duplicate["total_count"] = len(duplicate["artifacts"])
+        variants["duplicate"] = duplicate
+        reassigned = copy.deepcopy(exact)
+        reassigned["artifacts"][0]["workflow_run"]["id"] += 1
+        variants["run-reassigned"] = reassigned
+        for label, response in variants.items():
+            with self.subTest(label=label):
+                with mock.patch.object(cohort, "gh_json", return_value=response):
+                    with self.assertRaises(HarnessError):
+                        cohort.require_remote_run_artifacts(
+                            dispatch,
+                            run,
+                            1,
+                        )
 
     def test_late_duplicate_is_rejected_after_initial_discovery(self) -> None:
         dispatch = completed_dispatch()
@@ -1198,6 +1342,67 @@ class DurationCrossCohortTests(unittest.TestCase):
         finally:
             path.write_bytes(original)
             markdown.write_bytes(original_markdown)
+
+    def test_coordinated_local_replacement_is_rejected_by_remote_inventory(
+        self,
+    ) -> None:
+        fixture = self.passing_fixture
+        original_dispatch = json.loads(
+            fixture["dispatch"].read_text(encoding="UTF-8")
+        )
+        original_run = original_dispatch["runs"][0]
+        artifact = next(
+            item
+            for item in original_run["artifacts"]
+            if item["platform"] == "ubuntu-22.04-x86_64"
+        )
+        artifact_dir = fixture["input_dir"] / artifact["name"]
+        paths = [
+            artifact_dir / "artifact.zip",
+            artifact_dir / "report.json",
+            artifact_dir / "report.md",
+            fixture["dispatch"],
+            fixture["manifest"],
+            fixture["cohort"],
+            fixture["cohort"].with_suffix(".md"),
+        ]
+        originals = {path: path.read_bytes() for path in paths}
+        try:
+            replace_retained_report(
+                fixture,
+                sequence=1,
+                platform="ubuntu-22.04-x86_64",
+                ratio=1.001,
+            )
+            with (
+                mock.patch.object(
+                    cohort,
+                    "require_live_dispatch_membership",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    cohort,
+                    "gh_json",
+                    return_value=remote_artifact_response(original_run),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    HarnessError,
+                    "remote artifact inventory differs",
+                ):
+                    cohort.analyze(
+                        fixture["cohort"],
+                        fixture["input_dir"],
+                        fixture["dispatch"],
+                        fixture["manifest"],
+                        REPO_ROOT
+                        / "tests/benchmarks/wasi-threads/"
+                        "derivation-policy.production.json",
+                        self.scratch / "conclusion.json",
+                    )
+        finally:
+            for path, content in originals.items():
+                path.write_bytes(content)
 
     def test_changed_report_bytes_are_rejected(self) -> None:
         report = next(self.passing_fixture["input_dir"].glob("*/report.json"))

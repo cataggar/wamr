@@ -93,9 +93,16 @@ def expected_artifact_names(run_id: int) -> set[str]:
 def parse_artifacts(value: Any, run_id: int) -> list[dict[str, Any]]:
     require(isinstance(value, dict), f"artifact response for run {run_id}")
     artifacts = value.get("artifacts")
-    require(isinstance(artifacts, list), f"artifact list for run {run_id}")
+    require(
+        isinstance(artifacts, list)
+        and value.get("total_count") == len(artifacts),
+        f"artifact list for run {run_id}",
+    )
     result = []
     for index, artifact in enumerate(artifacts):
+        workflow_run = (
+            artifact.get("workflow_run") if isinstance(artifact, dict) else None
+        )
         require(
             isinstance(artifact, dict)
             and isinstance(artifact.get("id"), int)
@@ -111,6 +118,18 @@ def parse_artifacts(value: Any, run_id: int) -> list[dict[str, Any]]:
             and artifact.get("expired") is False,
             f"artifact {index} for run {run_id}",
         )
+        require(
+            isinstance(workflow_run, dict)
+            and workflow_run.get("id") == run_id,
+            f"artifact {index} for run {run_id}",
+        )
+        platform = artifact["name"].removeprefix(
+            "wasi-thread-duration-cross-"
+        ).removesuffix(f"-{run_id}-1")
+        require(
+            platform in PLATFORM_CELLS,
+            f"artifact {index} for run {run_id} platform mapping",
+        )
         result.append(
             {
                 "id": artifact["id"],
@@ -118,6 +137,8 @@ def parse_artifacts(value: Any, run_id: int) -> list[dict[str, Any]]:
                 "size_in_bytes": artifact["size_in_bytes"],
                 "digest_sha256": artifact["digest"].removeprefix("sha256:"),
                 "expired": False,
+                "run_id": run_id,
+                "platform": platform,
             }
         )
     require(
@@ -313,6 +334,13 @@ def validate_dispatch_plan(document: dict[str, Any], *, completed: bool) -> None
                         r"[0-9a-f]{64}", artifact["digest_sha256"]
                     )
                     is not None
+                    and artifact.get("run_id") == run["run_id"]
+                    and artifact.get("platform") in PLATFORM_CELLS
+                    and artifact.get("name")
+                    == (
+                        "wasi-thread-duration-cross-"
+                        f"{artifact['platform']}-{run['run_id']}-1"
+                    )
                     and artifact.get("expired") is False
                     for artifact in run["artifacts"]
                 ),
@@ -441,6 +469,44 @@ def require_live_dispatch_membership(
         remaining = deadline - time.monotonic()
         require(remaining > 0, "workflow membership validation timed out")
         require_recorded_run_unique(document, run, remaining)
+
+
+def require_remote_run_artifacts(
+    document: dict[str, Any],
+    run: dict[str, Any],
+    timeout: float,
+) -> None:
+    remote_artifacts = parse_artifacts(
+        gh_json(
+            [
+                "api",
+                (
+                    f"repos/{document['repository']}/actions/runs/"
+                    f"{run['run_id']}/artifacts"
+                ),
+            ],
+            timeout,
+        ),
+        run["run_id"],
+    )
+    require(
+        remote_artifacts == run["artifacts"],
+        f"run {run['run_id']} remote artifact inventory differs from "
+        "completed dispatch",
+    )
+
+
+def require_remote_dispatch_artifacts(
+    document: dict[str, Any],
+    timeout: float,
+) -> None:
+    validate_dispatch_plan(document, completed=True)
+    require(timeout > 0, "remote artifact validation timed out")
+    deadline = time.monotonic() + timeout
+    for run in document["runs"]:
+        remaining = deadline - time.monotonic()
+        require(remaining > 0, "remote artifact validation timed out")
+        require_remote_run_artifacts(document, run, remaining)
 
 
 def finalize_dispatch_state(document: dict[str, Any], timeout: float) -> None:
@@ -648,23 +714,7 @@ def download_artifacts(
         )
         remaining = deadline - time.monotonic()
         require(remaining > 0, "artifact download timed out")
-        remote_artifacts = parse_artifacts(
-            gh_json(
-                [
-                    "api",
-                    (
-                        f"repos/{dispatch_document['repository']}/actions/runs/"
-                        f"{run['run_id']}/artifacts"
-                    ),
-                ],
-                remaining,
-            ),
-            run["run_id"],
-        )
-        require(
-            remote_artifacts == run["artifacts"],
-            f"run {run['run_id']} artifacts changed before download",
-        )
+        require_remote_run_artifacts(dispatch_document, run, remaining)
         for artifact in run["artifacts"]:
             artifact_dir = output_dir / artifact["name"]
             artifact_dir.mkdir(parents=True, exist_ok=False)
@@ -1568,7 +1618,15 @@ def analyze(
     dispatch_document = json.loads(dispatch_path.read_text(encoding="UTF-8"))
     validate_dispatch_plan(dispatch_document, completed=True)
     require(timeout_seconds > 0, "analysis timeout must be positive")
-    require_live_dispatch_membership(dispatch_document, timeout_seconds)
+    deadline = time.monotonic() + timeout_seconds
+    require_live_dispatch_membership(
+        dispatch_document,
+        deadline - time.monotonic(),
+    )
+    require_remote_dispatch_artifacts(
+        dispatch_document,
+        deadline - time.monotonic(),
+    )
     policy = validate_derivation_policy(
         json.loads(policy_path.read_text(encoding="UTF-8"))
     )
