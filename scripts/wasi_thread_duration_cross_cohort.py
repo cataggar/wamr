@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 import uuid
+import zipfile
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,7 @@ from wasi_thread_duration_cross import (
     X86_CPU_CLASS,
     arm_order,
     render_markdown,
+    summarize_report,
     validate_report,
 )
 
@@ -104,6 +106,8 @@ def parse_artifacts(value: Any, run_id: int) -> list[dict[str, Any]]:
             and isinstance(artifact.get("size_in_bytes"), int)
             and not isinstance(artifact["size_in_bytes"], bool)
             and artifact["size_in_bytes"] > 0
+            and isinstance(artifact.get("digest"), str)
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", artifact["digest"]) is not None
             and artifact.get("expired") is False,
             f"artifact {index} for run {run_id}",
         )
@@ -112,6 +116,7 @@ def parse_artifacts(value: Any, run_id: int) -> list[dict[str, Any]]:
                 "id": artifact["id"],
                 "name": artifact["name"],
                 "size_in_bytes": artifact["size_in_bytes"],
+                "digest_sha256": artifact["digest"].removeprefix("sha256:"),
                 "expired": False,
             }
         )
@@ -275,6 +280,10 @@ def validate_dispatch_plan(document: dict[str, Any], *, completed: bool) -> None
     require(isinstance(runs, list), "dispatch runs")
     if completed:
         require(len(runs) == 20, "completed dispatch requires exactly 20 runs")
+        run_ids: set[int] = set()
+        artifact_ids: set[int] = set()
+        artifact_names: set[str] = set()
+        artifact_digests: set[str] = set()
         for sequence, run in enumerate(runs, 1):
             require(
                 isinstance(run, dict)
@@ -299,11 +308,34 @@ def validate_dispatch_plan(document: dict[str, Any], *, completed: bool) -> None
                     and artifact["id"] > 0
                     and isinstance(artifact.get("size_in_bytes"), int)
                     and artifact["size_in_bytes"] > 0
+                    and isinstance(artifact.get("digest_sha256"), str)
+                    and re.fullmatch(
+                        r"[0-9a-f]{64}", artifact["digest_sha256"]
+                    )
+                    is not None
                     and artifact.get("expired") is False
                     for artifact in run["artifacts"]
                 ),
                 f"dispatch run {sequence} artifacts",
             )
+            require(run["run_id"] not in run_ids, "dispatch duplicate run ID")
+            run_ids.add(run["run_id"])
+            for artifact in run["artifacts"]:
+                require(
+                    artifact["id"] not in artifact_ids,
+                    "dispatch duplicate artifact ID",
+                )
+                require(
+                    artifact["name"] not in artifact_names,
+                    "dispatch duplicate artifact name",
+                )
+                require(
+                    artifact["digest_sha256"] not in artifact_digests,
+                    "dispatch duplicate artifact ZIP identity",
+                )
+                artifact_ids.add(artifact["id"])
+                artifact_names.add(artifact["name"])
+                artifact_digests.add(artifact["digest_sha256"])
 
 
 def gh_json(arguments: list[str], timeout: float) -> Any:
@@ -335,6 +367,7 @@ def matching_runs(
         f"WASI thread duration-cross {plan['cohort_id']}-"
         f"{sequence}-{PARTITIONS[sequence]}"
     )
+    workflow_branch = str(plan["workflow_ref"]).removeprefix("refs/tags/")
     runs = gh_json(
         [
             "run",
@@ -343,12 +376,14 @@ def matching_runs(
             plan["repository"],
             "--workflow",
             plan["workflow"],
+            "--branch",
+            workflow_branch,
             "--event",
             "workflow_dispatch",
             "--limit",
             "100",
             "--json",
-            "databaseId,displayTitle,headSha,url,status,conclusion",
+            "databaseId,displayTitle,headSha,headBranch,url,status,conclusion,attempt",
         ],
         timeout,
     )
@@ -358,6 +393,7 @@ def matching_runs(
         for run in runs
         if run.get("displayTitle") == title
         and run.get("headSha") == plan["workflow_head_sha"]
+        and run.get("headBranch") == workflow_branch
     ]
 
 
@@ -370,6 +406,46 @@ def find_run(plan: dict[str, Any], sequence: int, timeout: float) -> dict[str, A
             return matches[0]
         time.sleep(2)
     raise HarnessError(f"could not locate workflow run for sequence {sequence}")
+
+
+def require_recorded_run_unique(
+    document: dict[str, Any],
+    run: dict[str, Any],
+    timeout: float,
+) -> None:
+    matches = matching_runs(document, int(run["sequence"]), timeout)
+    require(
+        len(matches) == 1,
+        f"sequence {run['sequence']} must have exactly one matching workflow run",
+    )
+    require(
+        matches[0].get("databaseId") == run["run_id"],
+        f"sequence {run['sequence']} workflow run identity changed",
+    )
+    require(
+        matches[0].get("attempt") == 1
+        and matches[0].get("status") == "completed"
+        and matches[0].get("conclusion") == "success",
+        f"sequence {run['sequence']} workflow run changed or was rerun",
+    )
+
+
+def require_live_dispatch_membership(
+    document: dict[str, Any],
+    timeout: float,
+) -> None:
+    validate_dispatch_plan(document, completed=True)
+    require(timeout > 0, "workflow membership validation timed out")
+    deadline = time.monotonic() + timeout
+    for run in document["runs"]:
+        remaining = deadline - time.monotonic()
+        require(remaining > 0, "workflow membership validation timed out")
+        require_recorded_run_unique(document, run, remaining)
+
+
+def finalize_dispatch_state(document: dict[str, Any], timeout: float) -> None:
+    require_live_dispatch_membership(document, timeout)
+    validate_dispatch_plan(document, completed=True)
 
 
 def dispatch(plan_path: Path, output: Path, timeout_seconds: float) -> int:
@@ -508,8 +584,14 @@ def dispatch(plan_path: Path, output: Path, timeout_seconds: float) -> int:
             ),
             run_id,
         )
+        require_recorded_run_unique(
+            state,
+            record,
+            remaining(f"rechecking sequence {sequence}"),
+        )
         atomic_write_json(output, state)
-    validate_dispatch_plan(state, completed=True)
+    finalize_dispatch_state(state, remaining("finalizing dispatch membership"))
+    atomic_write_json(output, state)
     print(f"recorded 20 successful no-retry workflows in {output}")
     return 0
 
@@ -523,6 +605,11 @@ def download_artifacts(
     dispatch_document = json.loads(dispatch_path.read_text(encoding="UTF-8"))
     validate_dispatch_plan(dispatch_document, completed=True)
     require(timeout_seconds > 0, "download timeout must be positive")
+    deadline = time.monotonic() + timeout_seconds
+    require_live_dispatch_membership(
+        dispatch_document,
+        deadline - time.monotonic(),
+    )
     output_dir = output_dir.resolve()
     require(
         manifest_path.resolve() != output_dir
@@ -536,7 +623,6 @@ def download_artifacts(
         "download directory must be absent or empty; partial downloads are not reusable",
     )
     output_dir.mkdir(parents=True, exist_ok=True)
-    deadline = time.monotonic() + timeout_seconds
     entries = []
     for run in dispatch_document["runs"]:
         remaining = deadline - time.monotonic()
@@ -581,32 +667,53 @@ def download_artifacts(
         )
         for artifact in run["artifacts"]:
             artifact_dir = output_dir / artifact["name"]
+            artifact_dir.mkdir(parents=True, exist_ok=False)
+            artifact_zip = artifact_dir / "artifact.zip"
             remaining = deadline - time.monotonic()
             require(remaining > 0, "artifact download timed out")
-            subprocess.check_output(
-                [
-                    "gh",
-                    "run",
-                    "download",
-                    str(run["run_id"]),
-                    "--repo",
-                    dispatch_document["repository"],
-                    "--name",
-                    artifact["name"],
-                    "--dir",
-                    str(artifact_dir),
-                ],
-                text=True,
-                stderr=subprocess.STDOUT,
-                timeout=remaining,
+            with artifact_zip.open("wb") as output_stream:
+                subprocess.run(
+                    [
+                        "gh",
+                        "api",
+                        (
+                            f"repos/{dispatch_document['repository']}/actions/"
+                            f"artifacts/{artifact['id']}/zip"
+                        ),
+                    ],
+                    check=True,
+                    stdout=output_stream,
+                    stderr=subprocess.PIPE,
+                    timeout=remaining,
+                )
+            require(
+                artifact_zip.stat().st_size == artifact["size_in_bytes"]
+                and sha256_file(artifact_zip) == artifact["digest_sha256"],
+                f"artifact {artifact['name']} ZIP differs from dispatch identity",
             )
+            with zipfile.ZipFile(artifact_zip) as archive:
+                members = archive.infolist()
+                require(
+                    sorted(member.filename for member in members)
+                    == ["report.json", "report.md"]
+                    and all(not member.is_dir() for member in members),
+                    f"artifact {artifact['name']} is partial or contains unexpected files",
+                )
+                for member in members:
+                    require(
+                        (member.external_attr >> 16) & 0o170000 != 0o120000,
+                        f"artifact {artifact['name']} contains a symbolic link",
+                    )
+                    (artifact_dir / member.filename).write_bytes(
+                        archive.read(member.filename)
+                    )
             files = sorted(
                 path.relative_to(artifact_dir).as_posix()
                 for path in artifact_dir.rglob("*")
                 if path.is_file()
             )
             require(
-                files == ["report.json", "report.md"],
+                files == ["artifact.zip", "report.json", "report.md"],
                 f"artifact {artifact['name']} is partial or contains unexpected files",
             )
             platform = artifact["name"].removeprefix(
@@ -623,6 +730,13 @@ def download_artifacts(
                     "artifact_id": artifact["id"],
                     "artifact_name": artifact["name"],
                     "artifact_size_in_bytes": artifact["size_in_bytes"],
+                    "artifact_zip": {
+                        "path": (
+                            Path(artifact["name"]) / "artifact.zip"
+                        ).as_posix(),
+                        "sha256": artifact["digest_sha256"],
+                        "size_in_bytes": artifact_zip.stat().st_size,
+                    },
                     "report_json": {
                         "path": (
                             Path(artifact["name"]) / "report.json"
@@ -681,13 +795,14 @@ def render_cohort_markdown(cohort: dict[str, Any]) -> str:
         f"- Reports: `{len(cohort['observations'])}`",
         "- Exclusions/retries/replacements: `0 / 0 / 0`",
         "",
-        "| Sequence | Partition | Platform | Run | Artifact identity | JSON SHA-256 | Markdown SHA-256 |",
-        "|---:|---|---|---:|---|---|---|",
+        "| Sequence | Partition | Platform | Run | Artifact ID | ZIP SHA-256 | Artifact identity | JSON SHA-256 | Markdown SHA-256 |",
+        "|---:|---|---|---:|---:|---|---|---|---|",
     ]
     for item in cohort["observations"]:
         lines.append(
             f"| {item['sequence']} | `{item['partition']}` | "
             f"`{item['platform']}` | {item['run_id']} | "
+            f"{item['artifact_id']} | `{item['artifact_zip_sha256']}` | "
             f"`{item['artifact_identity_sha256']}` | "
             f"`{item['report_file_sha256']}` | "
             f"`{item['report_markdown_sha256']}` |"
@@ -720,6 +835,10 @@ def validate_download_manifest(
     }
     seen = set()
     report_paths = []
+    artifact_ids: set[int] = set()
+    artifact_names: set[str] = set()
+    zip_hashes: set[str] = set()
+    zip_paths: set[str] = set()
     for entry in entries:
         require(isinstance(entry, dict), "download manifest entry")
         key = (entry.get("sequence"), entry.get("platform"))
@@ -750,6 +869,69 @@ def validate_download_manifest(
             and entry.get("artifact_size_in_bytes") == artifact["size_in_bytes"],
             f"download manifest entry {key} artifact identity",
         )
+        require(entry["artifact_id"] not in artifact_ids, "duplicate artifact ID")
+        require(
+            entry["artifact_name"] not in artifact_names,
+            "duplicate artifact name",
+        )
+        artifact_ids.add(entry["artifact_id"])
+        artifact_names.add(entry["artifact_name"])
+        artifact_zip = entry.get("artifact_zip")
+        require(
+            isinstance(artifact_zip, dict)
+            and artifact_zip.get("path")
+            == (Path(artifact_name) / "artifact.zip").as_posix()
+            and isinstance(artifact_zip.get("sha256"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", artifact_zip["sha256"]) is not None
+            and isinstance(artifact_zip.get("size_in_bytes"), int)
+            and artifact_zip["size_in_bytes"] > 0,
+            f"download manifest entry {key} artifact ZIP",
+        )
+        require(
+            artifact_zip["sha256"] == artifact["digest_sha256"]
+            and artifact_zip["size_in_bytes"] == artifact["size_in_bytes"],
+            f"download manifest entry {key} ZIP differs from dispatch identity",
+        )
+        require(
+            artifact_zip["path"] not in zip_paths,
+            "duplicate artifact ZIP path",
+        )
+        require(
+            artifact_zip["sha256"] not in zip_hashes,
+            "duplicate artifact ZIP identity",
+        )
+        zip_paths.add(artifact_zip["path"])
+        zip_hashes.add(artifact_zip["sha256"])
+        zip_path = input_dir / artifact_zip["path"]
+        require(
+            zip_path.is_file()
+            and not zip_path.is_symlink()
+            and not zip_path.parent.is_symlink(),
+            f"downloaded artifact ZIP {zip_path} is missing or unsafe",
+        )
+        require(
+            zip_path.stat().st_size == artifact_zip["size_in_bytes"]
+            and sha256_file(zip_path) == artifact_zip["sha256"],
+            f"downloaded artifact ZIP {zip_path} identity mismatch",
+        )
+        extracted: dict[str, bytes] = {}
+        try:
+            with zipfile.ZipFile(zip_path) as archive:
+                members = archive.infolist()
+                require(
+                    sorted(member.filename for member in members)
+                    == ["report.json", "report.md"]
+                    and all(not member.is_dir() for member in members),
+                    f"artifact ZIP {zip_path} membership",
+                )
+                for member in members:
+                    require(
+                        (member.external_attr >> 16) & 0o170000 != 0o120000,
+                        f"artifact ZIP {zip_path} contains a symbolic link",
+                    )
+                    extracted[member.filename] = archive.read(member.filename)
+        except (OSError, zipfile.BadZipFile) as exc:
+            raise HarnessError(f"artifact ZIP {zip_path} is invalid: {exc}") from exc
         for field, filename in (
             ("report_json", "report.json"),
             ("report_markdown", "report.md"),
@@ -764,10 +946,19 @@ def validate_download_manifest(
                 f"download manifest entry {key} {field}",
             )
             path = input_dir / item["path"]
-            require(path.is_file(), f"downloaded file {path} is missing")
+            require(
+                path.is_file()
+                and not path.is_symlink()
+                and not path.parent.is_symlink(),
+                f"downloaded file {path} is missing or unsafe",
+            )
             require(
                 sha256_file(path) == item["sha256"],
                 f"downloaded file {path} hash mismatch",
+            )
+            require(
+                path.read_bytes() == extracted[filename],
+                f"downloaded file {path} differs from retained artifact ZIP",
             )
         report_paths.append(input_dir / entry["report_json"]["path"])
     require(seen == expected, "download manifest has partial or unexpected membership")
@@ -778,26 +969,31 @@ def validate_download_manifest(
             if path.is_file()
         )
         == sorted(
-            item[field]["path"]
+            path
             for item in entries
-            for field in ("report_json", "report_markdown")
+            for path in (
+                item["artifact_zip"]["path"],
+                item["report_json"]["path"],
+                item["report_markdown"]["path"],
+            )
         ),
         "download directory contains partial or unexpected files",
     )
     return sorted(report_paths)
 
 
-def validate_cohort(
+def build_validated_cohort(
     input_dir: Path,
-    dispatch_path: Path,
-    manifest_path: Path,
-    output: Path,
-) -> int:
-    dispatch_document = json.loads(dispatch_path.read_text(encoding="UTF-8"))
+    dispatch_document: dict[str, Any],
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
     validate_dispatch_plan(dispatch_document, completed=True)
     input_dir = input_dir.resolve()
-    manifest = json.loads(manifest_path.read_text(encoding="UTF-8"))
     paths = validate_download_manifest(manifest, dispatch_document, input_dir)
+    manifest_entries = {
+        (entry["sequence"], entry["platform"]): entry
+        for entry in manifest["entries"]
+    }
     reports = []
     seen = set()
     source_identity = None
@@ -820,6 +1016,7 @@ def validate_cohort(
         run_id = metadata["workflow_run_id"]
         run_attempt = metadata["workflow_run_attempt"]
         key = (sequence, platform)
+        manifest_entry = manifest_entries[key]
         require(key not in seen, f"duplicate report for sequence/platform {key}")
         require(
             metadata["cohort_id"] == dispatch_document["cohort_id"],
@@ -904,7 +1101,9 @@ def validate_cohort(
                 ),
                 "run_id": run_id,
                 "workflow_run_attempt": run_attempt,
+                "artifact_id": manifest_entry["artifact_id"],
                 "artifact_name": artifact_name,
+                "artifact_zip_sha256": manifest_entry["artifact_zip"]["sha256"],
                 "sequence": sequence,
                 "partition": metadata["partition"],
                 "platform": platform,
@@ -927,7 +1126,7 @@ def validate_cohort(
                     "reason": report["telemetry_sidecar"]["reason"],
                     "sample_count": len(report["telemetry_sidecar"]["samples"]),
                 },
-                "summaries": report["summaries"],
+                "summaries": summarize_report(report["records"]),
             }
         )
     expected_keys = {
@@ -975,6 +1174,18 @@ def validate_cohort(
         ),
     }
     validate_cohort_document(cohort)
+    return cohort
+
+
+def validate_cohort(
+    input_dir: Path,
+    dispatch_path: Path,
+    manifest_path: Path,
+    output: Path,
+) -> int:
+    dispatch_document = json.loads(dispatch_path.read_text(encoding="UTF-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="UTF-8"))
+    cohort = build_validated_cohort(input_dir, dispatch_document, manifest)
     atomic_write_json(output, cohort)
     markdown_output_path(output).write_text(
         render_cohort_markdown(cohort) + "\n",
@@ -1032,6 +1243,8 @@ def validate_cohort_document(cohort: dict[str, Any]) -> None:
     }
     seen = set()
     report_hashes = set()
+    artifact_ids: set[int] = set()
+    artifact_zip_hashes: set[str] = set()
     for observation in observations:
         require(isinstance(observation, dict), "cohort observation object")
         key = (observation.get("sequence"), observation.get("platform"))
@@ -1056,6 +1269,17 @@ def validate_cohort_document(cohort: dict[str, Any]) -> None:
             == f"wasi-thread-duration-cross-{platform}-{observation.get('run_id')}-1",
             f"cohort observation {key} artifact identity",
         )
+        expected_artifact = next(
+            artifact
+            for artifact in dispatch_document["runs"][sequence - 1]["artifacts"]
+            if artifact["name"] == observation["artifact_name"]
+        )
+        require(
+            observation.get("artifact_id") == expected_artifact["id"]
+            and observation["artifact_id"] not in artifact_ids,
+            f"cohort observation {key} artifact ID",
+        )
+        artifact_ids.add(observation["artifact_id"])
         for field in (
             "report_sha256",
             "report_file_sha256",
@@ -1064,12 +1288,18 @@ def validate_cohort_document(cohort: dict[str, Any]) -> None:
             "host_fingerprint_sha256",
             "plan_sha256",
             "plan_identity_sha256",
+            "artifact_zip_sha256",
         ):
             require(
                 isinstance(observation.get(field), str)
                 and re.fullmatch(r"[0-9a-f]{64}", observation[field]) is not None,
                 f"cohort observation {key} {field}",
             )
+        require(
+            observation["artifact_zip_sha256"] not in artifact_zip_hashes,
+            f"duplicate cohort artifact ZIP hash {observation['artifact_zip_sha256']}",
+        )
+        artifact_zip_hashes.add(observation["artifact_zip_sha256"])
         require(
             observation["report_sha256"] not in report_hashes,
             f"duplicate cohort report hash {observation['report_sha256']}",
@@ -1270,6 +1500,11 @@ def render_conclusion_markdown(conclusion: dict[str, Any]) -> str:
         "",
         f"- Result: `{'PASS' if conclusion['passed'] else 'FAIL'}`",
         f"- Cohort SHA-256: `{conclusion['source_cohort_sha256']}`",
+        "- Cohort Markdown SHA-256: "
+        f"`{conclusion['source_cohort_markdown_sha256']}`",
+        f"- Dispatch SHA-256: `{conclusion['source_dispatch_sha256']}`",
+        "- Download manifest SHA-256: "
+        f"`{conclusion['source_download_manifest_sha256']}`",
         f"- Production policy SHA-256: `{conclusion['policy_sha256']}`",
         "- Selected arm: `doubled`",
         "- Retained non-selecting arm: `current`",
@@ -1306,15 +1541,50 @@ def render_conclusion_markdown(conclusion: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def analyze(cohort_path: Path, policy_path: Path, output: Path) -> int:
-    cohort = json.loads(cohort_path.read_text(encoding="UTF-8"))
-    validate_cohort_document(cohort)
+def bound_cohort_evidence(cohort: dict[str, Any]) -> dict[str, Any]:
+    evidence = copy.deepcopy(cohort)
+    evidence.pop("validated_at", None)
+    return evidence
+
+
+def analyze(
+    cohort_path: Path,
+    input_dir: Path,
+    dispatch_path: Path,
+    manifest_path: Path,
+    policy_path: Path,
+    output: Path,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> int:
+    retained_cohort = json.loads(cohort_path.read_text(encoding="UTF-8"))
+    validate_cohort_document(retained_cohort)
+    cohort_markdown = markdown_output_path(cohort_path)
+    require(cohort_markdown.is_file(), "validated cohort Markdown is missing")
+    require(
+        cohort_markdown.read_text(encoding="UTF-8")
+        == render_cohort_markdown(retained_cohort) + "\n",
+        "validated cohort Markdown does not match cohort JSON",
+    )
+    dispatch_document = json.loads(dispatch_path.read_text(encoding="UTF-8"))
+    validate_dispatch_plan(dispatch_document, completed=True)
+    require(timeout_seconds > 0, "analysis timeout must be positive")
+    require_live_dispatch_membership(dispatch_document, timeout_seconds)
     policy = validate_derivation_policy(
         json.loads(policy_path.read_text(encoding="UTF-8"))
     )
     require(
         policy == PRODUCTION_DERIVATION_POLICY,
         "duration-cross analysis requires the unchanged production derivation policy",
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="UTF-8"))
+    cohort = build_validated_cohort(
+        input_dir.resolve(),
+        dispatch_document,
+        manifest,
+    )
+    require(
+        bound_cohort_evidence(retained_cohort) == bound_cohort_evidence(cohort),
+        "validated cohort does not match retained dispatch, artifacts, or recomputed summaries",
     )
     cushion = policy["rounding_cushion_log"]
     ceilings = policy["engineering_policy_ceiling_log"]
@@ -1414,7 +1684,10 @@ def analyze(cohort_path: Path, policy_path: Path, output: Path) -> int:
         "kind": CONCLUSION_KIND,
         "authoritative": False,
         "production_budget": None,
-        "source_cohort_sha256": cache_key(cohort),
+        "source_cohort_sha256": cache_key(retained_cohort),
+        "source_cohort_markdown_sha256": sha256_file(cohort_markdown),
+        "source_dispatch_sha256": cache_key(dispatch_document),
+        "source_download_manifest_sha256": cache_key(manifest),
         "policy_sha256": cache_key(policy),
         "diagnostic_plan": {
             "kind": PLAN_KIND,
@@ -1483,7 +1756,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     analyze_parser = sub.add_parser("analyze")
     analyze_parser.add_argument("--cohort", type=Path, required=True)
+    analyze_parser.add_argument("--input-dir", type=Path, required=True)
+    analyze_parser.add_argument("--dispatch", type=Path, required=True)
+    analyze_parser.add_argument("--manifest", type=Path, required=True)
     analyze_parser.add_argument("--policy", type=Path, required=True)
+    analyze_parser.add_argument(
+        "--timeout-seconds", type=float, default=DEFAULT_TIMEOUT_SECONDS
+    )
     analyze_parser.add_argument(
         "--output", type=Path, default=Path("wasi-thread-duration-cross-conclusion.json")
     )
@@ -1520,7 +1799,15 @@ def main(argv: list[str] | None = None) -> int:
                 args.manifest,
                 args.output,
             )
-        return analyze(args.cohort, args.policy, args.output)
+        return analyze(
+            args.cohort,
+            args.input_dir,
+            args.dispatch,
+            args.manifest,
+            args.policy,
+            args.output,
+            args.timeout_seconds,
+        )
     except (
         HarnessError,
         OSError,

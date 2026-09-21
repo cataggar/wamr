@@ -58,7 +58,10 @@ python3 scripts/wasi_thread_duration_cross_cohort.py plan \
 After review, `dispatch` runs exactly one manual workflow at a time; the x86
 and Arm jobs within each workflow are also serialized. It never retries or
 replaces a failed workflow. Download the two predeclared artifacts from every
-successful first-attempt run, then validate and analyze them offline:
+successful first-attempt run, retain each original artifact ZIP, and require
+its bytes to match the immutable SHA-256 digest recorded by GitHub in the
+completed dispatch state before validating and analyzing it. Download and
+analysis requery GitHub and fail if any matching workflow was added or changed:
 
 ```sh
 python3 scripts/wasi_thread_duration_cross_cohort.py download \
@@ -74,6 +77,9 @@ python3 scripts/wasi_thread_duration_cross_cohort.py validate \
 
 python3 scripts/wasi_thread_duration_cross_cohort.py analyze \
   --cohort /d/wasi-thread-duration-cross-cohort.json \
+  --input-dir /d/wasi-thread-duration-cross-reports \
+  --dispatch /d/wasi-thread-duration-cross-dispatch.completed.json \
+  --manifest /d/wasi-thread-duration-cross-download-manifest.json \
   --policy tests/benchmarks/wasi-threads/derivation-policy.production.json \
   --output /d/wasi-thread-duration-cross-conclusion.json
 ```

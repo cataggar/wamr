@@ -9,7 +9,9 @@ import shutil
 import sys
 import unittest
 import uuid
+import zipfile
 from pathlib import Path
+from unittest import mock
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -421,6 +423,13 @@ def completed_dispatch() -> dict:
                         f"{10_000 + sequence}-1"
                     ),
                     "size_in_bytes": 1000,
+                    "digest_sha256": cache_key(
+                        {
+                            "sequence": sequence,
+                            "platform": platform,
+                            "kind": "artifact-zip",
+                        }
+                    ),
                     "expired": False,
                 }
                 for index, platform in enumerate(duration.PLATFORM_CELLS, 1)
@@ -447,6 +456,9 @@ def synthetic_cohort(value: float = 1.0) -> dict:
                     "report_markdown_sha256": cache_key(
                         {"sequence": sequence, "platform": platform, "kind": "markdown"}
                     ),
+                    "artifact_zip_sha256": cache_key(
+                        {"sequence": sequence, "platform": platform, "kind": "zip"}
+                    ),
                     "artifact_identity_sha256": cache_key(
                         {
                             "sequence": sequence,
@@ -456,6 +468,9 @@ def synthetic_cohort(value: float = 1.0) -> dict:
                     ),
                     "run_id": str(10_000 + sequence),
                     "workflow_run_attempt": "1",
+                    "artifact_id": sequence * 10 + (
+                        1 if platform == "ubuntu-22.04-x86_64" else 2
+                    ),
                     "sequence": sequence,
                     "partition": duration.PARTITIONS[sequence],
                     "platform": platform,
@@ -521,8 +536,20 @@ def synthetic_download_manifest(root: Path) -> tuple[dict, dict]:
             artifact_dir.mkdir(parents=True)
             json_path = artifact_dir / "report.json"
             markdown_path = artifact_dir / "report.md"
-            json_path.write_text("{}\n", encoding="UTF-8")
-            markdown_path.write_text("# synthetic\n", encoding="UTF-8")
+            zip_path = artifact_dir / "artifact.zip"
+            json_path.write_text(
+                json.dumps({"artifact": artifact["name"]}) + "\n",
+                encoding="UTF-8",
+            )
+            markdown_path.write_text(
+                f"# {artifact['name']}\n",
+                encoding="UTF-8",
+            )
+            with zipfile.ZipFile(zip_path, "w") as archive:
+                archive.write(json_path, "report.json")
+                archive.write(markdown_path, "report.md")
+            artifact["size_in_bytes"] = zip_path.stat().st_size
+            artifact["digest_sha256"] = sha256_file(zip_path)
             platform = artifact["name"].removeprefix(
                 "wasi-thread-duration-cross-"
             ).removesuffix(f"-{run['run_id']}-1")
@@ -536,6 +563,11 @@ def synthetic_download_manifest(root: Path) -> tuple[dict, dict]:
                     "artifact_id": artifact["id"],
                     "artifact_name": artifact["name"],
                     "artifact_size_in_bytes": artifact["size_in_bytes"],
+                    "artifact_zip": {
+                        "path": f"{artifact['name']}/artifact.zip",
+                        "sha256": sha256_file(zip_path),
+                        "size_in_bytes": zip_path.stat().st_size,
+                    },
                     "report_json": {
                         "path": f"{artifact['name']}/report.json",
                         "sha256": sha256_file(json_path),
@@ -556,6 +588,105 @@ def synthetic_download_manifest(root: Path) -> tuple[dict, dict]:
         "entries": sorted(
             entries, key=lambda item: (item["sequence"], item["platform"])
         ),
+    }
+
+
+def retained_fixture(
+    root: Path,
+    *,
+    ratios: dict[tuple[int, str], float] | None = None,
+) -> dict[str, Path]:
+    ratios = ratios or {}
+    input_dir = root / "reports"
+    input_dir.mkdir(parents=True)
+    dispatch = completed_dispatch()
+    entries = []
+    for run in dispatch["runs"]:
+        for artifact in run["artifacts"]:
+            platform = artifact["name"].removeprefix(
+                "wasi-thread-duration-cross-"
+            ).removesuffix(f"-{run['run_id']}-1")
+            artifact_dir = input_dir / artifact["name"]
+            artifact_dir.mkdir()
+            report = synthetic_report(
+                sequence=run["sequence"],
+                platform=platform,
+                ratio=ratios.get((run["sequence"], platform), 1.0),
+            )
+            report_path = artifact_dir / "report.json"
+            markdown_path = artifact_dir / "report.md"
+            zip_path = artifact_dir / "artifact.zip"
+            report_path.write_text(
+                json.dumps(report, indent=2, sort_keys=True) + "\n",
+                encoding="UTF-8",
+            )
+            markdown_path.write_text(
+                duration.render_markdown(report) + "\n",
+                encoding="UTF-8",
+            )
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.write(report_path, "report.json")
+                archive.write(markdown_path, "report.md")
+            artifact["size_in_bytes"] = zip_path.stat().st_size
+            artifact["digest_sha256"] = sha256_file(zip_path)
+            entries.append(
+                {
+                    "sequence": run["sequence"],
+                    "partition": run["partition"],
+                    "run_id": run["run_id"],
+                    "workflow_run_attempt": 1,
+                    "platform": platform,
+                    "artifact_id": artifact["id"],
+                    "artifact_name": artifact["name"],
+                    "artifact_size_in_bytes": artifact["size_in_bytes"],
+                    "artifact_zip": {
+                        "path": f"{artifact['name']}/artifact.zip",
+                        "sha256": sha256_file(zip_path),
+                        "size_in_bytes": zip_path.stat().st_size,
+                    },
+                    "report_json": {
+                        "path": f"{artifact['name']}/report.json",
+                        "sha256": sha256_file(report_path),
+                    },
+                    "report_markdown": {
+                        "path": f"{artifact['name']}/report.md",
+                        "sha256": sha256_file(markdown_path),
+                    },
+                }
+            )
+    dispatch_path = root / "dispatch.json"
+    dispatch_path.write_text(
+        json.dumps(dispatch, indent=2, sort_keys=True) + "\n",
+        encoding="UTF-8",
+    )
+    manifest = {
+        "schema_version": 1,
+        "kind": cohort.DOWNLOAD_MANIFEST_KIND,
+        "downloaded_at": "2026-09-21T00:00:00+00:00",
+        "dispatch_sha256": cache_key(dispatch),
+        "cohort_id": COHORT_ID,
+        "source_sha": SHA,
+        "entries": sorted(
+            entries, key=lambda item: (item["sequence"], item["platform"])
+        ),
+    }
+    manifest_path = root / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="UTF-8",
+    )
+    cohort_path = root / "cohort.json"
+    cohort.validate_cohort(
+        input_dir,
+        dispatch_path,
+        manifest_path,
+        cohort_path,
+    )
+    return {
+        "input_dir": input_dir,
+        "dispatch": dispatch_path,
+        "manifest": manifest_path,
+        "cohort": cohort_path,
     }
 
 
@@ -785,6 +916,25 @@ class DurationCrossReportTests(unittest.TestCase):
 
 
 class DurationCrossCohortTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.fixture_root = (
+            REPO_ROOT / "zig-out" / f"duration-cross-bound-{uuid.uuid4().hex}"
+        )
+        cls.fixture_root.mkdir(parents=True)
+        cls.passing_fixture = retained_fixture(cls.fixture_root / "passing")
+        cls.failing_fixture = retained_fixture(
+            cls.fixture_root / "failing",
+            ratios={
+                (1, "ubuntu-22.04-x86_64"): math.exp(0.20),
+                (17, "ubuntu-24.04-aarch64"): 1.25,
+            },
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        shutil.rmtree(cls.fixture_root, ignore_errors=True)
+
     def setUp(self) -> None:
         self.scratch = (
             REPO_ROOT / "zig-out" / f"duration-cross-unit-{uuid.uuid4().hex}"
@@ -793,6 +943,25 @@ class DurationCrossCohortTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         shutil.rmtree(self.scratch, ignore_errors=True)
+
+    def analyze_fixture(
+        self,
+        fixture: dict[str, Path],
+        output: Path,
+        *,
+        policy: str = "derivation-policy.production.json",
+    ) -> int:
+        with mock.patch.object(
+            cohort, "require_live_dispatch_membership", return_value=None
+        ):
+            return cohort.analyze(
+                fixture["cohort"],
+                fixture["input_dir"],
+                fixture["dispatch"],
+                fixture["manifest"],
+                REPO_ROOT / "tests/benchmarks/wasi-threads" / policy,
+                output,
+            )
 
     def test_dispatch_membership_is_exact_and_no_retry(self) -> None:
         plan = completed_dispatch()
@@ -810,6 +979,25 @@ class DurationCrossCohortTests(unittest.TestCase):
         partial["runs"].pop()
         with self.assertRaisesRegex(HarnessError, "exactly 20"):
             cohort.validate_dispatch_plan(partial, completed=True)
+        duplicate_run = copy.deepcopy(plan)
+        duplicate_run["runs"][1]["run_id"] = duplicate_run["runs"][0]["run_id"]
+        duplicate_run["runs"][1]["artifacts"] = copy.deepcopy(
+            duplicate_run["runs"][0]["artifacts"]
+        )
+        with self.assertRaisesRegex(HarnessError, "duplicate run ID"):
+            cohort.validate_dispatch_plan(duplicate_run, completed=True)
+        duplicate_artifact = copy.deepcopy(plan)
+        duplicate_artifact["runs"][1]["artifacts"][0]["id"] = (
+            duplicate_artifact["runs"][0]["artifacts"][0]["id"]
+        )
+        with self.assertRaisesRegex(HarnessError, "duplicate artifact ID"):
+            cohort.validate_dispatch_plan(duplicate_artifact, completed=True)
+        duplicate_zip = copy.deepcopy(plan)
+        duplicate_zip["runs"][1]["artifacts"][0]["digest_sha256"] = (
+            duplicate_zip["runs"][0]["artifacts"][0]["digest_sha256"]
+        )
+        with self.assertRaisesRegex(HarnessError, "duplicate artifact ZIP"):
+            cohort.validate_dispatch_plan(duplicate_zip, completed=True)
 
     def test_download_manifest_rejects_partial_or_unexpected_files(self) -> None:
         download_dir = self.scratch / "download"
@@ -826,16 +1014,123 @@ class DurationCrossCohortTests(unittest.TestCase):
         with self.assertRaisesRegex(HarnessError, "unexpected files"):
             cohort.validate_download_manifest(manifest, dispatch, download_dir)
 
-    def test_synthetic_pass_accepts_all_doubled_gates(self) -> None:
-        cohort_document = synthetic_cohort()
-        cohort_path = self.scratch / "cohort.json"
-        output = self.scratch / "conclusion.json"
-        cohort_path.write_text(json.dumps(cohort_document), encoding="UTF-8")
-        policy = (
-            REPO_ROOT
-            / "tests/benchmarks/wasi-threads/derivation-policy.production.json"
+    def test_download_manifest_rejects_zip_not_bound_to_dispatch(self) -> None:
+        download_dir = self.scratch / "download"
+        dispatch, manifest = synthetic_download_manifest(download_dir)
+        manifest["entries"][1]["artifact_zip"]["sha256"] = manifest["entries"][0][
+            "artifact_zip"
+        ]["sha256"]
+        with self.assertRaisesRegex(HarnessError, "differs from dispatch identity"):
+            cohort.validate_download_manifest(manifest, dispatch, download_dir)
+
+    def test_late_duplicate_is_rejected_after_initial_discovery(self) -> None:
+        dispatch = completed_dispatch()
+        selected = {"databaseId": dispatch["runs"][0]["run_id"]}
+        duplicate = {"databaseId": 99_999}
+        with mock.patch.object(
+            cohort,
+            "matching_runs",
+            side_effect=[[selected], [selected, duplicate]],
+        ):
+            self.assertEqual(
+                cohort.find_run(dispatch, 1, 1)["databaseId"],
+                selected["databaseId"],
+            )
+            with self.assertRaisesRegex(HarnessError, "exactly one"):
+                cohort.require_recorded_run_unique(
+                    dispatch,
+                    dispatch["runs"][0],
+                    1,
+                )
+
+    def test_matching_runs_requires_exact_tag_ref(self) -> None:
+        dispatch = completed_dispatch()
+        title = (
+            f"WASI thread duration-cross {dispatch['cohort_id']}-1-training"
         )
-        self.assertEqual(cohort.analyze(cohort_path, policy, output), 0)
+        correct = {
+            "databaseId": dispatch["runs"][0]["run_id"],
+            "displayTitle": title,
+            "headSha": SHA,
+            "headBranch": "wasi-thread-duration-cross-v21",
+        }
+        wrong_ref = {**correct, "databaseId": 99_999, "headBranch": "main"}
+        with mock.patch.object(
+            cohort,
+            "gh_json",
+            return_value=[wrong_ref, correct],
+        ) as gh:
+            self.assertEqual(cohort.matching_runs(dispatch, 1, 1), [correct])
+        arguments = gh.call_args.args[0]
+        self.assertEqual(
+            arguments[arguments.index("--branch") + 1],
+            "wasi-thread-duration-cross-v21",
+        )
+
+    def test_duplicate_is_rejected_during_dispatch_finalization(self) -> None:
+        dispatch = completed_dispatch()
+        with mock.patch.object(
+            cohort,
+            "matching_runs",
+            return_value=[
+                {"databaseId": dispatch["runs"][0]["run_id"]},
+                {"databaseId": 99_999},
+            ],
+        ):
+            with self.assertRaisesRegex(HarnessError, "exactly one"):
+                cohort.finalize_dispatch_state(dispatch, 1)
+
+    def test_duplicate_is_rejected_before_download(self) -> None:
+        dispatch = completed_dispatch()
+        dispatch_path = self.scratch / "dispatch.json"
+        dispatch_path.write_text(json.dumps(dispatch), encoding="UTF-8")
+        with mock.patch.object(
+            cohort,
+            "matching_runs",
+            return_value=[
+                {"databaseId": dispatch["runs"][0]["run_id"]},
+                {"databaseId": 99_999},
+            ],
+        ):
+            with self.assertRaisesRegex(HarnessError, "exactly one"):
+                cohort.download_artifacts(
+                    dispatch_path,
+                    self.scratch / "download",
+                    self.scratch / "manifest.json",
+                    1,
+                )
+
+    def test_duplicate_is_rejected_before_analysis(self) -> None:
+        dispatch = json.loads(
+            self.passing_fixture["dispatch"].read_text(encoding="UTF-8")
+        )
+        with mock.patch.object(
+            cohort,
+            "matching_runs",
+            return_value=[
+                {"databaseId": dispatch["runs"][0]["run_id"]},
+                {"databaseId": 99_999},
+            ],
+        ):
+            with self.assertRaisesRegex(HarnessError, "exactly one"):
+                cohort.analyze(
+                    self.passing_fixture["cohort"],
+                    self.passing_fixture["input_dir"],
+                    self.passing_fixture["dispatch"],
+                    self.passing_fixture["manifest"],
+                    REPO_ROOT
+                    / "tests/benchmarks/wasi-threads/"
+                    "derivation-policy.production.json",
+                    self.scratch / "conclusion.json",
+                    1,
+                )
+
+    def test_synthetic_pass_accepts_all_doubled_gates(self) -> None:
+        output = self.scratch / "conclusion.json"
+        self.assertEqual(
+            self.analyze_fixture(self.passing_fixture, output),
+            0,
+        )
         conclusion = json.loads(output.read_text(encoding="UTF-8"))
         self.assertTrue(conclusion["passed"])
         self.assertTrue(output.with_suffix(".md").is_file())
@@ -862,72 +1157,88 @@ class DurationCrossCohortTests(unittest.TestCase):
                 )
             )
 
-    def test_training_ceiling_failure_is_rejected(self) -> None:
-        document = synthetic_cohort()
-        for observation in document["observations"]:
-            if (
-                observation["platform"] == "ubuntu-22.04-x86_64"
-                and observation["sequence"] == 1
-            ):
-                item = next(
-                    metric
-                    for metric in observation["summaries"]["comparisons"]
-                    if metric["arm"] == "doubled"
-                    and metric["pair_key"] == "cancel-points/hot/8"
-                    and metric["condition"] == "cancel-points-on"
-                )
-                item["throughput_candidate_over_baseline"] = metric_stats(
-                    math.exp(-0.20)
-                )
-                break
-        cohort_path = self.scratch / "cohort.json"
-        cohort_path.write_text(json.dumps(document), encoding="UTF-8")
+    def test_bound_training_and_holdout_failures_are_rejected(self) -> None:
         output = self.scratch / "conclusion.json"
-        with self.assertRaisesRegex(HarnessError, "training final bound"):
-            cohort.analyze(
-                cohort_path,
-                REPO_ROOT
-                / "tests/benchmarks/wasi-threads/derivation-policy.production.json",
-                output,
-            )
+        with self.assertRaises(HarnessError) as captured:
+            self.analyze_fixture(self.failing_fixture, output)
+        self.assertIn("training final bound", str(captured.exception))
+        self.assertIn("holdout sequence 17 failed", str(captured.exception))
         conclusion = json.loads(output.read_text(encoding="UTF-8"))
         self.assertFalse(conclusion["passed"])
         self.assertTrue(output.with_suffix(".md").is_file())
 
     def test_nonproduction_policy_is_rejected(self) -> None:
-        cohort_path = self.scratch / "cohort.json"
-        cohort_path.write_text(json.dumps(synthetic_cohort()), encoding="UTF-8")
         with self.assertRaisesRegex(HarnessError, "unchanged production"):
-            cohort.analyze(
-                cohort_path,
-                REPO_ROOT
-                / "tests/benchmarks/wasi-threads/derivation-policy.synthetic.json",
+            self.analyze_fixture(
+                self.passing_fixture,
                 self.scratch / "conclusion.json",
+                policy="derivation-policy.synthetic.json",
             )
 
-    def test_holdout_failure_is_rejected(self) -> None:
-        document = synthetic_cohort()
-        for observation in document["observations"]:
-            if (
-                observation["platform"] == "ubuntu-24.04-aarch64"
-                and observation["sequence"] == 17
-            ):
-                item = next(
-                    metric
-                    for metric in observation["summaries"]["ratio_of_ratios"]
-                    if metric["arm"] == "doubled"
-                )
-                item["throughput_ratio_of_ratios"] = metric_stats(0.8)
-                break
-        cohort_path = self.scratch / "cohort.json"
-        cohort_path.write_text(json.dumps(document), encoding="UTF-8")
-        with self.assertRaisesRegex(HarnessError, "holdout sequence 17 failed"):
-            cohort.analyze(
-                cohort_path,
-                REPO_ROOT
-                / "tests/benchmarks/wasi-threads/derivation-policy.production.json",
-                self.scratch / "conclusion.json",
+    def test_fabricated_cohort_summary_is_rejected(self) -> None:
+        path = self.passing_fixture["cohort"]
+        original = path.read_bytes()
+        markdown = path.with_suffix(".md")
+        original_markdown = markdown.read_bytes()
+        try:
+            document = json.loads(original)
+            document["observations"][0]["summaries"]["comparisons"][0][
+                "throughput_candidate_over_baseline"
+            ] = metric_stats(2.0)
+            path.write_text(json.dumps(document), encoding="UTF-8")
+            markdown.write_text(
+                cohort.render_cohort_markdown(document) + "\n",
+                encoding="UTF-8",
             )
+            with self.assertRaisesRegex(HarnessError, "recomputed summaries"):
+                self.analyze_fixture(
+                    self.passing_fixture,
+                    self.scratch / "conclusion.json",
+                )
+        finally:
+            path.write_bytes(original)
+            markdown.write_bytes(original_markdown)
+
+    def test_changed_report_bytes_are_rejected(self) -> None:
+        report = next(self.passing_fixture["input_dir"].glob("*/report.json"))
+        original = report.read_bytes()
+        try:
+            report.write_bytes(original + b" ")
+            with self.assertRaisesRegex(HarnessError, "hash mismatch"):
+                self.analyze_fixture(
+                    self.passing_fixture,
+                    self.scratch / "conclusion.json",
+                )
+        finally:
+            report.write_bytes(original)
+
+    def test_changed_report_markdown_is_rejected(self) -> None:
+        markdown = next(self.passing_fixture["input_dir"].glob("*/report.md"))
+        original = markdown.read_bytes()
+        try:
+            markdown.write_bytes(original + b"changed\n")
+            with self.assertRaisesRegex(HarnessError, "hash mismatch"):
+                self.analyze_fixture(
+                    self.passing_fixture,
+                    self.scratch / "conclusion.json",
+                )
+        finally:
+            markdown.write_bytes(original)
+
+    def test_missing_artifact_zip_is_rejected(self) -> None:
+        artifact_zip = next(
+            self.passing_fixture["input_dir"].glob("*/artifact.zip")
+        )
+        original = artifact_zip.read_bytes()
+        try:
+            artifact_zip.unlink()
+            with self.assertRaisesRegex(HarnessError, "ZIP.*missing"):
+                self.analyze_fixture(
+                    self.passing_fixture,
+                    self.scratch / "conclusion.json",
+                )
+        finally:
+            artifact_zip.write_bytes(original)
 
     def test_cohort_rejects_duplicate_and_partial_membership(self) -> None:
         document = synthetic_cohort()
