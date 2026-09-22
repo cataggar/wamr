@@ -99,10 +99,10 @@ def make_worktree(repo: Path, ref: str, root: Path, label: str) -> Path:
 def worktree_env(wt: Path) -> dict:
     """Return an environment that keeps Zig caches isolated per worktree."""
     env = os.environ.copy()
-    # setup-zig exports both cache dirs to the checkout's .zig-cache. This
-    # script builds two temporary worktrees; sharing cache state can let the
-    # target ref reuse baseline artifacts. Keep each ref's local and global Zig
-    # caches independent.
+    # CI configures shared job-level cache directories, but this script builds
+    # two temporary worktrees. Keep each ref's global cache independent and let
+    # Zig choose a local cache beneath each worktree so the target ref cannot
+    # reuse baseline artifacts.
     env.pop("ZIG_LOCAL_CACHE_DIR", None)
     global_cache = wt / ".zig-global-cache"
     global_cache.mkdir(exist_ok=True)

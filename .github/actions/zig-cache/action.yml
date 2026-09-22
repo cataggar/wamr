@@ -1,12 +1,11 @@
 name: 'Configure Zig caches'
 description: >-
-  Move ZIG_GLOBAL_CACHE_DIR and ZIG_LOCAL_CACHE_DIR out of $GITHUB_WORKSPACE.
-  mlugg/setup-zig unconditionally exports both to <workspace>/.zig-cache,
-  which (1) conflates the global and local cache, (2) puts the global cache
-  inside a checkout it does not belong in, and (3) collides between worktrees
-  spawned by perf scripts (scripts/bench_coremark.py, scripts/bench_simd.py,
-  which already pop these env vars). This composite action runs immediately
-  after setup-zig and replaces those exports with sane values:
+  Configure separate ZIG_GLOBAL_CACHE_DIR and ZIG_LOCAL_CACHE_DIR paths
+  outside $GITHUB_WORKSPACE. Keeping the caches distinct and outside the
+  checkout avoids collisions between worktrees spawned by perf scripts
+  (scripts/bench_coremark.py and scripts/bench_simd.py, which already adjust
+  these variables). This composite action runs after Zig is installed and
+  exports worktree-safe values:
     * ZIG_GLOBAL_CACHE_DIR -> a stable path outside the workspace.
     * ZIG_LOCAL_CACHE_DIR  -> a separate per-job scratch path outside the
                               workspace. We do not unset it (an empty value
@@ -74,4 +73,3 @@ runs:
         } >> "$GITHUB_ENV"
         echo "[zig-cache] ZIG_GLOBAL_CACHE_DIR=$GLOBAL"
         echo "[zig-cache] ZIG_LOCAL_CACHE_DIR=$LOCAL"
-

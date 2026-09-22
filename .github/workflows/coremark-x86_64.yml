@@ -42,6 +42,7 @@ concurrency:
 
 permissions:
   contents: read
+  attestations: read
   pull-requests: write
 
 jobs:
@@ -55,10 +56,14 @@ jobs:
           fetch-depth: 0
 
       - name: Install Zig 0.16.0
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          version: 0.16.0
-          use-cache: false
+          ghr-version: v0.8.1
+          tools: >-
+            cataggar/zig@v0.16.0
+            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Configure Zig caches
         uses: ./.github/actions/zig-cache

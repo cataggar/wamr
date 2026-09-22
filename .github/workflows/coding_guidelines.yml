@@ -10,6 +10,7 @@ concurrency:
 
 permissions:
   contents: read
+  attestations: read
 
 jobs:
   compliance_job:
@@ -19,10 +20,14 @@ jobs:
         uses: actions/checkout@v6.0.2
 
       - name: Install Zig
-        uses: mlugg/setup-zig@v2
+        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          version: 0.16.0
-          use-cache: false
+          ghr-version: v0.8.1
+          tools: >-
+            cataggar/zig@v0.16.0
+            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Configure Zig caches
         uses: ./.github/actions/zig-cache
