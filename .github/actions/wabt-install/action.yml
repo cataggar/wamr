@@ -1,8 +1,10 @@
 name: 'Install cataggar/wabt CLI'
 description: |
-  Installs `wabt` from a pinned cataggar/wabt release into ~/.local/bin (and
-  prepends it to GITHUB_PATH) using `ghr install`. Forwards `GH_TOKEN` so the
-  GitHub API calls `ghr` makes use the workflow's authenticated 5000/hr quota
+  Installs `wabt` from a pinned cataggar/wabt release into the job's
+  ghr-managed tool directory and prepends it to GITHUB_PATH. Uses an explicitly
+  pinned and verified ghr executable, and verifies the wabt release's minisign
+  signature with the public key published in the release notes. Forwards
+  `GH_TOKEN` so GitHub API calls use the workflow's authenticated 5000/hr quota
   instead of the unauthenticated 60/hr-per-IP limit observed flaking on
   Azure-hosted runners that share IPs across tenants.
 
@@ -22,34 +24,88 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Set up verified ghr
+      id: setup-ghr
+      uses: cataggar/ghr/actions/setup@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+      with:
+        ghr-version: v0.8.1
+        token: ${{ github.token }}
+
     - name: Install wabt via ghr (Linux + macOS)
       if: runner.os != 'Windows'
       shell: bash
       env:
+        GHR: ${{ steps.setup-ghr.outputs.ghr-path }}
         GH_TOKEN: ${{ github.token }}
         WABT_VERSION: ${{ inputs.version }}
+        WABT_MINISIGN_KEY: RWSBnHWjwk/kkqdYc74cGupHMNVobpmF3lPc7b8RIllYMmYBr5G2EyF0
       run: |
         set -euo pipefail
-        # ghr-bin is a tiny PyPI wrapper that downloads sha256-verified
-        # GitHub release archives and links the chosen binary into
-        # ~/.local/bin. pipx is preinstalled on ubuntu-latest; pip is
-        # blocked by PEP 668. Pin both ghr-bin and the wabt release.
-        pipx install ghr-bin==0.1.6
-        ghr install "cataggar/wabt@${WABT_VERSION}"
-        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-        "$HOME/.local/bin/wabt" version
+        test "$("$GHR" version)" = "0.8.1"
+        tool_dir="${GHR_TOOL_DIR:-${RUNNER_TEMP}/ghr-tools}"
+        bin_dir="${GHR_BIN_DIR:-${RUNNER_TEMP}/ghr-bin}"
+        cache_dir="${GHR_CACHE_DIR:-${RUNNER_TEMP}/ghr-cache}"
+        mkdir -p "$tool_dir" "$bin_dir" "$cache_dir"
+        export GHR_TOOL_DIR="$tool_dir"
+        export GHR_BIN_DIR="$bin_dir"
+        export GHR_CACHE_DIR="$cache_dir"
+        "$GHR" install \
+          "cataggar/wabt@${WABT_VERSION}" \
+          "$WABT_MINISIGN_KEY"
+        {
+          echo "GHR_TOOL_DIR=$tool_dir"
+          echo "GHR_BIN_DIR=$bin_dir"
+          echo "GHR_CACHE_DIR=$cache_dir"
+        } >> "$GITHUB_ENV"
+        echo "$bin_dir" >> "$GITHUB_PATH"
+        "$bin_dir/wabt" version
         echo "::notice::cataggar/wabt ${WABT_VERSION} installed"
 
     - name: Install wabt via ghr (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
       env:
+        GHR: ${{ steps.setup-ghr.outputs.ghr-path }}
         GH_TOKEN: ${{ github.token }}
         WABT_VERSION: ${{ inputs.version }}
+        WABT_MINISIGN_KEY: RWSBnHWjwk/kkqdYc74cGupHMNVobpmF3lPc7b8RIllYMmYBr5G2EyF0
       run: |
         $ErrorActionPreference = "Stop"
-        pipx install ghr-bin==0.1.6
-        ghr install "cataggar/wabt@$env:WABT_VERSION"
-        Add-Content -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.local\bin"
-        & "$env:USERPROFILE\.local\bin\wabt.exe" version
+        $ghrVersion = (& $env:GHR version).Trim()
+        if ($ghrVersion -ne "0.8.1") {
+          throw "expected ghr 0.8.1, got $ghrVersion"
+        }
+        $toolDir = if ($env:GHR_TOOL_DIR) {
+          $env:GHR_TOOL_DIR
+        } else {
+          Join-Path $env:RUNNER_TEMP "ghr-tools"
+        }
+        $binDir = if ($env:GHR_BIN_DIR) {
+          $env:GHR_BIN_DIR
+        } else {
+          Join-Path $env:RUNNER_TEMP "ghr-bin"
+        }
+        $cacheDir = if ($env:GHR_CACHE_DIR) {
+          $env:GHR_CACHE_DIR
+        } else {
+          Join-Path $env:RUNNER_TEMP "ghr-cache"
+        }
+        New-Item -ItemType Directory -Force -Path $toolDir, $binDir, $cacheDir | Out-Null
+        $env:GHR_TOOL_DIR = $toolDir
+        $env:GHR_BIN_DIR = $binDir
+        $env:GHR_CACHE_DIR = $cacheDir
+        & $env:GHR install "cataggar/wabt@$env:WABT_VERSION" $env:WABT_MINISIGN_KEY
+        if ($LASTEXITCODE -ne 0) {
+          throw "ghr failed to install cataggar/wabt@$env:WABT_VERSION"
+        }
+        @(
+          "GHR_TOOL_DIR=$toolDir"
+          "GHR_BIN_DIR=$binDir"
+          "GHR_CACHE_DIR=$cacheDir"
+        ) | Add-Content -Path $env:GITHUB_ENV
+        Add-Content -Path $env:GITHUB_PATH -Value $binDir
+        & (Join-Path $binDir "wabt.exe") version
+        if ($LASTEXITCODE -ne 0) {
+          throw "installed wabt failed its version check"
+        }
         Write-Host "::notice::cataggar/wabt $env:WABT_VERSION installed"
