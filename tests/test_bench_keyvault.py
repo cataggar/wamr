@@ -309,6 +309,10 @@ class KeyvaultHarnessTest(unittest.TestCase):
                     {},
                 )
 
+    @unittest.skipUnless(
+        platform.system() == "Linux" and platform.machine() == "x86_64",
+        "exact-image disassembly requires Linux x86_64",
+    )
     def test_frame_artifact_binds_exact_core_and_fails_closed(self) -> None:
         config = bench.load_manifest(self.manifest)
         artifacts = self.scratch / "artifacts"
@@ -363,6 +367,10 @@ class KeyvaultHarnessTest(unittest.TestCase):
         with self.assertRaisesRegex(bench.HarnessError, "perf.hot_func"):
             bench.precompile(config, artifacts, 10, frame_attribution=True)
 
+    @unittest.skipUnless(
+        platform.system() == "Linux" and platform.machine() == "x86_64",
+        "perf profiling requires Linux x86_64",
+    )
     def test_profile_reports_matching_sidecar_and_rejects_wrong_identity(self) -> None:
         config = bench.load_manifest(self.manifest)
         config.perf["hot_func"] = 0
