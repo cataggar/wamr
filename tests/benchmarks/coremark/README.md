@@ -205,9 +205,15 @@ For the retained #986 capture (run `34197146825`), download artifact
 into a local directory and audit the sample-level partitions and gate offline:
 
 ```sh
+mkdir -p .cache/issue-986
+gh run download 34197146825 -R cataggar/wamr \
+  -n coremark-aarch64-profile-613865671a7eeabe5b0659ce8d7b4a74ddabd20e \
+  -D .cache/issue-986
 python3 scripts/reanalyze_coremark_986.py \
-  --artifact-dir <downloaded-artifact-directory> \
-  --json-out <output-in-your-work-directory>.json
+  --artifact-dir .cache/issue-986 \
+  --json-out .cache/issue-986/reanalysis.json
+COREMARK_986_ARTIFACT_DIR=.cache/issue-986 \
+  python3 -m unittest scripts.test_reanalyze_coremark_986 -q
 ```
 
 The audit checks the benchmark report hash/ID, exact uncompressed cwasm
@@ -225,6 +231,11 @@ unattributed samples keep the address-generation conservative headroom at
 **-7.4314 pp**, below the +5 pp gate. A new matched semantic/path proof
 (and independent verification against the recorded analysis sources) is
 required before an optimizer can be authorized.
+The optional artifact-backed test also rejects modified benchmark/cwasm bytes,
+changed sample partitions, and gate tampering; without the environment variable
+it skips only that test. The downloaded archive extracts the three required
+files (`profile.json`, `benchmark-report.json`, `wamr-profiled.cwasm.gz`)
+directly into the specified directory.
 
 Exact frame-origin attribution is opt-in: pass `--frame-func 10` to the
 profiler, or set the workflow's `frame_func` input to `10`, for
