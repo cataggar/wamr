@@ -413,15 +413,15 @@ class HotFunctionComparisonTest(unittest.TestCase):
 
     def _attribution(self) -> dict:
         classes = {
-            "spill_load (reloads)": 30,
-            "frame stores": 20,
-            "reg-reg mov": 10,
-            "ALU": 3,
-            "bounds-check": 1,
-            "linear-mem access": 1,
-            "dispatch (computed-goto)": 5,
+            "allocator_spill_load": 30,
+            "wasm_local_or_phi_store": 20,
+            "regmov": 10,
+            "alu": 3,
+            "bounds_cmp": 1,
+            "linear_memory": 1,
+            "dispatch_jmp": 5,
             "call": 4,
-            "other branches": 1,
+            "cond_branch": 1,
             "other": 0,
         }
         return {
@@ -453,9 +453,41 @@ class HotFunctionComparisonTest(unittest.TestCase):
                     }
                     for name, samples in classes.items()
                 },
+                "frame_attribution": {
+                    "coverage": {
+                        "origin_coverage_pct": 100,
+                        "origin_sample_coverage_pct": 100,
+                        "unknown_frame_instructions": 0,
+                        "unknown_frame_samples": 0,
+                        "frame_samples": 50,
+                    },
+                    "origins": {
+                        "allocator_spill": {"samples": 30},
+                        "wasm_local_or_phi": {"samples": 20},
+                    },
+                },
                 "hottest_instructions": [],
             },
         }
+
+    def test_frame_metrics_require_proven_origins(self) -> None:
+        attr = self._attribution()
+        metrics, _ = compare.wamr_dynamic_metrics(attr)
+        self.assertEqual(metrics["frame_loads"]["samples"], 30)
+        self.assertEqual(metrics["frame_stores"]["samples"], 20)
+        self.assertEqual(metrics["reg_reg_moves"]["samples"], 10)
+        self.assertEqual(metrics["indirect_dispatch"]["samples"], 5)
+        del attr["classified_function"]["frame_attribution"]
+        metrics, _ = compare.wamr_dynamic_metrics(attr)
+        self.assertEqual(metrics["frame_loads"]["status"], "unavailable")
+        attr = self._attribution()
+        attr["classified_function"]["frame_attribution"]["coverage"]["unknown_frame_samples"] = 1
+        metrics, _ = compare.wamr_dynamic_metrics(attr)
+        self.assertEqual(metrics["frame_stores"]["status"], "unavailable")
+        attr = self._attribution()
+        attr["classified_function"]["frame_attribution"]["coverage"]["frame_samples"] = 51
+        metrics, _ = compare.wamr_dynamic_metrics(attr)
+        self.assertEqual(metrics["frame_loads"]["status"], "unavailable")
 
     def _write_benchmark(self) -> None:
         document = {
@@ -506,9 +538,20 @@ class HotFunctionComparisonTest(unittest.TestCase):
             },
             "perf": {"selected": True, "attribution": self._attribution()},
         }
+        del document["perf"]["attribution"]["classified_function"]["frame_attribution"]
         self.benchmark.write_text(
             json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="UTF-8"
         )
+
+    def test_unlinked_frame_sidecar_rejected_by_capture(self) -> None:
+        document = json.loads(self.benchmark.read_text(encoding="UTF-8"))
+        document["perf"]["attribution"]["classified_function"]["frame_attribution"] = (
+            self._attribution()["classified_function"]["frame_attribution"]
+        )
+        self.benchmark.write_text(json.dumps(document), encoding="UTF-8")
+        self._write_config()
+        with self.assertRaisesRegex(compare.ComparisonError, "frame_attribution"):
+            compare._validate_benchmark(compare.load_capture_config(self.config))
 
     def _write_config(
         self, *, wasm_index: int | None = 1, function_name: str | None = "hot"
@@ -803,7 +846,7 @@ class HotFunctionComparisonTest(unittest.TestCase):
             compare.sha256_file(self.core_wasm),
         )
         self.assertIn(
-            "Gate passed",
+            "No optimization lever clears the evidence gate",
             markdown_path.read_text(encoding="UTF-8"),
         )
 

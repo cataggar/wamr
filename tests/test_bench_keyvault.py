@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import bench_keyvault as bench  # noqa: E402
+from test_aot_jit_attr import LOAD, STORE, aot, metadata_for, section, target_info  # noqa: E402
 
 
 def _load_attr_module():
@@ -307,6 +308,146 @@ class KeyvaultHarnessTest(unittest.TestCase):
                     10,
                     {},
                 )
+
+    @unittest.skipUnless(
+        platform.system() == "Linux" and platform.machine() == "x86_64",
+        "exact-image disassembly requires Linux x86_64",
+    )
+    def test_frame_artifact_binds_exact_core_and_fails_closed(self) -> None:
+        config = bench.load_manifest(self.manifest)
+        artifacts = self.scratch / "artifacts"
+        artifacts.mkdir()
+        with self.assertRaisesRegex(bench.HarnessError, "exact core and sidecar"):
+            bench.validate_frame_artifact(config, artifacts, 10)
+        code = LOAD + STORE
+        core = artifacts / "keyvault.4.cwasm"
+        core.write_bytes(
+            struct.pack("<II", aot.AOT_MAGIC, aot.AOT_VERSION)
+            + section(aot.SEC_TARGET_INFO, target_info())
+            + section(aot.SEC_TEXT, code)
+            + section(aot.SEC_FUNCTION, struct.pack("<III", 1, 0, 0))
+        )
+        sidecar = bench.frame_metadata_path(config, artifacts)
+        sidecar.parent.mkdir(parents=True)
+        raw = metadata_for(code)
+        raw["local_func"] = config.perf["hot_func"]
+        sidecar.write_text(json.dumps(raw), encoding="UTF-8")
+        # The controlled metadata identifies function 7, not function 6145;
+        # the compiler/consumer must reject an out-of-range function.
+        with self.assertRaisesRegex(bench.HarnessError, "exact-image frame metadata validation"):
+            bench.validate_frame_artifact(config, artifacts, 10)
+        config.perf["hot_func"] = 0
+        raw["local_func"] = 0
+        new_sidecar = bench.frame_metadata_path(config, artifacts)
+        new_sidecar.write_text(json.dumps(raw), encoding="UTF-8")
+        validated = bench.validate_frame_artifact(config, artifacts, 10)
+        self.assertEqual(validated["cwasm_sha256"], bench.sha256_file(core))
+        self.assertEqual(validated["sidecar_sha256"], bench.sha256_file(new_sidecar))
+        core.write_bytes(core.read_bytes().replace(LOAD, b"\x90" * len(LOAD)))
+        with self.assertRaisesRegex(bench.HarnessError, "exact-image frame metadata validation"):
+            bench.validate_frame_artifact(config, artifacts, 10)
+
+    def test_profile_precompile_requires_selected_sidecar(self) -> None:
+        config = bench.load_manifest(self.manifest)
+        artifacts = self.scratch / "artifacts"
+        def fake_compile(command, *, timeout, label, extra_env=None):
+            if label == "WAMR precompile":
+                self.assertEqual(
+                    extra_env["WAMR_AOT_FRAME_ATTRIBUTION"],
+                    str(artifacts / "frame" / "keyvault"),
+                )
+                (artifacts / "keyvault.cwasm.json").write_text("{}", encoding="UTF-8")
+                (artifacts / "keyvault.4.cwasm").write_bytes(b"core")
+            elif label == "Wasmtime precompile":
+                (artifacts / "keyvault.wasmtime.cwasm").write_bytes(b"wasmtime")
+        with mock.patch.object(bench, "_run_checked", side_effect=fake_compile):
+            with self.assertRaisesRegex(bench.HarnessError, "exact core and sidecar"):
+                bench.precompile(config, artifacts, 10, frame_attribution=True)
+        config.perf["hot_func"] = None
+        with self.assertRaisesRegex(bench.HarnessError, "perf.hot_func"):
+            bench.precompile(config, artifacts, 10, frame_attribution=True)
+
+    @unittest.skipUnless(
+        platform.system() == "Linux" and platform.machine() == "x86_64",
+        "perf profiling requires Linux x86_64",
+    )
+    def test_profile_reports_matching_sidecar_and_rejects_wrong_identity(self) -> None:
+        config = bench.load_manifest(self.manifest)
+        config.perf["hot_func"] = 0
+        artifacts = self.scratch / "artifacts"
+        artifacts.mkdir()
+        code = LOAD + STORE
+        core = artifacts / "keyvault.4.cwasm"
+        core.write_bytes(
+            struct.pack("<II", aot.AOT_MAGIC, aot.AOT_VERSION)
+            + section(aot.SEC_TARGET_INFO, target_info())
+            + section(aot.SEC_TEXT, code)
+            + section(aot.SEC_FUNCTION, struct.pack("<III", 1, 0, 0))
+        )
+        sidecar = bench.frame_metadata_path(config, artifacts)
+        sidecar.parent.mkdir(parents=True)
+        raw = metadata_for(code)
+        raw["local_func"] = 0
+        sidecar.write_text(json.dumps(raw), encoding="UTF-8")
+        real_run = bench._run_checked
+        wrong_identity = False
+
+        def run(command, *, timeout, label, extra_env=None):
+            if label == "exact-image frame metadata validation":
+                return real_run(command, timeout=timeout, label=label)
+            if label == "WAMR perf capture":
+                out = self.scratch / "perf" / "output"
+                (out / "generated.zig").write_text("same\n", encoding="UTF-8")
+                return subprocess.CompletedProcess(command, 0, "got 58187 bytes back from tcgc.compile", "")
+            self.assertEqual(label, "perf attribution")
+            self.assertEqual(command[command.index("--frame-metadata") + 1], str(sidecar))
+            report = {
+                "cwasm": str(core), "attribution_coverage_pct": 100,
+                "classified_function": {
+                    "local_func": 0,
+                    "frame_metadata": str(sidecar),
+                    "frame_metadata_module": 4,
+                    "frame_metadata_identity": {
+                        "module_text_sha256": raw["module_text_sha256"],
+                        "normalized_code_sha256": (
+                            "0" * 64 if wrong_identity else raw["normalized_code_sha256"]
+                        ),
+                    },
+                    "frame_attribution": {"coverage": {
+                        "origin_sample_coverage_pct": 100,
+                        "unknown_frame_samples": 0,
+                    }, "origins": {"allocator_spill": {"samples": 10}}},
+                },
+            }
+            Path(command[command.index("--json-out") + 1]).write_text(
+                json.dumps(report), encoding="UTF-8"
+            )
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        reference_dir = self.scratch / "reference"
+        reference_dir.mkdir()
+        (reference_dir / "generated.zig").write_text("same\n", encoding="UTF-8")
+        reference = {key: value for key, value in bench.tree_snapshot(reference_dir).items()
+                     if key in ("sha256", "file_count", "total_bytes", "files")}
+        reference["sha256_tree"] = reference.pop("sha256")
+        read_text = Path.read_text
+        def controlled_read_text(path, *args, **kwargs):
+            if str(path) == "/proc/sys/kernel/perf_event_paranoid":
+                return "2"
+            return read_text(path, *args, **kwargs)
+        with mock.patch.object(bench, "_run_checked", side_effect=run), (
+            mock.patch.object(bench.shutil, "which", return_value="/usr/bin/tool")
+        ), (
+            mock.patch.object(Path, "read_text", controlled_read_text)
+        ):
+            report = bench.run_perf(config, self.scratch, artifacts / "keyvault.cwasm.json",
+                                    artifacts / "keyvault.wasmtime.cwasm", 10, reference)
+            self.assertEqual(report["frame_attribution"]["sidecar_sha256"], bench.sha256_file(sidecar))
+            self.assertIn("frame_attribution", report["attribution"]["classified_function"])
+            wrong_identity = True
+            with self.assertRaisesRegex(bench.HarnessError, "exact selected frame sidecar"):
+                bench.run_perf(config, self.scratch, artifacts / "keyvault.cwasm.json",
+                               artifacts / "keyvault.wasmtime.cwasm", 10, reference)
 
     def test_attribution_json_reports_sample_coverage(self) -> None:
         attr = _load_attr_module()

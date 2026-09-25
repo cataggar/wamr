@@ -105,12 +105,22 @@ python3 scripts/bench_keyvault.py \
 ```
 
 `--profile` requires Linux x86_64, `perf`, `objdump`, sampling permissions, the
-configured WAMR core index, at least `perf.min_samples`, and at least
+configured WAMR core index **and `perf.hot_func`**, at least `perf.min_samples`, and at least
 `perf.min_attribution_coverage_pct`. Any unmet requirement fails the command.
+The precompile enables `WAMR_AOT_FRAME_ATTRIBUTION` for that exact core/function
+and retains `artifacts/frame/keyvault.mod<M>.func<F>.json` alongside the
+per-core `.cwasm`. Before any measured run it validates the sidecar against
+that precise core image (target ABI, full text and function hash, instruction
+ranges, and spill-count reconciliation); missing or stale metadata is fatal.
+The perf attribution reuses the same sidecar and checks the reported identity.
 The profiled run is checked against the same response byte count and generated
 output tree before `aot_jit_attr.py` maps self samples to `local_func` indices.
 The JSON/Markdown reports record total samples, attributed samples, coverage,
-top functions, and (when `hot_func` is configured) instruction-class data.
+core/sidecar SHA-256s, proven and unknown frame-origin samples, top functions,
+and instruction-class data. Without a sidecar, the hot-function comparison
+marks frame dynamic metrics unavailable rather than interpreting frame traffic
+as allocator spills. Unknown or ambiguous frame origins also cannot clear the
+comparison's recommendation gate.
 
 For Azure Linux setup and interpretation details, see
 `.github/skills/aot-perf-profile/SKILL.md`.

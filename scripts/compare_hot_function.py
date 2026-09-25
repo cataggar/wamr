@@ -971,16 +971,64 @@ def wamr_dynamic_metrics(attribution: dict[str, Any]) -> tuple[dict[str, Any], d
         function_samples, function_samples, total
     )
     class_map = {
-        "frame_loads": "spill_load (reloads)",
-        "frame_stores": "frame stores",
-        "reg_reg_moves": "reg-reg mov",
-        "indirect_dispatch": "dispatch (computed-goto)",
+        "reg_reg_moves": "regmov",
+        "indirect_dispatch": "dispatch_jmp",
         "calls": "call",
     }
     for metric, class_name in class_map.items():
         dynamic[metric] = _sample_metric(
-            samples_for(class_name), function_samples, total
+            samples_for(class_name) if class_name in classes else 0,
+            function_samples, total
         )
+    frame = classified.get("frame_attribution")
+    if frame is None:
+        for metric in ("frame_loads", "frame_stores"):
+            dynamic[metric] = _unavailable(
+                "no exact-image frame sidecar; frame accesses cannot be assigned sound origins"
+            )
+    else:
+        coverage = _object(_object(frame, "frame_attribution").get("coverage"), "frame_attribution.coverage")
+        origins = _object(frame.get("origins"), "frame_attribution.origins")
+        proven = {
+            "allocator_spill", "wasm_local_or_phi",
+            "explicit_frame_storage", "fixed_runtime_frame_state",
+        }
+        if not set(origins).issubset(proven | {"unknown"}):
+            raise ComparisonError("unrecognized frame origin in attribution")
+        proven_samples = sum(
+            samples_for(f"{origin}_{kind}")
+            for origin in proven for kind in ("load", "store")
+            if f"{origin}_{kind}" in classes
+        )
+        if "frame_samples" in coverage and proven_samples > _integer(
+            coverage["frame_samples"], "frame_attribution.coverage.frame_samples"
+        ):
+            raise ComparisonError("proven frame class samples exceed frame coverage")
+        for metric, kind in (("frame_loads", "load"), ("frame_stores", "store")):
+            names = [f"{origin}_{kind}" for origin in proven]
+            count = sum(samples_for(name) for name in names if name in classes)
+            if (
+                coverage.get("origin_coverage_pct") != 100
+                or coverage.get("origin_sample_coverage_pct") != 100
+                or coverage.get("unknown_frame_instructions") != 0
+                or coverage.get("unknown_frame_samples") != 0
+                or (
+                    "frame_samples" in coverage
+                    and proven_samples != coverage["frame_samples"]
+                )
+                or any(
+                    name.endswith(f"_{kind}") and
+                    name not in names and
+                    (name.startswith("frame_") or name.startswith("unknown_frame_")
+                     or name.startswith("unknown_"))
+                    for name in classes
+                )
+            ):
+                dynamic[metric] = _unavailable(
+                    "frame sidecar has ambiguous or unknown frame origins"
+                )
+            else:
+                dynamic[metric] = _sample_metric(count, function_samples, total)
     dynamic["address_generation"] = _unavailable(
         "aot_jit_attr.py groups LEA with ALU, so address-generation samples "
         "cannot be separated without changing the concurrently-owned attribution tool"
@@ -1485,6 +1533,40 @@ def _validate_benchmark(
             "with --profile"
         )
     attribution = _object(perf.get("attribution"), "benchmark.perf.attribution")
+    classified = _object(
+        attribution.get("classified_function"), "benchmark.perf.attribution.classified_function"
+    )
+    if "frame_attribution" in classified:
+        frame = _object(perf.get("frame_attribution"), "benchmark.perf.frame_attribution")
+        compiled = _object(
+            _object(report.get("precompile"), "benchmark.precompile").get("frame_attribution"),
+            "benchmark.precompile.frame_attribution",
+        )
+        if frame != compiled:
+            raise ComparisonError("perf frame sidecar differs from precompiled frame sidecar")
+        core = Path(_string(frame.get("cwasm"), "frame.cwasm")).resolve()
+        sidecar = Path(_string(frame.get("sidecar"), "frame.sidecar")).resolve()
+        if not core.is_file() or not sidecar.is_file():
+            raise ComparisonError("frame sidecar or core artifact is missing")
+        if (
+            core != config.wamr_cwasm
+            or core != Path(_string(attribution.get("cwasm"), "attribution.cwasm")).resolve()
+            or sidecar != Path(_string(classified.get("frame_metadata"), "frame_metadata")).resolve()
+            or _sha256(frame.get("cwasm_sha256"), "frame.cwasm_sha256") != sha256_file(core)
+            or _sha256(frame.get("sidecar_sha256"), "frame.sidecar_sha256") != sha256_file(sidecar)
+        ):
+            raise ComparisonError("frame sidecar/core artifact identity mismatch")
+        metadata = _load_json(sidecar, "frame sidecar")
+        identity = _object(classified.get("frame_metadata_identity"), "frame_metadata_identity")
+        if (
+            classified.get("frame_metadata_module") != metadata.get("module")
+            or classified.get("local_func") != metadata.get("local_func")
+            or any(
+                identity.get(key) != metadata.get(key)
+                for key in ("module_text_sha256", "normalized_code_sha256")
+            )
+        ):
+            raise ComparisonError("frame sidecar metadata identity mismatch")
     return report, attribution, component_sha
 
 

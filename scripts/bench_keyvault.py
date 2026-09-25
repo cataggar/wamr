@@ -589,7 +589,10 @@ def controlled_host_env() -> dict[str, str]:
     return env
 
 
-def _run_checked(command: list[str], *, timeout: float, label: str) -> subprocess.CompletedProcess[str]:
+def _run_checked(
+    command: list[str], *, timeout: float, label: str,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     try:
         proc = subprocess.run(
             command,
@@ -597,7 +600,7 @@ def _run_checked(command: list[str], *, timeout: float, label: str) -> subproces
             capture_output=True,
             check=False,
             timeout=timeout,
-            env=controlled_host_env(),
+            env={**controlled_host_env(), **(extra_env or {})},
         )
     except subprocess.TimeoutExpired as exc:
         raise HarnessError(f"{label} exceeded timeout of {timeout:g}s") from exc
@@ -609,7 +612,35 @@ def _run_checked(command: list[str], *, timeout: float, label: str) -> subproces
     return proc
 
 
-def precompile(config: Config, artifact_dir: Path, timeout: float) -> tuple[Path, Path, dict[str, Any]]:
+def frame_metadata_path(config: Config, artifact_dir: Path) -> Path:
+    return artifact_dir / "frame" / (
+        f"keyvault.mod{config.perf['core_index']}.func{config.perf['hot_func']}.json"
+    )
+
+
+def validate_frame_artifact(config: Config, artifact_dir: Path, timeout: float) -> dict[str, Any]:
+    sidecar = frame_metadata_path(config, artifact_dir)
+    core = artifact_dir / f"keyvault.{config.perf['core_index']}.cwasm"
+    if not core.is_file() or not sidecar.is_file():
+        raise HarnessError(f"frame attribution requires the exact core and sidecar: {core}, {sidecar}")
+    helper = Path(__file__).resolve().parents[1] / ".github/skills/aot-perf-profile/aot_jit_attr.py"
+    command = [
+        sys.executable, str(helper), "--cwasm", str(core),
+        "--func", str(config.perf["hot_func"]),
+        "--frame-metadata", str(sidecar), "--validate-frame-metadata",
+    ]
+    _run_checked(command, timeout=timeout, label="exact-image frame metadata validation")
+    return {
+        "cwasm": str(core), "cwasm_sha256": sha256_file(core),
+        "sidecar": str(sidecar), "sidecar_sha256": sha256_file(sidecar),
+        "validation_command": command,
+    }
+
+
+def precompile(
+    config: Config, artifact_dir: Path, timeout: float, *,
+    frame_attribution: bool = False,
+) -> tuple[Path, Path, dict[str, Any]]:
     artifact_dir.mkdir(parents=True, exist_ok=True)
     wamr_cmd, wasmtime_cmd, wamr_manifest, wasmtime_cwasm = precompile_commands(
         config, artifact_dir
@@ -619,14 +650,29 @@ def precompile(config: Config, artifact_dir: Path, timeout: float) -> tuple[Path
             shutil.rmtree(old)
         else:
             old.unlink()
+    if frame_attribution and config.perf["hot_func"] is None:
+        raise HarnessError("--profile requires perf.hot_func for exact frame attribution")
+    frame_env = None
+    if frame_attribution:
+        prefix = artifact_dir / "frame" / "keyvault"
+        prefix.parent.mkdir(parents=True, exist_ok=True)
+        frame_env = {
+            "WAMR_AOT_FRAME_ATTRIBUTION": str(prefix),
+            "WAMR_AOT_FRAME_ATTRIBUTION_MODULE": str(config.perf["core_index"]),
+            "WAMR_AOT_FRAME_ATTRIBUTION_FUNC": str(config.perf["hot_func"]),
+        }
     start = time.perf_counter_ns()
-    _run_checked(wamr_cmd, timeout=timeout, label="WAMR precompile")
+    _run_checked(wamr_cmd, timeout=timeout, label="WAMR precompile", extra_env=frame_env)
     wamr_seconds = (time.perf_counter_ns() - start) / 1e9
     start = time.perf_counter_ns()
     _run_checked(wasmtime_cmd, timeout=timeout, label="Wasmtime precompile")
     wasmtime_seconds = (time.perf_counter_ns() - start) / 1e9
     if not wamr_manifest.is_file() or not wasmtime_cwasm.is_file():
         raise HarnessError("precompile completed without producing both artifacts")
+    frame_artifact = (
+        validate_frame_artifact(config, artifact_dir, timeout)
+        if frame_attribution else None
+    )
     artifacts = []
     for item in sorted(artifact_dir.iterdir()):
         if item.is_file():
@@ -643,6 +689,7 @@ def precompile(config: Config, artifact_dir: Path, timeout: float) -> tuple[Path
         "wasmtime_seconds": wasmtime_seconds,
         "commands": {"wamr": wamr_cmd, "wasmtime": wasmtime_cmd},
         "artifacts": artifacts,
+        "frame_attribution": frame_artifact,
     }
 
 
@@ -817,6 +864,9 @@ def run_perf(
             "check perf.core_index and the WAMR manifest"
         )
     attr_json = perf_dir / "attribution.json"
+    frame_artifact = validate_frame_artifact(
+        config, perf_dir.parent / "artifacts", timeout
+    )
     helper = Path(__file__).resolve().parents[1] / ".github/skills/aot-perf-profile/aot_jit_attr.py"
     attr_command = [
         sys.executable,
@@ -836,8 +886,22 @@ def run_perf(
         attr_command += ["--base", config.perf["base"]]
     if config.perf["hot_func"] is not None:
         attr_command += ["--func", str(config.perf["hot_func"])]
+        attr_command += ["--frame-metadata", frame_artifact["sidecar"]]
     _run_checked(attr_command, timeout=timeout, label="perf attribution")
     attribution = json.loads(attr_json.read_text(encoding="UTF-8"))
+    classified = attribution.get("classified_function") or {}
+    identity = classified.get("frame_metadata_identity") or {}
+    sidecar = json.loads(Path(frame_artifact["sidecar"]).read_text(encoding="UTF-8"))
+    if (
+        Path(attribution.get("cwasm", "")).resolve() != core.resolve()
+        or classified.get("local_func") != config.perf["hot_func"]
+        or classified.get("frame_metadata") != frame_artifact["sidecar"]
+        or classified.get("frame_metadata_module") != config.perf["core_index"]
+        or identity.get("module_text_sha256") != sidecar.get("module_text_sha256")
+        or identity.get("normalized_code_sha256") != sidecar.get("normalized_code_sha256")
+        or "frame_attribution" not in classified
+    ):
+        raise HarnessError("perf attribution does not report the exact selected frame sidecar/core")
     coverage = attribution["attribution_coverage_pct"]
     if coverage < config.perf["min_attribution_coverage_pct"]:
         raise HarnessError(
@@ -850,6 +914,7 @@ def run_perf(
         "perf_data": str(perf_data),
         "attribution": attribution,
         "attribution_command": attr_command,
+        "frame_attribution": frame_artifact,
     }
 
 
@@ -926,7 +991,20 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- Samples attributed to configured core: {attr['attributed_samples']}",
             f"- Attribution coverage: {attr['attribution_coverage_pct']:.2f}%",
             f"- `perf.data`: `{report['perf']['perf_data']}`",
+            f"- Exact frame sidecar: `{report['perf']['frame_attribution']['sidecar']}` "
+            f"(SHA-256 `{report['perf']['frame_attribution']['sidecar_sha256']}`)",
+            f"- Matched core image: `{report['perf']['frame_attribution']['cwasm']}` "
+            f"(SHA-256 `{report['perf']['frame_attribution']['cwasm_sha256']}`)",
         ]
+        frame = attr.get("classified_function", {}).get("frame_attribution", {})
+        if frame:
+            coverage = frame["coverage"]
+            lines.append(
+                f"- Proven frame origins: {coverage['origin_sample_coverage_pct']:.2f}% "
+                f"of frame samples; unknown: {coverage['unknown_frame_samples']} samples"
+            )
+            for origin, data in sorted(frame["origins"].items()):
+                lines.append(f"  - {origin}: {data['samples']} samples")
     else:
         lines += [
             "",
@@ -953,7 +1031,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     work_dir = args.work_dir.resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
     wamr_manifest, wasmtime_cwasm, compile_report = precompile(
-        config, work_dir / "artifacts", args.compile_timeout
+        config, work_dir / "artifacts", args.compile_timeout,
+        frame_attribution=args.profile,
     )
     records: list[dict[str, Any]] = []
     for index in range(1, args.warmups + 1):
