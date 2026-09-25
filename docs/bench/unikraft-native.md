@@ -194,6 +194,15 @@ Each target configuration has:
 Sources, compiler identities, options, architecture, CPU model, active CPU count,
 SKU and region must match. Source/build settings or guest CPU counts that cannot
 be established are pending evidence, not `"unknown"` measurements.
+For measurement plans, both targets must use the currently supported native
+Unikraft SDK WAMR source commit
+`a53205d77be3b880eb8f8b96679512ba58e2331a` (the pin consumed by
+cataggar/unikraft#163). A different WAMR revision requires a separately qualified
+native image integration and an explicit adapter pin update; matching two
+unsupported revisions is not sufficient. The commit check validates a declared
+source identity against the supported SDK, not the actual build or deployed image:
+retain independent source-closure, receipt and deployment evidence. Synthetic
+offline tests remain unpinned and cannot produce measurement evidence.
 
 The image integrator must supply a JSON receipt with exactly:
 
