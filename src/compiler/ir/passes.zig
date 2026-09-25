@@ -4075,6 +4075,7 @@ const pass_name_registry = [_]PassNameEntry{
     .{ .fn_ptr = &inductionVariableSimplification, .name = "inductionVariableSimplification" },
     .{ .fn_ptr = &hoistLoopInvariantCode, .name = "hoistLoopInvariantCode" },
     .{ .fn_ptr = &unrollSmallFixedLoops, .name = "unrollSmallFixedLoops" },
+    .{ .fn_ptr = &elideOverwrittenLocalSets, .name = "elideOverwrittenLocalSets" },
     .{ .fn_ptr = &@import("forward_redundant_loads.zig").forwardRedundantLoads, .name = "forwardRedundantLoads" },
     .{ .fn_ptr = &@import("forward_redundant_loads_dominator.zig").forwardRedundantLoadsDominator, .name = "forwardRedundantLoadsDominator" },
     .{ .fn_ptr = &deadStoreElimination, .name = "deadStoreElimination" },
@@ -5728,6 +5729,37 @@ pub fn deadLocalSetElimination(func: *ir.IrFunction, allocator: std.mem.Allocato
                 changed = true;
             } else {
                 i += 1;
+            }
+        }
+    }
+    return changed;
+}
+
+/// Drop stores overwritten in the same straight-line block before any read.
+/// In particular, full unrolling copies loop-carried local writes into one
+/// block, where only the last write must reach the next loop iteration.
+pub fn elideOverwrittenLocalSets(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var overwritten = std.AutoHashMap(u32, void).init(allocator);
+    defer overwritten.deinit();
+
+    var changed = false;
+    for (func.blocks.items) |*block| {
+        overwritten.clearRetainingCapacity();
+        var i = block.instructions.items.len;
+        while (i > 0) {
+            i -= 1;
+            const inst = block.instructions.items[i];
+            switch (inst.op) {
+                .local_get => |idx| _ = overwritten.remove(idx),
+                .local_set => |ls| {
+                    if (overwritten.contains(ls.idx)) {
+                        _ = block.instructions.orderedRemove(i);
+                        changed = true;
+                    } else {
+                        try overwritten.put(ls.idx, {});
+                    }
+                },
+                else => {},
             }
         }
     }
@@ -9223,6 +9255,7 @@ const x86_64_default_passes: []const PassFn = &.{
     &globalValueNumbering,
     &hoistLoopInvariantCode,
     &unrollSmallFixedLoops,
+    &elideOverwrittenLocalSets,
     &@import("forward_redundant_loads.zig").forwardRedundantLoads,
     @import("forward_redundant_loads.zig").forwardRedundantLoads,
     &@import("forward_redundant_loads_dominator.zig").forwardRedundantLoadsDominator,
@@ -9265,7 +9298,7 @@ const x86_64_default_passes_no_iv: []const PassFn = &.{
     &strengthReduceMulShiftAdd,  &strengthReduceDivRem,             &foldConstantBranches,       &foldInverseCompareEqz,
     &foldBranchOnEqz,            &threadChainedConditionalBranches, &tailDuplicateSmallJoins,    &foldSelectOnEqz,
     &foldSignExtendingLoad,      &foldFloatUnaryIdempotents,        &foldWrapOfExtend,           &globalValueNumbering,
-    &hoistLoopInvariantCode,     &unrollSmallFixedLoops,            &foldCompoundLea,            &deadCodeAndLocalSetCleanup,
+    &hoistLoopInvariantCode,     &unrollSmallFixedLoops,            &elideOverwrittenLocalSets, &foldCompoundLea,            &deadCodeAndLocalSetCleanup,
     &hoistLoopBoundsChecks,      &elideRedundantBoundsChecks,       &foldLoadStoreOffset,
 };
 
@@ -13146,6 +13179,36 @@ test "deadLocalSetElimination: keeps set when local is read" {
     const changed = try deadLocalSetElimination(&func, allocator);
     try std.testing.expect(!changed);
     try std.testing.expectEqual(@as(usize, 4), block.instructions.items.len);
+}
+
+test "elideOverwrittenLocalSets: preserve reads and block-exit writes" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 1);
+    defer func.deinit();
+    const first = try func.newBlock();
+    const second = try func.newBlock();
+    const a = func.newVReg();
+    const b = func.newVReg();
+    const c = func.newVReg();
+    const read = func.newVReg();
+    const result = func.newVReg();
+    const block = func.getBlock(first);
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = a, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 2 }, .dest = b, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = c, .type = .i32 });
+    try block.append(.{ .op = .{ .local_set = .{ .idx = 0, .val = a } } });
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = read, .type = .i32 });
+    try block.append(.{ .op = .{ .local_set = .{ .idx = 0, .val = b } } });
+    try block.append(.{ .op = .{ .local_set = .{ .idx = 0, .val = c } } });
+    try block.append(.{ .op = .{ .br = second } });
+    try func.getBlock(second).append(.{ .op = .{ .local_get = 0 }, .dest = result, .type = .i32 });
+    try func.getBlock(second).append(.{ .op = .{ .ret = result } });
+
+    try std.testing.expect(try elideOverwrittenLocalSets(&func, allocator));
+    try std.testing.expectEqual(@as(usize, 7), block.instructions.items.len);
+    try std.testing.expectEqual(a, block.instructions.items[3].op.local_set.val);
+    try std.testing.expectEqual(c, block.instructions.items[5].op.local_set.val);
+    try std.testing.expect(!try elideOverwrittenLocalSets(&func, allocator));
 }
 
 test "constantFold: shl of constants" {

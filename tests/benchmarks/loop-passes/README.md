@@ -6,6 +6,9 @@ These core-wasm fixtures isolate the two loop transforms discussed in #385:
   induction-variable address strength reduction.
 - `unroll4.wasm` repeatedly calls a four-trip scalar loop whose final value is
   live after the loop, exercising bounded full unrolling and live-out repair.
+  The x86-64 pipeline also drops intermediate `local.set` writes overwritten
+  within the unrolled block before a `local.get`; the final loop-carried
+  write must remain.
 
 Each `_start` traps if its result is wrong, so a timed sample is accepted only
 when the AOT process exits successfully. The tracked `.wasm` files are generated
