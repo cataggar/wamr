@@ -200,6 +200,32 @@ exact cwasm do not contain enough WAMR native bytes for sound def-use
 reclassification; rebuilding from source is not an evidence-preserving
 substitute.
 
+For the retained #986 capture (run `34197146825`), download artifact
+`coremark-aarch64-profile-613865671a7eeabe5b0659ce8d7b4a74ddabd20e`
+into a local directory and audit the sample-level partitions and gate offline:
+
+```sh
+python3 scripts/reanalyze_coremark_986.py \
+  --artifact-dir <downloaded-artifact-directory> \
+  --json-out <output-in-your-work-directory>.json
+```
+
+The audit checks the benchmark report hash/ID, exact uncompressed cwasm
+SHA-256, nonduplicate sampled instruction offsets, category sample totals,
+and the recomputed >=5 pp conservative gate. `top_uncertain_paths` ranks the
+sampled `unknown`/`mixed` instructions and their recorded def-use evidence for
+each engine. This is **not** an independent native disassembly or a rerun of
+the historical classifier. In particular, WAMR offset 708 (`add x17, x15,
+#4`, 5129 samples) reaches a compare at 716, but the control path does not
+prove a bounds check; Wasmtime offsets 176 (`cmp w2, w3`, 1318 samples) and
+284 (`mov x3, x19`, 1495 samples) respectively have unproven control and a
+multiple-definition join. Neither engine's unknowns can be reassigned from
+register names or adjacency. The retained reference unknowns and global
+unattributed samples keep the address-generation conservative headroom at
+**-7.4314 pp**, below the +5 pp gate. A new matched semantic/path proof
+(and independent verification against the recorded analysis sources) is
+required before an optimizer can be authorized.
+
 Exact frame-origin attribution is opt-in: pass `--frame-func 10` to the
 profiler, or set the workflow's `frame_func` input to `10`, for
 `core_state_transition` (module 0, local function 10, full wasm index 22).
