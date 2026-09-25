@@ -592,6 +592,9 @@ pub const CompileOptions = struct {
     /// `WAMR_AOT_SPILL_METRIC` is set. Combines the scalar (X) and v128 (V)
     /// allocations into one per-function report.
     spill_metric: passes.SpillMetricOptions = .{},
+    /// Compile-only snapshots of scalar linear scan for module 0 / local
+    /// function 10 (CoreMark #985); never changes allocation decisions.
+    allocator_trace_func10: bool = false,
     /// Versioned machine-readable AArch64 frame-origin metadata. Off unless
     /// `WAMR_AOT_FRAME_ATTRIBUTION=<output-prefix>` is set.
     frame_attribution: passes.FrameAttributionOptions = .{},
@@ -2513,13 +2516,41 @@ pub fn compileFunctionImpl(
     defer if (alloc_result_storage) |*ar| ar.deinit();
     if (ctx.options.enable_xreg_alloc) {
         if (tmr) |t| t.begin();
-        alloc_result_storage = try regalloc.allocateFromRangesWithHints(
-            allocator,
-            aarch64RegSetForSpillBase(spill_base),
-            clobbers.items,
-            scalar_live_ranges.items,
-            hint_points.items,
-        );
+        const trace_enabled = ctx.options.allocator_trace_func10 and ctx.options.module_idx == 0 and ctx.func_idx == 10;
+        if (trace_enabled) {
+            var trace: regalloc.AllocationTrace = .{};
+            defer trace.deinit(allocator);
+            alloc_result_storage = try regalloc.allocateFromRangesWithHintsTraced(
+                allocator,
+                aarch64RegSetForSpillBase(spill_base),
+                clobbers.items,
+                scalar_live_ranges.items,
+                hint_points.items,
+                &trace,
+            );
+            trace.print(ctx.options.module_idx, ctx.func_idx);
+            for ([_]ir.VReg{ 200, 190 }) |vreg| {
+                const location = alloc_result_storage.?.get(vreg);
+                if (location) |loc| {
+                    switch (loc) {
+                        .stack => |offset| std.debug.print("[alloc-trace] final vreg={d} fp_offset={d} slot={d}\n", .{
+                            vreg, offset, @divExact(offset - @as(i32, @intCast(spill_base)), 8),
+                        }),
+                        .reg => |reg| std.debug.print("[alloc-trace] final vreg={d} reg={d}\n", .{ vreg, reg }),
+                    }
+                } else {
+                    std.debug.print("[alloc-trace] final vreg={d} absent\n", .{vreg});
+                }
+            }
+        } else {
+            alloc_result_storage = try regalloc.allocateFromRangesWithHints(
+                allocator,
+                aarch64RegSetForSpillBase(spill_base),
+                clobbers.items,
+                scalar_live_ranges.items,
+                hint_points.items,
+            );
+        }
         if (tmr) |t| t.end(.regalloc);
 
         // Post-allocation move coalescing (issue #386). Retarget the
@@ -10153,7 +10184,9 @@ pub fn compileModuleCachedWithOptions(
         var reused = false;
         var hit_code: []const u8 = undefined;
         var hit_patches: []const codegen_cache.FuncCallPatch = undefined;
-        if (!frame_attr_live) {
+        if (!frame_attr_live and
+            !(options.allocator_trace_func10 and options.module_idx == 0 and fi == 10))
+        {
             if (reuse) |r| {
                 if (fi < r.functions.len and
                     std.mem.eql(u8, &r.functions[fi].ir_sha256, &ir_sha))

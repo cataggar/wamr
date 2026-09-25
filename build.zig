@@ -1646,6 +1646,8 @@ pub fn build(b: *std.Build) void {
     });
     const run_regalloc_tests = b.addRunArtifact(regalloc_tests);
     test_step.dependOn(&run_regalloc_tests.step);
+    const test_regalloc_step = b.step("test-regalloc", "Run compiler register allocator unit tests");
+    test_regalloc_step.dependOn(&run_regalloc_tests.step);
 
     // Compiler loop-aware live-range splitting tests (#383 / #524). The
     // file's tests were previously not wired into any module and so never

@@ -137,6 +137,61 @@ pub const Hint = struct {
     reg_idx: u8,
 };
 
+/// Opt-in, read-only linear-scan snapshots for a small set of investigated
+/// values. Masks index RegSet.alloc_regs, not architectural register numbers.
+pub const AllocationTrace = struct {
+    events: std.ArrayList(Event) = .empty,
+    competitors: std.ArrayList(Competitor) = .empty,
+
+    pub const Event = struct {
+        incoming: ir.VReg,
+        start: u32,
+        end: u32,
+        depth: u8,
+        hint: ?u8,
+        spans_clobber: bool,
+        clobber_count: u32,
+        clobbered_regs: u64,
+        free_regs: u64,
+        safe_regs: u64,
+        chosen_reg: ?PhysReg,
+        evicted: ?ir.VReg,
+        spill_vreg: ?ir.VReg,
+        spill_offset: ?i32,
+        competitor_start: usize,
+        competitor_len: usize,
+    };
+
+    pub const Competitor = struct {
+        vreg: ir.VReg,
+        end: u32,
+        depth: u8,
+        reg: PhysReg,
+        safe_for_incoming: bool,
+        eviction_eligible: bool,
+    };
+
+    pub fn deinit(self: *AllocationTrace, allocator: std.mem.Allocator) void {
+        self.events.deinit(allocator);
+        self.competitors.deinit(allocator);
+    }
+
+    pub fn print(self: *const AllocationTrace, module_idx: u32, func_idx: u32) void {
+        for (self.events.items) |event| {
+            std.debug.print(
+                "[alloc-trace] mod={d} local_func={d} incoming={d} range={d}..{d} depth={d} hint_idx={?d} spans_clobber={} clobbers={d} clobbered_idx=0x{x} free_idx=0x{x} safe_idx=0x{x} chosen_reg={?d} evicted={?d} spilled={?d} fp_offset={?d}\n",
+                .{ module_idx, func_idx, event.incoming, event.start, event.end, event.depth, event.hint, event.spans_clobber, event.clobber_count, event.clobbered_regs, event.free_regs, event.safe_regs, event.chosen_reg, event.evicted, event.spill_vreg, event.spill_offset },
+            );
+            for (self.competitors.items[event.competitor_start..][0..event.competitor_len]) |c| {
+                std.debug.print(
+                    "[alloc-trace] competitor={d} end={d} depth={d} reg={d} safe={} eviction_eligible={}\n",
+                    .{ c.vreg, c.end, c.depth, c.reg, c.safe_for_incoming, c.eviction_eligible },
+                );
+            }
+        }
+    }
+};
+
 /// A copy-like IR instruction whose emitted `mov rD, rS` becomes a NOP
 /// when the allocator places `dest` and `src` in the same physical
 /// register. Reported to `coalesceMoves` so it can retarget one
@@ -692,6 +747,29 @@ pub fn allocateFromRangesWithHintsRemat(
     hints: []const Hint,
     remat_candidates: ?*const std.AutoHashMap(ir.VReg, RematDef),
 ) !AllocResult {
+    return allocateFromRangesWithHintsRematTraced(allocator, reg_set, clobbers, ranges, hints, remat_candidates, null);
+}
+
+pub fn allocateFromRangesWithHintsTraced(
+    allocator: std.mem.Allocator,
+    reg_set: RegSet,
+    clobbers: []const ClobberPoint,
+    ranges: []const analysis.LiveRange,
+    hints: []const Hint,
+    trace: *AllocationTrace,
+) !AllocResult {
+    return allocateFromRangesWithHintsRematTraced(allocator, reg_set, clobbers, ranges, hints, null, trace);
+}
+
+fn allocateFromRangesWithHintsRematTraced(
+    allocator: std.mem.Allocator,
+    reg_set: RegSet,
+    clobbers: []const ClobberPoint,
+    ranges: []const analysis.LiveRange,
+    hints: []const Hint,
+    remat_candidates: ?*const std.AutoHashMap(ir.VReg, RematDef),
+    trace: ?*AllocationTrace,
+) !AllocResult {
     std.debug.assert(reg_set.alloc_regs.len <= max_alloc_regs);
 
     var assignments = std.AutoHashMap(ir.VReg, Allocation).init(allocator);
@@ -728,6 +806,11 @@ pub fn allocateFromRangesWithHintsRemat(
 
         // Try to find a free register that is safe (not clobbered during this range)
         if (findSafeReg(reg_set, reg_free, range.start, range.end, clobbers, hint_idx)) |reg_idx| {
+            if (trace) |t| {
+                if (isTracedVreg(range.vreg)) {
+                    try snapshotTrace(t, allocator, reg_set, clobbers, range, hint_idx, reg_free, active.items, reg_idx, null, null);
+                }
+            }
             reg_free &= ~(@as(u64, 1) << @intCast(reg_idx));
             try assignments.put(range.vreg, .{ .reg = reg_set.alloc_regs[reg_idx] });
             try insertActive(&active, allocator, .{
@@ -790,6 +873,11 @@ pub fn allocateFromRangesWithHintsRemat(
             }
 
             if (best_evict) |evict_idx| {
+                if (trace) |t| {
+                    if (isTracedVreg(range.vreg) or isTracedVreg(active.items[evict_idx].vreg)) {
+                        try snapshotTrace(t, allocator, reg_set, clobbers, range, hint_idx, reg_free, active.items, active.items[evict_idx].reg_idx, active.items[evict_idx].vreg, spill_slots_used);
+                    }
+                }
                 const evicted = active.orderedRemove(evict_idx);
                 const stolen_reg = evicted.reg_idx;
                 // #542: if the evicted vreg's def is rematerialisable,
@@ -821,6 +909,11 @@ pub fn allocateFromRangesWithHintsRemat(
                     .max_loop_depth = range.max_loop_depth,
                 });
             } else {
+                if (trace) |t| {
+                    if (isTracedVreg(range.vreg)) {
+                        try snapshotTrace(t, allocator, reg_set, clobbers, range, hint_idx, reg_free, active.items, null, null, spill_slots_used);
+                    }
+                }
                 // #542: rematerialise the new interval rather than
                 // spilling it, when its def is cheap to re-emit.
                 if (remat_candidates) |rc| {
@@ -841,6 +934,73 @@ pub fn allocateFromRangesWithHintsRemat(
         .spill_count = spill_slots_used,
         .remat = remat,
     };
+}
+
+fn isTracedVreg(vreg: ir.VReg) bool {
+    return vreg == 200 or vreg == 190;
+}
+
+fn snapshotTrace(
+    trace: *AllocationTrace,
+    allocator: std.mem.Allocator,
+    reg_set: RegSet,
+    clobbers: []const ClobberPoint,
+    range: analysis.LiveRange,
+    hint: ?u8,
+    free: u64,
+    active: []const ActiveInterval,
+    chosen: ?u8,
+    evicted: ?ir.VReg,
+    next_slot: ?u32,
+) !void {
+    var clobbered: u64 = 0;
+    var clobber_count: u32 = 0;
+    for (clobbers) |cp| {
+        if (cp.pos > range.start and cp.pos < range.end) {
+            clobber_count += 1;
+            clobbered |= cp.regs_clobbered;
+        }
+    }
+    const start = trace.competitors.items.len;
+    for (active) |ai| {
+        const safe = regSafeForRange(ai.reg_idx, range.start, range.end, clobbers);
+        try trace.competitors.append(allocator, .{
+            .vreg = ai.vreg,
+            .end = ai.end,
+            .depth = ai.max_loop_depth,
+            .reg = reg_set.alloc_regs[ai.reg_idx],
+            .safe_for_incoming = safe,
+            .eviction_eligible = ai.end > range.end and safe and
+                (range.max_loop_depth < 2 or ai.max_loop_depth <= range.max_loop_depth),
+        });
+    }
+    var safe_regs: u64 = 0;
+    for (reg_set.alloc_regs, 0..) |_, i| {
+        if (regSafeForRange(@intCast(i), range.start, range.end, clobbers)) {
+            safe_regs |= @as(u64, 1) << @intCast(i);
+        }
+    }
+    // This trace is used without rematerialisation. Scalar slots need no
+    // alignment padding; report the exact FP offset about to be allocated.
+    const spill_vreg: ?ir.VReg = if (next_slot != null) evicted orelse range.vreg else null;
+    try trace.events.append(allocator, .{
+        .incoming = range.vreg,
+        .start = range.start,
+        .end = range.end,
+        .depth = range.max_loop_depth,
+        .hint = hint,
+        .spans_clobber = spansClobber(range.start, range.end, clobbers),
+        .clobber_count = clobber_count,
+        .clobbered_regs = clobbered,
+        .free_regs = free,
+        .safe_regs = safe_regs,
+        .chosen_reg = if (chosen) |idx| reg_set.alloc_regs[idx] else null,
+        .evicted = evicted,
+        .spill_vreg = spill_vreg,
+        .spill_offset = if (next_slot) |slot| reg_set.spill_base + @as(i32, @intCast(slot)) * reg_set.spill_stride else null,
+        .competitor_start = start,
+        .competitor_len = trace.competitors.items.len - start,
+    });
 }
 
 /// Post-allocation move coalescing (issue #386).
@@ -1123,6 +1283,74 @@ const test_reg_set: RegSet = .{
     .spill_base = -536,
     .spill_stride = -8,
 };
+
+test "allocation trace records call-constrained competition and exact spill slot" {
+    const allocator = std.testing.allocator;
+    const reg_set: RegSet = .{
+        .alloc_regs = &.{ 19, 0 },
+        .callee_saved_indices = &.{0},
+        .caller_saved_indices = &.{1},
+        .spill_base = 248,
+        .spill_stride = 8,
+    };
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 200, .start = 0, .end = 10, .type = .i64, .max_loop_depth = 2 },
+        .{ .vreg = 190, .start = 1, .end = 8, .type = .i64, .max_loop_depth = 2 },
+    };
+    const clobbers = [_]ClobberPoint{.{ .pos = 5, .regs_clobbered = 0b10 }};
+    for (0..2) |_| {
+        var trace: AllocationTrace = .{};
+        defer trace.deinit(allocator);
+        var result = try allocateFromRangesWithHintsTraced(
+            allocator,
+            reg_set,
+            &clobbers,
+            &ranges,
+            &.{.{ .vreg = 190, .reg_idx = 1 }},
+            &trace,
+        );
+        defer result.deinit();
+        try std.testing.expectEqualDeep(Allocation{ .stack = 248 }, result.get(200).?);
+        try std.testing.expectEqualDeep(Allocation{ .reg = 19 }, result.get(190).?);
+        try std.testing.expectEqual(@as(usize, 2), trace.events.items.len);
+        const event = trace.events.items[1];
+        try std.testing.expectEqual(@as(ir.VReg, 190), event.incoming);
+        try std.testing.expectEqual(@as(?u8, 1), event.hint);
+        try std.testing.expectEqual(@as(u64, 0b01), event.safe_regs);
+        try std.testing.expectEqual(@as(u64, 0b10), event.clobbered_regs);
+        try std.testing.expectEqual(@as(u32, 1), event.clobber_count);
+        try std.testing.expectEqual(@as(?ir.VReg, 200), event.evicted);
+        try std.testing.expectEqual(@as(?i32, 248), event.spill_offset);
+        try std.testing.expectEqual(@as(usize, 1), event.competitor_len);
+        try std.testing.expect(trace.competitors.items[event.competitor_start].eviction_eligible);
+    }
+}
+
+test "allocation trace preserves equal-end no-eviction decision" {
+    const allocator = std.testing.allocator;
+    const reg_set: RegSet = .{
+        .alloc_regs = &.{19},
+        .callee_saved_indices = &.{0},
+        .caller_saved_indices = &.{},
+        .spill_base = 248,
+        .spill_stride = 8,
+    };
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 200, .start = 0, .end = 10, .type = .i64, .max_loop_depth = 1 },
+        .{ .vreg = 190, .start = 1, .end = 10, .type = .i64, .max_loop_depth = 1 },
+    };
+    var trace: AllocationTrace = .{};
+    defer trace.deinit(allocator);
+    var result = try allocateFromRangesWithHintsTraced(allocator, reg_set, &.{}, &ranges, &.{}, &trace);
+    defer result.deinit();
+    try std.testing.expectEqualDeep(Allocation{ .stack = 248 }, result.get(190).?);
+    const event = trace.events.items[1];
+    try std.testing.expectEqual(@as(?ir.VReg, 190), event.spill_vreg);
+    try std.testing.expectEqual(@as(?ir.VReg, null), event.evicted);
+    try std.testing.expectEqual(@as(u64, 0), event.free_regs);
+    try std.testing.expectEqual(@as(u64, 1), event.safe_regs);
+    try std.testing.expect(!trace.competitors.items[event.competitor_start].eviction_eligible);
+}
 
 test "allocate: simple function gets registers" {
     const allocator = std.testing.allocator;
@@ -1774,7 +2002,6 @@ test "allocateFromRangesWithHints: empty hint list behaves like allocateFromRang
     try std.testing.expectEqual(result_a.get(0).?, result_b.get(0).?);
     try std.testing.expectEqual(result_a.get(1).?, result_b.get(1).?);
 }
-
 
 // ── Loop-depth-weighted eviction (issue #382) ───────────────────────────
 
