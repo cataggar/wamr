@@ -50,6 +50,43 @@ def common_category(result, name):
 
 
 class AArch64InstructionProvenanceTests(unittest.TestCase):
+    def test_list_add_compare_without_trap_proof_remains_unknown(self):
+        result = analyze(
+            [
+                "add x17, x15, #0x4",
+                "cmp x17, x16",
+                "b.ls #0x14",
+                "ldr w0, [x20, x15]",
+                "ret",
+                "mov x0, x17",
+                "ret",
+            ],
+            [0, 4],
+            {0: 5129, 4: 194},
+            total=68829,
+        )
+        self.assertEqual(5129, common_category(result, "unknown") - 194)
+        self.assertEqual(0, result["cfg"]["structural_address_guard_branches"])
+
+    def test_list_reference_compare_and_xor_are_not_assumed_address(self):
+        result = analyze(
+            [
+                "and w3, w23, #0xffff",
+                "cmp w2, w3",
+                "b.eq #0x14",
+                "eor w2, w2, w3",
+                "cmp w2, #0",
+                "b.eq #0x1c",
+                "ret",
+                "ret",
+            ],
+            [0, 4, 12, 16],
+            {0: 308, 4: 1318, 12: 894, 16: 83},
+            total=33113,
+        )
+        self.assertEqual(2603, common_category(result, "unknown"))
+        self.assertEqual(0, common_category(result, "address_generation"))
+
     def test_w_and_x_aliases_and_extended_index_are_address_generation(self):
         result = analyze(
             [
