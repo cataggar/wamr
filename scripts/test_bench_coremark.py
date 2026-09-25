@@ -1514,6 +1514,29 @@ Correct operation validated. See README.md for run and reporting rules.
                 with self.assertRaisesRegex(ValueError, "unmatched"):
                     native_benchmark.validate_manifest(manifest, allow_synthetic=True)
 
+    def test_native_measurement_requires_supported_unikraft_sdk(self):
+        manifest = copy.deepcopy(self.manifest)
+        manifest["evidence_kind"] = "measurement"
+        for target in manifest["targets"].values():
+            target["platform"] = {**target["platform"], "cpu_model": "qualified-cpu",
+                                  "azure_sku": "qualified-sku",
+                                  "azure_region": "qualified-region"}
+            target["image_receipt"]["platform"] = copy.deepcopy(target["platform"])
+            target["image_receipt"]["evidence_kind"] = "measurement"
+            target["source"]["commit"] = "d" * 40
+            target["compiler"]["source"]["commit"] = "d" * 40
+            target["image_receipt"]["source"]["commit"] = "d" * 40
+            target["image_receipt"]["compiler"]["source"]["commit"] = "d" * 40
+        with self.assertRaisesRegex(ValueError, "unsupported Unikraft native SDK commit"):
+            native_benchmark.validate_manifest(manifest)
+        for target in manifest["targets"].values():
+            target["source"]["commit"] = native_benchmark.UNIKRAFT_NATIVE_SDK_COMMIT
+            target["compiler"]["source"]["commit"] = native_benchmark.UNIKRAFT_NATIVE_SDK_COMMIT
+            target["image_receipt"]["source"]["commit"] = native_benchmark.UNIKRAFT_NATIVE_SDK_COMMIT
+            target["image_receipt"]["compiler"]["source"]["commit"] = (
+                native_benchmark.UNIKRAFT_NATIVE_SDK_COMMIT)
+        native_benchmark.validate_manifest(manifest)
+
     def test_native_plan_checks_exact_image_bytes_and_receipt(self):
         image = Path(self.config["targets"]["unikraft"]["image_path"])
         image.write_bytes(b"changed synthetic image")
