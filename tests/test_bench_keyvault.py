@@ -430,8 +430,15 @@ class KeyvaultHarnessTest(unittest.TestCase):
         reference = {key: value for key, value in bench.tree_snapshot(reference_dir).items()
                      if key in ("sha256", "file_count", "total_bytes", "files")}
         reference["sha256_tree"] = reference.pop("sha256")
+        read_text = Path.read_text
+        def controlled_read_text(path, *args, **kwargs):
+            if str(path) == "/proc/sys/kernel/perf_event_paranoid":
+                return "2"
+            return read_text(path, *args, **kwargs)
         with mock.patch.object(bench, "_run_checked", side_effect=run), (
             mock.patch.object(bench.shutil, "which", return_value="/usr/bin/tool")
+        ), (
+            mock.patch.object(Path, "read_text", controlled_read_text)
         ):
             report = bench.run_perf(config, self.scratch, artifacts / "keyvault.cwasm.json",
                                     artifacts / "keyvault.wasmtime.cwasm", 10, reference)
