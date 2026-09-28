@@ -4,7 +4,7 @@ This harness supplies the threaded performance evidence required before #963
 adds more AOT cancellation polls. It runs checked-in, deterministic core-Wasm
 fixtures through the interpreter and AOT on x86_64 and AArch64.
 
-## v21 duration-cross diagnostic
+## Duration-cross diagnostic (plan v21)
 
 The v21 duration-cross path is a separate, non-authoritative diagnostic for
 issue #966. It does not change the `wasi-thread-benchmark` report, its schema,
@@ -46,12 +46,18 @@ counters) is pinned there.
 Missing sensors are recorded as
 unavailable and never cause retry, replacement, or exclusion.
 
+The `wasi-thread-duration-cross-966-v21` campaign stopped after its first
+workflow failed before measurement. Do not rerun it or reuse its tag or cohort
+ID; a subsequent campaign needs a newly audited source, immutable tag, and
+predeclared plan. The workflow executes the harness test script directly so
+Python does not interpret an absolute filename as a `unittest` module name.
+
 Create the immutable 20-workflow/40-report plan without dispatching:
 
 ```sh
 python3 scripts/wasi_thread_duration_cross_cohort.py plan \
   --source-sha "$SOURCE_SHA" \
-  --workflow-ref wasi-thread-duration-cross-966-v21 \
+  --workflow-ref "$DIAGNOSTIC_TAG" \
   --output /d/wasi-thread-duration-cross-dispatch.json
 ```
 
