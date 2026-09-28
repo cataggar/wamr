@@ -1472,6 +1472,10 @@ class DurationCrossCohortTests(unittest.TestCase):
         self.assertIn("cancel-in-progress: false", workflow)
         self.assertIn("needs: x86", workflow)
         self.assertIn("runs-on: wamr-temp-20260906", workflow)
+        self.assertIn(
+            'run: python3 "$ROOT/source/scripts/test_wasi_thread_duration_cross.py"',
+            workflow,
+        )
         self.assertIn("Neoverse-N2", workflow)
         self.assertNotIn("mlugg/setup-zig", workflow)
         self.assertIn("zig-x86_64-linux-0.16.0.tar.xz", workflow)

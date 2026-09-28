@@ -101,9 +101,7 @@ jobs:
           rm -- "$ARCHIVE"
 
       - name: Test diagnostic harness
-        run: >-
-          python3 -m unittest
-          "$ROOT/source/scripts/test_wasi_thread_duration_cross.py"
+        run: python3 "$ROOT/source/scripts/test_wasi_thread_duration_cross.py"
 
       - name: Run x86 duration-cross report
         env:
