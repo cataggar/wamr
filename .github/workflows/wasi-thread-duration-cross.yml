@@ -1,7 +1,7 @@
 name: WASI thread duration-cross diagnostic
 run-name: >-
   WASI thread duration-cross ${{ inputs.cohort_id }}-${{
-  inputs.report_sequence }}-${{ inputs.partition }}
+  inputs.report_sequence }}-${{ inputs.preflight_only && 'readiness' || inputs.partition }}
 
 on:
   workflow_dispatch:
@@ -20,6 +20,10 @@ on:
         type: choice
         options: [training, holdout]
         required: true
+      preflight_only:
+        description: "One-shot x86 gate readiness; collect no benchmark report"
+        type: boolean
+        default: false
 
 concurrency:
   group: wasi-thread-duration-cross-diagnostic
@@ -49,6 +53,7 @@ jobs:
           COHORT_ID: ${{ inputs.cohort_id }}
           REPORT_SEQUENCE: ${{ inputs.report_sequence }}
           PARTITION: ${{ inputs.partition }}
+          PREFLIGHT_ONLY: ${{ inputs.preflight_only }}
         run: |
           set -euo pipefail
           case "$ROOT:$HOME:$TMPDIR:$XDG_CACHE_HOME:$ZIG_GLOBAL_CACHE_DIR:$ZIG_LOCAL_CACHE_DIR" in
@@ -56,6 +61,7 @@ jobs:
             *) echo "all diagnostic paths must remain under /d" >&2; exit 2 ;;
           esac
           test "$RUNNER_NAME" = vm31e-wamr-temp-20260906
+          test "$GITHUB_RUN_ATTEMPT" = 1
           test "$(find /proc/[0-9]*/comm -type f -exec cat {} \; 2>/dev/null | grep -c '^Runner.Worker$')" = 1
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$COHORT_ID" =~ ^[0-9a-f]{32}$ ]]
@@ -63,6 +69,10 @@ jobs:
           EXPECTED_PARTITION=training
           (( REPORT_SEQUENCE >= 17 )) && EXPECTED_PARTITION=holdout
           test "$PARTITION" = "$EXPECTED_PARTITION"
+          if [ "$PREFLIGHT_ONLY" = true ]; then
+            test "$REPORT_SEQUENCE" = 1
+            test "$PARTITION" = training
+          fi
           [[ "$GITHUB_REF" =~ ^refs/tags/wasi-thread-duration-cross-[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
           test "$GITHUB_SHA" = "$SOURCE_SHA"
           mkdir -p "$ROOT"/{home,tmp,xdg-cache,zig-global-cache,zig-local-cache,zig,output,source}
@@ -104,6 +114,7 @@ jobs:
         run: python3 "$ROOT/source/scripts/test_wasi_thread_duration_cross.py"
 
       - name: Run x86 duration-cross report
+        if: ${{ !inputs.preflight_only }}
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
           COHORT_ID: ${{ inputs.cohort_id }}
@@ -122,14 +133,45 @@ jobs:
             --timeout 180
           cat "$ROOT/output/report.md" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Run x86 gate-readiness probe
+        if: ${{ inputs.preflight_only }}
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          COHORT_ID: ${{ inputs.cohort_id }}
+        run: |
+          set -euo pipefail
+          python3 "$ROOT/source/scripts/wasi_thread_duration_cross.py" \
+            --repo "$ROOT/source" \
+            --output-dir "$ROOT/output" \
+            --source-sha "$SOURCE_SHA" \
+            --platform-id ubuntu-22.04-x86_64 \
+            --report-sequence 1 \
+            --cohort-id "$COHORT_ID" \
+            --runner-environment self-hosted \
+            --host-pair-id "github:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}:ubuntu-22.04-x86_64" \
+            --timeout 180 \
+            --preflight-only
+          cat "$ROOT/output/preflight-readiness.md" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload x86 diagnostic report
-        if: always()
+        if: ${{ always() && !inputs.preflight_only }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: wasi-thread-duration-cross-ubuntu-22.04-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86/output/report.json
             /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86/output/report.md
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Retain x86 gate-readiness result
+        if: ${{ success() && inputs.preflight_only }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wasi-thread-duration-cross-readiness-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86/output/preflight-readiness.json
+            /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86/output/preflight-readiness.md
           if-no-files-found: error
           retention-days: 90
 
@@ -157,6 +199,7 @@ jobs:
   arm:
     name: Neoverse-N2 duration-cross
     needs: x86
+    if: ${{ !inputs.preflight_only }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 720
     permissions:
