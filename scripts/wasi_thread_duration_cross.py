@@ -36,6 +36,7 @@ from bench_wasi_threads import (
     MASK64,
     PAIR_EXECUTION_POLICY,
     PILOT_CLOCK_RESOLUTION_MINIMUM_NS,
+    PreflightProbeError,
     REVISION_ARTIFACT_POLICY,
     REVISION_ROLES,
     SIZING_SIGNIFICANT_DIGITS,
@@ -1724,6 +1725,76 @@ def render_markdown(document: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def checked_trusted_barrier_preflight(
+    *,
+    output: Path,
+    source: dict[str, Any],
+    platform_id: str,
+    report_sequence: int,
+    cohort_id: str,
+    **probe: Any,
+) -> dict[str, Any]:
+    def fail(
+        reason: str,
+        message: str,
+        samples: list[dict[str, Any]],
+        scenario: dict[str, Any],
+        summary: dict[str, Any] | None,
+    ) -> None:
+        document = {
+            "schema_version": 1,
+            "kind": "wasi-thread-duration-cross-preflight-failure",
+            "collected_at": collected_at(),
+            "source_sha": source["commit"],
+            "platform_id": platform_id,
+            "report_sequence": report_sequence,
+            "cohort_id": cohort_id,
+            "workflow_run_id": os.getenv("GITHUB_RUN_ID", ""),
+            "workflow_run_attempt": os.getenv("GITHUB_RUN_ATTEMPT", ""),
+            "reason": reason,
+            "message": message,
+            "scenario": scenario,
+            "minimum_timed_interval_ns": probe["minimum_interval_ns"],
+            "summary": summary,
+            "samples": samples,
+        }
+        atomic_write_json(output / "failure-diagnostic.json", document)
+        (output / "failure-diagnostic.md").write_text(
+            "# Duration-cross scheduler/barrier preflight failure\n\n"
+            f"- Reason: `{reason}`\n"
+            f"- Source: `{source['commit']}`\n"
+            f"- Sequence: `{report_sequence}`\n"
+            f"- Details: {message}\n"
+            f"- Retained probes: {len(samples)} (`failure-diagnostic.json`)\n",
+            encoding="UTF-8",
+        )
+
+    try:
+        result = run_trusted_barrier_preflight(**probe)
+    except PreflightProbeError as exc:
+        fail("probe-execution-failure", str(exc), exc.samples, exc.scenario, None)
+        raise
+    if result["status"] != "passed":
+        failed = next(sample for sample in result["samples"] if not sample["accepted"])
+        message = (
+            "trusted scheduler/barrier preflight failed: "
+            f"{failed['threads']} threads, probe {failed['probe_index']}, "
+            f"barrier {failed['timing_overhead_ns']} ns, "
+            f"timed interval {failed['timed_interval_ns']} ns, "
+            f"minimum {result['minimum_timed_interval_ns']} ns, "
+            f"maximum barrier {result['maximum_accepted_barrier_ns']} ns"
+        )
+        fail(
+            "timing-quality",
+            message,
+            result["samples"],
+            {"threads": failed["threads"], "probe_index": failed["probe_index"]},
+            result["summary"],
+        )
+        raise HarnessError(message)
+    return result
+
+
 def execute(args: argparse.Namespace) -> dict[str, Any]:
     missing = [
         name
@@ -1753,7 +1824,12 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     if not str(output).startswith("/d/") and os.getenv("GITHUB_ACTIONS") == "true":
         raise HarnessError("GitHub duration-cross output must remain under /d")
     output.mkdir(parents=True, exist_ok=True)
-    for stale in (output / "report.json", output / "report.md"):
+    for stale in (
+        output / "report.json",
+        output / "report.md",
+        output / "failure-diagnostic.json",
+        output / "failure-diagnostic.md",
+    ):
         stale.unlink(missing_ok=True)
     source = source_identity(repo)
     if args.source_sha and source["commit"] != args.source_sha:
@@ -1870,7 +1946,12 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     plan["pilots"] = pilot_records
     plan["runtime_admission"] = admission
 
-    quality_preflight = run_trusted_barrier_preflight(
+    quality_preflight = checked_trusted_barrier_preflight(
+        output=output,
+        source=source,
+        platform_id=args.platform_id,
+        report_sequence=args.report_sequence,
+        cohort_id=args.cohort_id,
         repo=repo,
         runner=runner,
         cpu_placement=cpu_placement,
@@ -1892,8 +1973,6 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             "cancel_poll_static"
         ]["sites_enabled"],
     )
-    if quality_preflight["status"] != "passed":
-        raise HarnessError("trusted scheduler/barrier preflight failed")
     for index in range(ATOMIC_WAIT_PREFLIGHT_RUNS["authoritative"]):
         measured_with_telemetry(
             context=context,

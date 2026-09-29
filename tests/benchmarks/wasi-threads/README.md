@@ -51,6 +51,12 @@ workflow failed before measurement. Do not rerun it or reuse its tag or cohort
 ID; a subsequent campaign needs a newly audited source, immutable tag, and
 predeclared plan. The workflow executes the harness test script directly so
 Python does not interpret an absolute filename as a `unittest` module name.
+The separate v22 campaign also stopped at its first workflow: its trusted
+scheduler/barrier preflight rejected timing quality after the pilots. Neither
+campaign produced a diagnostic report or can be resumed. Future failed
+scheduler/barrier preflights retain their exact probe samples in a separate
+failure artifact before run-scoped cleanup; this does not relax the quality
+gate, make the failed run eligible for a cohort, or authorize another campaign.
 
 Create the immutable 20-workflow/40-report plan without dispatching:
 

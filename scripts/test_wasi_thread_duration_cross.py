@@ -5,8 +5,10 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
 import shutil
 import sys
+import tempfile
 import unittest
 import uuid
 import zipfile
@@ -20,6 +22,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from benchmark_schema import BenchmarkDataError, cache_key, sha256_file  # noqa: E402
 from bench_wasi_threads import (  # noqa: E402
     HarnessError,
+    PreflightProbeError,
     cpu_affinity_for,
     cpu_placement_from_topology,
     expected_guest_clock_id,
@@ -773,6 +776,95 @@ def replace_retained_report(
 
 
 class DurationCrossReportTests(unittest.TestCase):
+    def test_failed_barrier_preflight_retains_exact_probe_evidence(self) -> None:
+        samples = [
+            {
+                "threads": 2,
+                "probe_index": 0,
+                "accepted": True,
+                "timing_overhead_ns": 100,
+                "timed_interval_ns": 1_300_000_000,
+            },
+            {
+                "threads": 8,
+                "probe_index": 3,
+                "accepted": False,
+                "timing_overhead_ns": 13_000_000,
+                "timed_interval_ns": 1_300_000_000,
+            },
+        ]
+        result = {
+            "status": "failed",
+            "samples": samples,
+            "summary": {"maximum_barrier_ns": 13_000_000},
+            "minimum_timed_interval_ns": 1_250_000_000,
+            "maximum_accepted_barrier_ns": 12_626_262,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            with mock.patch.object(duration, "run_trusted_barrier_preflight", return_value=result):
+                with mock.patch.dict(os.environ, {"GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}):
+                    with self.assertRaisesRegex(HarnessError, "13000000"):
+                        duration.checked_trusted_barrier_preflight(
+                            output=output,
+                            source={"commit": SHA},
+                            platform_id="ubuntu-22.04-x86_64",
+                            report_sequence=1,
+                            cohort_id=COHORT_ID,
+                            minimum_interval_ns=1_250_000_000,
+                        )
+            evidence = json.loads((output / "failure-diagnostic.json").read_text())
+            self.assertEqual(evidence["reason"], "timing-quality")
+            self.assertEqual(evidence["source_sha"], SHA)
+            self.assertEqual(evidence["cohort_id"], COHORT_ID)
+            self.assertEqual(evidence["workflow_run_attempt"], "1")
+            self.assertEqual(evidence["samples"], samples)
+            self.assertEqual(evidence["summary"], result["summary"])
+            self.assertIn("8 threads, probe 3", evidence["message"])
+            self.assertTrue((output / "failure-diagnostic.md").is_file())
+            self.assertFalse((output / "report.json").exists())
+
+    def test_probe_exception_retains_partial_evidence_and_propagates(self) -> None:
+        sample = {"threads": 2, "probe_index": 0, "accepted": True}
+        error = PreflightProbeError(
+            "probe failed", samples=[sample], scenario={"threads": 8, "probe_index": 1}
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            with mock.patch.object(duration, "run_trusted_barrier_preflight", side_effect=error):
+                with self.assertRaises(PreflightProbeError):
+                    duration.checked_trusted_barrier_preflight(
+                        output=output,
+                        source={"commit": SHA},
+                        platform_id="ubuntu-22.04-x86_64",
+                        report_sequence=1,
+                        cohort_id=COHORT_ID,
+                        minimum_interval_ns=1_250_000_000,
+                    )
+            evidence = json.loads((output / "failure-diagnostic.json").read_text())
+            self.assertEqual(evidence["reason"], "probe-execution-failure")
+            self.assertEqual(evidence["samples"], [sample])
+            self.assertEqual(evidence["scenario"], error.scenario)
+            self.assertFalse((output / "report.json").exists())
+
+    def test_passed_barrier_preflight_has_no_failure_artifact(self) -> None:
+        result = {"status": "passed", "samples": [{"accepted": True}]}
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            with mock.patch.object(duration, "run_trusted_barrier_preflight", return_value=result):
+                self.assertIs(
+                    duration.checked_trusted_barrier_preflight(
+                        output=output,
+                        source={"commit": SHA},
+                        platform_id="ubuntu-22.04-x86_64",
+                        report_sequence=1,
+                        cohort_id=COHORT_ID,
+                        minimum_interval_ns=1_250_000_000,
+                    ),
+                    result,
+                )
+            self.assertFalse((output / "failure-diagnostic.json").exists())
+
     def test_exact_cells_targets_and_identity_are_isolated(self) -> None:
         self.assertEqual(len(duration.X86_CELLS), 11)
         self.assertEqual(len(duration.ARM_CELLS), 3)
@@ -1476,6 +1568,9 @@ class DurationCrossCohortTests(unittest.TestCase):
             'run: python3 "$ROOT/source/scripts/test_wasi_thread_duration_cross.py"',
             workflow,
         )
+        self.assertIn("Retain x86 preflight failure evidence", workflow)
+        self.assertIn("Retain Arm preflight failure evidence", workflow)
+        self.assertIn("if-no-files-found: ignore", workflow)
         self.assertIn("Neoverse-N2", workflow)
         self.assertNotIn("mlugg/setup-zig", workflow)
         self.assertIn("zig-x86_64-linux-0.16.0.tar.xz", workflow)

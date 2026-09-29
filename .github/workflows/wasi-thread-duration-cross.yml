@@ -133,6 +133,17 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+      - name: Retain x86 preflight failure evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wasi-thread-duration-cross-failure-x86-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86/output/failure-diagnostic.json
+            /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86/output/failure-diagnostic.md
+          if-no-files-found: ignore
+          retention-days: 90
+
       - name: Clean run-scoped files
         if: always()
         run: |
@@ -242,6 +253,17 @@ jobs:
             /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-arm/output/report.json
             /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-arm/output/report.md
           if-no-files-found: error
+          retention-days: 90
+
+      - name: Retain Arm preflight failure evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wasi-thread-duration-cross-failure-arm-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-arm/output/failure-diagnostic.json
+            /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-arm/output/failure-diagnostic.md
+          if-no-files-found: ignore
           retention-days: 90
 
       - name: Clean run-scoped files
