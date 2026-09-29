@@ -776,6 +776,45 @@ def replace_retained_report(
 
 
 class DurationCrossReportTests(unittest.TestCase):
+    def test_arm_readiness_result_has_no_cohort_or_report(self) -> None:
+        source = {"commit": SHA}
+        plan = duration.build_plan("ubuntu-24.04-aarch64", 1, source)
+        preflight = {
+            "status": "passed",
+            "probe_count": 12,
+            "samples": [{"threads": 4, "accepted": True}],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            result = duration.write_preflight_readiness(
+                output=output,
+                source_sha=SHA,
+                platform_id="ubuntu-24.04-aarch64",
+                report_sequence=1,
+                cohort_id=COHORT_ID,
+                host={"cpu": "Neoverse-N2"},
+                quiescence={"runner_worker_process_count": 1},
+                cpu_placement={"assigned": [0, 1]},
+                hashes={"aot": DIGEST},
+                fixture_set_sha256=DIGEST,
+                plan=plan,
+                counts={"cell": {"aot": 1}},
+                admission={"accepted": True},
+                pilot_count=6,
+                quality_preflight=preflight,
+            )
+            self.assertEqual(result["platform_id"], "ubuntu-24.04-aarch64")
+            self.assertEqual(result["pilot_count"], 6)
+            self.assertEqual(result["quality_preflight"], preflight)
+            self.assertEqual(result["benchmark_observations"], 0)
+            self.assertFalse(result["cohort_eligible"])
+            self.assertIsNone(result["production_budget"])
+            self.assertIn(
+                "ubuntu-24.04-aarch64",
+                (output / "preflight-readiness.md").read_text(),
+            )
+            self.assertFalse((output / "report.json").exists())
+
     def test_hot_preflight_count_has_fixed_workload_floor(self) -> None:
         counts_by_thread = {
             1: 3_260_000_000,
@@ -1676,6 +1715,11 @@ class DurationCrossCohortTests(unittest.TestCase):
         self.assertIn("if: ${{ !inputs.preflight_only }}", workflow)
         self.assertIn("if: ${{ success() && inputs.preflight_only }}", workflow)
         self.assertIn("--preflight-only", workflow)
+        self.assertIn("preflight_platform:", workflow)
+        self.assertIn("needs.x86.result == 'skipped'", workflow)
+        self.assertIn("name: Run Arm gate-readiness probe", workflow)
+        self.assertIn("name: Retain Arm gate-readiness result", workflow)
+        self.assertIn("wasi-thread-duration-cross-readiness-arm-", workflow)
         self.assertIn("Neoverse-N2", workflow)
         self.assertNotIn("mlugg/setup-zig", workflow)
         self.assertIn("zig-x86_64-linux-0.16.0.tar.xz", workflow)
