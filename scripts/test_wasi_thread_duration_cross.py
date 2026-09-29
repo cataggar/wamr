@@ -776,6 +776,49 @@ def replace_retained_report(
 
 
 class DurationCrossReportTests(unittest.TestCase):
+    def test_hot_preflight_count_has_fixed_workload_floor(self) -> None:
+        counts_by_thread = {
+            1: 3_260_000_000,
+            2: 681_000_000,
+            4: 151_000_000,
+            8: 1_560_000_000,
+        }
+        expected = {
+            "1": 3_260_000_000,
+            "2": 1_800_000_000,
+            "4": 900_000_000,
+            "8": 1_560_000_000,
+        }
+        for platform in duration.PLATFORM_CELLS:
+            with self.subTest(platform=platform):
+                plan = duration.build_plan(platform, 1, {"commit": SHA})
+                counts = {
+                    cell["pair_key"]: {
+                        condition: counts_by_thread[cell["threads"]]
+                        for condition in (cell["left"], cell["right"])
+                    }
+                    for cell in plan["cells"]
+                }
+                actual = duration.barrier_preflight_counts(
+                    plan, counts, tuple(sorted({cell["threads"] for cell in plan["cells"]}))
+                )
+                self.assertEqual(actual, {
+                    key: value for key, value in expected.items()
+                    if int(key) in {cell["threads"] for cell in plan["cells"]}
+                })
+                self.assertEqual(
+                    plan["barrier_preflight_sizing"]["count_rule"],
+                    "max(selected-cell-count, fixed-aot-hot-pilot-count)",
+                )
+                self.assertEqual(
+                    plan["barrier_preflight_sizing"]["minimum_timed_interval_ns"],
+                    1_250_000_000,
+                )
+                self.assertEqual(plan["barrier_preflight_sizing"]["retries"], 0)
+                self.assertEqual(
+                    actual["4"] * 4, 3_600_000_000
+                )
+
     def test_readiness_result_is_non_authoritative_and_has_no_report(self) -> None:
         source = {"commit": SHA}
         plan = duration.build_plan("ubuntu-22.04-x86_64", 1, source)

@@ -391,6 +391,15 @@ def build_plan(platform_id: str, sequence: int, source: dict[str, str]) -> dict[
             "adaptation": "forbidden-after-first-measured-invocation",
             "doubled_admission": "fail-if-exactly-two-times-current-is-not-admitted",
         },
+        "barrier_preflight_sizing": {
+            "probe_workload": "hot",
+            "count_rule": "max(selected-cell-count, fixed-aot-hot-pilot-count)",
+            "fixed_hot_pilot_counts": copy.deepcopy(
+                DEFAULT_PILOT_ITERATION_PLAN["aot"]["hot"]
+            ),
+            "minimum_timed_interval_ns": MINIMUM_INTERVAL_NS,
+            "retries": 0,
+        },
         "telemetry": copy.deepcopy(TELEMETRY_POLICY),
         "cells": cells,
         "acceptance_checks": acceptance_checks_for_platform(platform_id),
@@ -1795,6 +1804,27 @@ def checked_trusted_barrier_preflight(
     return result
 
 
+def barrier_preflight_counts(
+    plan: dict[str, Any],
+    counts: dict[str, dict[str, int]],
+    thread_counts: tuple[int, ...],
+) -> dict[str, int]:
+    result = {}
+    for threads in thread_counts:
+        selected = [
+            counts[cell["pair_key"]][condition]
+            for cell in plan["cells"]
+            if cell["threads"] == threads
+            for condition in (cell["left"], cell["right"])
+        ]
+        require(bool(selected), f"no selected cells for {threads}-thread preflight")
+        result[str(threads)] = max(
+            max(selected),
+            DEFAULT_PILOT_ITERATION_PLAN["aot"]["hot"][str(threads)],
+        )
+    return result
+
+
 def write_preflight_readiness(
     *,
     output: Path,
@@ -2022,15 +2052,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         build=builds["enabled-aot"],
         module=aot_artifacts["threaded-polls-on"],
         thread_counts=thread_counts,
-        iterations_by_thread={
-            str(threads): max(
-                counts[cell["pair_key"]][condition]
-                for cell in plan["cells"]
-                for condition in (cell["left"], cell["right"])
-                if cell["threads"] == threads
-            )
-            for threads in thread_counts
-        },
+        iterations_by_thread=barrier_preflight_counts(plan, counts, thread_counts),
         timeout=args.timeout,
         minimum_interval_ns=int(args.min_interval_ms * 1_000_000),
         static_cancel_poll_sites=context["aot_artifacts_metadata"][
