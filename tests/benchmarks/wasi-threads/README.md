@@ -58,6 +58,17 @@ scheduler/barrier preflights retain their exact probe samples in a separate
 failure artifact before run-scoped cleanup; this does not relax the quality
 gate, make the failed run eligible for a cohort, or authorize another campaign.
 
+For a separate, one-shot trusted x86 gate-readiness check, manually dispatch
+the diagnostic workflow from a fresh audited tag with `preflight_only=true`,
+`report_sequence=1`, and `partition=training`. Use a new 32-character cohort
+identifier that has never appeared in a failed or full campaign. This path
+runs the same fixture builds, frozen sizing pilots, and trusted scheduler/barrier
+probes, then stops: it records a separate `preflight-readiness.json` on success
+or the failure diagnostic on rejection. It never runs the warmups/measurements,
+uploads a duration-cross report, schedules Arm, or contributes to any cohort.
+A passing x86 probe does not establish Arm readiness or authorize a full
+20-workflow cohort; all retries and replacements remain forbidden.
+
 Create the immutable 20-workflow/40-report plan without dispatching:
 
 ```sh

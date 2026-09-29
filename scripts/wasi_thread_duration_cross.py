@@ -1795,6 +1795,63 @@ def checked_trusted_barrier_preflight(
     return result
 
 
+def write_preflight_readiness(
+    *,
+    output: Path,
+    source_sha: str,
+    platform_id: str,
+    report_sequence: int,
+    cohort_id: str,
+    host: dict[str, Any],
+    quiescence: dict[str, Any],
+    cpu_placement: dict[str, Any],
+    hashes: dict[str, Any],
+    fixture_set_sha256: str,
+    plan: dict[str, Any],
+    counts: dict[str, Any],
+    admission: dict[str, Any],
+    pilot_count: int,
+    quality_preflight: dict[str, Any],
+) -> dict[str, Any]:
+    require(quality_preflight["status"] == "passed", "readiness gate did not pass")
+    readiness = {
+        "schema_version": 1,
+        "kind": "wasi-thread-duration-cross-preflight-readiness",
+        "authoritative": False,
+        "production_budget": None,
+        "collected_at": collected_at(),
+        "source_sha": source_sha,
+        "platform_id": platform_id,
+        "report_sequence": report_sequence,
+        "cohort_id": cohort_id,
+        "workflow_run_id": os.getenv("GITHUB_RUN_ID", ""),
+        "workflow_run_attempt": os.getenv("GITHUB_RUN_ATTEMPT", ""),
+        "host": host,
+        "host_quiescence_at_start": quiescence,
+        "cpu_placement": cpu_placement,
+        "artifact_identity": hashes,
+        "fixture_set_sha256": fixture_set_sha256,
+        "plan_identity_sha256": plan_identity(plan),
+        "resolved_counts": counts,
+        "runtime_admission": admission,
+        "pilot_count": pilot_count,
+        "quality_preflight": quality_preflight,
+        "benchmark_observations": 0,
+        "cohort_eligible": False,
+    }
+    atomic_write_json(output / "preflight-readiness.json", readiness)
+    (output / "preflight-readiness.md").write_text(
+        "# Duration-cross x86 gate readiness (non-authoritative)\n\n"
+        f"- Source: `{source_sha}`\n"
+        f"- Sequence: `{report_sequence}`\n"
+        f"- Preflight: `{quality_preflight['status']}` with "
+        f"{quality_preflight['probe_count']} retained probes\n"
+        "- Benchmark observations: 0; no full cohort was dispatched.\n",
+        encoding="UTF-8",
+    )
+    return readiness
+
+
 def execute(args: argparse.Namespace) -> dict[str, Any]:
     missing = [
         name
@@ -1827,10 +1884,17 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     for stale in (
         output / "report.json",
         output / "report.md",
+        output / "preflight-readiness.json",
+        output / "preflight-readiness.md",
         output / "failure-diagnostic.json",
         output / "failure-diagnostic.md",
     ):
         stale.unlink(missing_ok=True)
+    if args.preflight_only and (
+        args.platform_id != "ubuntu-22.04-x86_64"
+        or args.report_sequence != 1
+    ):
+        raise HarnessError("readiness-only probe is restricted to x86 sequence 1")
     source = source_identity(repo)
     if args.source_sha and source["commit"] != args.source_sha:
         raise HarnessError(
@@ -1973,6 +2037,24 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             "cancel_poll_static"
         ]["sites_enabled"],
     )
+    if args.preflight_only:
+        return write_preflight_readiness(
+            output=output,
+            source_sha=source["commit"],
+            platform_id=args.platform_id,
+            report_sequence=args.report_sequence,
+            cohort_id=args.cohort_id,
+            host=host,
+            quiescence=quiescence,
+            cpu_placement=cpu_placement,
+            hashes=hashes,
+            fixture_set_sha256=fixture_set_sha256,
+            plan=plan,
+            counts=counts,
+            admission=admission,
+            pilot_count=len(pilot_records),
+            quality_preflight=quality_preflight,
+        )
     for index in range(ATOMIC_WAIT_PREFLIGHT_RUNS["authoritative"]):
         measured_with_telemetry(
             context=context,
@@ -2156,6 +2238,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--aot-target", choices=("x86_64", "aarch64"))
     parser.add_argument("--runner", default="")
     parser.add_argument("--rebuild", action="store_true")
+    parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument(
         "--validate-report",
         type=Path,
@@ -2172,7 +2255,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"validated {args.validate_report}")
             return 0
         document = execute(args)
-        print(render_markdown(document))
+        if args.preflight_only:
+            print("readiness-only preflight passed; no benchmark report was collected")
+        else:
+            print(render_markdown(document))
         return 0
     except (
         BenchmarkDataError,

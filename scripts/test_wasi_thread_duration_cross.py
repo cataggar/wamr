@@ -776,6 +776,62 @@ def replace_retained_report(
 
 
 class DurationCrossReportTests(unittest.TestCase):
+    def test_readiness_result_is_non_authoritative_and_has_no_report(self) -> None:
+        source = {"commit": SHA}
+        plan = duration.build_plan("ubuntu-22.04-x86_64", 1, source)
+        preflight = {
+            "status": "passed",
+            "probe_count": 16,
+            "samples": [{"threads": 8, "accepted": True}],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            result = duration.write_preflight_readiness(
+                output=output,
+                source_sha=SHA,
+                platform_id="ubuntu-22.04-x86_64",
+                report_sequence=1,
+                cohort_id=COHORT_ID,
+                host={"runner_name": "trusted"},
+                quiescence={"runner_worker_process_count": 1},
+                cpu_placement={"assigned": [0, 1]},
+                hashes={"aot": DIGEST},
+                fixture_set_sha256=DIGEST,
+                plan=plan,
+                counts={"cell": {"aot": 1}},
+                admission={"accepted": True},
+                pilot_count=22,
+                quality_preflight=preflight,
+            )
+            self.assertEqual(result, json.loads((output / "preflight-readiness.json").read_text()))
+            self.assertEqual(result["quality_preflight"], preflight)
+            self.assertEqual(result["benchmark_observations"], 0)
+            self.assertFalse(result["authoritative"])
+            self.assertFalse(result["cohort_eligible"])
+            self.assertIsNone(result["production_budget"])
+            self.assertEqual(result["plan_identity_sha256"], duration.plan_identity(plan))
+            self.assertTrue((output / "preflight-readiness.md").is_file())
+            self.assertFalse((output / "report.json").exists())
+
+            with self.assertRaises(BenchmarkDataError):
+                duration.write_preflight_readiness(
+                    output=output,
+                    source_sha=SHA,
+                    platform_id="ubuntu-22.04-x86_64",
+                    report_sequence=1,
+                    cohort_id=COHORT_ID,
+                    host={},
+                    quiescence={},
+                    cpu_placement={},
+                    hashes={},
+                    fixture_set_sha256=DIGEST,
+                    plan=plan,
+                    counts={},
+                    admission={},
+                    pilot_count=0,
+                    quality_preflight={"status": "failed"},
+                )
+
     def test_failed_barrier_preflight_retains_exact_probe_evidence(self) -> None:
         samples = [
             {
@@ -1571,6 +1627,12 @@ class DurationCrossCohortTests(unittest.TestCase):
         self.assertIn("Retain x86 preflight failure evidence", workflow)
         self.assertIn("Retain Arm preflight failure evidence", workflow)
         self.assertIn("if-no-files-found: ignore", workflow)
+        self.assertIn("preflight_only:", workflow)
+        self.assertIn("name: Run x86 gate-readiness probe", workflow)
+        self.assertIn("name: Retain x86 gate-readiness result", workflow)
+        self.assertIn("if: ${{ !inputs.preflight_only }}", workflow)
+        self.assertIn("if: ${{ success() && inputs.preflight_only }}", workflow)
+        self.assertIn("--preflight-only", workflow)
         self.assertIn("Neoverse-N2", workflow)
         self.assertNotIn("mlugg/setup-zig", workflow)
         self.assertIn("zig-x86_64-linux-0.16.0.tar.xz", workflow)
