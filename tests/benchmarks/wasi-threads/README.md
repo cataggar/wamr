@@ -68,6 +68,15 @@ or the failure diagnostic on rejection. It never runs the warmups/measurements,
 uploads a duration-cross report, schedules Arm, or contributes to any cohort.
 A passing x86 probe does not establish Arm readiness or authorize a full
 20-workflow cohort; all retries and replacements remain forbidden.
+The first readiness probe rejected all four 4-thread hot intervals (0.978–1.077
+seconds) against the unchanged 1.25-second minimum; its barrier overhead was
+well within the unchanged limit. That probe used a count sized for an atomic
+cell despite running the hot workload. Subsequent, separately tagged source
+revisions floor each scheduler/barrier *hot* probe count at the existing fixed
+AOT hot-pilot count for its thread width. This changes only probe sizing, not
+the production measurement counts, acceptance thresholds, or retry policy;
+another one-shot readiness run must establish the result before considering
+any full cohort.
 
 Create the immutable 20-workflow/40-report plan without dispatching:
 
