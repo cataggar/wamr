@@ -1871,7 +1871,7 @@ def write_preflight_readiness(
     }
     atomic_write_json(output / "preflight-readiness.json", readiness)
     (output / "preflight-readiness.md").write_text(
-        "# Duration-cross x86 gate readiness (non-authoritative)\n\n"
+        f"# Duration-cross {platform_id} gate readiness (non-authoritative)\n\n"
         f"- Source: `{source_sha}`\n"
         f"- Sequence: `{report_sequence}`\n"
         f"- Preflight: `{quality_preflight['status']}` with "
@@ -1920,11 +1920,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         output / "failure-diagnostic.md",
     ):
         stale.unlink(missing_ok=True)
-    if args.preflight_only and (
-        args.platform_id != "ubuntu-22.04-x86_64"
-        or args.report_sequence != 1
-    ):
-        raise HarnessError("readiness-only probe is restricted to x86 sequence 1")
+    if args.preflight_only and args.report_sequence != 1:
+        raise HarnessError("readiness-only probe requires sequence 1")
     source = source_identity(repo)
     if args.source_sha and source["commit"] != args.source_sha:
         raise HarnessError(

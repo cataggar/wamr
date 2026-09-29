@@ -60,7 +60,7 @@ gate, make the failed run eligible for a cohort, or authorize another campaign.
 
 For a separate, one-shot trusted x86 gate-readiness check, manually dispatch
 the diagnostic workflow from a fresh audited tag with `preflight_only=true`,
-`report_sequence=1`, and `partition=training`. Use a new 32-character cohort
+`preflight_platform=x86`, `report_sequence=1`, and `partition=training`. Use a new 32-character cohort
 identifier that has never appeared in a failed or full campaign. This path
 runs the same fixture builds, frozen sizing pilots, and trusted scheduler/barrier
 probes, then stops: it records a separate `preflight-readiness.json` on success
@@ -77,6 +77,12 @@ AOT hot-pilot count for its thread width. This changes only probe sizing, not
 the production measurement counts, acceptance thresholds, or retry policy;
 another one-shot readiness run must establish the result before considering
 any full cohort.
+For an independently tagged Arm-only readiness check, set
+`preflight_platform=arm` instead. The x86 job is skipped; a single hosted
+Neoverse-N2 job runs the frozen Arm sizing pilots and scheduler/barrier probes
+and retains a separate readiness or failure artifact. No benchmark report,
+x86 measurement, or cohort is produced. The default `preflight_only=false`
+continues to run x86 followed by Arm for a full diagnostic.
 
 Create the immutable 20-workflow/40-report plan without dispatching:
 
