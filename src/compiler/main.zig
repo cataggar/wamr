@@ -468,6 +468,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
             .enable_xreg_alloc = enable_aarch64_xreg_alloc,
             .codegen_timing = codegen_timing,
             .spill_metric = passes.spillMetricOptionsFromEnv(init.environ_map),
+            .allocator_trace_func10 = envFlagEnabled(init.environ_map, "WAMR_AOT_ALLOC_TRACE_FUNC10"),
             .frame_attribution = frame_attribution,
         }) catch |err| {
             std.debug.print("Error compiling to AArch64: {}\n", .{err});
