@@ -554,8 +554,7 @@ fn rewriteReadReg(word: u32, old_reg: u5, new_reg: u5) ?u32 {
     // Add/sub shifted reg, add/sub extended reg, logical shifted reg.
     if ((word & 0x1F200000) == 0x0B000000 //
     or (word & 0x1F200000) == 0x0B200000 //
-    or (word & 0x1F000000) == 0x0A000000)
-    {
+    or (word & 0x1F000000) == 0x0A000000) {
         _ = replaceField(&w, 5, old_reg, new_reg);
         _ = replaceField(&w, 16, old_reg, new_reg);
         return w;

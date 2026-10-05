@@ -575,13 +575,27 @@ fn skipInitExpr(reader: *BinaryReader) LoadError!void {
         const b = try reader.readByte();
         switch (b) {
             0x0B => return, // end
-            0x41 => { _ = try reader.readI32(); },
-            0x42 => { _ = try reader.readI64(); },
-            0x43 => { _ = try reader.readBytes(4); },
-            0x44 => { _ = try reader.readBytes(8); },
-            0x23 => { _ = try reader.readU32(); },
-            0xD0 => { _ = try readHeapTypeAsValType(reader); },
-            0xD2 => { _ = try reader.readU32(); },
+            0x41 => {
+                _ = try reader.readI32();
+            },
+            0x42 => {
+                _ = try reader.readI64();
+            },
+            0x43 => {
+                _ = try reader.readBytes(4);
+            },
+            0x44 => {
+                _ = try reader.readBytes(8);
+            },
+            0x23 => {
+                _ = try reader.readU32();
+            },
+            0xD0 => {
+                _ = try readHeapTypeAsValType(reader);
+            },
+            0xD2 => {
+                _ = try reader.readU32();
+            },
             else => {},
         }
     }
@@ -593,16 +607,28 @@ fn validateAndSkipInitExpr(reader: *BinaryReader, max_global_idx: u32) LoadError
         const b = try reader.readByte();
         switch (b) {
             0x0B => return,
-            0x41 => { _ = try reader.readI32(); },
-            0x42 => { _ = try reader.readI64(); },
-            0x43 => { _ = try reader.readBytes(4); },
-            0x44 => { _ = try reader.readBytes(8); },
+            0x41 => {
+                _ = try reader.readI32();
+            },
+            0x42 => {
+                _ = try reader.readI64();
+            },
+            0x43 => {
+                _ = try reader.readBytes(4);
+            },
+            0x44 => {
+                _ = try reader.readBytes(8);
+            },
             0x23 => {
                 const idx = try reader.readU32();
                 if (idx >= max_global_idx) return error.UnknownGlobal;
             },
-            0xD0 => { _ = try readHeapTypeAsValType(reader); },
-            0xD2 => { _ = try reader.readU32(); },
+            0xD0 => {
+                _ = try readHeapTypeAsValType(reader);
+            },
+            0xD2 => {
+                _ = try reader.readU32();
+            },
             else => {},
         }
     }
@@ -683,17 +709,44 @@ fn parseInitExprChecked(reader: *BinaryReader, _: ?u32, module_types: ?[]const t
                 return .{ .bytecode = reader.data[start_pos .. reader.pos - 1] };
             },
             // Valid const expr opcodes that push 1 value
-            0x41 => { _ = try reader.readI32(); stack_depth += 1; },
-            0x42 => { _ = try reader.readI64(); stack_depth += 1; },
-            0x43 => { _ = try reader.readBytes(4); stack_depth += 1; },
-            0x44 => { _ = try reader.readBytes(8); stack_depth += 1; },
-            0x23 => { _ = try reader.readU32(); stack_depth += 1; },
-            0xD0 => { _ = try readHeapTypeAsValType(reader); stack_depth += 1; },
-            0xD2 => { _ = try reader.readU32(); stack_depth += 1; },
+            0x41 => {
+                _ = try reader.readI32();
+                stack_depth += 1;
+            },
+            0x42 => {
+                _ = try reader.readI64();
+                stack_depth += 1;
+            },
+            0x43 => {
+                _ = try reader.readBytes(4);
+                stack_depth += 1;
+            },
+            0x44 => {
+                _ = try reader.readBytes(8);
+                stack_depth += 1;
+            },
+            0x23 => {
+                _ = try reader.readU32();
+                stack_depth += 1;
+            },
+            0xD0 => {
+                _ = try readHeapTypeAsValType(reader);
+                stack_depth += 1;
+            },
+            0xD2 => {
+                _ = try reader.readU32();
+                stack_depth += 1;
+            },
             // Valid const expr binary ops: pop 2, push 1
-            0x6A, 0x6B, 0x6C, // i32.add, i32.sub, i32.mul
-            0x7C, 0x7D, 0x7E, // i64.add, i64.sub, i64.mul
-            => { stack_depth -= 1; },
+            0x6A,
+            0x6B,
+            0x6C, // i32.add, i32.sub, i32.mul
+            0x7C,
+            0x7D,
+            0x7E, // i64.add, i64.sub, i64.mul
+            => {
+                stack_depth -= 1;
+            },
             // GC prefix opcodes valid in constant expressions
             0xFB => {
                 const sub = try reader.readU32();
@@ -711,24 +764,53 @@ fn parseInitExprChecked(reader: *BinaryReader, _: ?u32, module_types: ?[]const t
                         }
                         stack_depth += 1;
                     },
-                    0x01 => { _ = try reader.readU32(); stack_depth += 1; }, // struct.new_default: push structref
+                    0x01 => {
+                        _ = try reader.readU32();
+                        stack_depth += 1;
+                    }, // struct.new_default: push structref
                     0x08 => { // array.new_fixed: type_idx + count → pop count, push 1
                         _ = try reader.readU32();
                         const count: i32 = @intCast(try reader.readU32());
                         if (stack_depth >= count) stack_depth -= count;
                         stack_depth += 1;
                     },
-                    0x02, 0x03, 0x04 => { _ = try reader.readU32(); _ = try reader.readU32(); }, // struct.get: net 0
-                    0x05 => { _ = try reader.readU32(); _ = try reader.readU32(); }, // struct.set
-                    0x06 => { _ = try reader.readU32(); stack_depth -= 1; }, // array.new: pop init+len, push arrayref (net -1)
-                    0x07 => { _ = try reader.readU32(); }, // array.new_default: pop len, push arrayref (net 0)
-                    0x09, 0x0A => { _ = try reader.readU32(); _ = try reader.readU32(); stack_depth -= 1; }, // array.new_data/elem: pop offset+len, push arrayref (net -1)
-                    0x0B, 0x0C, 0x0D => { _ = try reader.readU32(); }, // array.get
-                    0x0E => { _ = try reader.readU32(); }, // array.set
+                    0x02, 0x03, 0x04 => {
+                        _ = try reader.readU32();
+                        _ = try reader.readU32();
+                    }, // struct.get: net 0
+                    0x05 => {
+                        _ = try reader.readU32();
+                        _ = try reader.readU32();
+                    }, // struct.set
+                    0x06 => {
+                        _ = try reader.readU32();
+                        stack_depth -= 1;
+                    }, // array.new: pop init+len, push arrayref (net -1)
+                    0x07 => {
+                        _ = try reader.readU32();
+                    }, // array.new_default: pop len, push arrayref (net 0)
+                    0x09, 0x0A => {
+                        _ = try reader.readU32();
+                        _ = try reader.readU32();
+                        stack_depth -= 1;
+                    }, // array.new_data/elem: pop offset+len, push arrayref (net -1)
+                    0x0B, 0x0C, 0x0D => {
+                        _ = try reader.readU32();
+                    }, // array.get
+                    0x0E => {
+                        _ = try reader.readU32();
+                    }, // array.set
                     0x0F => {}, // array.len
-                    0x10, 0x11, 0x12, 0x13 => { _ = try reader.readU32(); _ = try reader.readU32(); }, // array.fill/copy/init
-                    0x14, 0x15 => { _ = try reader.readU32(); }, // ref.test
-                    0x16, 0x17 => { _ = try reader.readU32(); }, // ref.cast
+                    0x10, 0x11, 0x12, 0x13 => {
+                        _ = try reader.readU32();
+                        _ = try reader.readU32();
+                    }, // array.fill/copy/init
+                    0x14, 0x15 => {
+                        _ = try reader.readU32();
+                    }, // ref.test
+                    0x16, 0x17 => {
+                        _ = try reader.readU32();
+                    }, // ref.cast
                     else => return error.InvalidInitExpr,
                 }
             },
@@ -736,7 +818,10 @@ fn parseInitExprChecked(reader: *BinaryReader, _: ?u32, module_types: ?[]const t
             0xFD => {
                 const sub = try reader.readU32();
                 switch (sub) {
-                    0x0C => { _ = try reader.readBytes(16); stack_depth += 1; }, // v128.const: 16 bytes
+                    0x0C => {
+                        _ = try reader.readBytes(16);
+                        stack_depth += 1;
+                    }, // v128.const: 16 bytes
                     else => return error.InvalidInitExpr,
                 }
             },
@@ -1113,8 +1198,7 @@ fn parseElementSection(reader: *BinaryReader, allocator: std.mem.Allocator, type
                     .ref_null => |vt| {
                         // For flags=4, kind defaults to func_ref but may need adjustment
                         if (flags == 4) {
-                            if (vt.isExternRef()) kind = .extern_ref
-                            else if (!vt.isFuncRef()) kind = .gc_ref;
+                            if (vt.isExternRef()) kind = .extern_ref else if (!vt.isFuncRef()) kind = .gc_ref;
                         }
                         // Only enforce type compatibility for func_ref and extern_ref kinds (not gc_ref)
                         if (kind != .gc_ref) {
@@ -1293,12 +1377,12 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
 
         // Enforce section ordering (custom sections can appear anywhere)
         if (section_id != 0) {
-            if (section_id > @intFromEnum(types.SectionId.tag)) {
+            if (section_id > @backingInt(types.SectionId.tag)) {
                 return error.MalformedSectionId;
             }
             // Tag section (13) and data count section (12) don't participate in strict ordering
-            if (section_id != @intFromEnum(types.SectionId.tag) and
-                section_id != @intFromEnum(types.SectionId.data_count))
+            if (section_id != @backingInt(types.SectionId.tag) and
+                section_id != @backingInt(types.SectionId.data_count))
             {
                 if (last_section_id) |last| {
                     if (section_id <= last) return error.InvalidSectionOrder;
@@ -1310,58 +1394,58 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
         const section_start = reader.pos;
         if (section_start + section_size > reader.data.len) return error.InvalidSectionSize;
 
-        switch (@as(types.SectionId, @enumFromInt(section_id))) {
+        switch (@as(types.SectionId, @fromBackingInt(@intCast(section_id)))) {
             .custom => {
                 // Parse the custom section name to validate UTF-8
                 _ = try reader.readName();
                 if (reader.pos > section_start + section_size) return error.InvalidSectionSize;
                 reader.pos = section_start + section_size;
             },
-                .type => {
-                    const type_result = try parseTypeSection(&reader, allocator);
-                    module.types = type_result.types;
-                    module.rec_groups = type_result.rec_groups;
-                    canonicalizeTypeIndices(&module, allocator);
-                },
-                .import => {
-                    const tc: u32 = @intCast(module.types.len);
-                    module.imports = try parseImportSection(&reader, allocator, tc, &module.import_tag_count);
-                    for (module.imports) |imp| {
-                        switch (imp.kind) {
-                            .function => module.import_function_count += 1,
-                            .table => module.import_table_count += 1,
-                            .memory => module.import_memory_count += 1,
-                            .global => module.import_global_count += 1,
-                            .tag => {}, // tag count already tracked by parseImportSection
-                        }
+            .type => {
+                const type_result = try parseTypeSection(&reader, allocator);
+                module.types = type_result.types;
+                module.rec_groups = type_result.rec_groups;
+                canonicalizeTypeIndices(&module, allocator);
+            },
+            .import => {
+                const tc: u32 = @intCast(module.types.len);
+                module.imports = try parseImportSection(&reader, allocator, tc, &module.import_tag_count);
+                for (module.imports) |imp| {
+                    switch (imp.kind) {
+                        .function => module.import_function_count += 1,
+                        .table => module.import_table_count += 1,
+                        .memory => module.import_memory_count += 1,
+                        .global => module.import_global_count += 1,
+                        .tag => {}, // tag count already tracked by parseImportSection
                     }
-                },
-                .function => func_type_indices = try parseFunctionSection(&reader, allocator),
-                .table => module.tables = try parseTableSection(&reader, allocator, @intCast(module.types.len), module.import_global_count),
-                .memory => module.memories = try parseMemorySection(&reader, allocator),
-                .global => module.globals = try parseGlobalSection(&reader, allocator, @intCast(module.types.len), module.types),
-                .@"export" => module.exports = try parseExportSection(&reader, allocator),
-                .start => module.start_function = try reader.readU32(),
-                .element => module.elements = try parseElementSection(&reader, allocator, @intCast(module.types.len)),
-                .code => module.functions = try parseCodeSection(&reader, func_type_indices, module.types, allocator),
-                .data => module.data_segments = try parseDataSection(&reader, allocator),
-                .data_count => module.data_count = try reader.readU32(),
-                .tag => {
-                    // Tag section (exception handling): count + (attribute, type_idx)*
-                    const tag_count = try reader.readU32();
-                    if (tag_count > 0) {
-                        const tag_types = allocator.alloc(u32, tag_count) catch return error.OutOfMemory;
-                        for (tag_types) |*tt| {
-                            _ = try reader.readByte(); // attribute (0 = exception)
-                            tt.* = try reader.readU32(); // type index
-                        }
-                        module.tag_types = tag_types;
+                }
+            },
+            .function => func_type_indices = try parseFunctionSection(&reader, allocator),
+            .table => module.tables = try parseTableSection(&reader, allocator, @intCast(module.types.len), module.import_global_count),
+            .memory => module.memories = try parseMemorySection(&reader, allocator),
+            .global => module.globals = try parseGlobalSection(&reader, allocator, @intCast(module.types.len), module.types),
+            .@"export" => module.exports = try parseExportSection(&reader, allocator),
+            .start => module.start_function = try reader.readU32(),
+            .element => module.elements = try parseElementSection(&reader, allocator, @intCast(module.types.len)),
+            .code => module.functions = try parseCodeSection(&reader, func_type_indices, module.types, allocator),
+            .data => module.data_segments = try parseDataSection(&reader, allocator),
+            .data_count => module.data_count = try reader.readU32(),
+            .tag => {
+                // Tag section (exception handling): count + (attribute, type_idx)*
+                const tag_count = try reader.readU32();
+                if (tag_count > 0) {
+                    const tag_types = allocator.alloc(u32, tag_count) catch return error.OutOfMemory;
+                    for (tag_types) |*tt| {
+                        _ = try reader.readByte(); // attribute (0 = exception)
+                        tt.* = try reader.readU32(); // type index
                     }
-                },
-            }
+                    module.tag_types = tag_types;
+                }
+            },
+        }
 
-            // Verify we consumed exactly section_size bytes
-            if (reader.pos != section_start + section_size) return error.InvalidSectionSize;
+        // Verify we consumed exactly section_size bytes
+        if (reader.pos != section_start + section_size) return error.InvalidSectionSize;
     }
 
     // Function section count must match code section count
@@ -1521,10 +1605,18 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
                     }
                 }
             },
-            .i32_const => { if (g.global_type.val_type != .i32) return error.TypeMismatch; },
-            .i64_const => { if (g.global_type.val_type != .i64) return error.TypeMismatch; },
-            .f32_const => { if (g.global_type.val_type != .f32) return error.TypeMismatch; },
-            .f64_const => { if (g.global_type.val_type != .f64) return error.TypeMismatch; },
+            .i32_const => {
+                if (g.global_type.val_type != .i32) return error.TypeMismatch;
+            },
+            .i64_const => {
+                if (g.global_type.val_type != .i64) return error.TypeMismatch;
+            },
+            .f32_const => {
+                if (g.global_type.val_type != .f32) return error.TypeMismatch;
+            },
+            .f64_const => {
+                if (g.global_type.val_type != .f64) return error.TypeMismatch;
+            },
             .ref_null => |rt| {
                 if (g.global_type.val_type != rt and
                     !rt.isSubtypeOf(g.global_type.val_type))
@@ -1570,8 +1662,12 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
                 break :blk if (li < module.memories.len) module.memories[li].is_memory64 else false;
             };
             switch (seg.offset) {
-                .i32_const => { if (is_mem64) return error.TypeMismatch; },
-                .i64_const => { if (!is_mem64) return error.TypeMismatch; },
+                .i32_const => {
+                    if (is_mem64) return error.TypeMismatch;
+                },
+                .i64_const => {
+                    if (!is_mem64) return error.TypeMismatch;
+                },
                 .global_get => |idx| {
                     if (idx >= total_globals) return error.UnknownGlobal;
                     if (idx < module.import_global_count) {
@@ -1641,8 +1737,12 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
                     break :blk if (li < module.tables.len) module.tables[li].is_table64 else false;
                 };
                 switch (offset) {
-                    .i32_const => { if (is_tbl64) return error.TypeMismatch; },
-                    .i64_const => { if (!is_tbl64) return error.TypeMismatch; },
+                    .i32_const => {
+                        if (is_tbl64) return error.TypeMismatch;
+                    },
+                    .i64_const => {
+                        if (!is_tbl64) return error.TypeMismatch;
+                    },
                     .global_get => |idx| {
                         if (idx >= total_globals) return error.UnknownGlobal;
                         if (idx < module.import_global_count) {
@@ -1672,9 +1772,13 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
 
     // Validate function bodies (alignment, index bounds)
     const has_memory64 = blk: {
-        for (module.memories) |m| { if (m.is_memory64) break :blk true; }
+        for (module.memories) |m| {
+            if (m.is_memory64) break :blk true;
+        }
         for (module.imports) |imp| {
-            if (imp.kind == .memory) if (imp.memory_type) |mt| { if (mt.is_memory64) break :blk true; };
+            if (imp.kind == .memory) if (imp.memory_type) |mt| {
+                if (mt.is_memory64) break :blk true;
+            };
         }
         break :blk false;
     };
@@ -1797,7 +1901,8 @@ fn skipBlockTypeImm(code: []const u8, i: *usize) void {
     const bt = code[i.*];
     if (bt == 0x40 or bt == 0x7F or bt == 0x7E or bt == 0x7D or bt == 0x7C or bt == 0x7B or
         bt == 0x70 or bt == 0x6F or bt == 0x6E or bt == 0x6D or bt == 0x6C or bt == 0x6B or
-        bt == 0x6A or bt == 0x65 or bt == 0x71 or bt == 0x69 or bt == 0x68 or bt == 0x74) {
+        bt == 0x6A or bt == 0x65 or bt == 0x71 or bt == 0x69 or bt == 0x68 or bt == 0x74)
+    {
         i.* += 1;
     } else if (bt == 0x63 or bt == 0x64) {
         i.* += 1; // skip ref prefix
@@ -1805,7 +1910,8 @@ fn skipBlockTypeImm(code: []const u8, i: *usize) void {
         const ht = code[i.*];
         if (ht == 0x70 or ht == 0x6F or ht == 0x73 or ht == 0x72 or
             ht == 0x6E or ht == 0x6D or ht == 0x6C or ht == 0x6B or ht == 0x6A or
-            ht == 0x65 or ht == 0x71 or ht == 0x69 or ht == 0x68 or ht == 0x74) {
+            ht == 0x65 or ht == 0x71 or ht == 0x69 or ht == 0x68 or ht == 0x74)
+        {
             i.* += 1; // known heap type
         } else {
             // Type index LEB128
@@ -1864,45 +1970,87 @@ fn checkRefFuncDeclared(code: []const u8, declared: []const bool) LoadError!void
             0x02, 0x03, 0x04 => { // block/loop/if: blocktype
                 skipBlockTypeImm(code, &i);
             },
-            0x0C, 0x0D, 0xD5, 0xD6 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; },
+            0x0C, 0x0D, 0xD5, 0xD6 => {
+                const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += r.bytes_read;
+            },
             // Exception handling opcodes
-            0x06 => { skipBlockTypeImm(code, &i); }, // try
-            0x07, 0x08, 0x09, 0x19 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; },
+            0x06 => {
+                skipBlockTypeImm(code, &i);
+            }, // try
+            0x07, 0x08, 0x09, 0x19 => {
+                const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += r.bytes_read;
+            },
             0x0A => {}, // throw_ref
             0x1F => { // try_table
                 skipBlockTypeImm(code, &i);
-                const clause_count_r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += clause_count_r.bytes_read;
+                const clause_count_r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += clause_count_r.bytes_read;
                 var ci: u32 = 0;
                 while (ci < clause_count_r.value) : (ci += 1) {
-                    const ck = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += ck.bytes_read;
-                    if (ck.value == 0 or ck.value == 1) { const tr = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += tr.bytes_read; }
-                    const lr = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += lr.bytes_read;
+                    const ck = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                    i += ck.bytes_read;
+                    if (ck.value == 0 or ck.value == 1) {
+                        const tr = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += tr.bytes_read;
+                    }
+                    const lr = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                    i += lr.bytes_read;
                 }
             },
             0x0E => { // br_table
-                const cr = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += cr.bytes_read;
+                const cr = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += cr.bytes_read;
                 var j: u32 = 0;
-                while (j <= cr.value) : (j += 1) { const lr = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += lr.bytes_read; }
+                while (j <= cr.value) : (j += 1) {
+                    const lr = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                    i += lr.bytes_read;
+                }
             },
-            0x10, 0x12, 0x14, 0x15 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; },
+            0x10, 0x12, 0x14, 0x15 => {
+                const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += r.bytes_read;
+            },
             0x11, 0x13 => {
-                const r1 = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r1.bytes_read;
-                const r2 = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r2.bytes_read;
+                const r1 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += r1.bytes_read;
+                const r2 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += r2.bytes_read;
             },
-            0x1C => { const cr = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += cr.bytes_read; i += cr.value; },
-            0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; },
+            0x1C => {
+                const cr = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += cr.bytes_read;
+                i += cr.value;
+            },
+            0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26 => {
+                const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += r.bytes_read;
+            },
             0x28...0x3E => { // memory load/store
-                const r1 = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r1.bytes_read;
+                const r1 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += r1.bytes_read;
                 // Multi-memory: bit 6 of alignment signals a memory index follows
                 if (r1.value & 0x40 != 0) {
-                    const r_mi = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r_mi.bytes_read;
+                    const r_mi = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                    i += r_mi.bytes_read;
                 }
                 // Offset: u64 for memory64, u32 for memory32 (u64 read is backward-compatible)
-                const r2 = leb128_mod.readUnsigned(u64, code[i..]) catch return; i += r2.bytes_read;
+                const r2 = leb128_mod.readUnsigned(u64, code[i..]) catch return;
+                i += r2.bytes_read;
             },
-            0x3F, 0x40 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; },
-            0x41 => { const r = leb128_mod.readSigned(i32, code[i..]) catch return; i += r.bytes_read; },
-            0x42 => { const r = leb128_mod.readSigned(i64, code[i..]) catch return; i += r.bytes_read; },
+            0x3F, 0x40 => {
+                const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += r.bytes_read;
+            },
+            0x41 => {
+                const r = leb128_mod.readSigned(i32, code[i..]) catch return;
+                i += r.bytes_read;
+            },
+            0x42 => {
+                const r = leb128_mod.readSigned(i64, code[i..]) catch return;
+                i += r.bytes_read;
+            },
             0x43 => i += 4,
             0x44 => i += 8,
             0xD0 => { // ref.null: skip heap type
@@ -1927,11 +2075,20 @@ fn checkRefFuncDeclared(code: []const u8, declared: []const bool) LoadError!void
                 }
             },
             0xFC => {
-                const sr = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += sr.bytes_read;
+                const sr = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += sr.bytes_read;
                 switch (sr.value) {
                     0...7 => {},
-                    8, 10, 12, 14 => { const a = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += a.bytes_read; const b = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += b.bytes_read; },
-                    9, 11, 13, 15, 16, 17 => { const a = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += a.bytes_read; },
+                    8, 10, 12, 14 => {
+                        const a = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += a.bytes_read;
+                        const b = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += b.bytes_read;
+                    },
+                    9, 11, 13, 15, 16, 17 => {
+                        const a = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += a.bytes_read;
+                    },
                     else => {},
                 }
             },
@@ -2185,7 +2342,10 @@ fn validateFunctionBody(
                     i += 1;
                     if (ht != 0x70 and ht != 0x6F and ht != 0x73 and ht != 0x72 and ht & 0x80 != 0) {
                         while (i < code.len) {
-                            if (code[i] & 0x80 == 0) { i += 1; break; }
+                            if (code[i] & 0x80 == 0) {
+                                i += 1;
+                                break;
+                            }
                             i += 1;
                         }
                     }
@@ -2212,7 +2372,10 @@ fn validateFunctionBody(
                         const a1 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
                         i += a1.bytes_read;
                         // multi-memory: bit 6 of align signals memory index follows
-                        if (a1.value & 0x40 != 0) { const m = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += m.bytes_read; }
+                        if (a1.value & 0x40 != 0) {
+                            const m = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                            i += m.bytes_read;
+                        }
                         const o1 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
                         i += o1.bytes_read;
                     },
@@ -2224,7 +2387,10 @@ fn validateFunctionBody(
                     0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x5B => {
                         const a2 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
                         i += a2.bytes_read;
-                        if (a2.value & 0x40 != 0) { const m2 = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += m2.bytes_read; }
+                        if (a2.value & 0x40 != 0) {
+                            const m2 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                            i += m2.bytes_read;
+                        }
                         const o2 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
                         i += o2.bytes_read;
                         i += 1; // lane byte
@@ -2233,7 +2399,10 @@ fn validateFunctionBody(
                     0x5C, 0x5D => {
                         const a3 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
                         i += a3.bytes_read;
-                        if (a3.value & 0x40 != 0) { const m3 = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += m3.bytes_read; }
+                        if (a3.value & 0x40 != 0) {
+                            const m3 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                            i += m3.bytes_read;
+                        }
                         const o3 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
                         i += o3.bytes_read;
                     },
@@ -2268,12 +2437,26 @@ fn validateFunctionBody(
             },
 
             // Exception handling opcodes
-            0x06 => { skipBlockTypeImm(code, &i); }, // try (legacy): blocktype
-            0x07 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; }, // catch: tagidx
-            0x08 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; }, // throw: tagidx
-            0x09 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; }, // rethrow: labelidx
+            0x06 => {
+                skipBlockTypeImm(code, &i);
+            }, // try (legacy): blocktype
+            0x07 => {
+                const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += r.bytes_read;
+            }, // catch: tagidx
+            0x08 => {
+                const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += r.bytes_read;
+            }, // throw: tagidx
+            0x09 => {
+                const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += r.bytes_read;
+            }, // rethrow: labelidx
             0x0A => {}, // throw_ref: no immediates
-            0x19 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; }, // delegate: labelidx
+            0x19 => {
+                const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += r.bytes_read;
+            }, // delegate: labelidx
             0x1F => { // try_table: blocktype + catch clause list
                 skipBlockTypeImm(code, &i);
                 const clause_count = readU32Leb(code, &i);
@@ -2293,23 +2476,57 @@ fn validateFunctionBody(
                 i += sub_r.bytes_read;
                 switch (sub_r.value) {
                     // struct ops
-                    0x00, 0x01 => { _ = readU32Leb(code, &i); }, // struct.new, struct.new_default: typeidx
-                    0x02, 0x03, 0x04 => { _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); }, // struct.get/get_s/get_u: typeidx + fieldidx
-                    0x05 => { _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); }, // struct.set: typeidx + fieldidx
+                    0x00, 0x01 => {
+                        _ = readU32Leb(code, &i);
+                    }, // struct.new, struct.new_default: typeidx
+                    0x02, 0x03, 0x04 => {
+                        _ = readU32Leb(code, &i);
+                        _ = readU32Leb(code, &i);
+                    }, // struct.get/get_s/get_u: typeidx + fieldidx
+                    0x05 => {
+                        _ = readU32Leb(code, &i);
+                        _ = readU32Leb(code, &i);
+                    }, // struct.set: typeidx + fieldidx
                     // array ops
-                    0x06, 0x07 => { _ = readU32Leb(code, &i); }, // array.new, array.new_default: typeidx
-                    0x08 => { _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); }, // array.new_fixed: typeidx + count
-                    0x09, 0x0A => { _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); }, // array.new_data/elem: typeidx + idx
-                    0x0B, 0x0C, 0x0D => { _ = readU32Leb(code, &i); }, // array.get/get_s/get_u: typeidx
-                    0x0E => { _ = readU32Leb(code, &i); }, // array.set: typeidx
+                    0x06, 0x07 => {
+                        _ = readU32Leb(code, &i);
+                    }, // array.new, array.new_default: typeidx
+                    0x08 => {
+                        _ = readU32Leb(code, &i);
+                        _ = readU32Leb(code, &i);
+                    }, // array.new_fixed: typeidx + count
+                    0x09, 0x0A => {
+                        _ = readU32Leb(code, &i);
+                        _ = readU32Leb(code, &i);
+                    }, // array.new_data/elem: typeidx + idx
+                    0x0B, 0x0C, 0x0D => {
+                        _ = readU32Leb(code, &i);
+                    }, // array.get/get_s/get_u: typeidx
+                    0x0E => {
+                        _ = readU32Leb(code, &i);
+                    }, // array.set: typeidx
                     0x0F => {}, // array.len: no immediates
-                    0x10 => { _ = readU32Leb(code, &i); }, // array.fill: typeidx
-                    0x11 => { _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); }, // array.copy: typeidx + typeidx
-                    0x12, 0x13 => { _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); }, // array.init_data/elem: typeidx + idx
+                    0x10 => {
+                        _ = readU32Leb(code, &i);
+                    }, // array.fill: typeidx
+                    0x11 => {
+                        _ = readU32Leb(code, &i);
+                        _ = readU32Leb(code, &i);
+                    }, // array.copy: typeidx + typeidx
+                    0x12, 0x13 => {
+                        _ = readU32Leb(code, &i);
+                        _ = readU32Leb(code, &i);
+                    }, // array.init_data/elem: typeidx + idx
                     // ref.test/ref.cast: heaptype
-                    0x14, 0x15, 0x16, 0x17 => { _ = readU32Leb(code, &i); },
+                    0x14, 0x15, 0x16, 0x17 => {
+                        _ = readU32Leb(code, &i);
+                    },
                     // br_on_cast: label + castflags(1 byte read as LEB) + target heaptype
-                    0x18, 0x19 => { _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); },
+                    0x18, 0x19 => {
+                        _ = readU32Leb(code, &i);
+                        _ = readU32Leb(code, &i);
+                        _ = readU32Leb(code, &i);
+                    },
                     // No immediates
                     0x1A, 0x1B, 0x1C, 0x1D, 0x1E => {},
                     else => {},
@@ -2404,10 +2621,14 @@ const BlockType = struct {
 fn readBlockType(code: []const u8, pos: *usize, module_types: []const types.FuncType) LoadError!BlockType {
     if (pos.* >= code.len) return .{ .results = &.{} };
     const bt = code[pos.*];
-    if (bt == 0x40) { pos.* += 1; return .{ .results = &.{} }; }
+    if (bt == 0x40) {
+        pos.* += 1;
+        return .{ .results = &.{} };
+    }
     if (bt == 0x7F or bt == 0x7E or bt == 0x7D or bt == 0x7C or bt == 0x7B or bt == 0x70 or bt == 0x6F or
         bt == 0x6E or bt == 0x6D or bt == 0x6C or bt == 0x6B or bt == 0x6A or bt == 0x65 or bt == 0x71 or
-        bt == 0x69 or bt == 0x68 or bt == 0x74) {
+        bt == 0x69 or bt == 0x68 or bt == 0x74)
+    {
         pos.* += 1;
         return switch (bt) {
             0x7F => .{ .results = &[_]VT{.i32} },
@@ -2436,19 +2657,50 @@ fn readBlockType(code: []const u8, pos: *usize, module_types: []const types.Func
         pos.* += 1; // consume 0x63/0x64
         if (pos.* >= code.len) return error.TypeMismatch;
         const ht = code[pos.*];
-        if (ht == 0x70 or ht == 0x73) { pos.* += 1; return .{ .results = if (is_nullable) &[_]VT{.funcref} else &[_]VT{.nonfuncref} }; }
-        if (ht == 0x6F or ht == 0x72) { pos.* += 1; return .{ .results = if (is_nullable) &[_]VT{.externref} else &[_]VT{.nonexternref} }; }
+        if (ht == 0x70 or ht == 0x73) {
+            pos.* += 1;
+            return .{ .results = if (is_nullable) &[_]VT{.funcref} else &[_]VT{.nonfuncref} };
+        }
+        if (ht == 0x6F or ht == 0x72) {
+            pos.* += 1;
+            return .{ .results = if (is_nullable) &[_]VT{.externref} else &[_]VT{.nonexternref} };
+        }
         // GC abstract heap types
-        if (ht == 0x6E) { pos.* += 1; return .{ .results = &[_]VT{.anyref} }; }
-        if (ht == 0x6D) { pos.* += 1; return .{ .results = &[_]VT{.eqref} }; }
-        if (ht == 0x6C) { pos.* += 1; return .{ .results = &[_]VT{.i31ref} }; }
-        if (ht == 0x6B) { pos.* += 1; return .{ .results = &[_]VT{.structref} }; }
-        if (ht == 0x6A) { pos.* += 1; return .{ .results = &[_]VT{.arrayref} }; }
-        if (ht == 0x65) { pos.* += 1; return .{ .results = &[_]VT{.nullref} }; }
-        if (ht == 0x71) { pos.* += 1; return .{ .results = if (is_nullable) &[_]VT{.funcref} else &[_]VT{.nonfuncref} }; }
-        if (ht == 0x69) { pos.* += 1; return .{ .results = &[_]VT{.exnref} }; }
+        if (ht == 0x6E) {
+            pos.* += 1;
+            return .{ .results = &[_]VT{.anyref} };
+        }
+        if (ht == 0x6D) {
+            pos.* += 1;
+            return .{ .results = &[_]VT{.eqref} };
+        }
+        if (ht == 0x6C) {
+            pos.* += 1;
+            return .{ .results = &[_]VT{.i31ref} };
+        }
+        if (ht == 0x6B) {
+            pos.* += 1;
+            return .{ .results = &[_]VT{.structref} };
+        }
+        if (ht == 0x6A) {
+            pos.* += 1;
+            return .{ .results = &[_]VT{.arrayref} };
+        }
+        if (ht == 0x65) {
+            pos.* += 1;
+            return .{ .results = &[_]VT{.nullref} };
+        }
+        if (ht == 0x71) {
+            pos.* += 1;
+            return .{ .results = if (is_nullable) &[_]VT{.funcref} else &[_]VT{.nonfuncref} };
+        }
+        if (ht == 0x69) {
+            pos.* += 1;
+            return .{ .results = &[_]VT{.exnref} };
+        }
         if (ht == 0x68 or ht == 0x74) {
-            pos.* += 1; return .{ .results = if (is_nullable) &[_]VT{.externref} else &[_]VT{.nonexternref} };
+            pos.* += 1;
+            return .{ .results = if (is_nullable) &[_]VT{.externref} else &[_]VT{.nonexternref} };
         }
         // Concrete type index (LEB128) — validate and treat as funcref/nonfuncref result
         const tir = leb128_mod.readUnsigned(u32, code[pos.*..]) catch return error.TypeMismatch;
@@ -2493,12 +2745,20 @@ fn skipMemImm(code: []const u8, pos: *usize) u32 {
 }
 
 fn pushType(stack: []VT, sp: *u32, t: VT, tidx: []u32) void {
-    if (sp.* < stack.len) { stack[sp.*] = t; tidx[sp.*] = NO_TIDX; sp.* += 1; }
+    if (sp.* < stack.len) {
+        stack[sp.*] = t;
+        tidx[sp.*] = NO_TIDX;
+        sp.* += 1;
+    }
 }
 
 /// Push a ref type with a concrete type index.
 fn pushV(stack: []VT, sp: *u32, t: VT, tidx: []u32, concrete: u32) void {
-    if (sp.* < stack.len) { stack[sp.*] = t; tidx[sp.*] = concrete; sp.* += 1; }
+    if (sp.* < stack.len) {
+        stack[sp.*] = t;
+        tidx[sp.*] = concrete;
+        sp.* += 1;
+    }
 }
 
 fn popExpect(stack: []VT, sp: *u32, expected: VT, cf: ?*CtrlFrame) bool {
@@ -2848,7 +3108,7 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
     const func_type = func.func_type;
 
     var local_types_buf: [1024]VT = undefined;
-    var local_tidx_buf: [1024]u32 = .{NO_TIDX} ** 1024;
+    var local_tidx_buf: [1024]u32 = @splat(NO_TIDX);
     var total_locals: u32 = @intCast(func_type.params.len);
     for (func_type.params, 0..) |p, li| {
         if (li >= local_types_buf.len) return;
@@ -2868,7 +3128,7 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
     const local_tidxs = local_tidx_buf[0..total_locals];
 
     var stack_buf: [4096]VT = undefined;
-    var stack_tidx: [4096]u32 = .{NO_TIDX} ** 4096;
+    var stack_tidx: [4096]u32 = @splat(NO_TIDX);
     var sp: u32 = 0;
 
     var ctrl_buf: [256]CtrlFrame = undefined;
@@ -2971,8 +3231,12 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 ctrl_sp += 1;
             },
             // Exception handling: catch/catch_all/rethrow/delegate — skip immediates
-            0x07 => { _ = readU32Leb(code, &i); }, // catch: tagidx
-            0x09, 0x19 => { _ = readU32Leb(code, &i); }, // rethrow/delegate: labelidx
+            0x07 => {
+                _ = readU32Leb(code, &i);
+            }, // catch: tagidx
+            0x09, 0x19 => {
+                _ = readU32Leb(code, &i);
+            }, // rethrow/delegate: labelidx
 
             // block, loop, if
             0x02, 0x03, 0x04 => {
@@ -3286,7 +3550,9 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 }
             },
 
-            0x1A => { _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); }, // drop
+            0x1A => {
+                _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+            }, // drop
             0x1B => { // select (numeric types only; use select_t for ref types)
                 const cf = ctrl_top.get(&ctrl_buf, ctrl_sp);
                 if (!popExpect(&stack_buf, &sp, .i32, cf))
@@ -3297,8 +3563,12 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 // In non-unreachable code, both operands must be present
                 if (!is_unreachable and (t1 == null or t2 == null)) return error.TypeMismatch;
                 // select (untyped) requires numeric types — ref types need select_t
-                if (t1) |v| { if (v.isRef()) return error.TypeMismatch; }
-                if (t2) |v| { if (v.isRef()) return error.TypeMismatch; }
+                if (t1) |v| {
+                    if (v.isRef()) return error.TypeMismatch;
+                }
+                if (t2) |v| {
+                    if (v.isRef()) return error.TypeMismatch;
+                }
                 if (t1 != null and t2 != null) {
                     if (t1.? != t2.?) return error.TypeMismatch;
                 }
@@ -3317,7 +3587,7 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 } else {
                     const type_byte = code[i];
                     const sel_type: VT = switch (type_byte) {
-                        0x7F, 0x7E, 0x7D, 0x7C, 0x7B, 0x70, 0x6F, 0x6E => @enumFromInt(type_byte),
+                        0x7F, 0x7E, 0x7D, 0x7C, 0x7B, 0x70, 0x6F, 0x6E => @fromBackingInt(@intCast(type_byte)),
                         else => return error.TypeMismatch,
                     };
                     i += count_sel;
@@ -3403,34 +3673,100 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
             },
 
             // Memory loads
-            0x28 => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doLoad64(&stack_buf, &sp, .i32, at, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
-            0x29 => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doLoad64(&stack_buf, &sp, .i64, at, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
-            0x2A => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doLoad64(&stack_buf, &sp, .f32, at, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
-            0x2B => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doLoad64(&stack_buf, &sp, .f64, at, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
-            0x2C, 0x2D, 0x2E, 0x2F => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doLoad64(&stack_buf, &sp, .i32, at, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
-            0x30, 0x31, 0x32, 0x33, 0x34, 0x35 => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doLoad64(&stack_buf, &sp, .i64, at, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
+            0x28 => {
+                const mi = skipMemImm(code, &i);
+                const at = getMemAddrType(module, mi);
+                doLoad64(&stack_buf, &sp, .i32, at, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch;
+            },
+            0x29 => {
+                const mi = skipMemImm(code, &i);
+                const at = getMemAddrType(module, mi);
+                doLoad64(&stack_buf, &sp, .i64, at, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch;
+            },
+            0x2A => {
+                const mi = skipMemImm(code, &i);
+                const at = getMemAddrType(module, mi);
+                doLoad64(&stack_buf, &sp, .f32, at, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch;
+            },
+            0x2B => {
+                const mi = skipMemImm(code, &i);
+                const at = getMemAddrType(module, mi);
+                doLoad64(&stack_buf, &sp, .f64, at, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch;
+            },
+            0x2C, 0x2D, 0x2E, 0x2F => {
+                const mi = skipMemImm(code, &i);
+                const at = getMemAddrType(module, mi);
+                doLoad64(&stack_buf, &sp, .i32, at, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch;
+            },
+            0x30, 0x31, 0x32, 0x33, 0x34, 0x35 => {
+                const mi = skipMemImm(code, &i);
+                const at = getMemAddrType(module, mi);
+                doLoad64(&stack_buf, &sp, .i64, at, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch;
+            },
 
             // Memory stores
-            0x36 => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doStore64(&stack_buf, &sp, .i32, at, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
-            0x37 => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doStore64(&stack_buf, &sp, .i64, at, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
-            0x38 => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doStore64(&stack_buf, &sp, .f32, at, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
-            0x39 => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doStore64(&stack_buf, &sp, .f64, at, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
-            0x3A, 0x3B => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doStore64(&stack_buf, &sp, .i32, at, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
-            0x3C, 0x3D, 0x3E => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doStore64(&stack_buf, &sp, .i64, at, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
+            0x36 => {
+                const mi = skipMemImm(code, &i);
+                const at = getMemAddrType(module, mi);
+                doStore64(&stack_buf, &sp, .i32, at, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch;
+            },
+            0x37 => {
+                const mi = skipMemImm(code, &i);
+                const at = getMemAddrType(module, mi);
+                doStore64(&stack_buf, &sp, .i64, at, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch;
+            },
+            0x38 => {
+                const mi = skipMemImm(code, &i);
+                const at = getMemAddrType(module, mi);
+                doStore64(&stack_buf, &sp, .f32, at, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch;
+            },
+            0x39 => {
+                const mi = skipMemImm(code, &i);
+                const at = getMemAddrType(module, mi);
+                doStore64(&stack_buf, &sp, .f64, at, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch;
+            },
+            0x3A, 0x3B => {
+                const mi = skipMemImm(code, &i);
+                const at = getMemAddrType(module, mi);
+                doStore64(&stack_buf, &sp, .i32, at, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch;
+            },
+            0x3C, 0x3D, 0x3E => {
+                const mi = skipMemImm(code, &i);
+                const at = getMemAddrType(module, mi);
+                doStore64(&stack_buf, &sp, .i64, at, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch;
+            },
 
             // memory.size
-            0x3F => { const mi = readU32Leb(code, &i); const at = getMemAddrType(module, mi); pushType(&stack_buf, &sp, at, &stack_tidx); },
+            0x3F => {
+                const mi = readU32Leb(code, &i);
+                const at = getMemAddrType(module, mi);
+                pushType(&stack_buf, &sp, at, &stack_tidx);
+            },
             // memory.grow
-            0x40 => { const mi = readU32Leb(code, &i); const at = getMemAddrType(module, mi);
+            0x40 => {
+                const mi = readU32Leb(code, &i);
+                const at = getMemAddrType(module, mi);
                 if (!popExpect(&stack_buf, &sp, at, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
                 pushType(&stack_buf, &sp, at, &stack_tidx);
             },
 
             // Constants
-            0x41 => { _ = readI32Leb(code, &i); pushType(&stack_buf, &sp, .i32, &stack_tidx); },
-            0x42 => { _ = readI64Leb(code, &i); pushType(&stack_buf, &sp, .i64, &stack_tidx); },
-            0x43 => { i += 4; pushType(&stack_buf, &sp, .f32, &stack_tidx); },
-            0x44 => { i += 8; pushType(&stack_buf, &sp, .f64, &stack_tidx); },
+            0x41 => {
+                _ = readI32Leb(code, &i);
+                pushType(&stack_buf, &sp, .i32, &stack_tidx);
+            },
+            0x42 => {
+                _ = readI64Leb(code, &i);
+                pushType(&stack_buf, &sp, .i64, &stack_tidx);
+            },
+            0x43 => {
+                i += 4;
+                pushType(&stack_buf, &sp, .f32, &stack_tidx);
+            },
+            0x44 => {
+                i += 8;
+                pushType(&stack_buf, &sp, .f64, &stack_tidx);
+            },
 
             // Comparison ops (i32)
             0x45 => doUnop(&stack_buf, &sp, .i32, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch,
@@ -3535,7 +3871,10 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                     }
                 }
             },
-            0xD1 => { _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); pushType(&stack_buf, &sp, .i32, &stack_tidx); },
+            0xD1 => {
+                _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                pushType(&stack_buf, &sp, .i32, &stack_tidx);
+            },
             0xD2 => { // ref.func: push nonfuncref with function's type index
                 const func_idx = readU32Leb(code, &i);
                 const func_tidx = if (module.getFuncTypeIdx(func_idx)) |ti| ti else NO_TIDX;
@@ -3642,7 +3981,9 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
                         if (!popExpect(&stack_buf, &sp, mat, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
                     },
-                    9 => { _ = readU32Leb(code, &i); }, // data.drop: [] -> []
+                    9 => {
+                        _ = readU32Leb(code, &i);
+                    }, // data.drop: [] -> []
                     10 => { // memory.copy: [at_d at_s n] -> []
                         const dst_mi = readU32Leb(code, &i);
                         const src_mi = readU32Leb(code, &i);
@@ -3675,7 +4016,9 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
                         if (!popExpect(&stack_buf, &sp, tat, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
                     },
-                    13 => { _ = readU32Leb(code, &i); }, // elem.drop: [] -> []
+                    13 => {
+                        _ = readU32Leb(code, &i);
+                    }, // elem.drop: [] -> []
                     14 => { // table.copy: [at_d at_s at] -> []
                         const dst_tidx = readU32Leb(code, &i);
                         const src_tidx = readU32Leb(code, &i);
@@ -3750,7 +4093,10 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                             const ft = module.types[tidx];
                             // Pop field values in reverse order
                             var fi = ft.field_types.len;
-                            while (fi > 0) { fi -= 1; _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); }
+                            while (fi > 0) {
+                                fi -= 1;
+                                _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                            }
                         }
                         pushType(&stack_buf, &sp, .structref, &stack_tidx);
                     },
@@ -3770,7 +4116,8 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         }
                     },
                     0x05 => { // struct.set: [structref val] -> []
-                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
+                        _ = readU32Leb(code, &i);
+                        _ = readU32Leb(code, &i);
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                     },
@@ -3793,7 +4140,8 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         pushType(&stack_buf, &sp, .arrayref, &stack_tidx);
                     },
                     0x09, 0x0A => { // array.new_data/elem: [offset len] -> [arrayref]
-                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
+                        _ = readU32Leb(code, &i);
+                        _ = readU32Leb(code, &i);
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         pushType(&stack_buf, &sp, .arrayref, &stack_tidx);
@@ -3832,7 +4180,8 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                     },
                     0x11 => { // array.copy
-                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
+                        _ = readU32Leb(code, &i);
+                        _ = readU32Leb(code, &i);
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
@@ -3893,22 +4242,17 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 const address_type = getMemAddrType(module, 0);
                 switch (sub) {
                     0x00 => { // memory.atomic.notify: [addr count] -> [i32]
-                        if (!popExpect(&stack_buf, &sp, .i32, cf)
-                            or !popExpect(&stack_buf, &sp, address_type, cf))
+                        if (!popExpect(&stack_buf, &sp, .i32, cf) or !popExpect(&stack_buf, &sp, address_type, cf))
                             return error.TypeMismatch;
                         pushType(&stack_buf, &sp, .i32, &stack_tidx);
                     },
                     0x01 => { // memory.atomic.wait32: [addr expected timeout] -> [i32]
-                        if (!popExpect(&stack_buf, &sp, .i64, cf)
-                            or !popExpect(&stack_buf, &sp, .i32, cf)
-                            or !popExpect(&stack_buf, &sp, address_type, cf))
+                        if (!popExpect(&stack_buf, &sp, .i64, cf) or !popExpect(&stack_buf, &sp, .i32, cf) or !popExpect(&stack_buf, &sp, address_type, cf))
                             return error.TypeMismatch;
                         pushType(&stack_buf, &sp, .i32, &stack_tidx);
                     },
                     0x02 => { // memory.atomic.wait64: [addr expected timeout] -> [i32]
-                        if (!popExpect(&stack_buf, &sp, .i64, cf)
-                            or !popExpect(&stack_buf, &sp, .i64, cf)
-                            or !popExpect(&stack_buf, &sp, address_type, cf))
+                        if (!popExpect(&stack_buf, &sp, .i64, cf) or !popExpect(&stack_buf, &sp, .i64, cf) or !popExpect(&stack_buf, &sp, address_type, cf))
                             return error.TypeMismatch;
                         pushType(&stack_buf, &sp, .i32, &stack_tidx);
                     },
@@ -3917,37 +4261,63 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                     0x11, 0x14, 0x15, 0x16 => try doLoad64(&stack_buf, &sp, .i64, address_type, cf, &stack_tidx),
                     0x17, 0x19, 0x1A => try doStore64(&stack_buf, &sp, .i32, address_type, cf),
                     0x18, 0x1B, 0x1C, 0x1D => try doStore64(&stack_buf, &sp, .i64, address_type, cf),
-                    0x1E, 0x20, 0x21,
-                    0x25, 0x27, 0x28,
-                    0x2C, 0x2E, 0x2F,
-                    0x33, 0x35, 0x36,
-                    0x3A, 0x3C, 0x3D,
-                    0x41, 0x43, 0x44,
+                    0x1E,
+                    0x20,
+                    0x21,
+                    0x25,
+                    0x27,
+                    0x28,
+                    0x2C,
+                    0x2E,
+                    0x2F,
+                    0x33,
+                    0x35,
+                    0x36,
+                    0x3A,
+                    0x3C,
+                    0x3D,
+                    0x41,
+                    0x43,
+                    0x44,
                     => {
                         try doStore64(&stack_buf, &sp, .i32, address_type, cf);
                         pushType(&stack_buf, &sp, .i32, &stack_tidx);
                     },
-                    0x1F, 0x22, 0x23, 0x24,
-                    0x26, 0x29, 0x2A, 0x2B,
-                    0x2D, 0x30, 0x31, 0x32,
-                    0x34, 0x37, 0x38, 0x39,
-                    0x3B, 0x3E, 0x3F, 0x40,
-                    0x42, 0x45, 0x46, 0x47,
+                    0x1F,
+                    0x22,
+                    0x23,
+                    0x24,
+                    0x26,
+                    0x29,
+                    0x2A,
+                    0x2B,
+                    0x2D,
+                    0x30,
+                    0x31,
+                    0x32,
+                    0x34,
+                    0x37,
+                    0x38,
+                    0x39,
+                    0x3B,
+                    0x3E,
+                    0x3F,
+                    0x40,
+                    0x42,
+                    0x45,
+                    0x46,
+                    0x47,
                     => {
                         try doStore64(&stack_buf, &sp, .i64, address_type, cf);
                         pushType(&stack_buf, &sp, .i64, &stack_tidx);
                     },
                     0x48, 0x4A, 0x4B => {
-                        if (!popExpect(&stack_buf, &sp, .i32, cf)
-                            or !popExpect(&stack_buf, &sp, .i32, cf)
-                            or !popExpect(&stack_buf, &sp, address_type, cf))
+                        if (!popExpect(&stack_buf, &sp, .i32, cf) or !popExpect(&stack_buf, &sp, .i32, cf) or !popExpect(&stack_buf, &sp, address_type, cf))
                             return error.TypeMismatch;
                         pushType(&stack_buf, &sp, .i32, &stack_tidx);
                     },
                     0x49, 0x4C, 0x4D, 0x4E => {
-                        if (!popExpect(&stack_buf, &sp, .i64, cf)
-                            or !popExpect(&stack_buf, &sp, .i64, cf)
-                            or !popExpect(&stack_buf, &sp, address_type, cf))
+                        if (!popExpect(&stack_buf, &sp, .i64, cf) or !popExpect(&stack_buf, &sp, .i64, cf) or !popExpect(&stack_buf, &sp, address_type, cf))
                             return error.TypeMismatch;
                         pushType(&stack_buf, &sp, .i64, &stack_tidx);
                     },
@@ -3961,16 +4331,21 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 switch (sub) {
                     // v128.load variants: [addr] -> [v128]
                     0x00...0x0A => {
-                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
+                        _ = readU32Leb(code, &i);
+                        _ = readU32Leb(code, &i);
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         pushType(&stack_buf, &sp, .v128, &stack_tidx);
                     },
                     0x0B => { // v128.store: [addr v128] -> []
-                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
+                        _ = readU32Leb(code, &i);
+                        _ = readU32Leb(code, &i);
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                     },
-                    0x0C => { i += 16; pushType(&stack_buf, &sp, .v128, &stack_tidx); }, // v128.const
+                    0x0C => {
+                        i += 16;
+                        pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    }, // v128.const
                     0x0D => { // i8x16.shuffle
                         i += 16;
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
@@ -3983,17 +4358,31 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         pushType(&stack_buf, &sp, .v128, &stack_tidx);
                     },
                     // extract_lane: [v128] -> [scalar]
-                    0x15, 0x16, // i8x16 extract_lane_s/u
-                    0x18, 0x19, // i16x8 extract_lane_s/u
+                    0x15,
+                    0x16, // i8x16 extract_lane_s/u
+                    0x18,
+                    0x19, // i16x8 extract_lane_s/u
                     0x1B, // i32x4 extract_lane
                     => {
                         i += 1;
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         pushType(&stack_buf, &sp, .i32, &stack_tidx);
                     },
-                    0x1D => { i += 1; _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); pushType(&stack_buf, &sp, .i64, &stack_tidx); }, // i64x2.extract_lane
-                    0x1F => { i += 1; _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); pushType(&stack_buf, &sp, .f32, &stack_tidx); }, // f32x4.extract_lane
-                    0x21 => { i += 1; _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); pushType(&stack_buf, &sp, .f64, &stack_tidx); }, // f64x2.extract_lane
+                    0x1D => {
+                        i += 1;
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .i64, &stack_tidx);
+                    }, // i64x2.extract_lane
+                    0x1F => {
+                        i += 1;
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .f32, &stack_tidx);
+                    }, // f32x4.extract_lane
+                    0x21 => {
+                        i += 1;
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .f64, &stack_tidx);
+                    }, // f64x2.extract_lane
                     // replace_lane: [v128 scalar] -> [v128]
                     0x17, // i8x16 replace_lane
                     0x1A, // i16x8 replace_lane
@@ -4009,20 +4398,25 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                     },
                     // v128.load lane: [addr v128] -> [v128]
                     0x54...0x57 => {
-                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); i += 1;
+                        _ = readU32Leb(code, &i);
+                        _ = readU32Leb(code, &i);
+                        i += 1;
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         pushType(&stack_buf, &sp, .v128, &stack_tidx);
                     },
                     // v128.store lane: [addr v128] -> []
                     0x58...0x5B => {
-                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); i += 1;
+                        _ = readU32Leb(code, &i);
+                        _ = readU32Leb(code, &i);
+                        i += 1;
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                     },
                     // v128.load zero: [addr] -> [v128]
                     0x5C, 0x5D => {
-                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
+                        _ = readU32Leb(code, &i);
+                        _ = readU32Leb(code, &i);
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         pushType(&stack_buf, &sp, .v128, &stack_tidx);
                     },
@@ -4060,10 +4454,18 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         pushType(&stack_buf, &sp, .i32, &stack_tidx);
                     },
                     // Shift ops: [v128 i32] -> [v128]
-                    0x6B, 0x6C, 0x6D, // i8x16 shl/shr_s/shr_u
-                    0x8B, 0x8C, 0x8D, // i16x8 shl/shr_s/shr_u
-                    0xAB, 0xAC, 0xAD, // i32x4 shl/shr_s/shr_u
-                    0xCB, 0xCC, 0xCD, // i64x2 shl/shr_s/shr_u
+                    0x6B,
+                    0x6C,
+                    0x6D, // i8x16 shl/shr_s/shr_u
+                    0x8B,
+                    0x8C,
+                    0x8D, // i16x8 shl/shr_s/shr_u
+                    0xAB,
+                    0xAC,
+                    0xAD, // i32x4 shl/shr_s/shr_u
+                    0xCB,
+                    0xCC,
+                    0xCD, // i64x2 shl/shr_s/shr_u
                     => {
                         if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
                             return error.TypeMismatch;
@@ -4191,7 +4593,8 @@ test "load: module with one function" {
         // function section: 1 func, type idx 0
         0x03, 0x02, 0x01, 0x00,
         // code section: 1 body, body_size=2, 0 locals, end
-        0x0A, 0x04, 0x01, 0x02, 0x00, 0x0B,
+        0x0A, 0x04,
+        0x01, 0x02, 0x00, 0x0B,
     };
     const module = try load(&data, allocator);
     try testing.expectEqual(@as(usize, 1), module.functions.len);
@@ -4240,9 +4643,12 @@ test "load: module with export" {
         // function section
         0x03, 0x02, 0x01, 0x00,
         // export section: 1 export, name="main", kind=function, idx=0
-        0x07, 0x08, 0x01, 0x04, 'm', 'a', 'i', 'n', 0x00, 0x00,
+        0x07, 0x08,
+        0x01, 0x04, 'm',  'a',  'i',  'n',
+        0x00, 0x00,
         // code section
-        0x0A, 0x04, 0x01, 0x02, 0x00, 0x0B,
+        0x0A, 0x04, 0x01, 0x02,
+        0x00, 0x0B,
     };
     const module = try load(&data, allocator);
     try testing.expectEqual(@as(usize, 1), module.exports.len);
@@ -4260,7 +4666,8 @@ test "load: module with import" {
         // type section: func() -> ()
         0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
         // import section: 1 import, module="env", field="f", kind=function, type=0
-        0x02, 0x09, 0x01, 0x03, 'e', 'n', 'v', 0x01, 'f', 0x00, 0x00,
+        0x02, 0x09, 0x01, 0x03, 'e',  'n',
+        'v',  0x01, 'f',  0x00, 0x00,
     };
     const module = try load(&data, allocator);
     try testing.expectEqual(@as(usize, 1), module.imports.len);
@@ -4280,7 +4687,8 @@ test "load: module with data segment" {
         // memory section: 1 memory, min=1
         0x05, 0x03, 0x01, 0x00, 0x01,
         // data section: 1 segment, flags=0, i32.const(0), end, 2 bytes "hi"
-        0x0B, 0x08, 0x01, 0x00, 0x41, 0x00, 0x0B, 0x02, 'h', 'i',
+        0x0B, 0x08, 0x01, 0x00, 0x41,
+        0x00, 0x0B, 0x02, 'h',  'i',
     };
     const module = try load(&data, allocator);
     try testing.expectEqual(@as(usize, 1), module.data_segments.len);
@@ -4316,9 +4724,11 @@ test "load: module with start function" {
         // function section
         0x03, 0x02, 0x01, 0x00,
         // start section: function index 0
-        0x08, 0x01, 0x00,
+        0x08, 0x01,
+        0x00,
         // code section
-        0x0A, 0x04, 0x01, 0x02, 0x00, 0x0B,
+        0x0A, 0x04, 0x01, 0x02, 0x00,
+        0x0B,
     };
     const module = try load(&data, allocator);
     try testing.expectEqual(@as(?u32, 0), module.start_function);
@@ -4348,7 +4758,8 @@ test "load: function with locals" {
         // function section: 1 func, type idx 0
         0x03, 0x02, 0x01, 0x00,
         // code section: 1 body, body_size=4, 1 local decl (2 x i32), end
-        0x0A, 0x06, 0x01, 0x04, 0x01, 0x02, 0x7F, 0x0B,
+        0x0A, 0x06,
+        0x01, 0x04, 0x01, 0x02, 0x7F, 0x0B,
     };
     const module = try load(&data, allocator);
     try testing.expectEqual(@as(usize, 1), module.functions.len);
@@ -4396,7 +4807,8 @@ test "load: out-of-order sections rejected" {
     const data = wasm_header ++ [_]u8{
         // function section (id=3) before type section (id=1) is out of order
         0x03, 0x02, 0x01, 0x00,
-        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x60,
+        0x00, 0x00,
     };
     try testing.expectError(error.InvalidSectionOrder, load(&data, arena.allocator()));
 }
@@ -4406,11 +4818,12 @@ test "load: custom section can appear anywhere" {
     defer arena.deinit();
     const data = wasm_header ++ [_]u8{
         // custom section (id=0): size=5, name="test" (4 bytes)
-        0x00, 0x05, 0x04, 't', 'e', 's', 't',
+        0x00, 0x05, 0x04, 't',  'e',  's',  't',
         // memory section
         0x05, 0x03, 0x01, 0x00, 0x01,
         // another custom section
-        0x00, 0x05, 0x04, 't', 'e', 's', 't',
+        0x00, 0x05,
+        0x04, 't',  'e',  's',  't',
     };
     const module = try load(&data, arena.allocator());
     try testing.expectEqual(@as(usize, 1), module.memories.len);

@@ -69,7 +69,7 @@ discriminant.
 ```sh
 unset ZIG_LOCAL_CACHE_DIR
 export ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-global-cache"
-zig build -Doptimize=ReleaseSafe
+zig build -Doptimize=safe
 
 ./zig-out/bin/wamrc compile-component tests/regressions/760-aot-cli-exit/exit-with-code-7.wasm
 ./zig-out/bin/wamr run tests/regressions/760-aot-cli-exit/exit-with-code-7.wasm

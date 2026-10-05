@@ -258,10 +258,10 @@ fn admit(o: Options, a: std.mem.Allocator) !Admitted {
     try equivalent(a, o.build.target_abi, try json.field(receipt, "target_abi"));
     try equivalent(a, runtime_options, try json.field(receipt, "options"));
     try equivalent(a, o.build.memory_policy, try json.field(receipt, "memory_policy"));
-    inline for (std.meta.fields(@TypeOf(o.build.memory_policy.allocator_by_phase))) |f|
-        try token(@field(o.build.memory_policy.allocator_by_phase, f.name));
-    inline for (std.meta.fields(@TypeOf(o.build.memory_policy.page_policy))) |f|
-        try token(@field(o.build.memory_policy.page_policy, f.name));
+    inline for (@typeInfo(@TypeOf(o.build.memory_policy.allocator_by_phase)).@"struct".field_names) |name|
+        try token(@field(o.build.memory_policy.allocator_by_phase, name));
+    inline for (@typeInfo(@TypeOf(o.build.memory_policy.page_policy)).@"struct".field_names) |name|
+        try token(@field(o.build.memory_policy.page_policy, name));
     for ([_]json.Value{ config, target, receipt }) |value|
         try equivalent(a, runner.execution_lifecycle, try json.field(value, "execution_lifecycle"));
     try token(o.cpu.model);

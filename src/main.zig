@@ -409,7 +409,7 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
 
     const io = init.io;
     const cwd = std.Io.Dir.cwd();
-    const wasm_data = cwd.readFileAlloc(io, path, allocator, @enumFromInt(256 * 1024 * 1024)) catch |err| {
+    const wasm_data = cwd.readFileAlloc(io, path, allocator, @fromBackingInt(@intCast(256 * 1024 * 1024))) catch |err| {
         wamr.utils.read_file.dieReadFileError(path, err);
     };
     defer allocator.free(wasm_data);
@@ -755,7 +755,7 @@ fn runServe(init: std.process.Init, allocator: std.mem.Allocator, serve_args: []
 
     const io = init.io;
     const cwd = std.Io.Dir.cwd();
-    const wasm_data = cwd.readFileAlloc(io, path, allocator, @enumFromInt(256 * 1024 * 1024)) catch |err| {
+    const wasm_data = cwd.readFileAlloc(io, path, allocator, @fromBackingInt(@intCast(256 * 1024 * 1024))) catch |err| {
         wamr.utils.read_file.dieReadFileError(path, err);
     };
     defer allocator.free(wasm_data);
@@ -1068,7 +1068,7 @@ fn loadComponentConfigStore(
     if (config_path) |p| {
         const cwd = std.Io.Dir.cwd();
         const io = std.Io.Threaded.global_single_threaded.io();
-        const bytes = cwd.readFileAlloc(io, p, arena, @enumFromInt(8 * 1024 * 1024)) catch |err| switch (err) {
+        const bytes = cwd.readFileAlloc(io, p, arena, @fromBackingInt(@intCast(8 * 1024 * 1024))) catch |err| switch (err) {
             error.FileNotFound => return error.ConfigStoreNotFound,
             else => return err,
         };

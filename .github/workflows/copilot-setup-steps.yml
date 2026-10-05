@@ -56,15 +56,15 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ env.ZIG_GLOBAL_CACHE_DIR }}
-          key: zig-cache-${{ runner.os }}-0.16.0-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          key: zig-cache-${{ runner.os }}-0.17.0-${{ hashFiles('build.zig', 'build.zig.zon') }}
           restore-keys: |
-            zig-cache-${{ runner.os }}-0.16.0-
+            zig-cache-${{ runner.os }}-0.17.0-
 
       - name: Warm build (Debug + ReleaseSafe)
         continue-on-error: true
         run: |
           zig build
-          zig build -Doptimize=ReleaseSafe
+          zig build -Doptimize=safe
 
       - name: Smoke test
         continue-on-error: true

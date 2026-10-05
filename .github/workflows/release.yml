@@ -99,7 +99,7 @@ jobs:
 
       - name: Build
         shell: bash
-        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} -Dstrip=true -Dstack-protector=true "-Dversion=$RELEASE_VERSION" -j4
+        run: zig build -Doptimize=fast -Dtarget=${{ matrix.target }} -Dstrip=true -Dstack-protector=true "-Dversion=$RELEASE_VERSION" -j4
 
       - name: Azure login (for signing)
         if: endsWith(matrix.target, '-windows')

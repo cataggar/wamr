@@ -93,10 +93,10 @@ jobs:
         # which the Debug interpreter cannot complete inside the
         # 5-second per-`wait` timeout. Safety checks still fire so a
         # real regression still trips the gate.
-        run: zig build -Doptimize=ReleaseSafe
+        run: zig build -Doptimize=safe
 
       - name: Run Wasmtime parity gate
-        run: zig build wasi-p3-parity -Doptimize=ReleaseSafe
+        run: zig build wasi-p3-parity -Doptimize=safe
 
       - name: Upload parity JSON reports
         if: always()

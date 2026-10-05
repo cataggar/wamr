@@ -101,10 +101,10 @@ pub const MAX_FLAT_RESULTS: u32 = 1;
 pub const CoreFuncIdxComponent = enum(u32) {
     _,
     pub inline fn from(raw: u32) CoreFuncIdxComponent {
-        return @enumFromInt(raw);
+        return @fromBackingInt(@intCast(raw));
     }
     pub inline fn value(self: CoreFuncIdxComponent) u32 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 
@@ -2779,7 +2779,7 @@ pub fn dispatchCanonBuiltinWithCtx(
             // cancelled while parked (cancellable-only).
             const outcome: u32 = if (task_manager) |tm| blk: {
                 const handle = tm.currentTask() orelse break :blk 0;
-                break :blk @intFromEnum(async_canon.taskYield(tm, handle, info.cancellable, allocator));
+                break :blk @backingInt(async_canon.taskYield(tm, handle, info.cancellable, allocator));
             } else 0;
             env.pushI32(@bitCast(outcome)) catch return error.StackOverflow;
         },
@@ -4072,7 +4072,7 @@ fn dispatchAsyncCanon(
 
             // No ready waitable — `none` event-code. Caller (wit-bindgen
             // reactor) reschedules.
-            env.pushI32(@intFromEnum(async_canon.EventCode.none)) catch
+            env.pushI32(@backingInt(async_canon.EventCode.none)) catch
                 return error.StackOverflow;
         },
 
@@ -7928,7 +7928,7 @@ test "waitable.join + waitable-set.wait: stream-write event delivered to a parke
         testing.allocator,
     );
     const event: u32 = @bitCast(try env.popI32());
-    try testing.expectEqual(@intFromEnum(async_canon.EventCode.stream_write), event);
+    try testing.expectEqual(@backingInt(async_canon.EventCode.stream_write), event);
 
     // Payload at out_ptr: (handle, packed_status).
     const ev_bytes = inst.writableGuestBytes(out_ptr, 8).?;
@@ -7998,7 +7998,7 @@ test "wasi:http #616 A8 live: stream backpressure wake is latched before waitabl
         testing.allocator,
     );
     try testing.expectEqual(
-        @intFromEnum(async_canon.EventCode.stream_write),
+        @backingInt(async_canon.EventCode.stream_write),
         @as(u32, @bitCast(try env.popI32())),
     );
     const event = inst.writableGuestBytes(out_ptr, 8).?;
@@ -8073,7 +8073,7 @@ test "wasi:http #970 review: retired blocked writer joins a terminal tombstone" 
         testing.allocator,
     );
     try testing.expectEqual(
-        @intFromEnum(async_canon.EventCode.stream_write),
+        @backingInt(async_canon.EventCode.stream_write),
         @as(u32, @bitCast(try env.popI32())),
     );
     const event = inst.writableGuestBytes(out_ptr, 8).?;
@@ -8128,7 +8128,7 @@ test "wasi:http #970 review: retired blocked writer joins a terminal tombstone" 
         testing.allocator,
     );
     try testing.expectEqual(
-        @intFromEnum(async_canon.EventCode.none),
+        @backingInt(async_canon.EventCode.none),
         @as(u32, @bitCast(try env.popI32())),
     );
     try testing.expect(inst.streams.getPtr(replacement_handle) != null);
@@ -8161,7 +8161,7 @@ test "wasi:http #970 review: retired blocked writer joins a terminal tombstone" 
         testing.allocator,
     );
     try testing.expectEqual(
-        @intFromEnum(async_canon.EventCode.none),
+        @backingInt(async_canon.EventCode.none),
         @as(u32, @bitCast(try env.popI32())),
     );
 }
@@ -8224,7 +8224,7 @@ test "waitable-set.poll: settled future surfaces FUTURE_READ event with the righ
         null,
         testing.allocator,
     );
-    try testing.expectEqual(@intFromEnum(async_canon.EventCode.none), @as(u32, @bitCast(try env.popI32())));
+    try testing.expectEqual(@backingInt(async_canon.EventCode.none), @as(u32, @bitCast(try env.popI32())));
 
     // Simulate host settling the future the way
     // `writeViaStreamOnDropWritable` does: directly populate the
@@ -8253,7 +8253,7 @@ test "waitable-set.poll: settled future surfaces FUTURE_READ event with the righ
         null,
         testing.allocator,
     );
-    try testing.expectEqual(@intFromEnum(async_canon.EventCode.future_read), @as(u32, @bitCast(try env.popI32())));
+    try testing.expectEqual(@backingInt(async_canon.EventCode.future_read), @as(u32, @bitCast(try env.popI32())));
     const ev_bytes = inst.writableGuestBytes(out_ptr, 8).?;
     try testing.expectEqual(future_handle, std.mem.readInt(u32, ev_bytes[0..4], .little));
     try testing.expectEqual(async_canon.packStatus(.completed, 0), std.mem.readInt(u32, ev_bytes[4..8], .little));
@@ -8314,7 +8314,7 @@ test "waitable.join on already-settled future: marks ready synchronously so the 
         null,
         testing.allocator,
     );
-    try testing.expectEqual(@intFromEnum(async_canon.EventCode.future_read), @as(u32, @bitCast(try env.popI32())));
+    try testing.expectEqual(@backingInt(async_canon.EventCode.future_read), @as(u32, @bitCast(try env.popI32())));
     const ev_bytes = inst.writableGuestBytes(out_ptr, 8).?;
     try testing.expectEqual(future_handle, std.mem.readInt(u32, ev_bytes[0..4], .little));
 }
@@ -11384,7 +11384,7 @@ test "wamrAotDispatchCanonBuiltin: async context, task, waitable, future, and mu
     };
     const poll_result = Invoke.call(&waitable_poll, &two_to_i32, .{ waitable_set_handle, 0, 0, 0, 0, 0, 0, 0, 0 });
     try testing.expectEqual(@as(u32, 0), poll_result.status);
-    try testing.expectEqual(@as(u64, @intFromEnum(async_canon.EventCode.none)), poll_result.value);
+    try testing.expectEqual(@as(u64, @backingInt(async_canon.EventCode.none)), poll_result.value);
 
     var task_manager = async_mod.TaskManager{};
     defer task_manager.deinit(allocator);

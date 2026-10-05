@@ -54,7 +54,7 @@ jobs:
 
       # ── PR / HEAD bench ─────────────────────────────────────────
       - name: Build (ReleaseFast)
-        run: zig build -Doptimize=ReleaseFast
+        run: zig build -Doptimize=fast
 
       - name: Codegen micro-bench
         run: zig build bench 2>&1 | tee bench.txt

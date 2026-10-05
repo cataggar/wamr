@@ -70,7 +70,7 @@ aot transitive failure
    +- run ../../../zig-out/bin/wamrc (coremark.cwasm) failure
 
 error: the following build command failed with exit code 1:
-.zig-cache/o/f30ef4f7352ea887eaf3720bcddaa70e/build /home/g/.local/share/ghr/tools/ctaggart/zig/zig-x86_64-linux-0.16.0/zig /home/g/.local/share/ghr/tools/ctaggart/zig/zig-x86_64-linux-0.16.0/lib /work/bench-coremark-ie7ie366/target-safe-0c60142e7252/tests/benchmarks/coremark .zig-cache /work/bench-coremark-ie7ie366/target-safe-0c60142e7252/.zig-global-cache --seed 0x65de8d4f -Zfb0021a593286222 aot
+.zig-cache/o/f30ef4f7352ea887eaf3720bcddaa70e/build /home/g/.local/share/ghr/tools/ctaggart/zig/zig-x86_64-linux-0.17.0/zig /home/g/.local/share/ghr/tools/ctaggart/zig/zig-x86_64-linux-0.17.0/lib /work/bench-coremark-ie7ie366/target-safe-0c60142e7252/tests/benchmarks/coremark .zig-cache /work/bench-coremark-ie7ie366/target-safe-0c60142e7252/.zig-global-cache --seed 0x65de8d4f -Zfb0021a593286222 aot
 [harness] ReleaseSafe failed before producing complete CoreMark timings: Command '['zig', 'build', 'aot']' returned non-zero exit status 1.
 ### CoreMark AOT optimize-mode comparison
 
@@ -617,7 +617,7 @@ Unwind error at address `???:0x7088c1895523` (unwind info unavailable), remainin
 /work/wamr-710bench/src/main.zig:65:27: 0x1082253 in main (wamr)
         .run => try runRun(init, allocator, args[2..]),
                           ^
-/home/g/.local/share/ghr/tools/ctaggart/zig/zig-x86_64-linux-0.16.0/lib/std/start.zig:190:5: 0x107b73d in _start (wamr)
+/home/g/.local/share/ghr/tools/ctaggart/zig/zig-x86_64-linux-0.17.0/lib/std/start.zig:190:5: 0x107b73d in _start (wamr)
     asm volatile (switch (native_arch) {
     ^
 bash: line 1: 1060978 Aborted                 (core dumped) env WAMR=1 WAMR_BIN="$safe_bin" codegen/cli/scripts/run.sh "$spec" "$out_safe"

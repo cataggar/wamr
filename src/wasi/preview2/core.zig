@@ -189,7 +189,7 @@ test "Random: getRandomU64 returns values" {
 }
 
 test "Random: getRandomBytes fills buffer" {
-    var buf = [_]u8{0} ** 32;
+    var buf = @as([32]u8, @splat(0));
     Random.getRandomBytes(&buf);
     // Check at least one byte is non-zero (probabilistically certain)
     var all_zero = true;

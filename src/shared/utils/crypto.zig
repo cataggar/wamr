@@ -81,7 +81,7 @@ test "hashEqual - different hashes" {
 
 test "sha256 - large input (1 MB of zeros)" {
     const one_mb = 1024 * 1024;
-    const zeros = [_]u8{0} ** one_mb;
+    const zeros = @as([one_mb]u8, @splat(0));
     const digest = sha256(&zeros);
     // Just verify it produces a 32-byte result without error.
     try std.testing.expectEqual(@as(usize, sha256_digest_length), digest.len);

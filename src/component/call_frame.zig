@@ -56,13 +56,12 @@ const Allocator = std.mem.Allocator;
 pub const CoreFuncIdxLocal = enum(u32) {
     _,
     pub inline fn from(raw: u32) CoreFuncIdxLocal {
-        return @enumFromInt(raw);
+        return @fromBackingInt(@intCast(raw));
     }
     pub inline fn value(self: CoreFuncIdxLocal) u32 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
-
 
 pub const FrameError = error{
     StackOverflow,

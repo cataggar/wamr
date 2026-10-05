@@ -61,7 +61,7 @@ const Waiter = struct {
     key: usize,
     cancellation: if (config.lib_wasi_threads) ?CancellationEpoch.Ticket else void =
         if (config.lib_wasi_threads) null else {},
-    outcome: std.atomic.Value(u32) = .init(@intFromEnum(Outcome.waiting)),
+    outcome: std.atomic.Value(u32) = .init(@backingInt(Outcome.waiting)),
 };
 
 const Bucket = struct {
@@ -262,7 +262,7 @@ pub const ParkingLot = struct {
                 std.math.maxInt(u64);
 
         while (true) {
-            const outcome: Outcome = @enumFromInt(waiter.outcome.load(.acquire));
+            const outcome: Outcome = @fromBackingInt(@intCast(waiter.outcome.load(.acquire)));
             if (outcome != .waiting) return outcomeToResult(outcome);
 
             const remaining_ns: ?u64 = if (deadline_ns) |deadline| remaining: {
@@ -278,17 +278,17 @@ pub const ParkingLot = struct {
 
             const os_result = osWait(
                 &waiter.outcome.raw,
-                @intFromEnum(Outcome.waiting),
+                @backingInt(Outcome.waiting),
                 remaining_ns,
             ) catch |err| {
                 bucket.mutex.lock();
-                const final_outcome: Outcome = @enumFromInt(waiter.outcome.load(.acquire));
+                const final_outcome: Outcome = @fromBackingInt(@intCast(waiter.outcome.load(.acquire)));
                 if (final_outcome != .waiting) {
                     bucket.mutex.unlock();
                     return outcomeToResult(final_outcome);
                 }
                 self.removeLocked(bucket, &waiter);
-                waiter.outcome.store(@intFromEnum(Outcome.cancelled), .release);
+                waiter.outcome.store(@backingInt(Outcome.cancelled), .release);
                 bucket.mutex.unlock();
                 return err;
             };
@@ -308,11 +308,11 @@ pub const ParkingLot = struct {
     }
 
     fn removeTimedOutLocked(self: *ParkingLot, bucket: *Bucket, waiter: *Waiter) WaitResult {
-        const outcome: Outcome = @enumFromInt(waiter.outcome.load(.acquire));
+        const outcome: Outcome = @fromBackingInt(@intCast(waiter.outcome.load(.acquire)));
         if (outcome != .waiting) return outcomeToResult(outcome);
 
         self.removeLocked(bucket, waiter);
-        waiter.outcome.store(@intFromEnum(Outcome.cancelled), .release);
+        waiter.outcome.store(@backingInt(Outcome.cancelled), .release);
         return .timed_out;
     }
 
@@ -366,7 +366,7 @@ pub const ParkingLot = struct {
             bucket.mutex.lock();
             while (bucket.head) |w| {
                 bucket.head = w.next;
-                w.outcome.store(@intFromEnum(Outcome.cancelled), .release);
+                w.outcome.store(@backingInt(Outcome.cancelled), .release);
                 osWake(&w.outcome.raw) catch |err| {
                     bucket.mutex.unlock();
                     return err;
@@ -407,7 +407,7 @@ pub const ParkingLot = struct {
                         continue;
                     }
                     link.* = waiter.next;
-                    waiter.outcome.store(@intFromEnum(Outcome.cancelled), .release);
+                    waiter.outcome.store(@backingInt(Outcome.cancelled), .release);
                     osWake(&waiter.outcome.raw) catch |err| {
                         bucket.mutex.unlock();
                         return err;
@@ -433,7 +433,7 @@ pub const ParkingLot = struct {
                 continue;
             }
             link.* = waiter.next;
-            waiter.outcome.store(@intFromEnum(outcome), .release);
+            waiter.outcome.store(@backingInt(outcome), .release);
             try osWake(&waiter.outcome.raw);
             woken += 1;
         }
@@ -493,7 +493,7 @@ pub const ParkingLot = struct {
             bucket.head = null;
             while (waiter) |w| {
                 waiter = w.next;
-                w.outcome.store(@intFromEnum(Outcome.closed), .release);
+                w.outcome.store(@backingInt(Outcome.closed), .release);
                 osWake(&w.outcome.raw) catch |err| switch (err) {
                     error.InvalidAddress,
                     error.InvalidArgument,
@@ -636,7 +636,7 @@ fn macosWait(word: *const u32, expected: u32, timeout_ns: ?u64) BackendError!OsW
         0;
     const status = std.c.__ulock_wait(flags, word, expected, timeout_us);
     if (status >= 0) return .awakened;
-    return mapDarwinWaitErrno(@enumFromInt(-status));
+    return mapDarwinWaitErrno(@fromBackingInt(@intCast(-status)));
 }
 
 fn mapDarwinWaitErrno(err: std.c.E) BackendError!OsWaitResult {
@@ -659,7 +659,7 @@ fn macosWake(word: *const u32, all: bool) BackendError!void {
     while (true) {
         const status = std.c.__ulock_wake(flags, word, 0);
         if (status >= 0) return;
-        switch (@as(std.c.E, @enumFromInt(-status))) {
+        switch (@as(std.c.E, @fromBackingInt(@intCast(-status)))) {
             .INTR, .CANCELED => continue,
             .NOENT => return,
             .FAULT => return error.InvalidAddress,

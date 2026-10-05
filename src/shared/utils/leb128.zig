@@ -116,7 +116,7 @@ pub fn readSigned(comptime T: type, bytes: []const u8) Error!Result(T) {
         }
     }
 
-    return .{ .value = @bitCast(@as(std.meta.Int(.unsigned, maxbits), @truncate(result))), .bytes_read = byte_count };
+    return .{ .value = @bitCast(@as(@Int(.unsigned, maxbits), @truncate(result))), .bytes_read = byte_count };
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -354,7 +354,6 @@ test "extra trailing bytes are ignored" {
     try testing.expectEqual(@as(u32, 1), r.value);
     try testing.expectEqual(@as(usize, 1), r.bytes_read);
 }
-
 
 // -- Lossy wrapper behavior ------------------------------------------------
 

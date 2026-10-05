@@ -124,7 +124,7 @@ pub const ThreadExecutionContext = struct {
     host_task_context: ?*anyopaque = null,
     backend_context: ?*anyopaque = null,
     implicit_task_context: [task_context_slot_count]u32 =
-        [_]u32{0} ** task_context_slot_count,
+        @as([task_context_slot_count]u32, @splat(0)),
     cancellation_requested: ConditionalFlag = .{},
     trap_observed: ConditionalFlag = .{},
 

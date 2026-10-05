@@ -1,5 +1,9 @@
 # WAMR: WebAssembly Micro Runtime
 
+This compatibility branch preserves Unikraft's `a53205d` native AOT APIs and
+profile while requiring the signed `cataggar/zig` 0.17.0 compiler. Package
+versions are unchanged; WABT and TLS are pinned to immutable compatible sources.
+
 A fork of [bytecodealliance/wasm-micro-runtime](https://github.com/bytecodealliance/wasm-micro-runtime) ported from C to Zig and maintained with AI assistance. It passes the [WebAssembly/spec](https://github.com/WebAssembly/spec) test suite: 257 `.wast` files and 65,135 assertions, gated against `tests/spec-baseline.tsv` on every PR (`zig build spec-testsuite`). It supports the [Component Model](https://github.com/webassembly/component-model). It has a very fast cold start, small engine binary size with no dependencies, and is easy to build & fork.
 
 [Wasmtime](https://github.com/bytecodealliance/wasmtime) is currently about 2.1x faster in CoreMark steady-state throughput. For cold start, this repo's in-process JIT mode is instead ~4.9x *faster* than wasmtime's default run on small modules — see [docs/bench/jit-cold-start-comparison-2026-07-10.md](docs/bench/jit-cold-start-comparison-2026-07-10.md) for the full measured comparison (AOT, JIT `.fast`/`.full` presets, and wasmtime, across both cold-start and steady-state axes). Wasmtime has years of production usage and use with a proven track record and security audits.
@@ -32,7 +36,7 @@ a bigger binary (~25 MB) and per-invocation compile latency.
 
 | | AOT-only (default) | JIT (`-Djit=true`) |
 |---|---|---|
-| Build | `zig build -Doptimize=ReleaseSafe` | `zig build -Doptimize=ReleaseSafe -Djit=true` |
+| Build | `zig build -Doptimize=safe` | `zig build -Doptimize=safe -Djit=true` |
 | Core wasm | `wamrc compile foo.wasm` → `wamr run foo.cwasm` | `wamr run foo.wasm` |
 | Component | `wamrc compile-component foo.wasm` → `wamr run foo.wasm` (auto-detects the sidecar manifest) | `wamr run foo.wasm` (no manifest needed) |
 | One-shot testing | `wamrc run foo.wasm` (compiles, then spawns `wamr` as a subprocess) | `wamr run foo.wasm` (single process, no subprocess) |
@@ -67,7 +71,7 @@ $ zig build
 For release builds:
 
 ```console
-$ zig build -Doptimize=ReleaseSafe
+$ zig build -Doptimize=safe
 ```
 
 `ReleaseSafe` is the primary source-build recommendation. The 2026-05-29 optimize-mode comparison shows cold-start `noop.cwasm` at ×0.54 Safe/Fast and SIMD interpreter rows at ×0.99 median on the project VM, while also showing `ReleaseSafe` catching a CoreMark AOT compiler invariant before timing; see [`docs/bench/optimize-mode-comparison-2026-05-29.md`](docs/bench/optimize-mode-comparison-2026-05-29.md).
@@ -75,10 +79,10 @@ $ zig build -Doptimize=ReleaseSafe
 Cross-compilation works out of the box:
 
 ```console
-$ zig build -Dtarget=aarch64-linux -Doptimize=ReleaseSafe
-$ zig build -Dtarget=aarch64-macos -Doptimize=ReleaseSafe
-$ zig build -Dtarget=x86_64-windows -Doptimize=ReleaseSafe
-$ zig build -Dtarget=wasm32-wasi -Doptimize=ReleaseSafe
+$ zig build -Dtarget=aarch64-linux -Doptimize=safe
+$ zig build -Dtarget=aarch64-macos -Doptimize=safe
+$ zig build -Dtarget=x86_64-windows -Doptimize=safe
+$ zig build -Dtarget=wasm32-wasi -Doptimize=safe
 ```
 
 The `wasm32-wasi` target produces an interpreter-only `wamr.wasm` that can

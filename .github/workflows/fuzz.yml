@@ -111,7 +111,7 @@ jobs:
           ls .fuzz-corpus/${{ matrix.target }} | wc -l
 
       - name: Build fuzz harness
-        run: zig build fuzz -Doptimize=ReleaseSafe
+        run: zig build fuzz -Doptimize=safe
 
       - name: Fuzz
         env:

@@ -279,7 +279,7 @@ pub fn emit(
         for (exports) |exp| {
             try appendU32Le(&tmp, allocator, @intCast(exp.name.len));
             try tmp.appendSlice(allocator, exp.name);
-            try tmp.append(allocator, @intFromEnum(exp.kind));
+            try tmp.append(allocator, @backingInt(exp.kind));
             try appendU32Le(&tmp, allocator, exp.index);
         }
         try emitSection(allocator, &buf, 4, tmp.items);
@@ -292,7 +292,7 @@ pub fn emit(
             defer tmp.deinit(allocator);
             try appendU32Le(&tmp, allocator, @intCast(segments.len));
             for (segments) |seg| {
-                try tmp.append(allocator, @intFromEnum(seg.offset_kind));
+                try tmp.append(allocator, @backingInt(seg.offset_kind));
                 try appendU32Le(&tmp, allocator, seg.memory_idx);
                 try appendU32Le(&tmp, allocator, seg.offset);
                 try appendU32Le(&tmp, allocator, @intCast(seg.data.len));
@@ -315,11 +315,11 @@ pub fn emit(
                 try tmp.appendSlice(allocator, imp.module_name);
                 try appendU32Le(&tmp, allocator, @intCast(imp.field_name.len));
                 try tmp.appendSlice(allocator, imp.field_name);
-                try tmp.append(allocator, @intFromEnum(imp.kind));
+                try tmp.append(allocator, @backingInt(imp.kind));
                 switch (imp.kind) {
                     .function => try appendU32Le(&tmp, allocator, imp.func_type_idx),
                     .table => {
-                        try tmp.append(allocator, @intFromEnum(imp.table_elem_type));
+                        try tmp.append(allocator, @backingInt(imp.table_elem_type));
                         try appendU32Le(&tmp, allocator, imp.table_min);
                         if (imp.table_max) |max| {
                             try tmp.append(allocator, 1);
@@ -340,7 +340,7 @@ pub fn emit(
                         try tmp.append(allocator, if (imp.memory_shared) 1 else 0);
                     },
                     .global => {
-                        try tmp.append(allocator, @intFromEnum(imp.global_val_type));
+                        try tmp.append(allocator, @backingInt(imp.global_val_type));
                         try tmp.append(allocator, if (imp.global_mutable) 1 else 0);
                     },
                     .tag => {
@@ -447,7 +447,7 @@ pub fn emit(
             defer tmp.deinit(allocator);
             try appendU32Le(&tmp, allocator, @intCast(tbl_list.len));
             for (tbl_list) |t| {
-                try tmp.append(allocator, @intFromEnum(t.elem_type));
+                try tmp.append(allocator, @backingInt(t.elem_type));
                 try appendU32Le(&tmp, allocator, t.min);
                 if (t.max) |max| {
                     try tmp.append(allocator, 1);
@@ -690,10 +690,10 @@ test "roundtrip: emit then load with AOT loader" {
     // Verify exports
     try std.testing.expectEqual(@as(usize, 2), module.exports.len);
     try std.testing.expect(std.mem.eql(u8, module.exports[0].name, "add"));
-    try std.testing.expectEqual(@as(u8, 0x00), @intFromEnum(module.exports[0].kind)); // function
+    try std.testing.expectEqual(@as(u8, 0x00), @backingInt(module.exports[0].kind)); // function
     try std.testing.expectEqual(@as(u32, 0), module.exports[0].index);
     try std.testing.expect(std.mem.eql(u8, module.exports[1].name, "mem"));
-    try std.testing.expectEqual(@as(u8, 0x02), @intFromEnum(module.exports[1].kind)); // memory
+    try std.testing.expectEqual(@as(u8, 0x02), @backingInt(module.exports[1].kind)); // memory
 }
 
 test "emit: import section round-trip" {

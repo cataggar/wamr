@@ -115,7 +115,7 @@ pub const BLOCKED_STATUS: u32 = 0xFFFF_FFFF;
 /// into the single i32 status word the spec returns from
 /// `{future,stream}.{read,write,cancel-read,cancel-write}`.
 pub fn packStatus(status: FutureStatus, count: u32) u32 {
-    return @intFromEnum(status) | (count << 4);
+    return @backingInt(status) | (count << 4);
 }
 
 /// Event-code discriminants returned by `canon waitable-set.{wait,poll}`
@@ -145,7 +145,7 @@ pub const EventCode = enum(u32) {
 /// numeric value. Centralised so the executor's wait/poll arm and
 /// future tests stay in lockstep with the spec encoding.
 pub fn eventCodeForKind(kind: async_mod.WaitableSet.WaitableItem.Kind) u32 {
-    return @intFromEnum(@as(EventCode, switch (kind) {
+    return @backingInt(@as(EventCode, switch (kind) {
         .subtask => .subtask,
         .stream_read => .stream_read,
         .stream_write => .stream_write,

@@ -101,23 +101,25 @@ pub fn decodeStreamFutureInner(payload: u32) StreamFutureInner {
     }
     const byte_tag: u8 = @intCast(payload & 0xFF);
     if (byte_tag == 0) return .empty;
-    return .{ .primitive = switch (byte_tag) {
-        0x7F => ValType.bool,
-        0x7E => ValType.s8,
-        0x7D => ValType.u8,
-        0x7C => ValType.s16,
-        0x7B => ValType.u16,
-        0x7A => ValType.s32,
-        0x79 => ValType.u32,
-        0x78 => ValType.s64,
-        0x77 => ValType.u64,
-        0x76 => ValType.f32,
-        0x75 => ValType.f64,
-        0x74 => ValType.char,
-        0x73 => ValType.string,
-        // Unknown byte tag — fall back to typeidx (best-effort).
-        else => return .{ .typeidx = payload },
-    } };
+    return .{
+        .primitive = switch (byte_tag) {
+            0x7F => ValType.bool,
+            0x7E => ValType.s8,
+            0x7D => ValType.u8,
+            0x7C => ValType.s16,
+            0x7B => ValType.u16,
+            0x7A => ValType.s32,
+            0x79 => ValType.u32,
+            0x78 => ValType.s64,
+            0x77 => ValType.u64,
+            0x76 => ValType.f32,
+            0x75 => ValType.f64,
+            0x74 => ValType.char,
+            0x73 => ValType.string,
+            // Unknown byte tag — fall back to typeidx (best-effort).
+            else => return .{ .typeidx = payload },
+        },
+    };
 }
 
 // ── Compound type definitions ───────────────────────────────────────────────

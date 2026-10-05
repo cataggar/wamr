@@ -590,7 +590,7 @@ test "interp: load and store round-trip memory" {
     try func.getBlock(b).append(.{ .dest = loaded, .type = .i32, .op = .{ .load = .{ .base = base, .offset = 0, .size = 4 } } });
     try func.getBlock(b).append(.{ .op = .{ .ret = loaded } });
 
-    var outcome = try run(a, &func, .{ .memory = &([_]u8{0} ** 16) });
+    var outcome = try run(a, &func, .{ .memory = &(@as([16]u8, @splat(0))) });
     defer outcome.deinit(a);
     try std.testing.expectEqual(@as(u64, 0x11223344), outcome.returned.results[0].bits);
     try std.testing.expectEqualSlices(u8, &.{ 0x44, 0x33, 0x22, 0x11 }, outcome.returned.memory[4..8]);

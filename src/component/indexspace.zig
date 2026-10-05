@@ -715,11 +715,13 @@ test "resolveInstanceExpr: alias of alias errors with MultiHopAliasUnsupported" 
             .instance_idx = 0,
             .name = "outer",
         } },
-        .{ .instance_export = .{
-            .sort = .instance,
-            .instance_idx = 1, // points at the prior alias
-            .name = "inner",
-        } },
+        .{
+            .instance_export = .{
+                .sort = .instance,
+                .instance_idx = 1, // points at the prior alias
+                .name = "inner",
+            },
+        },
     };
     const comp = ctypes.Component{
         .core_modules = &.{},
@@ -744,11 +746,13 @@ test "resolveInstanceExpr: self-referential alias errors with AliasDepthExceeded
     // Pathological self-loop: alias 0 points at instance idx 1 which
     // resolves back to alias 0.
     const aliases = [_]ctypes.Alias{
-        .{ .instance_export = .{
-            .sort = .instance,
-            .instance_idx = 1, // index space slot for this very alias
-            .name = "loop",
-        } },
+        .{
+            .instance_export = .{
+                .sort = .instance,
+                .instance_idx = 1, // index space slot for this very alias
+                .name = "loop",
+            },
+        },
     };
     const comp = ctypes.Component{
         .core_modules = &.{},
@@ -759,7 +763,7 @@ test "resolveInstanceExpr: self-referential alias errors with AliasDepthExceeded
         .aliases = &aliases,
         .types = &.{},
         .canons = &.{},
-        .imports = &.{ .{ .name = "host", .desc = .{ .instance = 0 } } },
+        .imports = &.{.{ .name = "host", .desc = .{ .instance = 0 } }},
         .exports = &.{},
     };
     // index space: 0=imported, 1=alias[0]. Resolving alias[0] looks up

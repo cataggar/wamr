@@ -21,8 +21,8 @@ inputs remain mandatory; enabling this software does not qualify hardware or ima
 From the repository root, with Zig 0.16:
 
 ```sh
-zig build native-bench-linux native-bench-fixtures -Doptimize=ReleaseFast -j2
-zig build test-native-bench -Doptimize=ReleaseFast -j2
+zig build native-bench-linux native-bench-fixtures -Doptimize=fast -j2
+zig build test-native-bench -Doptimize=fast -j2
 
 zig-out/bin/wamr-native-bench --check zig-out/native-bench/coremark.cwasm 100 3 coremark
 zig-out/bin/wamr-native-bench --check zig-out/native-bench/coremark-nofp.cwasm 100 3 coremark-nofp

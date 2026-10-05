@@ -42,7 +42,7 @@ fn context() minimal.Context {
 }
 
 fn binding(imports: []const NativeContract.HostImport, function: minimal.Function) NativeContract.HostImport {
-    return imports[@intFromEnum(function)];
+    return imports[@backingInt(function)];
 }
 
 fn run(imports: []const NativeContract.HostImport, host: *NativeContract.HostContext, function: minimal.Function, args: []const NativeContract.Value) !i32 {
@@ -71,7 +71,7 @@ test "native WASI adapter binds all exact snapshot-0 signatures" {
 test "native WASI adapter validates value shapes before touching guest memory" {
     var ctx = context();
     const imports = Bindings.imports(&ctx);
-    var mem = [_]u8{0xaa} ** 32;
+    var mem = @as([32]u8, @splat(0xaa));
     var host: NativeContract.HostContext = .{ .bytes = &mem };
     const entry = binding(&imports, .args_sizes_get);
     var results = [_]NativeContract.Value{.{ .i32 = -1 }};
@@ -88,8 +88,8 @@ test "native WASI adapter validates value shapes before touching guest memory" {
 test "native WASI adapter refreshes memory and preserves scalar bit patterns" {
     var ctx = context();
     const imports = Bindings.imports(&ctx);
-    var small = [_]u8{0xaa} ** 4;
-    var grown = [_]u8{0xaa} ** 64;
+    var small = @as([4]u8, @splat(0xaa));
+    var grown = @as([64]u8, @splat(0xaa));
     var host: NativeContract.HostContext = .{ .bytes = &small };
     const size_args = [_]NativeContract.Value{ .{ .i32 = 0 }, .{ .i32 = 4 } };
     try testing.expectEqual(@as(i32, 21), try run(&imports, &host, .args_sizes_get, &size_args));
@@ -128,7 +128,7 @@ test "native WASI adapter preserves 64-bit clock precision" {
     var clock: PrecisionClock = .{};
     ctx.clock = .{ .userdata = &clock, .resolution_ns = .{ 0, 100, 0, 0 }, .read = PrecisionClock.read };
     const imports = Bindings.imports(&ctx);
-    var mem = [_]u8{0xaa} ** 8;
+    var mem = @as([8]u8, @splat(0xaa));
     var host: NativeContract.HostContext = .{ .bytes = &mem };
     try testing.expectEqual(@as(i32, 0), try run(&imports, &host, .clock_time_get, &.{ .{ .i32 = 1 }, .{ .i64 = -1 }, .{ .i32 = 0 } }));
     try testing.expectEqual(std.math.maxInt(u64), clock.precision);
@@ -154,7 +154,7 @@ test "native WASI adapter preserves actual partial output and deferred callback 
     var capture: Capture = .{};
     ctx.output = .{ .userdata = &capture, .write = Capture.write };
     const imports = Bindings.imports(&ctx);
-    var mem = [_]u8{0xaa} ** 32;
+    var mem = @as([32]u8, @splat(0xaa));
     std.mem.writeInt(u32, mem[0..4], 16, .little);
     std.mem.writeInt(u32, mem[4..8], 4, .little);
     @memcpy(mem[16..20], "a\x00bc");
@@ -176,7 +176,7 @@ test "native WASI adapter requests zero and nonzero exits then returns without e
     for ([_]i32{ 0, 7, -1 }) |code| {
         var ctx = context();
         const imports = Bindings.imports(&ctx);
-        var mem = [_]u8{0xaa} ** 8;
+        var mem = @as([8]u8, @splat(0xaa));
         var host: NativeContract.HostContext = .{ .bytes = &mem };
         const entry = binding(&imports, .proc_exit);
         var callback_returned = false;

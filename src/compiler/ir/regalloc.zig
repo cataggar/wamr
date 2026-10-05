@@ -1775,7 +1775,6 @@ test "allocateFromRangesWithHints: empty hint list behaves like allocateFromRang
     try std.testing.expectEqual(result_a.get(1).?, result_b.get(1).?);
 }
 
-
 // ── Loop-depth-weighted eviction (issue #382) ───────────────────────────
 
 test "allocateFromRanges: cold vreg evicted over hot vreg under pressure" {

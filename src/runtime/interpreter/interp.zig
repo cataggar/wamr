@@ -341,7 +341,10 @@ fn gcStructNew(env: *ExecEnv, type_idx: u32, is_default: bool) TrapError!void {
     } else {
         // Pop fields in reverse (last field is TOS)
         var i = field_count;
-        while (i > 0) { i -= 1; fields_buf[i] = try env.pop(); }
+        while (i > 0) {
+            i -= 1;
+            fields_buf[i] = try env.pop();
+        }
     }
     const obj_idx = try allocGcObject(env.module_inst, type_idx, fields_buf[0..field_count]);
     try env.push(.{ .structref = obj_idx });
@@ -442,7 +445,10 @@ fn gcArrayNewFixed(env: *ExecEnv, type_idx: u32, count: u32) TrapError!void {
     var fields_buf: [65536]types.Value = undefined;
     if (count > fields_buf.len) return error.StackOverflow;
     var i = count;
-    while (i > 0) { i -= 1; fields_buf[i] = try env.pop(); }
+    while (i > 0) {
+        i -= 1;
+        fields_buf[i] = try env.pop();
+    }
     const obj_idx = try allocGcObject(env.module_inst, type_idx, fields_buf[0..count]);
     try env.push(.{ .arrayref = obj_idx });
 }
@@ -462,7 +468,10 @@ fn gcArrayNewData(env: *ExecEnv, type_idx: u32, data_idx: u32) TrapError!void {
             elem_size = 2; // i16
         } else if (ft.field_types.len > 0) {
             elem_size = switch (ft.field_types[0]) {
-                .i32, .f32 => 4, .i64, .f64 => 8, .v128 => 16, else => 1,
+                .i32, .f32 => 4,
+                .i64, .f64 => 8,
+                .v128 => 16,
+                else => 1,
             };
         }
     }
@@ -618,8 +627,14 @@ fn gcArrayCopy(env: *ExecEnv) TrapError!void {
     const src_ref = try env.pop();
     const dst_off = @as(u32, @bitCast(try env.popI32()));
     const dst_ref = try env.pop();
-    const src_idx = switch (src_ref) { .arrayref, .anyref, .eqref => |r| r orelse return error.Unreachable, else => return error.Unreachable };
-    const dst_idx = switch (dst_ref) { .arrayref, .anyref, .eqref => |r| r orelse return error.Unreachable, else => return error.Unreachable };
+    const src_idx = switch (src_ref) {
+        .arrayref, .anyref, .eqref => |r| r orelse return error.Unreachable,
+        else => return error.Unreachable,
+    };
+    const dst_idx = switch (dst_ref) {
+        .arrayref, .anyref, .eqref => |r| r orelse return error.Unreachable,
+        else => return error.Unreachable,
+    };
     const src_obj = getGcObject(env.module_inst, src_idx) orelse return error.Unreachable;
     const dst_obj = getGcObject(env.module_inst, dst_idx) orelse return error.Unreachable;
     if (@as(u64, src_off) + len > src_obj.fields.len or @as(u64, dst_off) + len > dst_obj.fields.len) return error.OutOfBoundsMemoryAccess;
@@ -628,7 +643,10 @@ fn gcArrayCopy(env: *ExecEnv) TrapError!void {
         for (0..len) |i| dst_obj.fields[dst_off + i] = src_obj.fields[src_off + i];
     } else {
         var i = len;
-        while (i > 0) { i -= 1; dst_obj.fields[dst_off + i] = src_obj.fields[src_off + i]; }
+        while (i > 0) {
+            i -= 1;
+            dst_obj.fields[dst_off + i] = src_obj.fields[src_off + i];
+        }
     }
 }
 
@@ -668,7 +686,10 @@ fn gcArrayInitData(env: *ExecEnv, type_idx: u32, data_idx: u32) TrapError!void {
     const src_off = @as(u32, @bitCast(try env.popI32()));
     const dst_off = @as(u32, @bitCast(try env.popI32()));
     const ref = try env.pop();
-    const obj_idx = switch (ref) { .arrayref, .anyref, .eqref => |r| r orelse return error.Unreachable, else => return error.Unreachable };
+    const obj_idx = switch (ref) {
+        .arrayref, .anyref, .eqref => |r| r orelse return error.Unreachable,
+        else => return error.Unreachable,
+    };
     const obj = getGcObject(env.module_inst, obj_idx) orelse return error.Unreachable;
     const module = env.module_inst.module;
     if (data_idx >= module.data_segments.len) return error.Unreachable;
@@ -718,7 +739,10 @@ fn gcArrayInitElem(env: *ExecEnv, type_idx: u32, elem_seg_idx: u32) TrapError!vo
     const src_off = @as(u32, @bitCast(try env.popI32()));
     const dst_off = @as(u32, @bitCast(try env.popI32()));
     const ref = try env.pop();
-    const obj_idx = switch (ref) { .arrayref, .anyref, .eqref => |r| r orelse return error.Unreachable, else => return error.Unreachable };
+    const obj_idx = switch (ref) {
+        .arrayref, .anyref, .eqref => |r| r orelse return error.Unreachable,
+        else => return error.Unreachable,
+    };
     const obj = getGcObject(env.module_inst, obj_idx) orelse return error.Unreachable;
     const module = env.module_inst.module;
     if (elem_seg_idx >= module.elements.len) return error.OutOfBoundsTableAccess;
@@ -1174,7 +1198,7 @@ fn findBlockEnd(code: []const u8, start: usize) usize {
     while (pos < code.len) {
         const b = code[pos];
         pos += 1;
-        switch (@as(Opcode, @enumFromInt(b))) {
+        switch (@as(Opcode, @fromBackingInt(@intCast(b)))) {
             .block, .loop, .@"if", .@"try" => {
                 depth += 1;
                 pos = skipBlockTypeBytes(code, pos);
@@ -1189,12 +1213,29 @@ fn findBlockEnd(code: []const u8, start: usize) usize {
                 if (depth == 0) return pos;
             },
             // Skip LEB128 immediates
-            .br, .br_if, .local_get, .local_set, .local_tee,
-            .global_get, .global_set, .i32_const, .call, .return_call,
-            .ref_null, .ref_func,
-            .table_get, .table_set,
-            .call_ref, .return_call_ref, .br_on_null, .br_on_non_null,
-            .throw, .@"catch", .rethrow, .delegate, .catch_all,
+            .br,
+            .br_if,
+            .local_get,
+            .local_set,
+            .local_tee,
+            .global_get,
+            .global_set,
+            .i32_const,
+            .call,
+            .return_call,
+            .ref_null,
+            .ref_func,
+            .table_get,
+            .table_set,
+            .call_ref,
+            .return_call_ref,
+            .br_on_null,
+            .br_on_non_null,
+            .throw,
+            .@"catch",
+            .rethrow,
+            .delegate,
+            .catch_all,
             => {
                 pos = skipLeb128(code, pos);
             },
@@ -1210,13 +1251,29 @@ fn findBlockEnd(code: []const u8, start: usize) usize {
                 var j: u32 = 0;
                 while (j < cnt) : (j += 1) pos = skipLeb128(code, pos);
             },
-            .i32_load, .i64_load, .f32_load, .f64_load,
-            .i32_load8_s, .i32_load8_u, .i32_load16_s, .i32_load16_u,
-            .i64_load8_s, .i64_load8_u, .i64_load16_s, .i64_load16_u,
-            .i64_load32_s, .i64_load32_u,
-            .i32_store, .i64_store, .f32_store, .f64_store,
-            .i32_store8, .i32_store16,
-            .i64_store8, .i64_store16, .i64_store32,
+            .i32_load,
+            .i64_load,
+            .f32_load,
+            .f64_load,
+            .i32_load8_s,
+            .i32_load8_u,
+            .i32_load16_s,
+            .i32_load16_u,
+            .i64_load8_s,
+            .i64_load8_u,
+            .i64_load16_s,
+            .i64_load16_u,
+            .i64_load32_s,
+            .i64_load32_u,
+            .i32_store,
+            .i64_store,
+            .f32_store,
+            .f64_store,
+            .i32_store8,
+            .i32_store16,
+            .i64_store8,
+            .i64_store16,
+            .i64_store32,
             => {
                 pos = skipLeb128(code, pos);
                 pos = skipLeb128(code, pos);
@@ -1272,20 +1329,41 @@ fn findBlockEnd(code: []const u8, start: usize) usize {
                 switch (sub_op) {
                     // struct ops with type index
                     0x00, 0x01 => pos = skipLeb128(code, pos), // struct.new, struct.new_default
-                    0x02, 0x03, 0x04, 0x05 => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); }, // struct.get/set
+                    0x02, 0x03, 0x04, 0x05 => {
+                        pos = skipLeb128(code, pos);
+                        pos = skipLeb128(code, pos);
+                    }, // struct.get/set
                     // array ops with type index
                     0x06, 0x07 => pos = skipLeb128(code, pos), // array.new, array.new_default
-                    0x08 => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); }, // array.new_fixed
-                    0x09, 0x0A => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); }, // array.new_data, array.new_elem
+                    0x08 => {
+                        pos = skipLeb128(code, pos);
+                        pos = skipLeb128(code, pos);
+                    }, // array.new_fixed
+                    0x09, 0x0A => {
+                        pos = skipLeb128(code, pos);
+                        pos = skipLeb128(code, pos);
+                    }, // array.new_data, array.new_elem
                     0x0B, 0x0C, 0x0D, 0x0E => pos = skipLeb128(code, pos), // array.get/set
                     0x0F => {}, // array.len: no immediates
                     0x10 => pos = skipLeb128(code, pos), // array.fill
-                    0x11 => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); }, // array.copy
-                    0x12, 0x13 => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); }, // array.init_data/elem
+                    0x11 => {
+                        pos = skipLeb128(code, pos);
+                        pos = skipLeb128(code, pos);
+                    }, // array.copy
+                    0x12, 0x13 => {
+                        pos = skipLeb128(code, pos);
+                        pos = skipLeb128(code, pos);
+                    }, // array.init_data/elem
                     // ref.test/ref.cast: flags + type immediates
-                    0x14, 0x15, 0x16, 0x17 => { pos = skipLeb128(code, pos); }, // simplified
+                    0x14, 0x15, 0x16, 0x17 => {
+                        pos = skipLeb128(code, pos);
+                    }, // simplified
                     // br_on_cast/br_on_cast_fail: label + 2 type immediates
-                    0x18, 0x19 => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); },
+                    0x18, 0x19 => {
+                        pos = skipLeb128(code, pos);
+                        pos = skipLeb128(code, pos);
+                        pos = skipLeb128(code, pos);
+                    },
                     // No immediates
                     0x1A, 0x1B, 0x1C, 0x1D, 0x1E => {},
                     else => {},
@@ -1306,7 +1384,7 @@ fn findElse(code: []const u8, start: usize) ?usize {
     while (pos < code.len) {
         const b = code[pos];
         pos += 1;
-        switch (@as(Opcode, @enumFromInt(b))) {
+        switch (@as(Opcode, @fromBackingInt(@intCast(b)))) {
             .block, .loop, .@"if", .@"try" => {
                 depth += 1;
                 pos = skipBlockTypeBytes(code, pos);
@@ -1323,12 +1401,29 @@ fn findElse(code: []const u8, start: usize) ?usize {
             .@"else" => {
                 if (depth == 1) return pos;
             },
-            .br, .br_if, .local_get, .local_set, .local_tee,
-            .global_get, .global_set, .i32_const, .call, .return_call,
-            .ref_null, .ref_func,
-            .table_get, .table_set,
-            .call_ref, .return_call_ref, .br_on_null, .br_on_non_null,
-            .throw, .@"catch", .rethrow, .delegate, .catch_all,
+            .br,
+            .br_if,
+            .local_get,
+            .local_set,
+            .local_tee,
+            .global_get,
+            .global_set,
+            .i32_const,
+            .call,
+            .return_call,
+            .ref_null,
+            .ref_func,
+            .table_get,
+            .table_set,
+            .call_ref,
+            .return_call_ref,
+            .br_on_null,
+            .br_on_non_null,
+            .throw,
+            .@"catch",
+            .rethrow,
+            .delegate,
+            .catch_all,
             => {
                 pos = skipLeb128(code, pos);
             },
@@ -1344,13 +1439,29 @@ fn findElse(code: []const u8, start: usize) ?usize {
                 var j: u32 = 0;
                 while (j < cnt) : (j += 1) pos = skipLeb128(code, pos);
             },
-            .i32_load, .i64_load, .f32_load, .f64_load,
-            .i32_load8_s, .i32_load8_u, .i32_load16_s, .i32_load16_u,
-            .i64_load8_s, .i64_load8_u, .i64_load16_s, .i64_load16_u,
-            .i64_load32_s, .i64_load32_u,
-            .i32_store, .i64_store, .f32_store, .f64_store,
-            .i32_store8, .i32_store16,
-            .i64_store8, .i64_store16, .i64_store32,
+            .i32_load,
+            .i64_load,
+            .f32_load,
+            .f64_load,
+            .i32_load8_s,
+            .i32_load8_u,
+            .i32_load16_s,
+            .i32_load16_u,
+            .i64_load8_s,
+            .i64_load8_u,
+            .i64_load16_s,
+            .i64_load16_u,
+            .i64_load32_s,
+            .i64_load32_u,
+            .i32_store,
+            .i64_store,
+            .f32_store,
+            .f64_store,
+            .i32_store8,
+            .i32_store16,
+            .i64_store8,
+            .i64_store16,
+            .i64_store32,
             => {
                 pos = skipLeb128(code, pos);
                 pos = skipLeb128(code, pos);
@@ -1405,15 +1516,31 @@ fn findElse(code: []const u8, start: usize) ?usize {
                 const sub_op = readU32Static(code, &pos);
                 switch (sub_op) {
                     0x00, 0x01 => pos = skipLeb128(code, pos),
-                    0x02, 0x03, 0x04, 0x05 => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); },
+                    0x02, 0x03, 0x04, 0x05 => {
+                        pos = skipLeb128(code, pos);
+                        pos = skipLeb128(code, pos);
+                    },
                     0x06, 0x07 => pos = skipLeb128(code, pos),
-                    0x08, 0x09, 0x0A => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); },
+                    0x08, 0x09, 0x0A => {
+                        pos = skipLeb128(code, pos);
+                        pos = skipLeb128(code, pos);
+                    },
                     0x0B, 0x0C, 0x0D, 0x0E => pos = skipLeb128(code, pos),
                     0x10 => pos = skipLeb128(code, pos),
-                    0x11 => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); },
-                    0x12, 0x13 => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); },
+                    0x11 => {
+                        pos = skipLeb128(code, pos);
+                        pos = skipLeb128(code, pos);
+                    },
+                    0x12, 0x13 => {
+                        pos = skipLeb128(code, pos);
+                        pos = skipLeb128(code, pos);
+                    },
                     0x14, 0x15, 0x16, 0x17 => pos = skipLeb128(code, pos),
-                    0x18, 0x19 => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); },
+                    0x18, 0x19 => {
+                        pos = skipLeb128(code, pos);
+                        pos = skipLeb128(code, pos);
+                        pos = skipLeb128(code, pos);
+                    },
                     0x1A, 0x1B, 0x1C, 0x1D, 0x1E => {},
                     else => {},
                 }
@@ -1566,7 +1693,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
         }
         const byte = code[ip];
         ip += 1;
-        const op: Opcode = @enumFromInt(byte);
+        const op: Opcode = @fromBackingInt(@intCast(byte));
 
         switch (op) {
             // ── Control ──
@@ -2118,9 +2245,18 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
             },
 
             // ── i32 arithmetic ──
-            .i32_add => { const b = try env.popI32(); try env.pushI32((try env.popI32()) +% b); },
-            .i32_sub => { const b = try env.popI32(); try env.pushI32((try env.popI32()) -% b); },
-            .i32_mul => { const b = try env.popI32(); try env.pushI32((try env.popI32()) *% b); },
+            .i32_add => {
+                const b = try env.popI32();
+                try env.pushI32((try env.popI32()) +% b);
+            },
+            .i32_sub => {
+                const b = try env.popI32();
+                try env.pushI32((try env.popI32()) -% b);
+            },
+            .i32_mul => {
+                const b = try env.popI32();
+                try env.pushI32((try env.popI32()) *% b);
+            },
             .i32_div_s => {
                 const b = try env.popI32();
                 const a = try env.popI32();
@@ -2146,9 +2282,18 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 if (b == 0) return error.IntegerDivisionByZero;
                 try env.pushI32(@bitCast(a % b));
             },
-            .i32_and => { const b = try env.popI32(); try env.pushI32((try env.popI32()) & b); },
-            .i32_or => { const b = try env.popI32(); try env.pushI32((try env.popI32()) | b); },
-            .i32_xor => { const b = try env.popI32(); try env.pushI32((try env.popI32()) ^ b); },
+            .i32_and => {
+                const b = try env.popI32();
+                try env.pushI32((try env.popI32()) & b);
+            },
+            .i32_or => {
+                const b = try env.popI32();
+                try env.pushI32((try env.popI32()) | b);
+            },
+            .i32_xor => {
+                const b = try env.popI32();
+                try env.pushI32((try env.popI32()) ^ b);
+            },
             .i32_shl => {
                 const b: u32 = @bitCast(try env.popI32());
                 const a: u32 = @bitCast(try env.popI32());
@@ -2484,9 +2629,18 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
             },
 
             // ── i64 arithmetic ──
-            .i64_add => { const b = try env.popI64(); try env.pushI64((try env.popI64()) +% b); },
-            .i64_sub => { const b = try env.popI64(); try env.pushI64((try env.popI64()) -% b); },
-            .i64_mul => { const b = try env.popI64(); try env.pushI64((try env.popI64()) *% b); },
+            .i64_add => {
+                const b = try env.popI64();
+                try env.pushI64((try env.popI64()) +% b);
+            },
+            .i64_sub => {
+                const b = try env.popI64();
+                try env.pushI64((try env.popI64()) -% b);
+            },
+            .i64_mul => {
+                const b = try env.popI64();
+                try env.pushI64((try env.popI64()) *% b);
+            },
             .i64_div_s => {
                 const b = try env.popI64();
                 const a = try env.popI64();
@@ -2512,9 +2666,18 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 if (b == 0) return error.IntegerDivisionByZero;
                 try env.pushI64(@bitCast(a % b));
             },
-            .i64_and => { const b = try env.popI64(); try env.pushI64((try env.popI64()) & b); },
-            .i64_or => { const b = try env.popI64(); try env.pushI64((try env.popI64()) | b); },
-            .i64_xor => { const b = try env.popI64(); try env.pushI64((try env.popI64()) ^ b); },
+            .i64_and => {
+                const b = try env.popI64();
+                try env.pushI64((try env.popI64()) & b);
+            },
+            .i64_or => {
+                const b = try env.popI64();
+                try env.pushI64((try env.popI64()) | b);
+            },
+            .i64_xor => {
+                const b = try env.popI64();
+                try env.pushI64((try env.popI64()) ^ b);
+            },
             .i64_shl => {
                 const b: u64 = @bitCast(try env.popI64());
                 const a: u64 = @bitCast(try env.popI64());
@@ -2583,10 +2746,22 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
             .f32_sqrt => try env.pushF32(canonF32(@sqrt(try env.popF32()))),
 
             // ── f32 arithmetic ──
-            .f32_add => { const b = try env.popF32(); try env.pushF32(canonF32(try env.popF32() + b)); },
-            .f32_sub => { const b = try env.popF32(); try env.pushF32(canonF32(try env.popF32() - b)); },
-            .f32_mul => { const b = try env.popF32(); try env.pushF32(canonF32(try env.popF32() * b)); },
-            .f32_div => { const b = try env.popF32(); try env.pushF32(canonF32(try env.popF32() / b)); },
+            .f32_add => {
+                const b = try env.popF32();
+                try env.pushF32(canonF32(try env.popF32() + b));
+            },
+            .f32_sub => {
+                const b = try env.popF32();
+                try env.pushF32(canonF32(try env.popF32() - b));
+            },
+            .f32_mul => {
+                const b = try env.popF32();
+                try env.pushF32(canonF32(try env.popF32() * b));
+            },
+            .f32_div => {
+                const b = try env.popF32();
+                try env.pushF32(canonF32(try env.popF32() / b));
+            },
             .f32_min => {
                 const b = try env.popF32();
                 const a = try env.popF32();
@@ -2645,10 +2820,22 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
             .f64_sqrt => try env.pushF64(canonF64(@sqrt(try env.popF64()))),
 
             // ── f64 arithmetic ──
-            .f64_add => { const b = try env.popF64(); try env.pushF64(canonF64(try env.popF64() + b)); },
-            .f64_sub => { const b = try env.popF64(); try env.pushF64(canonF64(try env.popF64() - b)); },
-            .f64_mul => { const b = try env.popF64(); try env.pushF64(canonF64(try env.popF64() * b)); },
-            .f64_div => { const b = try env.popF64(); try env.pushF64(canonF64(try env.popF64() / b)); },
+            .f64_add => {
+                const b = try env.popF64();
+                try env.pushF64(canonF64(try env.popF64() + b));
+            },
+            .f64_sub => {
+                const b = try env.popF64();
+                try env.pushF64(canonF64(try env.popF64() - b));
+            },
+            .f64_mul => {
+                const b = try env.popF64();
+                try env.pushF64(canonF64(try env.popF64() * b));
+            },
+            .f64_div => {
+                const b = try env.popF64();
+                try env.pushF64(canonF64(try env.popF64() / b));
+            },
             .f64_min => {
                 const b = try env.popF64();
                 const a = try env.popF64();
@@ -3163,7 +3350,10 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                         const dst_table = if (dst_table_idx < env.module_inst.tables.len) env.module_inst.tables[dst_table_idx] else return error.OutOfBoundsTableAccess;
                         const src_table = if (src_table_idx < env.module_inst.tables.len) env.module_inst.tables[src_table_idx] else return error.OutOfBoundsTableAccess;
                         const is_64 = dst_table.table_type.is_table64 or src_table.table_type.is_table64;
-                        const n: u32 = if (is_64) blk: { const v: u64 = @bitCast(try env.popI64()); break :blk if (v > std.math.maxInt(u32)) return error.OutOfBoundsTableAccess else @as(u32, @intCast(v)); } else @bitCast(try env.popI32());
+                        const n: u32 = if (is_64) blk: {
+                            const v: u64 = @bitCast(try env.popI64());
+                            break :blk if (v > std.math.maxInt(u32)) return error.OutOfBoundsTableAccess else @as(u32, @intCast(v));
+                        } else @bitCast(try env.popI32());
                         const s: u32 = try popTableIdx(env, src_table);
                         const d: u32 = try popTableIdx(env, dst_table);
                         if (src_table == dst_table) {
@@ -3358,25 +3548,59 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                         const fi = readU32(code, &ip);
                         try gcStructGet(env, ti, fi, sub_op);
                     },
-                    0x05 => { const ti = readU32(code, &ip); const fi = readU32(code, &ip); try gcStructSet(env, ti, fi); },
+                    0x05 => {
+                        const ti = readU32(code, &ip);
+                        const fi = readU32(code, &ip);
+                        try gcStructSet(env, ti, fi);
+                    },
                     // ── GC array operations ────────────────────────────
                     0x06 => try gcArrayNew(env, readU32(code, &ip)),
                     0x07 => try gcArrayNewDefault(env, readU32(code, &ip)),
-                    0x08 => { const ti = readU32(code, &ip); const n = readU32(code, &ip); try gcArrayNewFixed(env, ti, n); },
-                    0x09 => { const ti = readU32(code, &ip); const di = readU32(code, &ip); try gcArrayNewData(env, ti, di); },
-                    0x0A => { const ti = readU32(code, &ip); const ei = readU32(code, &ip); try gcArrayNewElem(env, ti, ei); },
+                    0x08 => {
+                        const ti = readU32(code, &ip);
+                        const n = readU32(code, &ip);
+                        try gcArrayNewFixed(env, ti, n);
+                    },
+                    0x09 => {
+                        const ti = readU32(code, &ip);
+                        const di = readU32(code, &ip);
+                        try gcArrayNewData(env, ti, di);
+                    },
+                    0x0A => {
+                        const ti = readU32(code, &ip);
+                        const ei = readU32(code, &ip);
+                        try gcArrayNewElem(env, ti, ei);
+                    },
                     0x0B, 0x0C, 0x0D => try gcArrayGet(env, readU32(code, &ip), sub_op),
                     0x0E => try gcArraySet(env, readU32(code, &ip)),
                     0x0F => { // array.len
                         const ref = try env.pop();
-                        const oi = switch (ref) { .arrayref, .anyref, .eqref, .structref => |r| r orelse return error.Unreachable, else => return error.Unreachable };
+                        const oi = switch (ref) {
+                            .arrayref, .anyref, .eqref, .structref => |r| r orelse return error.Unreachable,
+                            else => return error.Unreachable,
+                        };
                         const obj = getGcObject(env.module_inst, oi) orelse return error.Unreachable;
                         try env.pushI32(@intCast(obj.fields.len));
                     },
-                    0x10 => { _ = readU32(code, &ip); try gcArrayFill(env); },
-                    0x11 => { _ = readU32(code, &ip); _ = readU32(code, &ip); try gcArrayCopy(env); },
-                    0x12 => { const ti = readU32(code, &ip); const di = readU32(code, &ip); try gcArrayInitData(env, ti, di); },
-                    0x13 => { const ti = readU32(code, &ip); const ei = readU32(code, &ip); try gcArrayInitElem(env, ti, ei); },
+                    0x10 => {
+                        _ = readU32(code, &ip);
+                        try gcArrayFill(env);
+                    },
+                    0x11 => {
+                        _ = readU32(code, &ip);
+                        _ = readU32(code, &ip);
+                        try gcArrayCopy(env);
+                    },
+                    0x12 => {
+                        const ti = readU32(code, &ip);
+                        const di = readU32(code, &ip);
+                        try gcArrayInitData(env, ti, di);
+                    },
+                    0x13 => {
+                        const ti = readU32(code, &ip);
+                        const ei = readU32(code, &ip);
+                        try gcArrayInitElem(env, ti, ei);
+                    },
                     0x18, 0x19 => { // br_on_cast (0x18), br_on_cast_fail (0x19)
                         try handleBrOnCast(env, sub_op, code, &ip, labels, &label_sp);
                     },
@@ -3411,21 +3635,21 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                         platform.memoryFenceSeqCst();
                     },
                     // atomic loads
-                    0x10 => try atomicLoad(env, code, &ip, u32, u32, 4),   // i32.atomic.load
-                    0x11 => try atomicLoad64(env, code, &ip, u64, 8),      // i64.atomic.load
-                    0x12 => try atomicLoad(env, code, &ip, u8, u32, 1),    // i32.atomic.load8_u
-                    0x13 => try atomicLoad(env, code, &ip, u16, u32, 2),   // i32.atomic.load16_u
-                    0x14 => try atomicLoad64(env, code, &ip, u8, 1),       // i64.atomic.load8_u
-                    0x15 => try atomicLoad64(env, code, &ip, u16, 2),      // i64.atomic.load16_u
-                    0x16 => try atomicLoad64(env, code, &ip, u32, 4),      // i64.atomic.load32_u
+                    0x10 => try atomicLoad(env, code, &ip, u32, u32, 4), // i32.atomic.load
+                    0x11 => try atomicLoad64(env, code, &ip, u64, 8), // i64.atomic.load
+                    0x12 => try atomicLoad(env, code, &ip, u8, u32, 1), // i32.atomic.load8_u
+                    0x13 => try atomicLoad(env, code, &ip, u16, u32, 2), // i32.atomic.load16_u
+                    0x14 => try atomicLoad64(env, code, &ip, u8, 1), // i64.atomic.load8_u
+                    0x15 => try atomicLoad64(env, code, &ip, u16, 2), // i64.atomic.load16_u
+                    0x16 => try atomicLoad64(env, code, &ip, u32, 4), // i64.atomic.load32_u
                     // atomic stores
-                    0x17 => try atomicStore(env, code, &ip, u32, 4),       // i32.atomic.store
-                    0x18 => try atomicStore64(env, code, &ip, u64, 8),     // i64.atomic.store
-                    0x19 => try atomicStore(env, code, &ip, u8, 1),        // i32.atomic.store8
-                    0x1A => try atomicStore(env, code, &ip, u16, 2),       // i32.atomic.store16
-                    0x1B => try atomicStore64(env, code, &ip, u8, 1),      // i64.atomic.store8
-                    0x1C => try atomicStore64(env, code, &ip, u16, 2),     // i64.atomic.store16
-                    0x1D => try atomicStore64(env, code, &ip, u32, 4),     // i64.atomic.store32
+                    0x17 => try atomicStore(env, code, &ip, u32, 4), // i32.atomic.store
+                    0x18 => try atomicStore64(env, code, &ip, u64, 8), // i64.atomic.store
+                    0x19 => try atomicStore(env, code, &ip, u8, 1), // i32.atomic.store8
+                    0x1A => try atomicStore(env, code, &ip, u16, 2), // i32.atomic.store16
+                    0x1B => try atomicStore64(env, code, &ip, u8, 1), // i64.atomic.store8
+                    0x1C => try atomicStore64(env, code, &ip, u16, 2), // i64.atomic.store16
+                    0x1D => try atomicStore64(env, code, &ip, u32, 4), // i64.atomic.store32
                     // RMW add
                     0x1E => try atomicRmw(env, code, &ip, u32, 4, .Add),
                     0x1F => try atomicRmw64(env, code, &ip, u64, 8, .Add),
@@ -3539,7 +3763,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                             => return error.OutOfBoundsMemoryAccess,
                         };
                         switch (result) {
-                            .notified, .not_equal, .timed_out => try env.pushI32(@intCast(@intFromEnum(result))),
+                            .notified, .not_equal, .timed_out => try env.pushI32(@intCast(@backingInt(result))),
                             .cancelled, .closed => return error.ThreadCancelled,
                         }
                     },
@@ -3575,7 +3799,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                             => return error.OutOfBoundsMemoryAccess,
                         };
                         switch (result) {
-                            .notified, .not_equal, .timed_out => try env.pushI32(@intCast(@intFromEnum(result))),
+                            .notified, .not_equal, .timed_out => try env.pushI32(@intCast(@backingInt(result))),
                             .cancelled, .closed => return error.ThreadCancelled,
                         }
                     },
@@ -4115,7 +4339,10 @@ test "interp: loop with br_if counts down" {
         0x0B, //   end (function)
     };
 
-    { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, &code, &dummy_target); }
+    {
+        var dummy_target: u32 = 0;
+        _ = try dispatchLoop(&env, &code, &dummy_target);
+    }
     _ = try env.popFrame();
     const result = try env.popI32();
     try testing.expectEqual(@as(i32, 0), result);
@@ -4248,7 +4475,10 @@ test "interp: call another function" {
         0x10, 0x00, // call 0
         0x0B, //       end
     };
-    { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, &caller_code, &dummy_target); }
+    {
+        var dummy_target: u32 = 0;
+        _ = try dispatchLoop(&env, &caller_code, &dummy_target);
+    }
     _ = try env.popFrame();
     const result = try env.popI32();
     try testing.expectEqual(@as(i32, 42), result);
@@ -4300,7 +4530,8 @@ test "interp: br_table dispatch" {
                 0x00, 0x01, 0x02, // labels: 0, 1, default=2
                 // Unreachable after br_table, but block scanners still must
                 // skip the atomic subopcode and memarg.
-                0x41, 0x00, 0x41, 0x00, 0x41, 0x01,
+                0x41, 0x00, 0x41,
+                0x00, 0x41, 0x01,
                 0xFE, 0x48, 0x02, 0x00, // i32.atomic.rmw.cmpxchg
                 0x1A, // drop
                 0x0B, //     end L0
@@ -4316,7 +4547,10 @@ test "interp: br_table dispatch" {
                 0x0B, //   end (function)
             };
 
-            { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, &code, &dummy_target); }
+            {
+                var dummy_target: u32 = 0;
+                _ = try dispatchLoop(&env, &code, &dummy_target);
+            }
             _ = try env.popFrame();
             return env.popI32();
         }
@@ -4357,7 +4591,10 @@ fn runCodeI64(code: []const u8) !i64 {
     defer alloc.free(env.call_stack);
     defer alloc.free(env.label_stack);
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
-    { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, code, &dummy_target); }
+    {
+        var dummy_target: u32 = 0;
+        _ = try dispatchLoop(&env, code, &dummy_target);
+    }
     return env.popI64();
 }
 
@@ -4384,7 +4621,10 @@ fn runCodeF32(code: []const u8) !f32 {
     defer alloc.free(env.call_stack);
     defer alloc.free(env.label_stack);
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
-    { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, code, &dummy_target); }
+    {
+        var dummy_target: u32 = 0;
+        _ = try dispatchLoop(&env, code, &dummy_target);
+    }
     return env.popF32();
 }
 
@@ -4411,7 +4651,10 @@ fn runCodeF64(code: []const u8) !f64 {
     defer alloc.free(env.call_stack);
     defer alloc.free(env.label_stack);
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
-    { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, code, &dummy_target); }
+    {
+        var dummy_target: u32 = 0;
+        _ = try dispatchLoop(&env, code, &dummy_target);
+    }
     return env.popF64();
 }
 
@@ -4791,7 +5034,10 @@ fn runCodeWithMem(code: []const u8) !i32 {
     defer alloc.free(env.call_stack);
     defer alloc.free(env.label_stack);
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
-    { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, code, &dummy_target); }
+    {
+        var dummy_target: u32 = 0;
+        _ = try dispatchLoop(&env, code, &dummy_target);
+    }
     return env.popI32();
 }
 
@@ -4827,7 +5073,10 @@ fn runCodeWithMemI64(code: []const u8) !i64 {
     defer alloc.free(env.call_stack);
     defer alloc.free(env.label_stack);
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
-    { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, code, &dummy_target); }
+    {
+        var dummy_target: u32 = 0;
+        _ = try dispatchLoop(&env, code, &dummy_target);
+    }
     return env.popI64();
 }
 
@@ -4863,7 +5112,10 @@ fn runCodeWithMemF32(code: []const u8) !f32 {
     defer alloc.free(env.call_stack);
     defer alloc.free(env.label_stack);
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
-    { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, code, &dummy_target); }
+    {
+        var dummy_target: u32 = 0;
+        _ = try dispatchLoop(&env, code, &dummy_target);
+    }
     return env.popF32();
 }
 
@@ -4899,7 +5151,10 @@ fn runCodeWithMemF64(code: []const u8) !f64 {
     defer alloc.free(env.call_stack);
     defer alloc.free(env.label_stack);
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
-    { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, code, &dummy_target); }
+    {
+        var dummy_target: u32 = 0;
+        _ = try dispatchLoop(&env, code, &dummy_target);
+    }
     return env.popF64();
 }
 

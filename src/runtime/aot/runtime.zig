@@ -664,7 +664,7 @@ pub const VmCtx = extern struct {
     /// path. Read by `aotThrowUncaught` to relay them to the embedder.
     /// Per-thread isolation is the embedder's responsibility (one VmCtx
     /// per call-frame chain).
-    exception_params: [16]u64 = [_]u64{0} ** 16,
+    exception_params: [16]u64 = @as([16]u64, @splat(0)),
     /// Valid-prefix length of `exception_params` for the most recent throw.
     exception_param_count: u32 = 0,
     /// Padding so `wasi_ctx` stays 8-byte aligned.
@@ -718,8 +718,8 @@ pub const VmCtx = extern struct {
 test "native embedding ABI matches every hosted VmCtx field" {
     const Native = @import("native_abi.zig").VmCtx;
     try std.testing.expectEqual(@sizeOf(VmCtx), @sizeOf(Native));
-    inline for (@typeInfo(Native).@"struct".fields) |field| {
-        try std.testing.expectEqual(@offsetOf(VmCtx, field.name), @offsetOf(Native, field.name));
+    inline for (@typeInfo(Native).@"struct".field_names) |name| {
+        try std.testing.expectEqual(@offsetOf(VmCtx, name), @offsetOf(Native, name));
     }
 }
 
@@ -769,7 +769,7 @@ const AotCallState = struct {
     cancel_unwind: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     last_trap_code: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     trap_reason: std.atomic.Value(u8) =
-        std.atomic.Value(u8).init(@intFromEnum(TrapReason.unknown)),
+        std.atomic.Value(u8).init(@backingInt(TrapReason.unknown)),
 };
 
 fn contextTerminating(
@@ -904,7 +904,7 @@ fn isTrapCatching() bool {
 
 fn noteTrapReason(reason: TrapReason) void {
     const state = activeAotCallState() orelse return;
-    state.trap_reason.store(@intFromEnum(reason), .release);
+    state.trap_reason.store(@backingInt(reason), .release);
 }
 
 /// Install the calling AOT instance's diagnostic identity. Caller is
@@ -1303,7 +1303,7 @@ pub fn aotAtomicWait32(vmctx: *VmCtx, addr: u32, expected: u32, timeout_lo: u32,
         },
     };
     return switch (result) {
-        .notified, .not_equal => @intCast(@intFromEnum(result)),
+        .notified, .not_equal => @intCast(@backingInt(result)),
         .timed_out => timed_out: {
             if (timeout_ns < 0) {
                 std.debug.print(
@@ -1311,7 +1311,7 @@ pub fn aotAtomicWait32(vmctx: *VmCtx, addr: u32, expected: u32, timeout_lo: u32,
                     .{timeout_ns},
                 );
             }
-            break :timed_out @intCast(@intFromEnum(result));
+            break :timed_out @intCast(@backingInt(result));
         },
         .cancelled, .closed => |outcome| {
             if (threadGroupTerminating(vmctx)) terminateAotThread(vmctx);
@@ -1352,7 +1352,7 @@ pub fn aotAtomicWait64(vmctx: *VmCtx, addr: u32, exp_lo: u32, exp_hi: u32, timeo
         },
     };
     return switch (result) {
-        .notified, .not_equal => @intCast(@intFromEnum(result)),
+        .notified, .not_equal => @intCast(@backingInt(result)),
         .timed_out => timed_out: {
             if (timeout_ns < 0) {
                 std.debug.print(
@@ -1360,7 +1360,7 @@ pub fn aotAtomicWait64(vmctx: *VmCtx, addr: u32, exp_lo: u32, exp_hi: u32, timeo
                     .{timeout_ns},
                 );
             }
-            break :timed_out @intCast(@intFromEnum(result));
+            break :timed_out @intCast(@backingInt(result));
         },
         .cancelled, .closed => |outcome| {
             if (threadGroupTerminating(vmctx)) terminateAotThread(vmctx);
@@ -1861,7 +1861,7 @@ pub const LazyJitState = struct {
 
     pub fn slotState(self: *const LazyJitState, local_idx: usize) SlotState {
         if (local_idx >= self.slot_states.len) return .inactive;
-        const state: SlotState = @enumFromInt(self.slot_states[local_idx].load(.acquire));
+        const state: SlotState = @fromBackingInt(@intCast(self.slot_states[local_idx].load(.acquire)));
         return state;
     }
 
@@ -1871,7 +1871,7 @@ pub const LazyJitState = struct {
         const slot = &self.slot_states[local_idx];
         var spins: u32 = 0;
         while (true) {
-            const state: SlotState = @enumFromInt(slot.load(.acquire));
+            const state: SlotState = @fromBackingInt(@intCast(slot.load(.acquire)));
             switch (state) {
                 .inactive => return null,
                 .ready => {
@@ -1880,26 +1880,26 @@ pub const LazyJitState = struct {
                 },
                 .pending => {
                     if (slot.cmpxchgWeak(
-                        @intFromEnum(SlotState.pending),
-                        @intFromEnum(SlotState.compiling),
+                        @backingInt(SlotState.pending),
+                        @backingInt(SlotState.compiling),
                         .acquire,
                         .acquire,
                     ) != null) continue;
 
                     const compile_ctx = self.compile_ctx orelse {
-                        slot.store(@intFromEnum(SlotState.pending), .release);
+                        slot.store(@backingInt(SlotState.pending), .release);
                         return error.CodeMappingFailed;
                     };
                     const compile_fn = self.compile_fn orelse {
-                        slot.store(@intFromEnum(SlotState.pending), .release);
+                        slot.store(@backingInt(SlotState.pending), .release);
                         return error.CodeMappingFailed;
                     };
                     const compiled = compile_fn(compile_ctx, @intCast(local_idx)) catch |err| {
-                        slot.store(@intFromEnum(SlotState.pending), .release);
+                        slot.store(@backingInt(SlotState.pending), .release);
                         return err;
                     };
                     self.compiled[local_idx] = compiled;
-                    slot.store(@intFromEnum(SlotState.ready), .release);
+                    slot.store(@backingInt(SlotState.ready), .release);
                     return compiled.addr;
                 },
                 .compiling => {
@@ -2019,7 +2019,7 @@ pub const AotInstance = struct {
     /// The public call still returns `error.WasmTrap`; embedders and the CLI
     /// may inspect this for diagnostic parity with the interpreter.
     last_trap_reason: std.atomic.Value(u8) =
-        std.atomic.Value(u8).init(@intFromEnum(TrapReason.unknown)),
+        std.atomic.Value(u8).init(@backingInt(TrapReason.unknown)),
     /// Base address of the mapped executable code (null if not yet mapped).
     code_base: ?[*]const u8 = null,
     /// Size of the mapped executable region (for cleanup).
@@ -3488,7 +3488,7 @@ pub fn findExportFunc(inst: *const AotInstance, name: []const u8) ?u32 {
 }
 
 pub fn lastTrapReason(inst: *const AotInstance) TrapReason {
-    return @enumFromInt(inst.last_trap_reason.load(.acquire));
+    return @fromBackingInt(@intCast(inst.last_trap_reason.load(.acquire)));
 }
 
 fn functionTypeForIndex(
@@ -4049,7 +4049,7 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     // AOT-compiled functions receive a VmCtx pointer as hidden first parameter.
     const FnPtr = *const fn (*VmCtx) callconv(.c) Result;
     const func_ptr: FnPtr = @ptrCast(@alignCast(addr));
-    inst.last_trap_reason.store(@intFromEnum(TrapReason.unknown), .release);
+    inst.last_trap_reason.store(@backingInt(TrapReason.unknown), .release);
     var aot_call_state = AotCallState{};
     var backend_scope = call_thread_context.bindBackendContext(@ptrCast(&aot_call_state));
     defer backend_scope.deinit();
@@ -4530,16 +4530,16 @@ pub fn callFuncScalar(
     // hidden return pointer (HRP) at raw[args.len] pointing at `hrp_buf`;
     // the callee stores results[1..] there (codegen writes RAX for results[0]
     // and `[HRP + (i-1)*8]` for i in [1, result_count)).
-    var raw: [MaxScalarArgs]u64 = [_]u64{0} ** MaxScalarArgs;
+    var raw: [MaxScalarArgs]u64 = @as([MaxScalarArgs]u64, @splat(0));
     for (args, param_types, 0..) |v, pt, i| {
         raw[i] = try valueToRawBits(inst, pt, v);
     }
-    var hrp_buf: [MaxScalarResults - 1]u64 = [_]u64{0} ** (MaxScalarResults - 1);
+    var hrp_buf: [MaxScalarResults - 1]u64 = @splat(0);
     if (needs_hrp) {
         raw[args.len] = @intFromPtr(&hrp_buf);
     }
 
-    inst.last_trap_reason.store(@intFromEnum(TrapReason.unknown), .release);
+    inst.last_trap_reason.store(@backingInt(TrapReason.unknown), .release);
     var aot_call_state = AotCallState{};
     var backend_scope = call_thread_context.bindBackendContext(@ptrCast(&aot_call_state));
     defer backend_scope.deinit();
@@ -5025,7 +5025,7 @@ fn computeGlobalLayout(
         next += globalSlotSize(g.val_type);
     }
     for (inits, 0..) |ginit, i| {
-        const vt: types.ValType = @enumFromInt(ginit.val_type);
+        const vt: types.ValType = @fromBackingInt(@intCast(ginit.val_type));
         next = alignForwardU32(next, globalSlotAlignment(vt));
         offsets[imports.len + i] = next;
         next += globalSlotSize(vt);
@@ -5097,7 +5097,7 @@ fn allocateGlobals(
     for (module.global_inits, 0..) |ginit, i| {
         const slot = imports.len + i;
         const g = allocator.create(types.GlobalInstance) catch return error.OutOfMemory;
-        const vt: types.ValType = @enumFromInt(ginit.val_type);
+        const vt: types.ValType = @fromBackingInt(@intCast(ginit.val_type));
         // Tag the stored Value per the declared val_type so later
         // packing/unpacking through globals_buf preserves ref types
         // (funcref idx ↔ native ptr conversion happens in
@@ -5266,7 +5266,7 @@ test "core resource AOT global rollback releases borrowed override" {
         .mutable = true,
     }};
     const locals = [_]aot_loader.AotGlobalInit{.{
-        .val_type = @intFromEnum(types.ValType.i32),
+        .val_type = @backingInt(types.ValType.i32),
         .mutability = 1,
         .init_i64 = 1,
     }};
@@ -5315,9 +5315,9 @@ test "instantiate: empty module" {
 
 test "globals storage packs v128 globals on 16-byte aligned offsets" {
     const inits = [_]aot_loader.AotGlobalInit{
-        .{ .val_type = @intFromEnum(types.ValType.i32), .mutability = 0, .init_i64 = 5 },
-        .{ .val_type = @intFromEnum(types.ValType.v128), .mutability = 1, .init_v128 = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF },
-        .{ .val_type = @intFromEnum(types.ValType.i64), .mutability = 0, .init_i64 = 9 },
+        .{ .val_type = @backingInt(types.ValType.i32), .mutability = 0, .init_i64 = 5 },
+        .{ .val_type = @backingInt(types.ValType.v128), .mutability = 1, .init_v128 = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF },
+        .{ .val_type = @backingInt(types.ValType.i64), .mutability = 0, .init_i64 = 9 },
     };
     const module = aot_loader.AotModule{ .global_inits = &inits };
     const inst = try instantiate(&module, std.testing.allocator);
@@ -5911,7 +5911,7 @@ test "AOT thread clone bounds maxless table reservation while sharing resources"
         .limits = .{ .min = 1 },
     }};
     const globals = [_]aot_loader.AotGlobalInit{.{
-        .val_type = @intFromEnum(types.ValType.i32),
+        .val_type = @backingInt(types.ValType.i32),
         .mutability = 1,
         .init_i64 = 17,
     }};
@@ -6057,7 +6057,7 @@ test "AOT thread clone rolls back every partial retain and allocation" {
         .limits = .{ .min = 1, .max = 2 },
     }};
     const globals = [_]aot_loader.AotGlobalInit{.{
-        .val_type = @intFromEnum(types.ValType.i32),
+        .val_type = @backingInt(types.ValType.i32),
         .mutability = 1,
         .init_i64 = 7,
     }};

@@ -64,4 +64,3 @@ pub fn isSkippedInAot(basename: []const u8) bool {
     }
     return false;
 }
-

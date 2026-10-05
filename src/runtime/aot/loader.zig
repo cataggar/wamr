@@ -274,7 +274,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!AotModule 
         if (reader.remaining() < section_size) return error.UnexpectedEnd;
 
         const section_start = reader.pos;
-        const section_type: AotSectionType = @enumFromInt(section_type_raw);
+        const section_type: AotSectionType = @fromBackingInt(@intCast(section_type_raw));
 
         switch (section_type) {
             .target_info => {
@@ -469,12 +469,12 @@ fn parseTypeSection(reader: *BinaryReader, section_size: u32, module: *AotModule
         const params_len = try reader.readU32Le();
         const params_bytes = try reader.readBytes(params_len);
         const params = allocator.alloc(types.ValType, params_len) catch return error.OutOfMemory;
-        for (0..params_len) |j| params[j] = @enumFromInt(params_bytes[j]);
+        for (0..params_len) |j| params[j] = @fromBackingInt(@intCast(params_bytes[j]));
 
         const results_len = try reader.readU32Le();
         const results_bytes = try reader.readBytes(results_len);
         const results = allocator.alloc(types.ValType, results_len) catch return error.OutOfMemory;
-        for (0..results_len) |j| results[j] = @enumFromInt(results_bytes[j]);
+        for (0..results_len) |j| results[j] = @fromBackingInt(@intCast(results_bytes[j]));
 
         entries[i] = .{ .params = params, .results = results };
         initialized += 1;
@@ -555,7 +555,7 @@ fn parseExportSection(reader: *BinaryReader, section_size: u32, module: *AotModu
 
         exports[i] = .{
             .name = name_copy,
-            .kind = @enumFromInt(kind_raw),
+            .kind = @fromBackingInt(@intCast(kind_raw)),
             .index = index,
         };
     }
@@ -639,7 +639,7 @@ fn parseImportSection(reader: *BinaryReader, section_size: u32, module: *AotModu
         @memcpy(field_name, field_name_bytes);
 
         const kind_raw = try reader.readByte();
-        const kind: types.ExternalKind = @enumFromInt(kind_raw);
+        const kind: types.ExternalKind = @fromBackingInt(@intCast(kind_raw));
         var func_type_idx: u32 = 0;
 
         switch (kind) {
@@ -648,7 +648,7 @@ fn parseImportSection(reader: *BinaryReader, section_size: u32, module: *AotModu
                 func_count += 1;
             },
             .table => {
-                const elem_type: types.ValType = @enumFromInt(try reader.readByte());
+                const elem_type: types.ValType = @fromBackingInt(@intCast(try reader.readByte()));
                 const min = try reader.readU32Le();
                 const has_max = try reader.readByte();
                 const max: ?u32 = if (has_max != 0) try reader.readU32Le() else null;
@@ -676,7 +676,7 @@ fn parseImportSection(reader: *BinaryReader, section_size: u32, module: *AotModu
                 }) catch return error.OutOfMemory;
             },
             .global => {
-                const val_type: types.ValType = @enumFromInt(try reader.readByte());
+                const val_type: types.ValType = @fromBackingInt(@intCast(try reader.readByte()));
                 const mutable = (try reader.readByte()) != 0;
                 global_descs.append(allocator, .{
                     .module_name = mod_name,
@@ -724,7 +724,7 @@ fn parseTableSection(reader: *BinaryReader, section_size: u32, module: *AotModul
     errdefer allocator.free(tbl_types);
 
     for (0..count) |i| {
-        const elem_type: types.ValType = @enumFromInt(try reader.readByte());
+        const elem_type: types.ValType = @fromBackingInt(@intCast(try reader.readByte()));
         const min = try reader.readU32Le();
         const has_max = try reader.readByte();
         const max: ?u64 = if (has_max != 0) @as(u64, try reader.readU32Le()) else null;
@@ -841,7 +841,7 @@ fn writeU64Le(buf: []u8, offset: usize, val: u64) void {
 
 /// Build a minimal AOT binary: header + target_info section (56 bytes total).
 fn buildMinimalAot() [56]u8 {
-    var buf = [_]u8{0} ** 56;
+    var buf = @as([56]u8, @splat(0));
     // Header: magic(4) + version(4) = 8 bytes
     writeU32Le(&buf, 0, types.aot_magic);
     writeU32Le(&buf, 4, types.aot_version);
@@ -903,7 +903,7 @@ test "unload: frees without leaks on empty module" {
 
 test "load: function section with offsets" {
     // v7 layout: header(8) + section header(8) + count(4) + 3 pairs (3*8=24) = 44
-    var data = [_]u8{0} ** 44;
+    var data = @as([44]u8, @splat(0));
     writeU32Le(&data, 0, types.aot_magic);
     writeU32Le(&data, 4, types.aot_version);
     writeU32Le(&data, 8, 3); // section type = function
@@ -928,7 +928,7 @@ test "load: function section with offsets" {
 
 test "load: export section round-trip" {
     // Header(8) + section header(8) + count(4) + name_len(4) + "main"(4) + kind(1) + index(4) = 33
-    var data = [_]u8{0} ** 33;
+    var data = @as([33]u8, @splat(0));
     writeU32Le(&data, 0, types.aot_magic);
     writeU32Le(&data, 4, types.aot_version);
     writeU32Le(&data, 8, 4); // section type = export
@@ -967,13 +967,13 @@ test "AotModule: findExport" {
 }
 
 test "load: passive data segment preserves index and bytes" {
-    var data = [_]u8{0} ** 34;
+    var data = @as([34]u8, @splat(0));
     writeU32Le(&data, 0, types.aot_magic);
     writeU32Le(&data, 4, types.aot_version);
     writeU32Le(&data, 8, 5); // data section
     writeU32Le(&data, 12, 18);
     writeU32Le(&data, 16, 1);
-    data[20] = @intFromEnum(AotDataSegment.OffsetKind.passive);
+    data[20] = @backingInt(AotDataSegment.OffsetKind.passive);
     writeU32Le(&data, 21, 0);
     writeU32Le(&data, 25, 0);
     writeU32Le(&data, 29, 1);

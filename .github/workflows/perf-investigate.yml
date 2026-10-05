@@ -70,7 +70,7 @@ jobs:
             }
             core.setOutput('skip', skip ? 'true' : 'false');
 
-      - name: Install Zig 0.16.0
+      - name: Install Zig 0.17.0
         if: steps.guard.outputs.skip != 'true'
         uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
         env:
@@ -88,7 +88,7 @@ jobs:
       - name: Build and benchmark baseline
         if: steps.guard.outputs.skip != 'true'
         run: |
-          zig build -Doptimize=ReleaseFast
+          zig build -Doptimize=fast
           zig build bench 2>&1 | tee bench-baseline.txt
           zig build spec-tests-aot 2>&1 | tail -6 | tee spec-baseline.txt || true
 

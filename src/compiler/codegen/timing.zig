@@ -153,9 +153,9 @@ pub fn printSpill(r: SpillReport) void {
             "slots={d} spilled_vregs={d} scalar={d} v128={d} slots_scalar={d} slots_v128={d} " ++
             "spill_ld={d} spill_st={d} remat={d} callee_saved={d}\n",
         .{
-            r.func_idx,          r.module_idx,             r.func_name,         r.insts,          r.clobbers,
-            r.spill_count,       m.spilled_vregs,          m.spilled_vregs_scalar, m.spilled_vregs_v128, m.slots_scalar,
-            m.slots_v128,        m.spill_loads,            m.spill_stores,      m.remat_vregs,    m.callee_saved_used,
+            r.func_idx,    r.module_idx,    r.func_name,            r.insts,              r.clobbers,
+            r.spill_count, m.spilled_vregs, m.spilled_vregs_scalar, m.spilled_vregs_v128, m.slots_scalar,
+            m.slots_v128,  m.spill_loads,   m.spill_stores,         m.remat_vregs,        m.callee_saved_used,
         },
     );
 }
@@ -245,11 +245,11 @@ pub fn printAarch64Func(r: Aarch64FuncReport) void {
             "regalloc_ms={d}.{d:0>3} coalesce_ms={d}.{d:0>3} post_coalesce_ms={d}.{d:0>3} " ++
             "emit_ms={d}.{d:0>3}\n",
         .{
-            r.func_idx,                       r.module_idx,                        r.blocks,                       r.insts,                     r.reused,
-            r.hash_ns / ns_per_ms,            msFrac(r.hash_ns),                   r.total_ns / ns_per_ms,         msFrac(r.total_ns),          r.scheduling_ns / ns_per_ms,
-            msFrac(r.scheduling_ns),          r.range_split_ns / ns_per_ms,        msFrac(r.range_split_ns),       r.prepass_ns / ns_per_ms,    msFrac(r.prepass_ns),
-            r.liveness_ns / ns_per_ms,        msFrac(r.liveness_ns),               r.regalloc_ns / ns_per_ms,      msFrac(r.regalloc_ns),       r.coalesce_ns / ns_per_ms,
-            msFrac(r.coalesce_ns),            r.post_emit_coalesce_ns / ns_per_ms, msFrac(r.post_emit_coalesce_ns), emit_ns / ns_per_ms,        msFrac(emit_ns),
+            r.func_idx,                r.module_idx,                        r.blocks,                        r.insts,                  r.reused,
+            r.hash_ns / ns_per_ms,     msFrac(r.hash_ns),                   r.total_ns / ns_per_ms,          msFrac(r.total_ns),       r.scheduling_ns / ns_per_ms,
+            msFrac(r.scheduling_ns),   r.range_split_ns / ns_per_ms,        msFrac(r.range_split_ns),        r.prepass_ns / ns_per_ms, msFrac(r.prepass_ns),
+            r.liveness_ns / ns_per_ms, msFrac(r.liveness_ns),               r.regalloc_ns / ns_per_ms,       msFrac(r.regalloc_ns),    r.coalesce_ns / ns_per_ms,
+            msFrac(r.coalesce_ns),     r.post_emit_coalesce_ns / ns_per_ms, msFrac(r.post_emit_coalesce_ns), emit_ns / ns_per_ms,      msFrac(emit_ns),
         },
     );
 }
