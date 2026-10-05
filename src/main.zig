@@ -7,6 +7,12 @@ const wamr = @import("wamr");
 // contaminating conformance fixtures that assert byte-exact stderr.
 pub const std_options: std.Options = .{ .log_level = .info };
 
+const use_debug_allocator = builtin.cpu.arch != .wasm32 and builtin.cpu.arch != .wasm64 and switch (builtin.mode) {
+    .debug => true,
+    .safe => !builtin.link_libc,
+    .fast, .small => !builtin.link_libc and builtin.single_threaded,
+};
+
 const aot_supported = switch (builtin.cpu.arch) {
     .x86_64, .aarch64 => true,
     else => false,
@@ -40,9 +46,8 @@ fn parseSubcommand(s: []const u8) ?Subcommand {
 }
 
 /// Returns the host process exit code. Returning (rather than calling
-/// `std.process.exit`) lets the Zig 0.16 startup runtime run its own
-/// teardown — most importantly the `DebugAllocator` leak hook on
-/// `init.gpa` in Debug builds (#449, #450). Exit-code policy:
+/// `std.process.exit`) lets allocator teardown report leaks (#449, #450).
+/// Exit-code policy:
 ///   * 0 — successful guest run / `help` / `version`
 ///   * `outcome.exit_code` / `ctx.getExitCode()` — guest-requested
 ///     (preview1 `proc_exit`, `wasi:cli/exit.exit-with-code`)
@@ -50,7 +55,13 @@ fn parseSubcommand(s: []const u8) ?Subcommand {
 ///     during guest setup, etc.)
 ///   * 2 — CLI / arg-parsing / usage error
 pub fn main(init: std.process.Init) !u8 {
-    const allocator = init.gpa;
+    // Keep the 0.16 allocator's bounded thread-start cost and leak diagnostics;
+    // 0.17's startup SafeAllocator captures per-thread allocation traces.
+    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    defer if (use_debug_allocator) {
+        _ = debug_allocator.deinit();
+    };
+    const allocator = if (use_debug_allocator) debug_allocator.allocator() else init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     // Process-global AOT debug toggle. See `core_backend.setDebugAotEnabled`
