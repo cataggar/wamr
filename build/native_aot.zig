@@ -24,7 +24,7 @@ pub fn addTests(b: *std.Build, wamrc: *std.Build.Step.Compile, hosted_module: *s
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/unikraft-aot/fixture.zig"),
             .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
         }),
     });
     wasm.entry = .disabled;
@@ -45,7 +45,7 @@ pub fn addTests(b: *std.Build, wamrc: *std.Build.Step.Compile, hosted_module: *s
     const generator_module = b.createModule(.{
         .root_source_file = b.path("tests/unikraft-aot/generate.zig"),
         .target = b.graph.host,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
     });
     generator_module.addImport("wabt", wabt);
     const generator = b.addExecutable(.{ .name = "generate-native-aot-fixture", .root_module = generator_module });
@@ -67,7 +67,7 @@ pub fn addTests(b: *std.Build, wamrc: *std.Build.Step.Compile, hosted_module: *s
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/aot_native_tests.zig"),
             .target = target,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
         }),
     });
     tests.root_module.addAnonymousImport("native_fixture", .{ .root_source_file = fixture_module });
@@ -77,7 +77,7 @@ pub fn addTests(b: *std.Build, wamrc: *std.Build.Step.Compile, hosted_module: *s
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/aot_native_format_tests.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
         }),
     });
     format_tests.root_module.addAnonymousImport("native_fixture", .{ .root_source_file = fixture_module });

@@ -259,12 +259,12 @@ pub const Opcode = enum(u8) {
 
     /// Decode an opcode from a raw byte.
     pub fn fromByte(byte: u8) Opcode {
-        return @enumFromInt(byte);
+        return @fromBackingInt(@intCast(byte));
     }
 
     /// Encode this opcode back to its byte representation.
     pub fn toByte(self: Opcode) u8 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     /// Returns true if the opcode is a control-flow instruction.
@@ -1014,54 +1014,54 @@ pub const AtomicOpcode = enum(u32) {
 
 test "opcode values match Wasm spec" {
     // MVP control flow
-    try testing.expectEqual(@as(u8, 0x00), @intFromEnum(Opcode.@"unreachable"));
-    try testing.expectEqual(@as(u8, 0x01), @intFromEnum(Opcode.nop));
-    try testing.expectEqual(@as(u8, 0x0B), @intFromEnum(Opcode.end));
-    try testing.expectEqual(@as(u8, 0x0F), @intFromEnum(Opcode.@"return"));
-    try testing.expectEqual(@as(u8, 0x10), @intFromEnum(Opcode.call));
-    try testing.expectEqual(@as(u8, 0x11), @intFromEnum(Opcode.call_indirect));
+    try testing.expectEqual(@as(u8, 0x00), @backingInt(Opcode.@"unreachable"));
+    try testing.expectEqual(@as(u8, 0x01), @backingInt(Opcode.nop));
+    try testing.expectEqual(@as(u8, 0x0B), @backingInt(Opcode.end));
+    try testing.expectEqual(@as(u8, 0x0F), @backingInt(Opcode.@"return"));
+    try testing.expectEqual(@as(u8, 0x10), @backingInt(Opcode.call));
+    try testing.expectEqual(@as(u8, 0x11), @backingInt(Opcode.call_indirect));
 
     // Variables
-    try testing.expectEqual(@as(u8, 0x20), @intFromEnum(Opcode.local_get));
-    try testing.expectEqual(@as(u8, 0x24), @intFromEnum(Opcode.global_set));
+    try testing.expectEqual(@as(u8, 0x20), @backingInt(Opcode.local_get));
+    try testing.expectEqual(@as(u8, 0x24), @backingInt(Opcode.global_set));
 
     // Memory
-    try testing.expectEqual(@as(u8, 0x28), @intFromEnum(Opcode.i32_load));
-    try testing.expectEqual(@as(u8, 0x36), @intFromEnum(Opcode.i32_store));
-    try testing.expectEqual(@as(u8, 0x3F), @intFromEnum(Opcode.memory_size));
-    try testing.expectEqual(@as(u8, 0x40), @intFromEnum(Opcode.memory_grow));
+    try testing.expectEqual(@as(u8, 0x28), @backingInt(Opcode.i32_load));
+    try testing.expectEqual(@as(u8, 0x36), @backingInt(Opcode.i32_store));
+    try testing.expectEqual(@as(u8, 0x3F), @backingInt(Opcode.memory_size));
+    try testing.expectEqual(@as(u8, 0x40), @backingInt(Opcode.memory_grow));
 
     // Constants
-    try testing.expectEqual(@as(u8, 0x41), @intFromEnum(Opcode.i32_const));
-    try testing.expectEqual(@as(u8, 0x44), @intFromEnum(Opcode.f64_const));
+    try testing.expectEqual(@as(u8, 0x41), @backingInt(Opcode.i32_const));
+    try testing.expectEqual(@as(u8, 0x44), @backingInt(Opcode.f64_const));
 
     // Arithmetic boundary checks
-    try testing.expectEqual(@as(u8, 0x6A), @intFromEnum(Opcode.i32_add));
-    try testing.expectEqual(@as(u8, 0x7C), @intFromEnum(Opcode.i64_add));
-    try testing.expectEqual(@as(u8, 0xA0), @intFromEnum(Opcode.f64_add));
+    try testing.expectEqual(@as(u8, 0x6A), @backingInt(Opcode.i32_add));
+    try testing.expectEqual(@as(u8, 0x7C), @backingInt(Opcode.i64_add));
+    try testing.expectEqual(@as(u8, 0xA0), @backingInt(Opcode.f64_add));
 
     // Conversions
-    try testing.expectEqual(@as(u8, 0xA7), @intFromEnum(Opcode.i32_wrap_i64));
-    try testing.expectEqual(@as(u8, 0xBB), @intFromEnum(Opcode.f64_promote_f32));
+    try testing.expectEqual(@as(u8, 0xA7), @backingInt(Opcode.i32_wrap_i64));
+    try testing.expectEqual(@as(u8, 0xBB), @backingInt(Opcode.f64_promote_f32));
 
     // Reinterpret
-    try testing.expectEqual(@as(u8, 0xBC), @intFromEnum(Opcode.i32_reinterpret_f32));
-    try testing.expectEqual(@as(u8, 0xBF), @intFromEnum(Opcode.f64_reinterpret_i64));
+    try testing.expectEqual(@as(u8, 0xBC), @backingInt(Opcode.i32_reinterpret_f32));
+    try testing.expectEqual(@as(u8, 0xBF), @backingInt(Opcode.f64_reinterpret_i64));
 
     // Sign extension
-    try testing.expectEqual(@as(u8, 0xC0), @intFromEnum(Opcode.i32_extend8_s));
-    try testing.expectEqual(@as(u8, 0xC4), @intFromEnum(Opcode.i64_extend32_s));
+    try testing.expectEqual(@as(u8, 0xC0), @backingInt(Opcode.i32_extend8_s));
+    try testing.expectEqual(@as(u8, 0xC4), @backingInt(Opcode.i64_extend32_s));
 
     // Reference types
-    try testing.expectEqual(@as(u8, 0xD0), @intFromEnum(Opcode.ref_null));
-    try testing.expectEqual(@as(u8, 0xD2), @intFromEnum(Opcode.ref_func));
+    try testing.expectEqual(@as(u8, 0xD0), @backingInt(Opcode.ref_null));
+    try testing.expectEqual(@as(u8, 0xD2), @backingInt(Opcode.ref_func));
 }
 
 test "prefix opcodes are correct" {
-    try testing.expectEqual(@as(u8, 0xFB), @intFromEnum(Opcode.gc_prefix));
-    try testing.expectEqual(@as(u8, 0xFC), @intFromEnum(Opcode.misc_prefix));
-    try testing.expectEqual(@as(u8, 0xFD), @intFromEnum(Opcode.simd_prefix));
-    try testing.expectEqual(@as(u8, 0xFE), @intFromEnum(Opcode.atomic_prefix));
+    try testing.expectEqual(@as(u8, 0xFB), @backingInt(Opcode.gc_prefix));
+    try testing.expectEqual(@as(u8, 0xFC), @backingInt(Opcode.misc_prefix));
+    try testing.expectEqual(@as(u8, 0xFD), @backingInt(Opcode.simd_prefix));
+    try testing.expectEqual(@as(u8, 0xFE), @backingInt(Opcode.atomic_prefix));
 }
 
 test "fromByte / toByte roundtrip" {
@@ -1113,35 +1113,35 @@ test "immediateSize for known opcodes" {
 }
 
 test "MiscOpcode values" {
-    try testing.expectEqual(@as(u32, 0), @intFromEnum(MiscOpcode.i32_trunc_sat_f32_s));
-    try testing.expectEqual(@as(u32, 8), @intFromEnum(MiscOpcode.memory_init));
-    try testing.expectEqual(@as(u32, 0x0A), @intFromEnum(MiscOpcode.memory_copy));
-    try testing.expectEqual(@as(u32, 0x0B), @intFromEnum(MiscOpcode.memory_fill));
-    try testing.expectEqual(@as(u32, 0x11), @intFromEnum(MiscOpcode.table_fill));
+    try testing.expectEqual(@as(u32, 0), @backingInt(MiscOpcode.i32_trunc_sat_f32_s));
+    try testing.expectEqual(@as(u32, 8), @backingInt(MiscOpcode.memory_init));
+    try testing.expectEqual(@as(u32, 0x0A), @backingInt(MiscOpcode.memory_copy));
+    try testing.expectEqual(@as(u32, 0x0B), @backingInt(MiscOpcode.memory_fill));
+    try testing.expectEqual(@as(u32, 0x11), @backingInt(MiscOpcode.table_fill));
 }
 
 test "SimdOpcode values" {
-    try testing.expectEqual(@as(u32, 0x00), @intFromEnum(SimdOpcode.v128_load));
-    try testing.expectEqual(@as(u32, 0x0B), @intFromEnum(SimdOpcode.v128_store));
-    try testing.expectEqual(@as(u32, 0x0C), @intFromEnum(SimdOpcode.v128_const));
-    try testing.expectEqual(@as(u32, 0x0D), @intFromEnum(SimdOpcode.i8x16_shuffle));
-    try testing.expectEqual(@as(u32, 0xFF), @intFromEnum(SimdOpcode.f64x2_convert_low_i32x4_u));
+    try testing.expectEqual(@as(u32, 0x00), @backingInt(SimdOpcode.v128_load));
+    try testing.expectEqual(@as(u32, 0x0B), @backingInt(SimdOpcode.v128_store));
+    try testing.expectEqual(@as(u32, 0x0C), @backingInt(SimdOpcode.v128_const));
+    try testing.expectEqual(@as(u32, 0x0D), @backingInt(SimdOpcode.i8x16_shuffle));
+    try testing.expectEqual(@as(u32, 0xFF), @backingInt(SimdOpcode.f64x2_convert_low_i32x4_u));
 }
 
 test "AtomicOpcode values" {
-    try testing.expectEqual(@as(u32, 0x00), @intFromEnum(AtomicOpcode.memory_atomic_notify));
-    try testing.expectEqual(@as(u32, 0x01), @intFromEnum(AtomicOpcode.memory_atomic_wait32));
-    try testing.expectEqual(@as(u32, 0x03), @intFromEnum(AtomicOpcode.atomic_fence));
-    try testing.expectEqual(@as(u32, 0x10), @intFromEnum(AtomicOpcode.i32_atomic_load));
-    try testing.expectEqual(@as(u32, 0x48), @intFromEnum(AtomicOpcode.i32_atomic_rmw_cmpxchg));
-    try testing.expectEqual(@as(u32, 0x4E), @intFromEnum(AtomicOpcode.i64_atomic_rmw32_cmpxchg_u));
+    try testing.expectEqual(@as(u32, 0x00), @backingInt(AtomicOpcode.memory_atomic_notify));
+    try testing.expectEqual(@as(u32, 0x01), @backingInt(AtomicOpcode.memory_atomic_wait32));
+    try testing.expectEqual(@as(u32, 0x03), @backingInt(AtomicOpcode.atomic_fence));
+    try testing.expectEqual(@as(u32, 0x10), @backingInt(AtomicOpcode.i32_atomic_load));
+    try testing.expectEqual(@as(u32, 0x48), @backingInt(AtomicOpcode.i32_atomic_rmw_cmpxchg));
+    try testing.expectEqual(@as(u32, 0x4E), @backingInt(AtomicOpcode.i64_atomic_rmw32_cmpxchg_u));
 }
 
 test "GcOpcode values" {
-    try testing.expectEqual(@as(u32, 0x00), @intFromEnum(GcOpcode.struct_new));
-    try testing.expectEqual(@as(u32, 0x06), @intFromEnum(GcOpcode.array_new));
-    try testing.expectEqual(@as(u32, 0x1C), @intFromEnum(GcOpcode.ref_i31));
-    try testing.expectEqual(@as(u32, 0x80), @intFromEnum(GcOpcode.string_new_utf8));
+    try testing.expectEqual(@as(u32, 0x00), @backingInt(GcOpcode.struct_new));
+    try testing.expectEqual(@as(u32, 0x06), @backingInt(GcOpcode.array_new));
+    try testing.expectEqual(@as(u32, 0x1C), @backingInt(GcOpcode.ref_i31));
+    try testing.expectEqual(@as(u32, 0x80), @backingInt(GcOpcode.string_new_utf8));
 }
 
 test {

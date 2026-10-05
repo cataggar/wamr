@@ -107,10 +107,10 @@ const Hmu = extern struct {
 
     // -- type --
     fn getUt(self: *const Hmu) HmuType {
-        return @enumFromInt(getBits(self.header, ut_offset, ut_size));
+        return @fromBackingInt(@intCast(getBits(self.header, ut_offset, ut_size)));
     }
     fn setUt(self: *Hmu, ut: HmuType) void {
-        setBits(&self.header, ut_offset, ut_size, @intFromEnum(ut));
+        setBits(&self.header, ut_offset, ut_size, @backingInt(ut));
     }
 
     // -- previous-in-use --
@@ -139,12 +139,12 @@ const Hmu = extern struct {
     }
 
     fn fromObj(ptr: [*]u8) *Hmu {
-        return @alignCast(@ptrCast(ptr - hmu_size));
+        return @ptrCast(@alignCast(ptr - hmu_size));
     }
 
     fn nextHmu(self: *Hmu) *Hmu {
         const base: [*]u8 = @ptrCast(self);
-        return @alignCast(@ptrCast(base + self.getSize()));
+        return @ptrCast(@alignCast(base + self.getSize()));
     }
 };
 
@@ -232,10 +232,10 @@ pub const GcHeap = struct {
 
     mutex: SpinMutex = .{},
 
-    kfc_normal_list: [normal_node_count]NormalListHead = [_]NormalListHead{.{}} ** normal_node_count,
+    kfc_normal_list: [normal_node_count]NormalListHead = @splat(.{}),
 
     /// Inline storage for the sentinel tree root node.
-    kfc_tree_root_buf: [@sizeOf(TreeNode)]u8 align(@alignOf(TreeNode)) = [_]u8{0} ** @sizeOf(TreeNode),
+    kfc_tree_root_buf: [@sizeOf(TreeNode)]u8 align(@alignOf(TreeNode)) = @splat(0),
     kfc_tree_root: ?*TreeNode = null,
 
     is_heap_corrupted: bool = false,
@@ -259,7 +259,7 @@ pub const GcHeap = struct {
         const offset = aligned_start - pool_start;
         if (offset >= pool.len) return error.PoolTooSmall;
 
-        const heap: *GcHeap = @alignCast(@ptrCast(pool.ptr + offset));
+        const heap: *GcHeap = @ptrCast(@alignCast(pool.ptr + offset));
 
         // Base address: after the heap struct, 8-aligned, + head padding.
         const after_struct = aligned_start + @sizeOf(GcHeap);
@@ -285,7 +285,7 @@ pub const GcHeap = struct {
         heap.highmark_size = 0;
 
         // Initialize the sentinel tree root (lives inside the heap struct).
-        const root: *TreeNode = @alignCast(@ptrCast(&heap.kfc_tree_root_buf));
+        const root: *TreeNode = @ptrCast(@alignCast(&heap.kfc_tree_root_buf));
         root.* = TreeNode{ .hmu_header = .{} };
         root.size = @intCast(@sizeOf(TreeNode));
         root.hmu_header.setUt(.fc);
@@ -294,7 +294,7 @@ pub const GcHeap = struct {
 
         // The entire pool is one big free chunk; insert it as the root's
         // right child (so searches start there).
-        const q: *TreeNode = @alignCast(@ptrCast(base_ptr));
+        const q: *TreeNode = @ptrCast(@alignCast(base_ptr));
         q.* = TreeNode{ .hmu_header = .{} };
         q.hmu_header.setUt(.fc);
         q.hmu_header.setSize(heap_max_size);
@@ -435,7 +435,7 @@ pub const GcHeap = struct {
             return false;
         } else {
             // Tree node.
-            return self.removeTreeNode(@alignCast(@ptrCast(hmu)));
+            return self.removeTreeNode(@ptrCast(@alignCast(hmu)));
         }
     }
 
@@ -444,7 +444,7 @@ pub const GcHeap = struct {
     fn setFreeSize(hmu: *Hmu) void {
         const size = hmu.getSize();
         const base: [*]u8 = @ptrCast(hmu);
-        const tail: *u32 = @alignCast(@ptrCast(base + size - @sizeOf(u32)));
+        const tail: *u32 = @ptrCast(@alignCast(base + size - @sizeOf(u32)));
         tail.* = @intCast(size);
     }
 
@@ -458,7 +458,7 @@ pub const GcHeap = struct {
 
         if (size < fc_normal_max_size) {
             // Normal (small) list — prepend.
-            const np: *NormalNode = @alignCast(@ptrCast(hmu));
+            const np: *NormalNode = @ptrCast(@alignCast(hmu));
             const node_idx = size >> 3;
             np.setNext(self.kfc_normal_list[node_idx].next);
             self.kfc_normal_list[node_idx].next = np;
@@ -466,7 +466,7 @@ pub const GcHeap = struct {
         }
 
         // Large block — insert into BST.
-        const node: *TreeNode = @alignCast(@ptrCast(hmu));
+        const node: *TreeNode = @ptrCast(@alignCast(hmu));
         node.size = @intCast(size);
         node.left = null;
         node.right = null;
@@ -516,7 +516,7 @@ pub const GcHeap = struct {
                     if (idx != init_idx and found_size >= size + smallest_size) {
                         // Split: give back the remainder.
                         const rest_ptr: [*]u8 = @ptrCast(p_hmu);
-                        const rest: *Hmu = @alignCast(@ptrCast(rest_ptr + size));
+                        const rest: *Hmu = @ptrCast(@alignCast(rest_ptr + size));
                         if (!self.addFc(rest, found_size - size)) return null;
                         rest.markPinuse();
                     } else {
@@ -560,7 +560,7 @@ pub const GcHeap = struct {
 
             if (best_size >= size + smallest_size) {
                 const rest_base: [*]u8 = @ptrCast(best_hmu);
-                const rest: *Hmu = @alignCast(@ptrCast(rest_base + size));
+                const rest: *Hmu = @ptrCast(@alignCast(rest_base + size));
                 if (!self.addFc(rest, best_size - size)) return null;
                 rest.markPinuse();
             } else {
@@ -627,7 +627,7 @@ pub const GcHeap = struct {
         // Coalesce with previous block if it is free.
         if (!hmu.getPinuse()) {
             // Read the size stored at the end of the previous free block.
-            const prev_size_ptr: *u32 = @alignCast(@ptrCast(ptr - hmu_size - @sizeOf(u32)));
+            const prev_size_ptr: *u32 = @ptrCast(@alignCast(ptr - hmu_size - @sizeOf(u32)));
             const prev_size: usize = prev_size_ptr.*;
             if (prev_size > 0 and prev_size <= hmu_addr - base) {
                 const prev_addr = hmu_addr - prev_size;
@@ -678,7 +678,7 @@ pub const GcHeap = struct {
             if (old_total - new_total >= smallest_size) {
                 hmu.setSize(new_total);
                 const rest_base: [*]u8 = @ptrCast(hmu);
-                const rest: *Hmu = @alignCast(@ptrCast(rest_base + new_total));
+                const rest: *Hmu = @ptrCast(@alignCast(rest_base + new_total));
                 self.total_free_size += old_total - new_total;
                 if (!self.addFc(rest, old_total - new_total)) return false;
                 rest.markPinuse();
@@ -700,7 +700,7 @@ pub const GcHeap = struct {
                     if (combined - new_total >= smallest_size) {
                         hmu.setSize(new_total);
                         const rest_base: [*]u8 = @ptrCast(hmu);
-                        const rest: *Hmu = @alignCast(@ptrCast(rest_base + new_total));
+                        const rest: *Hmu = @ptrCast(@alignCast(rest_base + new_total));
                         if (!self.addFc(rest, combined - new_total)) return false;
                         rest.markPinuse();
                         // Zero the new region.
@@ -761,7 +761,7 @@ pub const EmsAllocator = struct {
     };
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
-        const self: *EmsAllocator = @alignCast(@ptrCast(ctx));
+        const self: *EmsAllocator = @ptrCast(@alignCast(ctx));
         self.heap.mutex.lock();
         defer self.heap.mutex.unlock();
 
@@ -791,7 +791,7 @@ pub const EmsAllocator = struct {
     }
 
     fn resize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, _: usize) bool {
-        const self: *EmsAllocator = @alignCast(@ptrCast(ctx));
+        const self: *EmsAllocator = @ptrCast(@alignCast(ctx));
         self.heap.mutex.lock();
         defer self.heap.mutex.unlock();
 
@@ -809,7 +809,7 @@ pub const EmsAllocator = struct {
     }
 
     fn free(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, _: usize) void {
-        const self: *EmsAllocator = @alignCast(@ptrCast(ctx));
+        const self: *EmsAllocator = @ptrCast(@alignCast(ctx));
         self.heap.mutex.lock();
         defer self.heap.mutex.unlock();
 
@@ -951,7 +951,7 @@ test "thread safety: concurrent allocations" {
 
     const Worker = struct {
         fn run(alloc_inner: std.mem.Allocator) void {
-            var ptrs: [allocs_per_thread]?[]u8 = [_]?[]u8{null} ** allocs_per_thread;
+            var ptrs: [allocs_per_thread]?[]u8 = @splat(null);
             for (0..allocs_per_thread) |i| {
                 ptrs[i] = alloc_inner.alloc(u8, 64) catch null;
             }
@@ -991,7 +991,7 @@ test "many small allocations and frees" {
     var ems = EmsAllocator{ .heap = heap };
     const a = ems.allocator();
 
-    var ptrs: [100]?[]u8 = [_]?[]u8{null} ** 100;
+    var ptrs: [100]?[]u8 = @splat(null);
 
     // Allocate many small blocks.
     for (0..100) |i| {

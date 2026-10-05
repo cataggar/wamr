@@ -107,7 +107,7 @@ const SectionId = enum(u8) {
     type = 7,
     canon = 8,
     start = 9,
-    @"import" = 10,
+    import = 10,
     @"export" = 11,
     value = 12,
 };
@@ -279,7 +279,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
             .start => {
                 start = try parseStart(&reader, allocator);
             },
-            .@"import" => {
+            .import => {
                 const count = try reader.readU32();
                 var i: u32 = 0;
                 while (i < count) : (i += 1) {
@@ -922,8 +922,8 @@ fn resolveInstanceTypeExportByName(
     // allocation; instance type bodies in real fixtures rarely exceed
     // a few dozen entries.
     const max_inner_slots = 256;
-    var inner_slots: [max_inner_slots]?ctypes.TypeDef = [_]?ctypes.TypeDef{null} ** max_inner_slots;
-    var inner_eq: [max_inner_slots]?u32 = [_]?u32{null} ** max_inner_slots;
+    var inner_slots: [max_inner_slots]?ctypes.TypeDef = @as([max_inner_slots]?ctypes.TypeDef, @splat(null));
+    var inner_eq: [max_inner_slots]?u32 = @as([max_inner_slots]?u32, @splat(null));
     var slot_count: u32 = 0;
     for (decls) |d| switch (d) {
         .type => |td| {
@@ -1523,7 +1523,7 @@ fn parseCanon(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!cty
 /// in sub-PR 1; widen later as conformance grows.
 fn parseContextCanon(reader: *BinaryReader, comptime kind: enum { get, set }) LoadError!ctypes.Canon {
     const val_byte = try reader.readByte();
-    if (val_byte != @intFromEnum(ctypes.CoreValType.i32)) return error.InvalidEncoding;
+    if (val_byte != @backingInt(ctypes.CoreValType.i32)) return error.InvalidEncoding;
     const slot = try reader.readU32();
     return switch (kind) {
         .get => .{ .context_get = .{ .val_type = ctypes.CoreValType.i32, .slot = slot } },
@@ -1997,9 +1997,15 @@ test "parseTypeDef: instance type with `sub resource` type decl" {
     //     0x00 0x00       ; bound: eq, typeidx 0
     const data = [_]u8{
         0x42, 0x02,
-        0x01, 0x3F, 0x00,
-        0x04, 0x00, 0x08, 'p', 'o', 'l', 'l', 'a', 'b', 'l', 'e',
-        0x03, 0x00, 0x00,
+        0x01, 0x3F,
+        0x00, 0x04,
+        0x00, 0x08,
+        'p',  'o',
+        'l',  'l',
+        'a',  'b',
+        'l',  'e',
+        0x03, 0x00,
+        0x00,
     };
     var reader = BinaryReader{ .data = &data };
     const td = try parseTypeDef(&reader, std.testing.allocator);
@@ -2103,9 +2109,14 @@ test "parseInstance: inline-export form expects exportname' (0x00 prefix) on eac
         // count of inline-exports = 1
         0x01,
         // exportname' = 0x00 prefix, len=3, "add"
-        0x00, 0x03, 'a', 'd', 'd',
+        0x00,
+        0x03,
+        'a',
+        'd',
+        'd',
         // sortidx = sort=0x01 (func), idx=0
-        0x01, 0x00,
+        0x01,
+        0x00,
     };
     var reader = BinaryReader{ .data = &data };
     const inst = try parseInstance(&reader, std.testing.allocator);

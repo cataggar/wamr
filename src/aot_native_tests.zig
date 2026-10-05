@@ -327,7 +327,7 @@ const CState = struct {
     }
     fn protect(context: ?*anyopaque, pointer: *anyopaque, size: usize, prot: u32) callconv(.c) c_int {
         const self: *CState = @ptrCast(@alignCast(context.?));
-        Pages.protect(&self.pages, @ptrCast(@alignCast(pointer)), size, @enumFromInt(prot)) catch return -1;
+        Pages.protect(&self.pages, @ptrCast(@alignCast(pointer)), size, @fromBackingInt(@intCast(prot))) catch return -1;
         return 0;
     }
     fn unmap(context: ?*anyopaque, pointer: *anyopaque, size: usize) callconv(.c) void {

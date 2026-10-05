@@ -12,7 +12,7 @@ pub fn Adapter(comptime aot: type) type {
         pub fn imports(context: *Context) [minimal.imports.len]aot.HostImport {
             var bindings: [minimal.imports.len]aot.HostImport = undefined;
             inline for (minimal.imports, 0..) |entry, index| {
-                const thunk = Thunk(@enumFromInt(index));
+                const thunk = Thunk(@fromBackingInt(@intCast(index)));
                 bindings[index] = .{
                     .module = entry.namespace,
                     .name = entry.name,
@@ -38,7 +38,7 @@ pub fn Adapter(comptime aot: type) type {
         }
 
         fn Thunk(comptime function: minimal.Function) type {
-            const spec = minimal.imports[@intFromEnum(function)];
+            const spec = minimal.imports[@backingInt(function)];
             return struct {
                 const params = types(spec.params);
                 const results = types(spec.results);
@@ -65,7 +65,7 @@ pub fn Adapter(comptime aot: type) type {
                     switch (outcome) {
                         .returned => |errno| {
                             if (comptime results.len != 1) return error.InvalidArgument;
-                            result[0] = .{ .i32 = @intFromEnum(errno) };
+                            result[0] = .{ .i32 = @backingInt(errno) };
                         },
                         .exited => |code| {
                             // Native terminate records a pending exit. Return to

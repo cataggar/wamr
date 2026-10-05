@@ -9,7 +9,7 @@ acceptance. No Azure resources are created by this build.
 ## Build boundaries
 
 ```sh
-zig build -Dprofile=unikraft-aot -Doptimize=ReleaseSafe -j2
+zig build -Dprofile=unikraft-aot -Doptimize=safe -j2
 ```
 
 The default target for this profile is `x86_64-freestanding-none`. Other targets,

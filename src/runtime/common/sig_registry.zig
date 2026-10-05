@@ -207,13 +207,13 @@ fn freeFuncType(allocator: std.mem.Allocator, ft: FuncType) void {
 /// the process-wide registry. Structural equality over ValTypes is what the
 /// Wasm MVP call_indirect check requires.
 fn encodeKey(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), ft: *const FuncType) !void {
-    try buf.append(allocator, @intFromEnum(ft.kind));
+    try buf.append(allocator, @backingInt(ft.kind));
     try appendU16(allocator, buf, @intCast(ft.params.len));
-    for (ft.params) |v| try buf.append(allocator, @intFromEnum(v));
+    for (ft.params) |v| try buf.append(allocator, @backingInt(v));
     try appendU16(allocator, buf, @intCast(ft.results.len));
-    for (ft.results) |v| try buf.append(allocator, @intFromEnum(v));
+    for (ft.results) |v| try buf.append(allocator, @backingInt(v));
     try appendU16(allocator, buf, @intCast(ft.field_types.len));
-    for (ft.field_types) |v| try buf.append(allocator, @intFromEnum(v));
+    for (ft.field_types) |v| try buf.append(allocator, @backingInt(v));
     for (ft.field_muts) |m| try buf.append(allocator, m);
     // Recursive group context: types in different groups or at different
     // positions within their group are distinct for call_indirect.

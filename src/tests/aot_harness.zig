@@ -1066,7 +1066,7 @@ fn compileToAot(
     for (module.exports) |exp| {
         try exports.append(a, .{
             .name = exp.name,
-            .kind = @enumFromInt(@intFromEnum(exp.kind)),
+            .kind = @fromBackingInt(@intCast(@backingInt(exp.kind))),
             .index = exp.index,
         });
     }
@@ -1212,7 +1212,7 @@ fn compileToAot(
         gi.* = .{ .global_type = g.global_type, .value = val };
         try tmp_globals.append(a, gi);
         try global_entries.append(a, .{
-            .val_type = @intFromEnum(g.global_type.val_type),
+            .val_type = @backingInt(g.global_type.val_type),
             .mutability = if (g.global_type.mutability == .mutable) @as(u8, 1) else @as(u8, 0),
             .init_i64 = valueToI64(val),
             .init_v128 = valueToV128(val),
@@ -1281,9 +1281,9 @@ fn compileToAot(
     var ft_entries: std.ArrayList(emit_aot.FuncTypeEntry) = .empty;
     for (module.types) |ft| {
         const pbytes = try a.alloc(u8, ft.params.len);
-        for (ft.params, 0..) |vt, i| pbytes[i] = @intFromEnum(vt);
+        for (ft.params, 0..) |vt, i| pbytes[i] = @backingInt(vt);
         const rbytes = try a.alloc(u8, ft.results.len);
-        for (ft.results, 0..) |vt, i| rbytes[i] = @intFromEnum(vt);
+        for (ft.results, 0..) |vt, i| rbytes[i] = @backingInt(vt);
         try ft_entries.append(a, .{ .params = pbytes, .results = rbytes });
     }
     const tidxs = try a.alloc(u32, module.functions.len);

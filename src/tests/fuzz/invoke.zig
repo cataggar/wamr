@@ -196,7 +196,7 @@ pub fn functionCode(module: *const types.WasmModule, func_idx: u32) ?[]const u8 
 fn isAotSafeStraightLineCode(code: []const u8) bool {
     var ip: usize = 0;
     while (ip < code.len) {
-        const op: Opcode = @enumFromInt(code[ip]);
+        const op: Opcode = @fromBackingInt(@intCast(code[ip]));
         ip += 1;
         switch (op) {
             .end => return ip == code.len,

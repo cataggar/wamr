@@ -257,9 +257,9 @@ test "ValType: byte sizes" {
 }
 
 test "SectionId: ordering" {
-    try std.testing.expect(@intFromEnum(SectionId.type) < @intFromEnum(SectionId.import));
-    try std.testing.expect(@intFromEnum(SectionId.import) < @intFromEnum(SectionId.function));
-    try std.testing.expect(@intFromEnum(SectionId.code) < @intFromEnum(SectionId.data));
+    try std.testing.expect(@backingInt(SectionId.type) < @backingInt(SectionId.import));
+    try std.testing.expect(@backingInt(SectionId.import) < @backingInt(SectionId.function));
+    try std.testing.expect(@backingInt(SectionId.code) < @backingInt(SectionId.data));
 }
 
 // ─── Module-level structures ────────────────────────────────────────────────

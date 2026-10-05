@@ -287,7 +287,7 @@ test "native guest bounded request workspace and output preserve failure evidenc
     o.workspace = workspace[0..1];
     try std.testing.expectError(error.OutOfMemory, guest.run(o));
     o = envelope.options;
-    o.request_json = "[" ** 25;
+    o.request_json = &@as([25:0]u8, @splat("["[0]));
     try std.testing.expectError(error.InputTooDeep, guest.run(o));
     o = envelope.options;
     o.max_output_bytes = 3;

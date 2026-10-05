@@ -31,10 +31,13 @@ jobs:
           submodules: true
 
       - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          version: 0.16.0
-          use-cache: false
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Configure Zig caches
         uses: ./.github/actions/zig-cache
@@ -61,7 +64,7 @@ jobs:
         if: runner.os == 'Linux' && runner.arch == 'X64'
         run: |
           zig build test-native-aot test-native-aot-abi test-native-bench -j2 --summary all
-          zig build -Dprofile=unikraft-aot -Doptimize=ReleaseSafe -j2 --summary all
+          zig build -Dprofile=unikraft-aot -Doptimize=safe -j2 --summary all
           zig cc -target x86_64-freestanding-none -ffreestanding -std=c11 -Werror \
             -Iinclude -c tests/unikraft-aot/header.c -o .zig-cache/native-header.o
 
@@ -69,7 +72,7 @@ jobs:
         if: runner.os == 'Linux' && runner.arch == 'X64'
         run: |
           zig build test-native-jit test-native-jit-bench -j2 --summary all
-          zig build -Dprofile=unikraft-jit -Doptimize=ReleaseSafe -j2 --summary all
+          zig build -Dprofile=unikraft-jit -Doptimize=safe -j2 --summary all
 
       - name: WASI thread lifecycle (enabled interpreter)
         run: zig build test-thread-lifecycle -Dlib_wasi_threads=true -Daot=false
@@ -90,13 +93,13 @@ jobs:
 
       - name: Build (ReleaseSafe)
         continue-on-error: true
-        run: zig build -Doptimize=ReleaseSafe
+        run: zig build -Doptimize=safe
 
       - name: SIMD NaN conformance (ReleaseSafe)
         # Both hosts cover the interpreter and class predicates; SIMD AOT is
         # currently supported only by the AArch64 backend.
         if: runner.os == 'Linux'
-        run: zig build test-simd-nan -Doptimize=ReleaseSafe -j4
+        run: zig build test-simd-nan -Doptimize=safe -j4
 
       - name: Spec tests (JSON)
         if: runner.os != 'Windows'
@@ -149,10 +152,13 @@ jobs:
           submodules: true
 
       - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          version: 0.16.0
-          use-cache: false
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Configure Zig caches
         uses: ./.github/actions/zig-cache
@@ -163,7 +169,7 @@ jobs:
           echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
 
       - name: Build for wasm32-wasi
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=wasm32-wasi -Dstrip=true
+        run: zig build -Doptimize=safe -Dtarget=wasm32-wasi -Dstrip=true
 
       - name: Run wamr via wasmtime
         run: |
@@ -180,10 +186,13 @@ jobs:
           submodules: true
 
       - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          version: 0.16.0
-          use-cache: false
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Configure Zig caches
         uses: ./.github/actions/zig-cache
@@ -212,10 +221,13 @@ jobs:
           submodules: true
 
       - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          version: 0.16.0
-          use-cache: false
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Configure Zig caches
         uses: ./.github/actions/zig-cache
@@ -244,10 +256,13 @@ jobs:
           submodules: true
 
       - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          version: 0.16.0
-          use-cache: false
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Configure Zig caches
         uses: ./.github/actions/zig-cache
@@ -276,10 +291,13 @@ jobs:
           submodules: true
 
       - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          version: 0.16.0
-          use-cache: false
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Configure Zig caches
         uses: ./.github/actions/zig-cache
@@ -300,10 +318,10 @@ jobs:
         # cannot complete inside the testsuite-runner's 5-second
         # per-`wait` timeout (#538). Safety checks still fire on this
         # build so a regression in adapter state still trips the gate.
-        run: zig build -Doptimize=ReleaseSafe
+        run: zig build -Doptimize=safe
 
       - name: Run unfiltered WASI Preview 3 conformance contract
-        run: zig build wasi-p3-testsuite-unfiltered -Doptimize=ReleaseSafe
+        run: zig build wasi-p3-testsuite-unfiltered -Doptimize=safe
 
   wasi-p3-testsuite-arm64:
     name: Build & Test (wasi-p3-testsuite-arm64)
@@ -328,10 +346,13 @@ jobs:
           submodules: true
 
       - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          version: 0.16.0
-          use-cache: false
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Configure Zig caches
         uses: ./.github/actions/zig-cache
@@ -342,10 +363,10 @@ jobs:
             -r tests/wasi-testsuite/test-runner/requirements.txt
 
       - name: Build wamr (ReleaseSafe)
-        run: zig build -Doptimize=ReleaseSafe
+        run: zig build -Doptimize=safe
 
       - name: Run unfiltered WASI Preview 3 conformance contract
-        run: zig build wasi-p3-testsuite-unfiltered -Doptimize=ReleaseSafe
+        run: zig build wasi-p3-testsuite-unfiltered -Doptimize=safe
 
   jit-parity:
     name: Build & Test (jit-parity)
@@ -368,10 +389,13 @@ jobs:
           submodules: true
 
       - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          version: 0.16.0
-          use-cache: false
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Configure Zig caches
         uses: ./.github/actions/zig-cache
@@ -402,16 +426,16 @@ jobs:
         # ReleaseSafe for the same reason as `wasi-p3-testsuite` above;
         # doubly so here since the JIT path compiles every fixture from
         # scratch on every invocation (no cross-process `.cwasm` cache).
-        run: zig build -Doptimize=ReleaseSafe -Djit=true
+        run: zig build -Doptimize=safe -Djit=true
 
       - name: Spec tests (JSON, AOT pipeline)
-        run: zig build spec-tests-aot -Doptimize=ReleaseSafe -Djit=true
+        run: zig build spec-tests-aot -Doptimize=safe -Djit=true
 
       - name: Run WASI Preview 1 conformance suite through the JIT path
-        run: zig build wasi-testsuite-jit -Doptimize=ReleaseSafe -Djit=true
+        run: zig build wasi-testsuite-jit -Doptimize=safe -Djit=true
 
       - name: Run unfiltered WASI Preview 3 contract through the JIT path
-        run: zig build wasi-p3-testsuite-jit-unfiltered -Doptimize=ReleaseSafe -Djit=true
+        run: zig build wasi-p3-testsuite-jit-unfiltered -Doptimize=safe -Djit=true
 
   lazy-jit:
     name: Build & Test (lazy-jit-${{ matrix.name }})
@@ -434,10 +458,13 @@ jobs:
           submodules: true
 
       - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          version: 0.16.0
-          use-cache: false
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Configure Zig caches
         uses: ./.github/actions/zig-cache
@@ -463,10 +490,13 @@ jobs:
           submodules: true
 
       - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          version: 0.16.0
-          use-cache: false
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Configure Zig caches
         uses: ./.github/actions/zig-cache

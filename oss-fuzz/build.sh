@@ -17,7 +17,7 @@ cd "$SRC/wamr"
 
 # Build the static-archive shims. ReleaseSafe keeps Zig safety checks
 # enabled so panics surface as libFuzzer crashes.
-zig build fuzz-oss -Doptimize=ReleaseSafe
+zig build fuzz-oss -Doptimize=safe
 
 mkdir -p "$OUT"
 

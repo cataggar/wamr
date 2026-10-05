@@ -413,7 +413,7 @@ test "#689: trampoline stub forwards 7 i32 args (widest WASIp2 method shape)" {
     // x86_64 SysV (only 6 reg args). On AArch64 all 7 fit in x0..x6 but the
     // injected slot pushes x6 -> x7, exercising the widened shift sequence.
     const Host = struct {
-        const State = struct { received: [7]i32 = [_]i32{0} ** 7, called: bool = false };
+        const State = struct { received: [7]i32 = @as([7]i32, @splat(0)), called: bool = false };
 
         fn capture(ctx: ?*anyopaque, _: *instance.ComponentInstance, args: []const instance.InterfaceValue, results: []instance.InterfaceValue, _: std.mem.Allocator) !void {
             const state: *State = @ptrCast(@alignCast(ctx.?));
@@ -471,7 +471,7 @@ test "#689: trampoline stub forwards 8 i32 args (cap)" {
     // stack-arg slots on x86_64 (caller a6, a7) and the stack-spill arg on
     // AArch64 (caller a7 lands at [sp+8] after the stub's push).
     const Host = struct {
-        const State = struct { received: [8]i32 = [_]i32{0} ** 8, called: bool = false };
+        const State = struct { received: [8]i32 = @as([8]i32, @splat(0)), called: bool = false };
 
         fn capture(ctx: ?*anyopaque, _: *instance.ComponentInstance, args: []const instance.InterfaceValue, results: []instance.InterfaceValue, _: std.mem.Allocator) !void {
             const state: *State = @ptrCast(@alignCast(ctx.?));

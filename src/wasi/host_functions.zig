@@ -181,7 +181,7 @@ fn interruptedHostError(env: *ExecEnv) types.HostFnError {
 
 /// Translate `wasi.Errno` into the i32 errno value placed on the stack.
 fn errnoVal(e: wasi.Errno) i32 {
-    return @intCast(@intFromEnum(e));
+    return @intCast(@backingInt(e));
 }
 
 // ── WASI host functions ───────────────────────────────────────────────
@@ -373,7 +373,7 @@ pub fn wasiFdClose(env_opaque: *anyopaque) types.HostFnError!void {
 
     if (getCtx(env)) |ctx| {
         if (fd < 0) {
-            env.pushI32(@intCast(@intFromEnum(wasi.Errno.badf))) catch return error.StackOverflow;
+            env.pushI32(@intCast(@backingInt(wasi.Errno.badf))) catch return error.StackOverflow;
             return;
         }
         const result = ctx.fd_close(@intCast(fd));
@@ -1234,7 +1234,7 @@ pub fn writeStringTable(mem: []u8, entries: []const []const u8, argv_ptrs: u32, 
 fn writeFdstat(mem: []u8, buf_ptr: u32, entry: wasi.FdEntrySnapshot) i32 {
     if (buf_ptr + 24 > mem.len) return wasi_core.WASI_EINVAL;
     @memset(mem[buf_ptr..][0..24], 0);
-    mem[buf_ptr] = @intFromEnum(filetypeForEntry(entry));
+    mem[buf_ptr] = @backingInt(filetypeForEntry(entry));
     _ = wasi_core.memWriteU16(mem, buf_ptr + 2, entry.fdflags);
     _ = wasi_core.memWriteU64(mem, buf_ptr + 8, entry.rights_base);
     _ = wasi_core.memWriteU64(mem, buf_ptr + 16, entry.rights_inheriting);
@@ -1493,8 +1493,8 @@ fn doRead(ctx: *wasi.WasiCtx, lease: *wasi.FdTable.Lease, data: []u8) !usize {
 fn errnoToI32(e: anyerror) i32 {
     return switch (e) {
         error.BadFd => wasi_core.WASI_EBADF,
-        error.AccessDenied => @intCast(@intFromEnum(wasi.Errno.acces)),
-        error.NoSpaceLeft => @intCast(@intFromEnum(wasi.Errno.nospc)),
+        error.AccessDenied => @intCast(@backingInt(wasi.Errno.acces)),
+        error.NoSpaceLeft => @intCast(@backingInt(wasi.Errno.nospc)),
         else => wasi_core.WASI_EINVAL,
     };
 }
@@ -1514,8 +1514,8 @@ pub fn ctxFdSeekCore(
     const entry = lease.snapshot();
     switch (entry.kind) {
         .regular_file => {},
-        .directory => return @intCast(@intFromEnum(wasi.Errno.isdir)),
-        .stdin, .stdout, .stderr, .socket => return @intCast(@intFromEnum(wasi.Errno.spipe)),
+        .directory => return @intCast(@backingInt(wasi.Errno.isdir)),
+        .stdin, .stdout, .stderr, .socket => return @intCast(@backingInt(wasi.Errno.spipe)),
     }
     const host_fd = entry.host_fd orelse return wasi_core.WASI_EBADF;
     const file = std.Io.File{ .handle = host_fd, .flags = .{ .nonblocking = false } };
@@ -1565,11 +1565,11 @@ fn pIoLookup(
     switch (entry.kind) {
         .stdin, .stdout, .stderr, .socket => {
             lease.release();
-            return .{ .err = @intCast(@intFromEnum(wasi.Errno.spipe)) };
+            return .{ .err = @intCast(@backingInt(wasi.Errno.spipe)) };
         },
         .directory => {
             lease.release();
-            return .{ .err = @intCast(@intFromEnum(wasi.Errno.isdir)) };
+            return .{ .err = @intCast(@backingInt(wasi.Errno.isdir)) };
         },
         .regular_file => {},
     }
@@ -1692,7 +1692,7 @@ pub fn ctxFdReaddirCore(
     var lease = ctx.fd_table.acquire(u_fd) orelse return wasi_core.WASI_EBADF;
     defer lease.release();
     const entry = lease.snapshot();
-    if (entry.kind != .directory) return @intCast(@intFromEnum(wasi.Errno.notdir));
+    if (entry.kind != .directory) return @intCast(@backingInt(wasi.Errno.notdir));
     const dir = entry.host_dir orelse return wasi_core.WASI_EBADF;
 
     if (builtin.os.tag != .linux) return wasi_core.WASI_ENOSYS;
@@ -1735,7 +1735,7 @@ pub fn ctxFdReaddirCore(
             std.mem.writeInt(u64, hdr[0..8], off_raw, .little);
             std.mem.writeInt(u64, hdr[8..16], ino, .little);
             std.mem.writeInt(u32, hdr[16..20], @intCast(name_len), .little);
-            hdr[20] = @intFromEnum(wasiFiletypeFromDt(dt));
+            hdr[20] = @backingInt(wasiFiletypeFromDt(dt));
 
             // Header — copy as much as fits.
             const remaining_h = buf_len - bufused;
@@ -1829,7 +1829,7 @@ pub fn ctxPathOpenCore(
     // dir. Absolute paths escape the sandbox and are rejected with
     // notcapable.
     if (path.len > 0 and path[0] == '/') {
-        return @intCast(@intFromEnum(wasi.Errno.notcapable));
+        return @intCast(@backingInt(wasi.Errno.notcapable));
     }
 
     // Reject paths that lexically escape the preopen via `..`. We track
@@ -1839,7 +1839,7 @@ pub fn ctxPathOpenCore(
     // exist on the host. Returns NOTCAPABLE before the host openat,
     // matching wasi-libc / wasmtime semantics.
     if (pathEscapesSandbox(path)) {
-        return @intCast(@intFromEnum(wasi.Errno.notcapable));
+        return @intCast(@backingInt(wasi.Errno.notcapable));
     }
 
     const want_creat = (oflags & 0x1) != 0;
@@ -1855,7 +1855,7 @@ pub fn ctxPathOpenCore(
     // fd_fdstat_set_rights.
     if (want_trunc) {
         if ((dir_entry.rights_base & wasi.RIGHTS_PATH_FILESTAT_SET_SIZE) == 0) {
-            return @intCast(@intFromEnum(wasi.Errno.notcapable));
+            return @intCast(@backingInt(wasi.Errno.notcapable));
         }
     }
 
@@ -1873,7 +1873,7 @@ pub fn ctxPathOpenCore(
             wasi.RIGHTS_FD_ALLOCATE |
             wasi.RIGHTS_FD_FILESTAT_SET_SIZE;
         if ((fs_rights_base & write_class) != 0) {
-            return @intCast(@intFromEnum(wasi.Errno.isdir));
+            return @intCast(@backingInt(wasi.Errno.isdir));
         }
     }
 
@@ -2005,7 +2005,7 @@ fn pPathLookup(
     const entry = lease.snapshot();
     if (entry.kind != .directory) {
         lease.release();
-        return .{ .err = @intCast(@intFromEnum(wasi.Errno.notdir)) };
+        return .{ .err = @intCast(@backingInt(wasi.Errno.notdir)) };
     }
     if (entry.host_dir == null) {
         lease.release();
@@ -2029,34 +2029,34 @@ fn readGuestPath(mem: []u8, path_ptr: u32, path_len: u32) ?[]const u8 {
 /// Errors not enumerated fall through to `inval`.
 fn mapStdIoErr(err: anyerror) i32 {
     return switch (err) {
-        error.FileNotFound => @intCast(@intFromEnum(wasi.Errno.noent)),
-        error.PathAlreadyExists => @intCast(@intFromEnum(wasi.Errno.exist)),
-        error.AccessDenied, error.PermissionDenied => @intCast(@intFromEnum(wasi.Errno.acces)),
-        error.IsDir => @intCast(@intFromEnum(wasi.Errno.isdir)),
-        error.NotDir => @intCast(@intFromEnum(wasi.Errno.notdir)),
-        error.DirNotEmpty => @intCast(@intFromEnum(wasi.Errno.notempty)),
-        error.SymLinkLoop => @intCast(@intFromEnum(wasi.Errno.loop)),
-        error.NameTooLong => @intCast(@intFromEnum(wasi.Errno.nametoolong)),
+        error.FileNotFound => @intCast(@backingInt(wasi.Errno.noent)),
+        error.PathAlreadyExists => @intCast(@backingInt(wasi.Errno.exist)),
+        error.AccessDenied, error.PermissionDenied => @intCast(@backingInt(wasi.Errno.acces)),
+        error.IsDir => @intCast(@backingInt(wasi.Errno.isdir)),
+        error.NotDir => @intCast(@backingInt(wasi.Errno.notdir)),
+        error.DirNotEmpty => @intCast(@backingInt(wasi.Errno.notempty)),
+        error.SymLinkLoop => @intCast(@backingInt(wasi.Errno.loop)),
+        error.NameTooLong => @intCast(@backingInt(wasi.Errno.nametoolong)),
         error.BadPathName => wasi_core.WASI_EINVAL,
-        error.NoSpaceLeft => @intCast(@intFromEnum(wasi.Errno.nospc)),
-        error.DiskQuota => @intCast(@intFromEnum(wasi.Errno.dquot)),
-        error.ReadOnlyFileSystem => @intCast(@intFromEnum(wasi.Errno.rofs)),
-        error.FileBusy => @intCast(@intFromEnum(wasi.Errno.busy)),
-        error.LinkQuotaExceeded => @intCast(@intFromEnum(wasi.Errno.mlink)),
-        error.CrossDevice => @intCast(@intFromEnum(wasi.Errno.xdev)),
-        error.OperationUnsupported => @intCast(@intFromEnum(wasi.Errno.notsup)),
-        error.SystemResources => @intCast(@intFromEnum(wasi.Errno.nomem)),
-        error.NoDevice => @intCast(@intFromEnum(wasi.Errno.nodev)),
+        error.NoSpaceLeft => @intCast(@backingInt(wasi.Errno.nospc)),
+        error.DiskQuota => @intCast(@backingInt(wasi.Errno.dquot)),
+        error.ReadOnlyFileSystem => @intCast(@backingInt(wasi.Errno.rofs)),
+        error.FileBusy => @intCast(@backingInt(wasi.Errno.busy)),
+        error.LinkQuotaExceeded => @intCast(@backingInt(wasi.Errno.mlink)),
+        error.CrossDevice => @intCast(@backingInt(wasi.Errno.xdev)),
+        error.OperationUnsupported => @intCast(@backingInt(wasi.Errno.notsup)),
+        error.SystemResources => @intCast(@backingInt(wasi.Errno.nomem)),
+        error.NoDevice => @intCast(@backingInt(wasi.Errno.nodev)),
         error.NotLink => wasi_core.WASI_EINVAL,
-        error.FileSystem, error.AntivirusInterference => @intCast(@intFromEnum(wasi.Errno.io)),
-        error.NetworkNotFound => @intCast(@intFromEnum(wasi.Errno.noent)),
-        error.UnsupportedReparsePointType => @intCast(@intFromEnum(wasi.Errno.notsup)),
-        error.PipeBusy, error.DeviceBusy => @intCast(@intFromEnum(wasi.Errno.busy)),
-        error.FileLocksUnsupported => @intCast(@intFromEnum(wasi.Errno.notsup)),
-        error.FileTooBig => @intCast(@intFromEnum(wasi.Errno.fbig)),
-        error.WouldBlock => @intCast(@intFromEnum(wasi.Errno.again)),
-        error.ProcessFdQuotaExceeded => @intCast(@intFromEnum(wasi.Errno.mfile)),
-        error.SystemFdQuotaExceeded => @intCast(@intFromEnum(wasi.Errno.nfile)),
+        error.FileSystem, error.AntivirusInterference => @intCast(@backingInt(wasi.Errno.io)),
+        error.NetworkNotFound => @intCast(@backingInt(wasi.Errno.noent)),
+        error.UnsupportedReparsePointType => @intCast(@backingInt(wasi.Errno.notsup)),
+        error.PipeBusy, error.DeviceBusy => @intCast(@backingInt(wasi.Errno.busy)),
+        error.FileLocksUnsupported => @intCast(@backingInt(wasi.Errno.notsup)),
+        error.FileTooBig => @intCast(@backingInt(wasi.Errno.fbig)),
+        error.WouldBlock => @intCast(@backingInt(wasi.Errno.again)),
+        error.ProcessFdQuotaExceeded => @intCast(@backingInt(wasi.Errno.mfile)),
+        error.SystemFdQuotaExceeded => @intCast(@backingInt(wasi.Errno.nfile)),
         else => wasi_core.WASI_EINVAL,
     };
 }
@@ -2108,12 +2108,12 @@ pub fn ctxPathFilestatSetTimesCore(
     const dir = dir_lease.snapshot().host_dir.?;
     const path = readGuestPath(mem, path_ptr, path_len) orelse return wasi_core.WASI_EINVAL;
 
-    if (builtin.os.tag != .linux) return @intCast(@intFromEnum(wasi.Errno.notsup));
+    if (builtin.os.tag != .linux) return @intCast(@backingInt(wasi.Errno.notsup));
     const linux = std.os.linux;
 
     // utimensat takes a NUL-terminated C string; copy into a stack buffer.
     var c_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    if (path.len >= c_path_buf.len) return @intCast(@intFromEnum(wasi.Errno.nametoolong));
+    if (path.len >= c_path_buf.len) return @intCast(@backingInt(wasi.Errno.nametoolong));
     @memcpy(c_path_buf[0..path.len], path);
     c_path_buf[path.len] = 0;
     const c_path: [*:0]const u8 = @ptrCast(&c_path_buf);
@@ -2275,7 +2275,7 @@ pub fn ctxPathSymlinkCore(
     // violation. wasmtime returns NOTCAPABLE; PERM is also accepted by
     // wasi-tests' assert_errno helper.
     if (old_path.len > 0 and old_path[0] == '/') {
-        return @intCast(@intFromEnum(wasi.Errno.notcapable));
+        return @intCast(@backingInt(wasi.Errno.notcapable));
     }
     dir.symLink(ctx.io, old_path, new_path, .{}) catch |err|
         return mapStdIoErr(err);
@@ -2321,7 +2321,7 @@ fn writeFilestat(mem: []u8, buf_ptr: u32, stat: anytype, filetype: wasi.Filetype
     // synthesize zero (wasi guests typically only use ino for tracking).
     _ = wasi_core.memWriteU64(mem, buf_ptr + 0, 0);
     _ = wasi_core.memWriteU64(mem, buf_ptr + 8, @intCast(stat.inode));
-    mem[buf_ptr + 16] = @intFromEnum(filetype);
+    mem[buf_ptr + 16] = @backingInt(filetype);
     _ = wasi_core.memWriteU64(mem, buf_ptr + 24, @intCast(stat.nlink));
     _ = wasi_core.memWriteU64(mem, buf_ptr + 32, stat.size);
     const atim_ns: u64 = if (stat.atime) |t| timestampToNs(t) else 0;
@@ -2384,7 +2384,7 @@ pub fn ctxFdFilestatGetCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, buf_ptr: u32
 fn writeFilestatSynthesised(mem: []u8, buf_ptr: u32, filetype: wasi.Filetype) i32 {
     if (buf_ptr + 64 > mem.len) return wasi_core.WASI_EINVAL;
     @memset(mem[buf_ptr..][0..64], 0);
-    mem[buf_ptr + 16] = @intFromEnum(filetype);
+    mem[buf_ptr + 16] = @backingInt(filetype);
     return wasi_core.WASI_ESUCCESS;
 }
 
@@ -2396,8 +2396,8 @@ pub fn ctxFdFilestatSetSizeCore(ctx: *wasi.WasiCtx, fd: i32, size: i64) i32 {
     var lease = ctx.fd_table.acquire(u_fd) orelse return wasi_core.WASI_EBADF;
     defer lease.release();
     const entry = lease.snapshot();
-    if (entry.kind == .directory) return @intCast(@intFromEnum(wasi.Errno.isdir));
-    if (entry.kind != .regular_file) return @intCast(@intFromEnum(wasi.Errno.inval));
+    if (entry.kind == .directory) return @intCast(@backingInt(wasi.Errno.isdir));
+    if (entry.kind != .regular_file) return @intCast(@backingInt(wasi.Errno.inval));
 
     if (builtin.os.tag != .linux) return wasi_core.WASI_ENOSYS;
 
@@ -2453,7 +2453,7 @@ pub fn ctxFdFdstatSetFlagsCore(ctx: *wasi.WasiCtx, fd: i32, fdflags: u16) i32 {
     // reject any request that tries to change them on every platform.
     // Otherwise guests would see a silent success-on-no-op.
     if ((fdflags & (wasi.FDFLAGS_DSYNC | wasi.FDFLAGS_RSYNC | wasi.FDFLAGS_SYNC)) != 0) {
-        return @intCast(@intFromEnum(wasi.Errno.notsup));
+        return @intCast(@backingInt(wasi.Errno.notsup));
     }
 
     if (builtin.os.tag == .linux) {
@@ -2481,7 +2481,7 @@ pub fn ctxFdFdstatSetRightsCore(ctx: *wasi.WasiCtx, fd: i32, base: u64, inheriti
     var lease = ctx.fd_table.acquire(u_fd) orelse return wasi_core.WASI_EBADF;
     defer lease.release();
     if (!lease.narrowRights(base, inheriting)) {
-        return @intCast(@intFromEnum(wasi.Errno.notcapable));
+        return @intCast(@backingInt(wasi.Errno.notcapable));
     }
     return wasi_core.WASI_ESUCCESS;
 }
@@ -2489,18 +2489,18 @@ pub fn ctxFdFdstatSetRightsCore(ctx: *wasi.WasiCtx, fd: i32, base: u64, inheriti
 pub fn ctxFdAdviseCore(ctx: *wasi.WasiCtx, fd: i32, offset: i64, len: i64, advice: u8) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
     if (offset < 0 or len < 0) return wasi_core.WASI_EINVAL;
-    if (advice > @intFromEnum(wasi.Advice.noreuse)) return wasi_core.WASI_EINVAL;
+    if (advice > @backingInt(wasi.Advice.noreuse)) return wasi_core.WASI_EINVAL;
 
     const u_fd: u32 = @intCast(fd);
     var lease = ctx.fd_table.acquire(u_fd) orelse return wasi_core.WASI_EBADF;
     defer lease.release();
     const entry = lease.snapshot();
-    if (entry.kind != .regular_file) return @intCast(@intFromEnum(wasi.Errno.spipe));
+    if (entry.kind != .regular_file) return @intCast(@backingInt(wasi.Errno.spipe));
 
     if (builtin.os.tag != .linux) return wasi_core.WASI_ESUCCESS;
 
     const linux = std.os.linux;
-    const linux_advice: usize = switch (@as(wasi.Advice, @enumFromInt(advice))) {
+    const linux_advice: usize = switch (@as(wasi.Advice, @fromBackingInt(@intCast(advice)))) {
         .normal => linux.POSIX_FADV.NORMAL,
         .sequential => linux.POSIX_FADV.SEQUENTIAL,
         .random => linux.POSIX_FADV.RANDOM,
@@ -2523,8 +2523,8 @@ pub fn ctxFdAllocateCore(ctx: *wasi.WasiCtx, fd: i32, offset: i64, len: i64) i32
     const entry = lease.snapshot();
     switch (entry.kind) {
         .regular_file => {},
-        .directory => return @intCast(@intFromEnum(wasi.Errno.isdir)),
-        .stdin, .stdout, .stderr, .socket => return @intCast(@intFromEnum(wasi.Errno.spipe)),
+        .directory => return @intCast(@backingInt(wasi.Errno.isdir)),
+        .stdin, .stdout, .stderr, .socket => return @intCast(@backingInt(wasi.Errno.spipe)),
     }
 
     if (builtin.os.tag != .linux) return wasi_core.WASI_ENOSYS;
@@ -2610,8 +2610,8 @@ pub fn ctxFdTellCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, offset_ptr: u32) i3
     const entry = lease.snapshot();
     switch (entry.kind) {
         .regular_file => {},
-        .directory => return @intCast(@intFromEnum(wasi.Errno.isdir)),
-        .stdin, .stdout, .stderr, .socket => return @intCast(@intFromEnum(wasi.Errno.spipe)),
+        .directory => return @intCast(@backingInt(wasi.Errno.isdir)),
+        .stdin, .stdout, .stderr, .socket => return @intCast(@backingInt(wasi.Errno.spipe)),
     }
     const position = if (entry.host_fd) |host_fd|
         wasi.hostFilePosition(host_fd) orelse entry.pos
@@ -2629,43 +2629,43 @@ fn mapLinuxErrno(rc: usize) i32 {
         .SUCCESS => wasi_core.WASI_ESUCCESS,
         .BADF => wasi_core.WASI_EBADF,
         .INVAL => wasi_core.WASI_EINVAL,
-        .ACCES => @intCast(@intFromEnum(wasi.Errno.acces)),
-        .PERM => @intCast(@intFromEnum(wasi.Errno.perm)),
-        .NOSPC => @intCast(@intFromEnum(wasi.Errno.nospc)),
-        .ROFS => @intCast(@intFromEnum(wasi.Errno.rofs)),
-        .ISDIR => @intCast(@intFromEnum(wasi.Errno.isdir)),
-        .NOTDIR => @intCast(@intFromEnum(wasi.Errno.notdir)),
-        .NOTEMPTY => @intCast(@intFromEnum(wasi.Errno.notempty)),
-        .NOENT => @intCast(@intFromEnum(wasi.Errno.noent)),
-        .EXIST => @intCast(@intFromEnum(wasi.Errno.exist)),
-        .FBIG => @intCast(@intFromEnum(wasi.Errno.fbig)),
-        .IO => @intCast(@intFromEnum(wasi.Errno.io)),
-        .SPIPE => @intCast(@intFromEnum(wasi.Errno.spipe)),
-        .OPNOTSUPP => @intCast(@intFromEnum(wasi.Errno.notsup)),
-        .DQUOT => @intCast(@intFromEnum(wasi.Errno.dquot)),
-        .NXIO => @intCast(@intFromEnum(wasi.Errno.nxio)),
-        .LOOP => @intCast(@intFromEnum(wasi.Errno.loop)),
-        .NAMETOOLONG => @intCast(@intFromEnum(wasi.Errno.nametoolong)),
-        .XDEV => @intCast(@intFromEnum(wasi.Errno.xdev)),
-        .MLINK => @intCast(@intFromEnum(wasi.Errno.mlink)),
+        .ACCES => @intCast(@backingInt(wasi.Errno.acces)),
+        .PERM => @intCast(@backingInt(wasi.Errno.perm)),
+        .NOSPC => @intCast(@backingInt(wasi.Errno.nospc)),
+        .ROFS => @intCast(@backingInt(wasi.Errno.rofs)),
+        .ISDIR => @intCast(@backingInt(wasi.Errno.isdir)),
+        .NOTDIR => @intCast(@backingInt(wasi.Errno.notdir)),
+        .NOTEMPTY => @intCast(@backingInt(wasi.Errno.notempty)),
+        .NOENT => @intCast(@backingInt(wasi.Errno.noent)),
+        .EXIST => @intCast(@backingInt(wasi.Errno.exist)),
+        .FBIG => @intCast(@backingInt(wasi.Errno.fbig)),
+        .IO => @intCast(@backingInt(wasi.Errno.io)),
+        .SPIPE => @intCast(@backingInt(wasi.Errno.spipe)),
+        .OPNOTSUPP => @intCast(@backingInt(wasi.Errno.notsup)),
+        .DQUOT => @intCast(@backingInt(wasi.Errno.dquot)),
+        .NXIO => @intCast(@backingInt(wasi.Errno.nxio)),
+        .LOOP => @intCast(@backingInt(wasi.Errno.loop)),
+        .NAMETOOLONG => @intCast(@backingInt(wasi.Errno.nametoolong)),
+        .XDEV => @intCast(@backingInt(wasi.Errno.xdev)),
+        .MLINK => @intCast(@backingInt(wasi.Errno.mlink)),
         // Socket-relevant errnos for sock_accept / sock_recv / sock_send.
-        .AGAIN => @intCast(@intFromEnum(wasi.Errno.again)),
-        .INTR => @intCast(@intFromEnum(wasi.Errno.intr)),
-        .CONNABORTED => @intCast(@intFromEnum(wasi.Errno.connaborted)),
-        .CONNRESET => @intCast(@intFromEnum(wasi.Errno.connreset)),
-        .CONNREFUSED => @intCast(@intFromEnum(wasi.Errno.connrefused)),
-        .NOTCONN => @intCast(@intFromEnum(wasi.Errno.notconn)),
-        .NOTSOCK => @intCast(@intFromEnum(wasi.Errno.notsock)),
-        .PIPE => @intCast(@intFromEnum(wasi.Errno.pipe)),
-        .NOBUFS => @intCast(@intFromEnum(wasi.Errno.nobufs)),
-        .NOMEM => @intCast(@intFromEnum(wasi.Errno.nomem)),
-        .MFILE => @intCast(@intFromEnum(wasi.Errno.mfile)),
-        .NFILE => @intCast(@intFromEnum(wasi.Errno.nfile)),
-        .MSGSIZE => @intCast(@intFromEnum(wasi.Errno.msgsize)),
-        .HOSTUNREACH => @intCast(@intFromEnum(wasi.Errno.hostunreach)),
-        .NETUNREACH => @intCast(@intFromEnum(wasi.Errno.netunreach)),
-        .NETDOWN => @intCast(@intFromEnum(wasi.Errno.netdown)),
-        .FAULT => @intCast(@intFromEnum(wasi.Errno.fault)),
+        .AGAIN => @intCast(@backingInt(wasi.Errno.again)),
+        .INTR => @intCast(@backingInt(wasi.Errno.intr)),
+        .CONNABORTED => @intCast(@backingInt(wasi.Errno.connaborted)),
+        .CONNRESET => @intCast(@backingInt(wasi.Errno.connreset)),
+        .CONNREFUSED => @intCast(@backingInt(wasi.Errno.connrefused)),
+        .NOTCONN => @intCast(@backingInt(wasi.Errno.notconn)),
+        .NOTSOCK => @intCast(@backingInt(wasi.Errno.notsock)),
+        .PIPE => @intCast(@backingInt(wasi.Errno.pipe)),
+        .NOBUFS => @intCast(@backingInt(wasi.Errno.nobufs)),
+        .NOMEM => @intCast(@backingInt(wasi.Errno.nomem)),
+        .MFILE => @intCast(@backingInt(wasi.Errno.mfile)),
+        .NFILE => @intCast(@backingInt(wasi.Errno.nfile)),
+        .MSGSIZE => @intCast(@backingInt(wasi.Errno.msgsize)),
+        .HOSTUNREACH => @intCast(@backingInt(wasi.Errno.hostunreach)),
+        .NETUNREACH => @intCast(@backingInt(wasi.Errno.netunreach)),
+        .NETDOWN => @intCast(@backingInt(wasi.Errno.netdown)),
+        .FAULT => @intCast(@backingInt(wasi.Errno.fault)),
         else => wasi_core.WASI_EINVAL,
     };
 }
@@ -2836,8 +2836,8 @@ fn applyWindowsInputResults(
                 sub.ready = true;
                 sub.hangup = true;
             },
-            .bad_handle => sub.errno = @intFromEnum(wasi.Errno.badf),
-            .io_error => sub.errno = @intFromEnum(wasi.Errno.io),
+            .bad_handle => sub.errno = @backingInt(wasi.Errno.badf),
+            .io_error => sub.errno = @backingInt(wasi.Errno.io),
         }
     }
 }
@@ -2950,7 +2950,7 @@ fn ctxPollOneoffCoreWithHooks(
                         .relative_start_ns = 0,
                         .absolute = abstime,
                         .valid = false,
-                        .errno = @intFromEnum(wasi.Errno.inval),
+                        .errno = @backingInt(wasi.Errno.inval),
                     }) catch return wasi_core.WASI_EINVAL;
                     continue;
                 }
@@ -2963,7 +2963,7 @@ fn ctxPollOneoffCoreWithHooks(
                             .relative_start_ns = 0,
                             .absolute = abstime,
                             .valid = false,
-                            .errno = @intFromEnum(wasi.Errno.notsup),
+                            .errno = @backingInt(wasi.Errno.notsup),
                         }) catch return wasi_core.WASI_EINVAL;
                         continue;
                     }
@@ -2998,7 +2998,7 @@ fn ctxPollOneoffCoreWithHooks(
                 };
 
                 var lease = ctx.fd_table.acquire(fd_raw) orelse {
-                    pending.errno = @intFromEnum(wasi.Errno.badf);
+                    pending.errno = @backingInt(wasi.Errno.badf);
                     fd_subs.append(ctx.allocator, pending) catch return wasi_core.WASI_EINVAL;
                     continue;
                 };
@@ -3008,7 +3008,7 @@ fn ctxPollOneoffCoreWithHooks(
                 const need_right: u64 = if (want_write) wasi.RIGHTS_FD_WRITE else wasi.RIGHTS_FD_READ;
                 if ((entry.rights_base & need_right) == 0) {
                     lease.release();
-                    pending.errno = @intFromEnum(wasi.Errno.notcapable);
+                    pending.errno = @backingInt(wasi.Errno.notcapable);
                     fd_subs.append(ctx.allocator, pending) catch return wasi_core.WASI_EINVAL;
                     continue;
                 }
@@ -3019,12 +3019,12 @@ fn ctxPollOneoffCoreWithHooks(
                             pending.ready = true;
                         } else {
                             // Reading from stdout/stderr: Linux returns EBADF.
-                            pending.errno = @intFromEnum(wasi.Errno.badf);
+                            pending.errno = @backingInt(wasi.Errno.badf);
                         }
                     },
                     .stdin => {
                         if (want_write) {
-                            pending.errno = @intFromEnum(wasi.Errno.badf);
+                            pending.errno = @backingInt(wasi.Errno.badf);
                         } else if (comptime builtin.os.tag == .windows) {
                             const input_index = windows_inputs.items.len;
                             windows_inputs.append(ctx.allocator, .{
@@ -3056,11 +3056,11 @@ fn ctxPollOneoffCoreWithHooks(
                         pending.ready = true;
                     },
                     .directory => {
-                        pending.errno = @intFromEnum(wasi.Errno.badf);
+                        pending.errno = @backingInt(wasi.Errno.badf);
                     },
                     .socket => {
                         if (comptime builtin.os.tag == .windows) {
-                            pending.errno = @intFromEnum(wasi.Errno.notsup);
+                            pending.errno = @backingInt(wasi.Errno.notsup);
                         } else if (entry.host_fd) |host_fd| {
                             const events: i16 = if (want_write) std.posix.POLL.OUT else std.posix.POLL.IN;
                             const pfd_index = pollfds.items.len;
@@ -3076,7 +3076,7 @@ fn ctxPollOneoffCoreWithHooks(
                             pending.lease = lease;
                             keep_lease = true;
                         } else {
-                            pending.errno = @intFromEnum(wasi.Errno.badf);
+                            pending.errno = @backingInt(wasi.Errno.badf);
                         }
                     },
                 }
@@ -3093,7 +3093,7 @@ fn ctxPollOneoffCoreWithHooks(
                     .ready = false,
                     .nbytes = 0,
                     .hangup = false,
-                    .errno = @intFromEnum(wasi.Errno.inval),
+                    .errno = @backingInt(wasi.Errno.inval),
                     .pollfd_index = null,
                     .windows_input_index = null,
                     .lease = null,
@@ -3110,7 +3110,7 @@ fn ctxPollOneoffCoreWithHooks(
                 if (windows_inputs.items.len != 0) {
                     switch (runWindowsPollWait(ctx, hooks, windows_inputs.items, 0)) {
                         .terminated => return terminated_result,
-                        .failed => return @intCast(@intFromEnum(wasi.Errno.io)),
+                        .failed => return @intCast(@backingInt(wasi.Errno.io)),
                         .ready, .timed_out => {},
                     }
                     applyWindowsInputResults(fd_subs.items, windows_inputs.items);
@@ -3256,7 +3256,7 @@ fn ctxPollOneoffCoreWithHooks(
 
         switch (wait_result) {
             .terminated => return terminated_result,
-            .failed => return @intCast(@intFromEnum(wasi.Errno.io)),
+            .failed => return @intCast(@backingInt(wasi.Errno.io)),
             .ready => probe_inputs = false,
             .timed_out => {},
         }
@@ -3287,11 +3287,11 @@ pub fn ctxSockShutdownCore(ctx: *wasi.WasiCtx, fd: i32, sdflags: i32) i32 {
     const entry = lease.snapshot();
 
     if (entry.kind != .socket) {
-        return @intCast(@intFromEnum(wasi.Errno.notsock));
+        return @intCast(@backingInt(wasi.Errno.notsock));
     }
 
     if ((entry.rights_base & wasi.RIGHTS_SOCK_SHUTDOWN) == 0) {
-        return @intCast(@intFromEnum(wasi.Errno.notcapable));
+        return @intCast(@backingInt(wasi.Errno.notcapable));
     }
 
     const host_fd = entry.host_fd orelse return wasi_core.WASI_EBADF;
@@ -3400,9 +3400,9 @@ pub fn ctxSockAcceptCore(
     defer lease.release();
     const entry = lease.snapshot();
 
-    if (entry.kind != .socket) return @intCast(@intFromEnum(wasi.Errno.notsock));
+    if (entry.kind != .socket) return @intCast(@backingInt(wasi.Errno.notsock));
     if ((entry.rights_base & wasi.RIGHTS_SOCK_ACCEPT) == 0) {
-        return @intCast(@intFromEnum(wasi.Errno.notcapable));
+        return @intCast(@backingInt(wasi.Errno.notcapable));
     }
 
     const host_listen_fd = entry.host_fd orelse return wasi_core.WASI_EBADF;
@@ -3463,9 +3463,9 @@ pub fn ctxSockRecvCore(
     defer lease.release();
     const entry = lease.snapshot();
 
-    if (entry.kind != .socket) return @intCast(@intFromEnum(wasi.Errno.notsock));
+    if (entry.kind != .socket) return @intCast(@backingInt(wasi.Errno.notsock));
     if ((entry.rights_base & wasi.RIGHTS_FD_READ) == 0) {
-        return @intCast(@intFromEnum(wasi.Errno.notcapable));
+        return @intCast(@backingInt(wasi.Errno.notcapable));
     }
     const host_fd = entry.host_fd orelse return wasi_core.WASI_EBADF;
 
@@ -3530,9 +3530,9 @@ pub fn ctxSockSendCore(
     defer lease.release();
     const entry = lease.snapshot();
 
-    if (entry.kind != .socket) return @intCast(@intFromEnum(wasi.Errno.notsock));
+    if (entry.kind != .socket) return @intCast(@backingInt(wasi.Errno.notsock));
     if ((entry.rights_base & wasi.RIGHTS_FD_WRITE) == 0) {
-        return @intCast(@intFromEnum(wasi.Errno.notcapable));
+        return @intCast(@backingInt(wasi.Errno.notcapable));
     }
     const host_fd = entry.host_fd orelse return wasi_core.WASI_EBADF;
 
@@ -3876,7 +3876,7 @@ test "ctxFdFdstatSetFlagsCore: invalid bits return EINVAL" {
 test "ctxFdFdstatSetFlagsCore: SYNC bits return notsup" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
-    const expected: i32 = @intCast(@intFromEnum(wasi.Errno.notsup));
+    const expected: i32 = @intCast(@backingInt(wasi.Errno.notsup));
     try std.testing.expectEqual(expected, ctxFdFdstatSetFlagsCore(ctx, 1, wasi.FDFLAGS_SYNC));
     try std.testing.expectEqual(expected, ctxFdFdstatSetFlagsCore(ctx, 1, wasi.FDFLAGS_DSYNC));
     try std.testing.expectEqual(expected, ctxFdFdstatSetFlagsCore(ctx, 1, wasi.FDFLAGS_RSYNC));
@@ -3897,7 +3897,7 @@ test "ctxFdFdstatSetRightsCore: narrow ok, widen rejected" {
     const after_narrow = ctx.fd_table.snapshot(50).?;
     try std.testing.expectEqual(@as(u64, 0x0F), after_narrow.rights_base);
     try std.testing.expectEqual(@as(u64, 0x0F), after_narrow.rights_inheriting);
-    const expected: i32 = @intCast(@intFromEnum(wasi.Errno.notcapable));
+    const expected: i32 = @intCast(@backingInt(wasi.Errno.notcapable));
     try std.testing.expectEqual(expected, ctxFdFdstatSetRightsCore(ctx, 50, 0xFF, 0x0F));
     try std.testing.expectEqual(@as(u64, 0x0F), ctx.fd_table.snapshot(50).?.rights_base);
 }
@@ -3937,7 +3937,7 @@ test "ctxFdTellCore: bad fd / spipe / cached pos" {
 
     try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdTellCore(ctx, &mem, -1, 0));
 
-    const spipe: i32 = @intCast(@intFromEnum(wasi.Errno.spipe));
+    const spipe: i32 = @intCast(@backingInt(wasi.Errno.spipe));
     try std.testing.expectEqual(spipe, ctxFdTellCore(ctx, &mem, 1, 0));
 
     try ctx.fd_table.insert(70, .{ .kind = .regular_file, .pos = 0xDEADBEEF });
@@ -3972,7 +3972,7 @@ test "ctxFdFilestatSetSizeCore: bad fd / directory rejected" {
     defer ctx.deinit();
     try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdFilestatSetSizeCore(ctx, -1, 0));
     try ctx.fd_table.insert(90, .{ .kind = .directory });
-    const isdir: i32 = @intCast(@intFromEnum(wasi.Errno.isdir));
+    const isdir: i32 = @intCast(@backingInt(wasi.Errno.isdir));
     try std.testing.expectEqual(isdir, ctxFdFilestatSetSizeCore(ctx, 90, 0));
 }
 
@@ -3985,13 +3985,13 @@ test "ctxFdPreadCore: bad fd / negative offset / spipe / isdir" {
     try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdPreadCore(ctx, &mem, 99, 0, 0, 0, 0));
     try std.testing.expectEqual(wasi_core.WASI_EINVAL, ctxFdPreadCore(ctx, &mem, 1, 0, 0, -1, 0));
 
-    const spipe: i32 = @intCast(@intFromEnum(wasi.Errno.spipe));
+    const spipe: i32 = @intCast(@backingInt(wasi.Errno.spipe));
     try std.testing.expectEqual(spipe, ctxFdPreadCore(ctx, &mem, 0, 0, 0, 0, 0));
     try std.testing.expectEqual(spipe, ctxFdPreadCore(ctx, &mem, 1, 0, 0, 0, 0));
     try std.testing.expectEqual(spipe, ctxFdPreadCore(ctx, &mem, 2, 0, 0, 0, 0));
 
     try ctx.fd_table.insert(90, .{ .kind = .directory });
-    const isdir: i32 = @intCast(@intFromEnum(wasi.Errno.isdir));
+    const isdir: i32 = @intCast(@backingInt(wasi.Errno.isdir));
     try std.testing.expectEqual(isdir, ctxFdPreadCore(ctx, &mem, 90, 0, 0, 0, 0));
 }
 
@@ -4003,11 +4003,11 @@ test "ctxFdPwriteCore: bad fd / negative offset / spipe / isdir / append rejecte
     try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdPwriteCore(ctx, &mem, -1, 0, 0, 0, 0));
     try std.testing.expectEqual(wasi_core.WASI_EINVAL, ctxFdPwriteCore(ctx, &mem, 1, 0, 0, -1, 0));
 
-    const spipe: i32 = @intCast(@intFromEnum(wasi.Errno.spipe));
+    const spipe: i32 = @intCast(@backingInt(wasi.Errno.spipe));
     try std.testing.expectEqual(spipe, ctxFdPwriteCore(ctx, &mem, 1, 0, 0, 0, 0));
 
     try ctx.fd_table.insert(91, .{ .kind = .directory });
-    const isdir: i32 = @intCast(@intFromEnum(wasi.Errno.isdir));
+    const isdir: i32 = @intCast(@backingInt(wasi.Errno.isdir));
     try std.testing.expectEqual(isdir, ctxFdPwriteCore(ctx, &mem, 91, 0, 0, 0, 0));
 
     // Append-mode regular file is allowed: Linux pwrite respects O_APPEND
@@ -4016,7 +4016,7 @@ test "ctxFdPwriteCore: bad fd / negative offset / spipe / isdir / append rejecte
     // ensure it doesn't return notsup. Without an iovec/host fd this exits
     // early with success once pre-checks pass.
     try ctx.fd_table.insert(92, .{ .kind = .regular_file, .fdflags = wasi.FDFLAGS_APPEND });
-    const notsup: i32 = @intCast(@intFromEnum(wasi.Errno.notsup));
+    const notsup: i32 = @intCast(@backingInt(wasi.Errno.notsup));
     try std.testing.expect(ctxFdPwriteCore(ctx, &mem, 92, 0, 0, 0, 0) != notsup);
 }
 
@@ -4030,7 +4030,7 @@ test "ctxFdReaddirCore: bad fd / notdir / inval buf" {
 
     // Regular file → notdir.
     try ctx.fd_table.insert(93, .{ .kind = .regular_file });
-    const notdir: i32 = @intCast(@intFromEnum(wasi.Errno.notdir));
+    const notdir: i32 = @intCast(@backingInt(wasi.Errno.notdir));
     try std.testing.expectEqual(notdir, ctxFdReaddirCore(ctx, &mem, 93, 0, 0, 0, 0));
 
     // buf_ptr + buf_len out of bounds → einval. Use a fresh dir entry
@@ -4225,13 +4225,13 @@ test "ctxFdReaddirCore: encodes preview1 dirents" {
         if (std.mem.eql(u8, name, "alpha")) {
             saw_alpha = true;
             try std.testing.expectEqual(
-                @intFromEnum(wasi.Filetype.regular_file),
+                @backingInt(wasi.Filetype.regular_file),
                 dt,
             );
         } else if (std.mem.eql(u8, name, "beta")) {
             saw_beta = true;
             try std.testing.expectEqual(
-                @intFromEnum(wasi.Filetype.regular_file),
+                @backingInt(wasi.Filetype.regular_file),
                 dt,
             );
         }
@@ -4282,7 +4282,7 @@ test "ctxPathFilestatGetCore: bad fd / not-a-directory dirfd / noent" {
     // Register a regular_file fd at 4 → notdir.
     try ctx.fd_table.insert(4, .{ .kind = .regular_file });
     defer _ = ctx.fd_table.remove(4);
-    const notdir: i32 = @intCast(@intFromEnum(wasi.Errno.notdir));
+    const notdir: i32 = @intCast(@backingInt(wasi.Errno.notdir));
     try std.testing.expectEqual(
         notdir,
         ctxPathFilestatGetCore(ctx, &mem, 4, 0, 0, 0, 64),
@@ -4314,7 +4314,7 @@ test "ctxPathFilestatGetCore: happy path on a regular file" {
     );
     // filestat.size lives at offset 32, filetype at offset 16.
     try std.testing.expectEqual(@as(u64, 2), wasi_core.memReadU64(&mem, 32).?);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(wasi.Filetype.regular_file)), mem[16]);
+    try std.testing.expectEqual(@as(u8, @backingInt(wasi.Filetype.regular_file)), mem[16]);
 }
 
 test "ctxPathFilestatSetTimesCore: explicit ns round-trip via stat" {
@@ -4406,7 +4406,7 @@ test "ctxPathCreateDirectoryCore: happy + exist + bad fd + notdir" {
     );
 
     // Second create → exist.
-    const exist: i32 = @intCast(@intFromEnum(wasi.Errno.exist));
+    const exist: i32 = @intCast(@backingInt(wasi.Errno.exist));
     try std.testing.expectEqual(
         exist,
         ctxPathCreateDirectoryCore(ctx, &mem, @intCast(fd), p.ptr, p.len),
@@ -4421,7 +4421,7 @@ test "ctxPathCreateDirectoryCore: happy + exist + bad fd + notdir" {
     // Not a directory.
     try ctx.fd_table.insert(99, .{ .kind = .regular_file });
     defer _ = ctx.fd_table.remove(99);
-    const notdir: i32 = @intCast(@intFromEnum(wasi.Errno.notdir));
+    const notdir: i32 = @intCast(@backingInt(wasi.Errno.notdir));
     try std.testing.expectEqual(
         notdir,
         ctxPathCreateDirectoryCore(ctx, &mem, 99, p.ptr, p.len),
@@ -4461,7 +4461,7 @@ test "ctxPathRemoveDirectoryCore: empty ok, populated -> notempty, regular -> no
     }
     {
         const p = encodePath(&mem, "populated");
-        const notempty: i32 = @intCast(@intFromEnum(wasi.Errno.notempty));
+        const notempty: i32 = @intCast(@backingInt(wasi.Errno.notempty));
         try std.testing.expectEqual(
             notempty,
             ctxPathRemoveDirectoryCore(ctx, &mem, @intCast(fd), p.ptr, p.len),
@@ -4469,7 +4469,7 @@ test "ctxPathRemoveDirectoryCore: empty ok, populated -> notempty, regular -> no
     }
     {
         const p = encodePath(&mem, "regular");
-        const notdir: i32 = @intCast(@intFromEnum(wasi.Errno.notdir));
+        const notdir: i32 = @intCast(@backingInt(wasi.Errno.notdir));
         try std.testing.expectEqual(
             notdir,
             ctxPathRemoveDirectoryCore(ctx, &mem, @intCast(fd), p.ptr, p.len),
@@ -4503,7 +4503,7 @@ test "ctxPathUnlinkFileCore: happy + noent + isdir-on-directory" {
     }
     {
         const p = encodePath(&mem, "victim");
-        const noent: i32 = @intCast(@intFromEnum(wasi.Errno.noent));
+        const noent: i32 = @intCast(@backingInt(wasi.Errno.noent));
         try std.testing.expectEqual(
             noent,
             ctxPathUnlinkFileCore(ctx, &mem, @intCast(fd), p.ptr, p.len),
@@ -4511,7 +4511,7 @@ test "ctxPathUnlinkFileCore: happy + noent + isdir-on-directory" {
     }
     {
         const p = encodePath(&mem, "sub");
-        const isdir: i32 = @intCast(@intFromEnum(wasi.Errno.isdir));
+        const isdir: i32 = @intCast(@backingInt(wasi.Errno.isdir));
         try std.testing.expectEqual(
             isdir,
             ctxPathUnlinkFileCore(ctx, &mem, @intCast(fd), p.ptr, p.len),
@@ -4644,7 +4644,7 @@ test "ctxPathSymlinkCore: bad fd / notdir / embedded NUL" {
 
     try ctx.fd_table.insert(4, .{ .kind = .regular_file });
     defer _ = ctx.fd_table.remove(4);
-    const notdir: i32 = @intCast(@intFromEnum(wasi.Errno.notdir));
+    const notdir: i32 = @intCast(@backingInt(wasi.Errno.notdir));
     try std.testing.expectEqual(
         notdir,
         ctxPathSymlinkCore(ctx, &mem, 0, 0, 4, 0, 0),
@@ -4723,7 +4723,7 @@ test "ctxPathReadlinkCore: bad fd / notdir" {
 
     try ctx.fd_table.insert(4, .{ .kind = .regular_file });
     defer _ = ctx.fd_table.remove(4);
-    const notdir: i32 = @intCast(@intFromEnum(wasi.Errno.notdir));
+    const notdir: i32 = @intCast(@backingInt(wasi.Errno.notdir));
     try std.testing.expectEqual(
         notdir,
         ctxPathReadlinkCore(ctx, &mem, 4, 0, 0, 0, 0, 0),
@@ -4836,7 +4836,7 @@ test "ctxPathOpenCore: bad fd / not-a-directory dirfd" {
 
     try ctx.fd_table.insert(4, .{ .kind = .regular_file });
     defer _ = ctx.fd_table.remove(4);
-    const notdir: i32 = @intCast(@intFromEnum(wasi.Errno.notdir));
+    const notdir: i32 = @intCast(@backingInt(wasi.Errno.notdir));
     try std.testing.expectEqual(
         notdir,
         ctxPathOpenCore(ctx, &mem, 4, 0, 0, 0, 0, 0, 0, 0, 64),
@@ -4857,7 +4857,7 @@ test "ctxPathOpenCore: missing file without CREAT → noent" {
     var mem: [128]u8 = @splat(0);
     const p = encodePath(&mem, "missing");
 
-    const noent: i32 = @intCast(@intFromEnum(wasi.Errno.noent));
+    const noent: i32 = @intCast(@backingInt(wasi.Errno.noent));
     try std.testing.expectEqual(
         noent,
         ctxPathOpenCore(ctx, &mem, @intCast(fd), 0, p.ptr, p.len, 0, 0, 0, 0, 64),
@@ -4907,7 +4907,7 @@ test "ctxPathOpenCore: CREAT|EXCL on existing file → exist" {
     var mem: [128]u8 = @splat(0);
     const p = encodePath(&mem, "victim");
 
-    const exist: i32 = @intCast(@intFromEnum(wasi.Errno.exist));
+    const exist: i32 = @intCast(@backingInt(wasi.Errno.exist));
     try std.testing.expectEqual(
         exist,
         ctxPathOpenCore(ctx, &mem, @intCast(dir_fd), 0, p.ptr, p.len, 0x1 | 0x4, 0, 0, 0, 64),
@@ -5712,7 +5712,7 @@ test "ctxPollOneoffCore: bad fd → BADF event" {
     );
     try std.testing.expectEqual(@as(u32, 1), wasi_core.memReadU32(&mem, 200).?);
     try std.testing.expectEqual(
-        @intFromEnum(wasi.Errno.badf),
+        @backingInt(wasi.Errno.badf),
         pollTestEventErrno(&mem, 64, 0),
     );
 }
@@ -5731,7 +5731,7 @@ test "ctxPollOneoffCore: directory fd → BADF event" {
     );
     try std.testing.expectEqual(@as(u32, 1), wasi_core.memReadU32(&mem, 200).?);
     try std.testing.expectEqual(
-        @intFromEnum(wasi.Errno.badf),
+        @backingInt(wasi.Errno.badf),
         pollTestEventErrno(&mem, 64, 0),
     );
 }
@@ -5783,7 +5783,7 @@ test "ctxPollOneoffCore: stdout fd_read → BADF event" {
     );
     try std.testing.expectEqual(@as(u32, 1), wasi_core.memReadU32(&mem, 200).?);
     try std.testing.expectEqual(
-        @intFromEnum(wasi.Errno.badf),
+        @backingInt(wasi.Errno.badf),
         pollTestEventErrno(&mem, 64, 0),
     );
 }
@@ -5801,7 +5801,7 @@ test "ctxPollOneoffCore: clock_id > 3 → einval event" {
     );
     try std.testing.expectEqual(@as(u32, 1), wasi_core.memReadU32(&mem, 200).?);
     try std.testing.expectEqual(
-        @intFromEnum(wasi.Errno.inval),
+        @backingInt(wasi.Errno.inval),
         pollTestEventErrno(&mem, 64, 0),
     );
     try std.testing.expectEqual(wasi.EVENTTYPE_CLOCK, pollTestEventType(&mem, 64, 0));
@@ -5820,7 +5820,7 @@ test "ctxPollOneoffCore: subscription tag > 2 → einval event" {
     );
     try std.testing.expectEqual(@as(u32, 1), wasi_core.memReadU32(&mem, 200).?);
     try std.testing.expectEqual(
-        @intFromEnum(wasi.Errno.inval),
+        @backingInt(wasi.Errno.inval),
         pollTestEventErrno(&mem, 64, 0),
     );
 }
@@ -5878,7 +5878,7 @@ test "ctxPollOneoffCore: rights deficit → notcapable event" {
     );
     try std.testing.expectEqual(@as(u32, 1), wasi_core.memReadU32(&mem, 200).?);
     try std.testing.expectEqual(
-        @intFromEnum(wasi.Errno.notcapable),
+        @backingInt(wasi.Errno.notcapable),
         pollTestEventErrno(&mem, 64, 0),
     );
 }
@@ -6218,7 +6218,7 @@ test "Windows poll review: ready pipe and unsupported socket both emit" {
     try std.testing.expectEqual(@as(u16, 0), pollTestEventErrno(&mem, 128, 0));
     try std.testing.expectEqual(@as(u64, 11), pollTestEventUserdata(&mem, 128, 1));
     try std.testing.expectEqual(
-        @intFromEnum(wasi.Errno.notsup),
+        @backingInt(wasi.Errno.notsup),
         pollTestEventErrno(&mem, 128, 1),
     );
 }
@@ -6340,7 +6340,7 @@ test "ctxSockShutdownCore: stdout fd → ENOTSOCK" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
     // Stdout (fd 1) is registered as a `.stdout` kind by WasiCtx.init.
-    const expected: i32 = @intCast(@intFromEnum(wasi.Errno.notsock));
+    const expected: i32 = @intCast(@backingInt(wasi.Errno.notsock));
     try std.testing.expectEqual(
         expected,
         ctxSockShutdownCore(ctx, 1, @as(i32, wasi.SDFLAGS_RD)),
@@ -6352,7 +6352,7 @@ test "ctxSockShutdownCore: regular_file fd → ENOTSOCK" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
     try ctx.fd_table.insert(100, .{ .kind = .regular_file });
-    const expected: i32 = @intCast(@intFromEnum(wasi.Errno.notsock));
+    const expected: i32 = @intCast(@backingInt(wasi.Errno.notsock));
     try std.testing.expectEqual(
         expected,
         ctxSockShutdownCore(ctx, 100, @as(i32, wasi.SDFLAGS_RD) | @as(i32, wasi.SDFLAGS_WR)),
@@ -6364,7 +6364,7 @@ test "ctxSockShutdownCore: directory fd → ENOTSOCK" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
     try ctx.fd_table.insert(101, .{ .kind = .directory });
-    const expected: i32 = @intCast(@intFromEnum(wasi.Errno.notsock));
+    const expected: i32 = @intCast(@backingInt(wasi.Errno.notsock));
     try std.testing.expectEqual(
         expected,
         ctxSockShutdownCore(ctx, 101, @as(i32, wasi.SDFLAGS_WR)),
@@ -6381,7 +6381,7 @@ test "ctxSockShutdownCore: socket without RIGHTS_SOCK_SHUTDOWN → ENOTCAPABLE" 
         .rights_base = 0,
         .rights_inheriting = 0,
     });
-    const expected: i32 = @intCast(@intFromEnum(wasi.Errno.notcapable));
+    const expected: i32 = @intCast(@backingInt(wasi.Errno.notcapable));
     try std.testing.expectEqual(
         expected,
         ctxSockShutdownCore(ctx, 102, @as(i32, wasi.SDFLAGS_RD)),
@@ -6426,7 +6426,7 @@ test "ctxSockAcceptCore: stdout fd → ENOTSOCK" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
     var mem: [16]u8 = @splat(0);
-    const expected: i32 = @intCast(@intFromEnum(wasi.Errno.notsock));
+    const expected: i32 = @intCast(@backingInt(wasi.Errno.notsock));
     try std.testing.expectEqual(expected, ctxSockAcceptCore(ctx, &mem, 1, 0, 0));
 }
 
@@ -6436,7 +6436,7 @@ test "ctxSockAcceptCore: socket without RIGHTS_SOCK_ACCEPT → ENOTCAPABLE" {
     defer ctx.deinit();
     try insertSocketEntry(ctx, 102, 0);
     var mem: [16]u8 = @splat(0);
-    const expected: i32 = @intCast(@intFromEnum(wasi.Errno.notcapable));
+    const expected: i32 = @intCast(@backingInt(wasi.Errno.notcapable));
     try std.testing.expectEqual(expected, ctxSockAcceptCore(ctx, &mem, 102, 0, 0));
 }
 
@@ -6473,7 +6473,7 @@ test "ctxSockRecvCore: stdout fd → ENOTSOCK" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
     var mem: [64]u8 = @splat(0);
-    const expected: i32 = @intCast(@intFromEnum(wasi.Errno.notsock));
+    const expected: i32 = @intCast(@backingInt(wasi.Errno.notsock));
     try std.testing.expectEqual(expected, ctxSockRecvCore(ctx, &mem, 1, 0, 0, 0, 0, 0));
 }
 
@@ -6484,7 +6484,7 @@ test "ctxSockRecvCore: socket without RIGHTS_FD_READ → ENOTCAPABLE" {
     // Listener has SOCKET_LISTEN_RIGHTS which omits FD_READ on purpose.
     try insertSocketEntry(ctx, 102, wasi.SOCKET_LISTEN_RIGHTS);
     var mem: [64]u8 = @splat(0);
-    const expected: i32 = @intCast(@intFromEnum(wasi.Errno.notcapable));
+    const expected: i32 = @intCast(@backingInt(wasi.Errno.notcapable));
     try std.testing.expectEqual(expected, ctxSockRecvCore(ctx, &mem, 102, 0, 0, 0, 0, 0));
 }
 
@@ -6521,7 +6521,7 @@ test "ctxSockSendCore: stdout fd → ENOTSOCK" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
     var mem: [64]u8 = @splat(0);
-    const expected: i32 = @intCast(@intFromEnum(wasi.Errno.notsock));
+    const expected: i32 = @intCast(@backingInt(wasi.Errno.notsock));
     try std.testing.expectEqual(expected, ctxSockSendCore(ctx, &mem, 1, 0, 0, 0, 0));
 }
 
@@ -6531,7 +6531,7 @@ test "ctxSockSendCore: socket without RIGHTS_FD_WRITE → ENOTCAPABLE" {
     defer ctx.deinit();
     try insertSocketEntry(ctx, 102, wasi.SOCKET_LISTEN_RIGHTS);
     var mem: [64]u8 = @splat(0);
-    const expected: i32 = @intCast(@intFromEnum(wasi.Errno.notcapable));
+    const expected: i32 = @intCast(@backingInt(wasi.Errno.notcapable));
     try std.testing.expectEqual(expected, ctxSockSendCore(ctx, &mem, 102, 0, 0, 0, 0));
 }
 

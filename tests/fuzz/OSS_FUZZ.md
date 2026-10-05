@@ -119,10 +119,10 @@ Two viable paths existed:
 ## Build environment
 
 `oss-fuzz/Dockerfile` mirrors `gcr.io/oss-fuzz-base/base-builder`,
-installs a pinned Zig 0.16.0 with a SHA-256 verified tarball, and
+installs a pinned Zig 0.17.0 with a SHA-256 verified tarball, and
 clones this repository. `oss-fuzz/build.sh` runs:
 
-- `zig build fuzz-oss -Doptimize=ReleaseSafe` to emit the static
+- `zig build fuzz-oss -Doptimize=safe` to emit the static
   archives;
 - `clang++ -Wl,--whole-archive lib*.a -Wl,--no-whole-archive
   $LIB_FUZZING_ENGINE -o $OUT/fuzz-oss-<name>` for each high-priority

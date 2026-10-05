@@ -291,9 +291,9 @@ fn callDepth(module: *const ir.IrModule, index: usize, memo: []u8, level: usize)
 
 test "native profile: rejects scalar ABI overflow before lowering" {
     var module: wamr.types.WasmModule = .{};
-    module.types = &.{.{ .params = &([_]wamr.types.ValType{.i32} ** 17), .results = &.{} }};
+    module.types = &.{.{ .params = &(@as([17]wamr.types.ValType, @splat(.i32))), .results = &.{} }};
     try std.testing.expectError(error.UnsupportedNativeFeature, validateModule(&module));
-    module.types = &.{.{ .params = &([_]wamr.types.ValType{.i32} ** 6), .results = &.{} }};
+    module.types = &.{.{ .params = &(@as([6]wamr.types.ValType, @splat(.i32))), .results = &.{} }};
     module.imports = &.{.{ .module_name = "env", .field_name = "too_many", .kind = .function, .func_type_idx = 0 }};
     try std.testing.expectError(error.UnsupportedNativeFeature, validateModule(&module));
 }

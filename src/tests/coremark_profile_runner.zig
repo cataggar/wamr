@@ -87,7 +87,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const wasm_bytes = std.Io.Dir.cwd().readFileAlloc(io, wasm_path, allocator, @enumFromInt(128 * 1024 * 1024)) catch |err| {
+    const wasm_bytes = std.Io.Dir.cwd().readFileAlloc(io, wasm_path, allocator, @fromBackingInt(@intCast(128 * 1024 * 1024))) catch |err| {
         std.debug.print("coremark-profile-runner: failed to read {s}: {s}\n", .{ wasm_path, @errorName(err) });
         std.process.exit(2);
     };

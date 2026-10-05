@@ -151,7 +151,7 @@ pub export fn wamr_aot_call(handle: *Handle, name: ?[*]const u8, name_len: usize
     }
     var returned: [1]aot.Value = undefined;
     const result = handle.instance.call(export_name, values[0..arg_count], returned[0..@min(result_capacity, 1)]) catch |err| return failure(err);
-    if (result == .returned and result.returned == 1) results.?[0] = .{ .kind = @intFromEnum(std.meta.activeTag(returned[0])), .bits = returned[0].raw() };
+    if (result == .returned and result.returned == 1) results.?[0] = .{ .kind = @backingInt(std.meta.activeTag(returned[0])), .bits = returned[0].raw() };
     return outcome(result);
 }
 pub export fn wamr_aot_memory(handle: *Handle, length: *usize) [*]u8 {
@@ -181,7 +181,7 @@ fn failure(err: anyerror) Result {
 fn outcome(result: aot.Outcome) Result {
     return switch (result) {
         .returned => |count| .{ .count = count },
-        .trap => |trap| .{ .kind = 1, .detail = @intFromEnum(trap) },
+        .trap => |trap| .{ .kind = 1, .detail = @backingInt(trap) },
         .exit => |code| .{ .kind = 2, .detail = code },
         .host_error => |err| .{ .kind = 3, .error_name = @errorName(err).ptr },
     };
@@ -190,8 +190,8 @@ fn hostCall(userdata: ?*anyopaque, context: *aot.HostContext, args: []const aot.
     const imp: *const CImport = @ptrCast(@alignCast(userdata.?));
     var raw_args: [5]CValue = undefined;
     var raw_result: [1]CValue = undefined;
-    for (args, 0..) |arg, i| raw_args[i] = .{ .kind = @intFromEnum(std.meta.activeTag(arg)), .bits = arg.raw() };
-    if (results.len == 1) raw_result[0] = .{ .kind = @intFromEnum(std.meta.activeTag(results[0])), .bits = 0 };
+    for (args, 0..) |arg, i| raw_args[i] = .{ .kind = @backingInt(std.meta.activeTag(arg)), .bits = arg.raw() };
+    if (results.len == 1) raw_result[0] = .{ .kind = @backingInt(std.meta.activeTag(results[0])), .bits = 0 };
     const status = imp.callback(imp.context, context, &raw_args, args.len, &raw_result, results.len);
     switch (status) {
         0 => {},
@@ -202,7 +202,7 @@ fn hostCall(userdata: ?*anyopaque, context: *aot.HostContext, args: []const aot.
         else => return error.InvalidArgument,
     }
     if (results.len == 1) {
-        if (raw_result[0].kind != @intFromEnum(std.meta.activeTag(results[0]))) return error.InvalidArgument;
+        if (raw_result[0].kind != @backingInt(std.meta.activeTag(results[0]))) return error.InvalidArgument;
         results[0] = aot.Value.fromRaw(std.meta.activeTag(results[0]), raw_result[0].bits);
     }
 }
@@ -246,7 +246,7 @@ fn commit(ptr: *anyopaque, base: [*]align(4096) u8, size: usize) aot.PlatformErr
 }
 fn protect(ptr: *anyopaque, base: [*]align(4096) u8, size: usize, protection: aot.platform.Protection) aot.PlatformError!void {
     const c = configOf(ptr);
-    if (c.protect(c.context, base, size, @intFromEnum(protection)) != 0) return error.ProtectionFailed;
+    if (c.protect(c.context, base, size, @backingInt(protection)) != 0) return error.ProtectionFailed;
 }
 fn unmap(ptr: *anyopaque, base: [*]align(4096) u8, size: usize) void {
     const c = configOf(ptr);

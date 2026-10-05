@@ -124,7 +124,7 @@ test "WasiP1Polyfill: clock_time_get" {
 }
 
 test "WasiP1Polyfill: random_get" {
-    var buf = [_]u8{0} ** 8;
+    var buf = @as([8]u8, @splat(0));
     WasiP1Polyfill.randomGet(&buf);
     // At least one byte should be non-zero
     var non_zero = false;

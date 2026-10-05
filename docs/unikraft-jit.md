@@ -15,9 +15,9 @@ or hard real-time latency claim follows from this work.
 
 ```sh
 # Unchanged compiler-free default guest profile:
-zig build -Dprofile=unikraft-aot -Doptimize=ReleaseSafe -j2
+zig build -Dprofile=unikraft-aot -Doptimize=safe -j2
 # Explicit opt-in, separate artifact and Zig module:
-zig build -Dprofile=unikraft-jit -Doptimize=ReleaseSafe -j2
+zig build -Dprofile=unikraft-jit -Doptimize=safe -j2
 ```
 
 The latter exports Zig module `wamr-jit`, namespaces `jit` and `aot`, and builds
@@ -182,7 +182,7 @@ The fixed workload's finite input/control flow and the host process timeout
 bound this comparator experiment; do not generalize that to arbitrary AOT.
 
 ```sh
-zig build native-jit-bench test-native-jit-bench -Doptimize=ReleaseSafe -j2
+zig build native-jit-bench test-native-jit-bench -Doptimize=safe -j2
 python3 -m scripts.native_jit_benchmark \
   --aot zig-out/bin/wamr-native-jit-aot-compare \
   --jit zig-out/bin/wamr-native-jit-bench \
@@ -257,7 +257,7 @@ Adapters built from the exported modules must likewise leave runtime bundling
 disabled in their integration archives. No native safety gate is relaxed.
 
 ```sh
-zig build -Dprofile=unikraft-jit -Doptimize=ReleaseSafe test-native-jit-archives -j2
+zig build -Dprofile=unikraft-jit -Doptimize=safe test-native-jit-archives -j2
 ```
 
 This additionally checks that neither installed embedding archive defines those

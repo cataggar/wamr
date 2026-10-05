@@ -115,8 +115,8 @@ pub fn aotFdSeek(vmctx: *VmCtx, fd: i32, offset: i64, whence: i32, newoffset_ptr
 pub fn aotFdClose(vmctx: *VmCtx, fd: i32) callconv(.c) i32 {
     traceAdapter("fd_close", vmctx, .{fd});
     if (getCtx(vmctx)) |ctx| {
-        if (fd < 0) return @intCast(@intFromEnum(wasi.Errno.badf));
-        return @intCast(@intFromEnum(ctx.fd_close(@intCast(fd))));
+        if (fd < 0) return @intCast(@backingInt(wasi.Errno.badf));
+        return @intCast(@backingInt(ctx.fd_close(@intCast(fd))));
     }
     return wasi_core.fdCloseCore(fd);
 }
@@ -695,21 +695,21 @@ pub fn resolveAotSpectestFunction(name: []const u8) ?*const anyopaque {
 
 test "resolveAotHostFunction: all known functions resolve" {
     const names = [_][]const u8{
-        "fd_write",              "fd_read",                "fd_pread",
-        "fd_pwrite",             "fd_readdir",             "fd_seek",
-        "fd_close",              "fd_renumber",            "fd_tell",
-        "fd_fdstat_get",         "fd_fdstat_set_flags",    "fd_fdstat_set_rights",
-        "fd_filestat_get",       "fd_filestat_set_size",   "fd_filestat_set_times",
-        "fd_advise",             "fd_allocate",            "fd_datasync",
-        "fd_sync",               "fd_prestat_get",         "fd_prestat_dir_name",
-        "path_open",             "path_filestat_get",      "path_filestat_set_times",
-        "path_create_directory", "path_remove_directory",  "path_unlink_file",
-        "path_link",             "path_rename",            "path_symlink",
-        "path_readlink",         "clock_time_get",         "clock_res_get",
-        "environ_sizes_get",     "environ_get",            "args_sizes_get",
-        "args_get",              "random_get",             "sched_yield",
-        "proc_raise",            "proc_exit",              "thread-spawn",
-        "poll_oneoff",           "sock_shutdown",          "sock_accept",
+        "fd_write",              "fd_read",               "fd_pread",
+        "fd_pwrite",             "fd_readdir",            "fd_seek",
+        "fd_close",              "fd_renumber",           "fd_tell",
+        "fd_fdstat_get",         "fd_fdstat_set_flags",   "fd_fdstat_set_rights",
+        "fd_filestat_get",       "fd_filestat_set_size",  "fd_filestat_set_times",
+        "fd_advise",             "fd_allocate",           "fd_datasync",
+        "fd_sync",               "fd_prestat_get",        "fd_prestat_dir_name",
+        "path_open",             "path_filestat_get",     "path_filestat_set_times",
+        "path_create_directory", "path_remove_directory", "path_unlink_file",
+        "path_link",             "path_rename",           "path_symlink",
+        "path_readlink",         "clock_time_get",        "clock_res_get",
+        "environ_sizes_get",     "environ_get",           "args_sizes_get",
+        "args_get",              "random_get",            "sched_yield",
+        "proc_raise",            "proc_exit",             "thread-spawn",
+        "poll_oneoff",           "sock_shutdown",         "sock_accept",
         "sock_recv",             "sock_send",
     };
     for (names) |name| {
@@ -734,7 +734,7 @@ test "aotFdWrite: returns EINVAL when no memory" {
 }
 
 test "aotFdWrite: writes to stdout with valid memory" {
-    var mem = [_]u8{0} ** 128;
+    var mem = @as([128]u8, @splat(0));
     // Set up one iov: buf_ptr=32, buf_len=5
     std.mem.writeInt(u32, mem[0..4], 32, .little);
     std.mem.writeInt(u32, mem[4..8], 5, .little);
@@ -757,7 +757,7 @@ test "aotFdClose: valid fds" {
 }
 
 test "aotClockTimeGet: returns time" {
-    var mem = [_]u8{0} ** 16;
+    var mem = @as([16]u8, @splat(0));
     var vmctx = VmCtx{
         .memory_base = @intFromPtr(&mem),
         .memory_size = mem.len,
@@ -782,7 +782,7 @@ test {
 }
 
 test "aotEnvironSizesGet: writes zeroes" {
-    var mem = [_]u8{0xFF} ** 16;
+    var mem = @as([16]u8, @splat(0xFF));
     var vmctx = VmCtx{
         .memory_base = @intFromPtr(&mem),
         .memory_size = mem.len,
@@ -794,7 +794,7 @@ test "aotEnvironSizesGet: writes zeroes" {
 }
 
 test "aotRandomGet: fills buffer with no ctx (zeroes)" {
-    var mem = [_]u8{0xAA} ** 32;
+    var mem = @as([32]u8, @splat(0xAA));
     var vmctx = VmCtx{
         .memory_base = @intFromPtr(&mem),
         .memory_size = mem.len,
@@ -805,7 +805,7 @@ test "aotRandomGet: fills buffer with no ctx (zeroes)" {
 }
 
 test "aotRandomGet: rejects OOB" {
-    var mem = [_]u8{0} ** 8;
+    var mem = @as([8]u8, @splat(0));
     var vmctx = VmCtx{
         .memory_base = @intFromPtr(&mem),
         .memory_size = mem.len,

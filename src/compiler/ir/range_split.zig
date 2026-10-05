@@ -275,7 +275,6 @@ pub fn splitLiveRangesAtLoopBoundariesWithConfig(
             continue;
         }
 
-
         // Build the "post-loop reachable AND exit.succ-dominated" block
         // set. Soundness invariant: every use we rewrite from orig → alt
         // must be dominated by the local_get (which lives at the start

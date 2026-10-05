@@ -102,7 +102,7 @@ test "readFileToBufferWithLimit: limit exceeded" {
     defer test_dir.cleanup();
 
     // Write 100 bytes.
-    try test_dir.dir.writeFile(io, .{ .sub_path = "big_file.txt", .data = &([_]u8{'A'} ** 100) });
+    try test_dir.dir.writeFile(io, .{ .sub_path = "big_file.txt", .data = &(@as([100]u8, @splat('A'))) });
 
     // Verify the stat-based size check.
     {

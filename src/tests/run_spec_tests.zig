@@ -107,7 +107,7 @@ pub fn main(init: std.process.Init) !void {
     while (iter.next(io) catch null) |entry| {
         if (entry.kind == .file and
             (std.mem.endsWith(u8, entry.name, ".json") or
-            std.mem.endsWith(u8, entry.name, ".wast")))
+                std.mem.endsWith(u8, entry.name, ".wast")))
         {
             const name_copy = try allocator.dupe(u8, entry.name);
             try test_files.append(allocator, name_copy);
@@ -230,7 +230,7 @@ fn runWastFile(path: []const u8, mode: spec_json_runner.Mode, allocator: std.mem
         return .{ .file = path, .passed = 0, .failed = 0, .skipped = 1, .total = 1 };
     }
     const wast_runner = @import("wast_runner.zig");
-    const source = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, @enumFromInt(64 * 1024 * 1024)) catch {
+    const source = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, @fromBackingInt(@intCast(64 * 1024 * 1024))) catch {
         return .{ .file = path, .passed = 0, .failed = 0, .skipped = 1, .total = 1 };
     };
     defer allocator.free(source);
