@@ -14,7 +14,17 @@ pub fn setPath(run: *std.Build.Step.Run, key: []const u8, path: std.Build.LazyPa
     run.argv = .empty;
     run.addArtifactArg(helper);
     run.addArg(key);
-    run.addFileArg(path);
+    const file_path: std.Build.LazyPath = switch (path) {
+        .relative => |relative| if (relative.base == .install_bin)
+            .{ .relative = .{
+                .base = .install_bin,
+                .sub_path = b.fmt("{s}{s}", .{ relative.sub_path, b.graph.host.result.exeFileExt() }),
+            } }
+        else
+            path,
+        else => path,
+    };
+    run.addFileArg(file_path);
     run.addArg("--");
     run.argv.appendSlice(b.allocator, command) catch @panic("OOM");
 }

@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from bench_optimize import zig_build_command
 from benchmark_schema import (
     BenchmarkDataError,
     HOST_FINGERPRINT_FIELDS,
@@ -2199,6 +2200,7 @@ def build_variant(
     compiler_toggle: bool,
 ) -> Build:
     name = f"{'enabled' if threads_enabled else 'disabled'}-{mode}"
+    command = zig_build_command(repo, optimize)
     parts: dict[str, Any] = {
         "build_source_sha256": source["build_source_sha256"],
         "mode": mode,
@@ -2207,7 +2209,7 @@ def build_variant(
         "target": target or "native",
         "compiler_toggle": compiler_toggle,
         "thread_manager_toggle": threads_enabled,
-        "zig": command_identity(["zig", "version"]),
+        "zig": command_identity([command[0], "version"]),
     }
     key = cache_key(parts)
     prefix = root / "builds" / f"{name}-{key[:16]}"
@@ -2225,10 +2227,7 @@ def build_variant(
 
     cache = root / "cache" / name
     env = controlled_env(cache)
-    command = [
-        "zig",
-        "build",
-        f"-Doptimize={optimize}",
+    command += [
         f"-Dlib_wasi_threads={'true' if threads_enabled else 'false'}",
         f"-Dinterp={'true' if mode == 'interpreter' else 'false'}",
         f"-Daot={'true' if mode == 'aot' else 'false'}",
