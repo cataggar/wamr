@@ -649,7 +649,10 @@ pub fn evalInitBytecode(code: []const u8, globals: []const *types.GlobalInstance
                 // For concrete type indices, consume remaining LEB128 bytes
                 if (ht & 0x80 != 0) {
                     while (ip < code.len) {
-                        if (code[ip] & 0x80 == 0) { ip += 1; break; }
+                        if (code[ip] & 0x80 == 0) {
+                            ip += 1;
+                            break;
+                        }
                         ip += 1;
                     }
                 }
@@ -675,13 +678,37 @@ pub fn evalInitBytecode(code: []const u8, globals: []const *types.GlobalInstance
                 sp += 1;
             },
             // i32 arithmetic
-            0x6A => { if (sp < 2) return error.InvalidInitExpr; sp -= 1; stack[sp - 1] = .{ .i32 = stack[sp - 1].i32 +% stack[sp].i32 }; },
-            0x6B => { if (sp < 2) return error.InvalidInitExpr; sp -= 1; stack[sp - 1] = .{ .i32 = stack[sp - 1].i32 -% stack[sp].i32 }; },
-            0x6C => { if (sp < 2) return error.InvalidInitExpr; sp -= 1; stack[sp - 1] = .{ .i32 = stack[sp - 1].i32 *% stack[sp].i32 }; },
+            0x6A => {
+                if (sp < 2) return error.InvalidInitExpr;
+                sp -= 1;
+                stack[sp - 1] = .{ .i32 = stack[sp - 1].i32 +% stack[sp].i32 };
+            },
+            0x6B => {
+                if (sp < 2) return error.InvalidInitExpr;
+                sp -= 1;
+                stack[sp - 1] = .{ .i32 = stack[sp - 1].i32 -% stack[sp].i32 };
+            },
+            0x6C => {
+                if (sp < 2) return error.InvalidInitExpr;
+                sp -= 1;
+                stack[sp - 1] = .{ .i32 = stack[sp - 1].i32 *% stack[sp].i32 };
+            },
             // i64 arithmetic
-            0x7C => { if (sp < 2) return error.InvalidInitExpr; sp -= 1; stack[sp - 1] = .{ .i64 = stack[sp - 1].i64 +% stack[sp].i64 }; },
-            0x7D => { if (sp < 2) return error.InvalidInitExpr; sp -= 1; stack[sp - 1] = .{ .i64 = stack[sp - 1].i64 -% stack[sp].i64 }; },
-            0x7E => { if (sp < 2) return error.InvalidInitExpr; sp -= 1; stack[sp - 1] = .{ .i64 = stack[sp - 1].i64 *% stack[sp].i64 }; },
+            0x7C => {
+                if (sp < 2) return error.InvalidInitExpr;
+                sp -= 1;
+                stack[sp - 1] = .{ .i64 = stack[sp - 1].i64 +% stack[sp].i64 };
+            },
+            0x7D => {
+                if (sp < 2) return error.InvalidInitExpr;
+                sp -= 1;
+                stack[sp - 1] = .{ .i64 = stack[sp - 1].i64 -% stack[sp].i64 };
+            },
+            0x7E => {
+                if (sp < 2) return error.InvalidInitExpr;
+                sp -= 1;
+                stack[sp - 1] = .{ .i64 = stack[sp - 1].i64 *% stack[sp].i64 };
+            },
             // GC prefix opcodes
             0xFB => {
                 const r = leb128_mod.readUnsigned(u32, code[ip..]) catch return error.InvalidInitExpr;
@@ -1265,7 +1292,8 @@ test "instantiate: data segment copied to memory" {
         // memory section: 1 memory, min=1
         0x05, 0x03, 0x01, 0x00, 0x01,
         // data section: 1 segment, flags=0, i32.const(0), end, 2 bytes "hi"
-        0x0B, 0x08, 0x01, 0x00, 0x41, 0x00, 0x0B, 0x02, 'h', 'i',
+        0x0B, 0x08, 0x01, 0x00, 0x41,
+        0x00, 0x0B, 0x02, 'h',  'i',
     };
     const module = try loader.load(&data, arena.allocator());
     const inst = try instantiate(&module, testing.allocator);
@@ -1285,7 +1313,9 @@ test "instantiate: data segment with nonzero offset" {
         // memory section: 1 memory, min=1
         0x05, 0x03, 0x01, 0x00, 0x01,
         // data section: 1 segment, flags=0, i32.const(16), end, 3 bytes "abc"
-        0x0B, 0x09, 0x01, 0x00, 0x41, 0x10, 0x0B, 0x03, 'a', 'b', 'c',
+        0x0B, 0x09, 0x01, 0x00, 0x41,
+        0x10, 0x0B, 0x03, 'a',  'b',
+        'c',
     };
     const module = try loader.load(&data, arena.allocator());
     const inst = try instantiate(&module, testing.allocator);

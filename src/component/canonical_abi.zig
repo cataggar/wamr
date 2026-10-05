@@ -153,7 +153,6 @@ fn enumDiscriminantOf(val: InterfaceValue) StoreError!u32 {
     };
 }
 
-
 /// Runtime representation of a component interface value.
 /// Primitives are stored inline; compound types use allocator-owned slices.
 pub const InterfaceValue = union(enum) {
@@ -1759,14 +1758,14 @@ test "flatten: basic types" {
 }
 
 test "loadVal/storeVal: i32 roundtrip" {
-    var mem = [_]u8{0} ** 16;
+    var mem = @as([16]u8, @splat(0));
     try storeVal(&mem, 0, .s32, .{ .s32 = -42 });
     const val = try loadVal(&mem, 0, .s32);
     try std.testing.expectEqual(@as(i32, -42), val.s32);
 }
 
 test "loadVal/storeVal: string roundtrip" {
-    var mem = [_]u8{0} ** 16;
+    var mem = @as([16]u8, @splat(0));
     try storeVal(&mem, 0, .string, .{ .string = .{ .ptr = 100, .len = 5 } });
     const val = try loadVal(&mem, 0, .string);
     try std.testing.expectEqual(@as(u32, 100), val.string.ptr);
@@ -1774,7 +1773,7 @@ test "loadVal/storeVal: string roundtrip" {
 }
 
 test "loadVal: compound types return error" {
-    var mem = [_]u8{0} ** 16;
+    var mem = @as([16]u8, @splat(0));
     try std.testing.expectError(error.CompoundNeedsRegistry, loadVal(&mem, 0, .{ .record = 0 }));
     try std.testing.expectError(error.CompoundNeedsRegistry, loadVal(&mem, 0, .{ .variant = 0 }));
 }
@@ -1817,7 +1816,7 @@ test "validateUtf8: valid and invalid" {
 test "canonical memory ranges reject wrapping pointers" {
     const allocator = std.testing.allocator;
     const max_u32 = std.math.maxInt(u32);
-    var mem = [_]u8{0} ** 8;
+    var mem = @as([8]u8, @splat(0));
 
     try std.testing.expect(!validateUtf8(&mem, max_u32 - 3, 8));
     try std.testing.expectError(error.BufferTooSmall, utf16ToUtf8(&mem, max_u32 - 1, 2, allocator));
@@ -1829,7 +1828,7 @@ test "canonical memory ranges reject wrapping pointers" {
     try std.testing.expectEqual(@as(u32, 0), loaded.string.len);
 
     try storeVal(&mem, max_u32 - 3, .string, .{ .string = .{ .ptr = 1, .len = 2 } });
-    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** 8, &mem);
+    try std.testing.expectEqualSlices(u8, &@as([8]u8, @splat(0)), &mem);
 }
 
 test "utf8ToUtf16: basic ASCII" {
@@ -1903,7 +1902,7 @@ test "sizeOfType: enum with 3 cases" {
 }
 
 test "sizeOfType: flags with 33 names" {
-    const names = [_][]const u8{"f"} ** 33;
+    const names = @as([33][]const u8, @splat("f"));
     const types = [_]ctypes.TypeDef{
         .{ .flags = .{ .names = &names } },
     };
@@ -1976,7 +1975,7 @@ test "loadValReg/storeValReg: record {u8, u32} roundtrip" {
         } } },
     };
     const reg = TypeRegistry.fromTypes(&types);
-    var mem = [_]u8{0} ** 32;
+    var mem = @as([32]u8, @splat(0));
 
     const val = InterfaceValue{ .record_val = &.{
         .{ .u8 = 42 },
@@ -1997,7 +1996,7 @@ test "loadValReg/storeValReg: enum roundtrip" {
         .{ .enum_ = .{ .names = &.{ "red", "green", "blue" } } },
     };
     const reg = TypeRegistry.fromTypes(&types);
-    var mem = [_]u8{0} ** 4;
+    var mem = @as([4]u8, @splat(0));
 
     try storeValReg(&mem, 0, .{ .enum_ = 0 }, .{ .enum_val = 2 }, reg);
 
@@ -2012,7 +2011,7 @@ test "loadValReg/storeValReg: option<u32> some roundtrip" {
         .{ .option = .{ .inner = .u32 } },
     };
     const reg = TypeRegistry.fromTypes(&types);
-    var mem = [_]u8{0} ** 16;
+    var mem = @as([16]u8, @splat(0));
 
     var payload_val = InterfaceValue{ .u32 = 999 };
     const val = InterfaceValue{ .option_val = .{ .is_some = true, .payload = &payload_val } };
@@ -2030,7 +2029,7 @@ test "loadValReg/storeValReg: option<u32> none roundtrip" {
         .{ .option = .{ .inner = .u32 } },
     };
     const reg = TypeRegistry.fromTypes(&types);
-    var mem = [_]u8{0} ** 16;
+    var mem = @as([16]u8, @splat(0));
 
     const val = InterfaceValue{ .option_val = .{ .is_some = false, .payload = null } };
     try storeValReg(&mem, 0, .{ .option = 0 }, val, reg);
@@ -2047,7 +2046,7 @@ test "loadValReg/storeValReg: result<u32, u8> ok roundtrip" {
         .{ .result = .{ .ok = .u32, .err = .u8 } },
     };
     const reg = TypeRegistry.fromTypes(&types);
-    var mem = [_]u8{0} ** 16;
+    var mem = @as([16]u8, @splat(0));
 
     var payload_val = InterfaceValue{ .u32 = 42 };
     const val = InterfaceValue{ .result_val = .{ .is_ok = true, .payload = &payload_val } };
@@ -2065,7 +2064,7 @@ test "loadValReg/storeValReg: flags roundtrip" {
         .{ .flags = .{ .names = &.{ "read", "write", "exec" } } },
     };
     const reg = TypeRegistry.fromTypes(&types);
-    var mem = [_]u8{0} ** 4;
+    var mem = @as([4]u8, @splat(0));
 
     const words: []const u32 = &.{0b101}; // read + exec
     try storeValReg(&mem, 0, .{ .flags = 0 }, .{ .flags_val = words }, reg);
@@ -2084,7 +2083,7 @@ test "loadValReg/storeValReg: variant roundtrip" {
         } } },
     };
     const reg = TypeRegistry.fromTypes(&types);
-    var mem = [_]u8{0} ** 16;
+    var mem = @as([16]u8, @splat(0));
 
     // Store case 1 (some_u32) with payload 0x1234
     var payload_val = InterfaceValue{ .u32 = 0x1234 };
@@ -2104,7 +2103,7 @@ test "loadValReg: invalid discriminant returns error" {
     };
     const reg = TypeRegistry.fromTypes(&types);
     // Write discriminant 5 (out of range for 2 cases)
-    var mem = [_]u8{0} ** 4;
+    var mem = @as([4]u8, @splat(0));
     mem[0] = 5;
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2127,7 +2126,7 @@ test "loadValReg: nested record roundtrip" {
     };
     const reg = TypeRegistry.fromTypes(&types);
 
-    var mem = [_]u8{0} ** 32;
+    var mem = @as([32]u8, @splat(0));
     // Store nested: inner = {x:10, y:20}, z = 0xABCD
     const inner_val = InterfaceValue{ .record_val = &.{
         .{ .u8 = 10 },
@@ -2153,7 +2152,7 @@ test "loadValReg/storeValReg: tuple roundtrip" {
         .{ .tuple = .{ .fields = &.{ .u8, .u32, .u8 } } },
     };
     const reg = TypeRegistry.fromTypes(&types);
-    var mem = [_]u8{0} ** 16;
+    var mem = @as([16]u8, @splat(0));
 
     const val = InterfaceValue{ .tuple_val = &.{
         .{ .u8 = 1 },
@@ -2219,7 +2218,7 @@ test "decodeLatin1Utf16: utf16 mode (tagged)" {
 }
 
 test "encodeUtf16ToMem: ASCII" {
-    var mem = [_]u8{0} ** 16;
+    var mem = @as([16]u8, @splat(0));
     const written = try encodeUtf16ToMem(&mem, 0, "Hi");
     try std.testing.expectEqual(@as(u32, 2), written);
     try std.testing.expectEqual(@as(u16, 0x48), std.mem.readInt(u16, mem[0..2], .little));
@@ -2227,7 +2226,7 @@ test "encodeUtf16ToMem: ASCII" {
 }
 
 test "encodeUtf16ToMem: surrogate pair" {
-    var mem = [_]u8{0} ** 16;
+    var mem = @as([16]u8, @splat(0));
     const written = try encodeUtf16ToMem(&mem, 0, "\xF0\x9F\x98\x80");
     try std.testing.expectEqual(@as(u32, 2), written); // surrogate pair = 2 code units
     try std.testing.expectEqual(@as(u16, 0xD83D), std.mem.readInt(u16, mem[0..2], .little));
@@ -2244,7 +2243,7 @@ test "loadVal/storeVal: list<u8> PtrLen roundtrip" {
     component.type_indexspace = &comp_idxspace;
     const reg = TypeRegistry.init(&component);
 
-    var mem = [_]u8{0} ** 32;
+    var mem = @as([32]u8, @splat(0));
     try storeValReg(&mem, 0, .{ .list = 0 }, .{ .list = .{ .ptr = 200, .len = 4 } }, reg);
     const val = try loadValReg(&mem, 0, .{ .list = 0 }, reg, std.testing.allocator);
     try std.testing.expect(val == .list);
@@ -2262,7 +2261,7 @@ test "list<u8>: lower elements then load PtrLen roundtrip" {
     component.type_indexspace = &comp_idxspace;
     const reg = TypeRegistry.init(&component);
 
-    var mem = [_]u8{0} ** 64;
+    var mem = @as([64]u8, @splat(0));
     const data_off: u32 = 16;
     const bytes_in = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
     for (bytes_in, 0..) |b, i| {
@@ -2288,7 +2287,7 @@ test "list<list<u8>>: nested lower/load roundtrip" {
     component.type_indexspace = &comp_idxspace;
     const reg = TypeRegistry.init(&component);
 
-    var mem = [_]u8{0} ** 256;
+    var mem = @as([256]u8, @splat(0));
     const inner_a_off: u32 = 16;
     const inner_b_off: u32 = 32;
     @memcpy(mem[inner_a_off..][0..3], &[_]u8{ 0x01, 0x02, 0x03 });
@@ -2370,7 +2369,7 @@ test "variant: mixed-arm alignment uses the max across all cases (#520 wave 2)" 
     inner_val.* = .{ .record_val = payload_field };
     const val: InterfaceValue = .{ .variant_val = .{ .discriminant = 0, .payload = inner_val } };
 
-    var mem: [16]u8 = .{0} ** 16;
+    var mem: [16]u8 = @splat(0);
     try storeValReg(&mem, 0, .{ .variant = 2 }, val, reg);
     // Payload must land at offset 4 (max align across arms = 4), not 2.
     try std.testing.expectEqual(@as(u8, 0xCD), mem[4]);
@@ -2407,7 +2406,7 @@ test "result<_, E>: store with null ok type does not crash (#520 wave 2)" {
     component.type_indexspace = &comp_idxspace;
     const reg = TypeRegistry.init(&component);
 
-    var mem: [4]u8 = .{0} ** 4;
+    var mem: [4]u8 = @splat(0);
     const empty_tuple: InterfaceValue = .{ .tuple_val = &.{} };
     const payload = std.testing.allocator.create(InterfaceValue) catch unreachable;
     defer std.testing.allocator.destroy(payload);
@@ -2452,7 +2451,7 @@ test "storeValReg: option discriminant padding is zeroed for full-word reads (#8
     const reg = TypeRegistry.fromTypes(&types);
 
     // Pre-dirty the whole buffer so any un-cleared byte is nonzero.
-    var mem = [_]u8{0xFF} ** 16;
+    var mem = @as([16]u8, @splat(0xFF));
 
     var payload_val = InterfaceValue{ .u32 = 999 };
     const val = InterfaceValue{ .option_val = .{ .is_some = true, .payload = &payload_val } };
@@ -2492,7 +2491,7 @@ test "storeValReg: result<option<list<u8>>, error> ok some clears discriminant p
     const reg = TypeRegistry.init(&component);
 
     // Pre-dirty so any un-cleared padding byte is nonzero.
-    var mem = [_]u8{0xFF} ** 32;
+    var mem = @as([32]u8, @splat(0xFF));
 
     // Build the guest-observed value: ok(some([...])). The list is a
     // PtrLen reference; contents don't matter for this padding check.

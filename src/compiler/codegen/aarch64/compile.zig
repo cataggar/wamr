@@ -84,7 +84,7 @@ const RegMap = struct {
     pub const tmp2: emit.Reg = .x15;
 
     entries: std.AutoHashMap(ir.VReg, Location),
-    reg_used: [scratch_regs.len]bool = [_]bool{false} ** scratch_regs.len,
+    reg_used: [scratch_regs.len]bool = @as([scratch_regs.len]bool, @splat(false)),
     /// Bit i is set iff `callee_saved_regs[i]` was ever assigned to some
     /// vreg during this function's compilation. Used to elide the prologue
     /// save and epilogue restore of callee-saved registers that are never
@@ -330,7 +330,7 @@ const V128RegCache = struct {
         28, 29, 30, 31,
     };
 
-    slots: [regs.len]Slot = [_]Slot{.{}} ** regs.len,
+    slots: [regs.len]Slot = @splat(.{}),
     current_block_insts: []const ir.Inst = &.{},
     current_inst_index: usize = 0,
 
@@ -1092,7 +1092,7 @@ fn relaxOutOfRangeConditionalBranches(
 
         // Swap buffers.
         code.bytes.deinit(code.allocator);
-        code.bytes = .{ .items = new_buf[0..new_len], .capacity = new_len };
+        code.bytes = .{ .items = new_buf[0..new_len], .capacity = new_len, .pointer_stability = .{} };
 
         // 6. Apply cumulative shifts. For byte position X, the shift is
         //    4 * (number of OOR insertion points strictly less than X).
@@ -1504,8 +1504,8 @@ fn classifyAarch64Component(
         const is_fp_lr_pair = raw_access.component_count == 2 and
             raw_access.components[0].data_register_class == .gpr and
             raw_access.components[1].data_register_class == .gpr and
-            raw_access.components[0].data_register == @intFromEnum(emit.Reg.fp) and
-            raw_access.components[1].data_register == @intFromEnum(emit.Reg.lr);
+            raw_access.components[0].data_register == @backingInt(emit.Reg.fp) and
+            raw_access.components[1].data_register == @backingInt(emit.Reg.lr);
         component.detail = if (is_fp_lr_pair)
             switch (raw_access.kind) {
                 .store => "prologue_saved_fp_lr",
@@ -7699,7 +7699,7 @@ fn emitStageHrp(
 }
 
 fn markScalarClobbered(mask: *u16, reg: emit.Reg) void {
-    const reg_num: u32 = @intFromEnum(reg);
+    const reg_num: u32 = @backingInt(reg);
     if (reg_num < RegMap.caller_saved_count) {
         mask.* |= (@as(u16, 1) << @intCast(reg_num));
     }
@@ -8574,7 +8574,7 @@ fn stageArgFromSaved(
     const loc = reg_map.get(vreg) orelse return error.UnboundVReg;
     switch (loc) {
         .reg => |r| {
-            const reg_num: u32 = @intFromEnum(r);
+            const reg_num: u32 = @backingInt(r);
             if (reg_num >= 19) {
                 try code.movRegReg(target, r);
             } else if (target == r) {
@@ -8692,7 +8692,7 @@ fn emitCallIndirect(
             const loc = reg_map.get(ci.elem_idx) orelse return error.UnboundVReg;
             switch (loc) {
                 .reg => |r| {
-                    const reg_idx: u32 = @intFromEnum(r);
+                    const reg_idx: u32 = @backingInt(r);
                     if (reg_idx >= 19) {
                         try code.movRegReg(RegMap.tmp2, r);
                     } else {
@@ -8993,7 +8993,7 @@ fn emitVmctxHelperCall(
         const loc = reg_map.get(vreg) orelse return error.UnboundVReg;
         switch (loc) {
             .reg => |r| {
-                const reg_idx: u32 = @intFromEnum(r);
+                const reg_idx: u32 = @backingInt(r);
                 if (reg_idx >= 19) {
                     try code.movRegReg(arg_regs[i], r);
                 } else {
@@ -9046,7 +9046,7 @@ fn readVregStable(
     const loc = reg_map.get(vreg) orelse return error.UnboundVReg;
     switch (loc) {
         .reg => |r| {
-            const reg_idx: u32 = @intFromEnum(r);
+            const reg_idx: u32 = @backingInt(r);
             if (reg_idx >= 19) {
                 if (r != dest_reg) try code.movRegReg(dest_reg, r);
             } else {
@@ -10414,7 +10414,7 @@ pub const aarch64_call_clobber_mask: u64 = (@as(u64, 1) << 15) - 1;
 /// AAPCS64 ABI-fixed call-arg targets (x1..x7) into hint indices.
 fn aarch64_alloc_idx(reg: emit.Reg) ?u8 {
     inline for (aarch64_alloc_regs, 0..) |phys, i| {
-        if (@intFromEnum(reg) == phys) return @intCast(i);
+        if (@backingInt(reg) == phys) return @intCast(i);
     }
     return null;
 }
@@ -10961,8 +10961,8 @@ test "#963 aarch64: non-threaded output keeps the disabled path byte-identical" 
 /// Standard form: 0xAA0003E0 | (Rm << 16) | Rd.
 fn testMovRegRegWord(rd: emit.Reg, rm: emit.Reg) u32 {
     return 0xAA0003E0 |
-        (@as(u32, @intFromEnum(rm)) << 16) |
-        @as(u32, @intFromEnum(rd));
+        (@as(u32, @backingInt(rm)) << 16) |
+        @as(u32, @backingInt(rd));
 }
 
 test "emitParallelRegMoves: empty input is a no-op" {
@@ -11148,7 +11148,7 @@ fn simulateParallelCopy(
 
     // Model: 32 GPRs + a stack keyed by the scaled (÷8) FP offset that the
     // emitted LDR/STR immediates use.
-    var reg_model = [_]u64{0} ** 32;
+    var reg_model = @as([32]u64, @splat(0));
     var stack_model = std.AutoHashMap(u32, u64).init(allocator);
     defer stack_model.deinit();
 
@@ -14825,15 +14825,15 @@ test "compile: v128 local zero-init uses full-width store without clobbering sca
 
     const add_local0_addr = @as(u32, 0x91000000) |
         (@as(u32, 32) << 10) |
-        (@as(u32, @intFromEnum(emit.Reg.fp)) << 5) |
-        @as(u32, @intFromEnum(RegMap.tmp1));
+        (@as(u32, @backingInt(emit.Reg.fp)) << 5) |
+        @as(u32, @backingInt(RegMap.tmp1));
     const str_q0_tmp1 = @as(u32, 0x3D800000) |
-        (@as(u32, @intFromEnum(RegMap.tmp1)) << 5) |
+        (@as(u32, @backingInt(RegMap.tmp1)) << 5) |
         @as(u32, v128_tmp0);
     const str_scalar_zero = @as(u32, 0xF9000000) |
         (@as(u32, 6) << 10) |
-        (@as(u32, @intFromEnum(emit.Reg.fp)) << 5) |
-        @as(u32, @intFromEnum(RegMap.tmp0));
+        (@as(u32, @backingInt(emit.Reg.fp)) << 5) |
+        @as(u32, @backingInt(RegMap.tmp0));
 
     var found_movi_zero = false;
     var found_local_addr = false;
@@ -15119,9 +15119,9 @@ test "load: checked memory32 offset zero uses every scalar register-offset form"
         .{ .spec = .{ .size = 4, .sign_extend = true, .result_type = .i64 }, .opcode = 0xB8A06800 },
         .{ .spec = .{ .size = 8, .result_type = .i64 }, .opcode = 0xF8606800 },
     };
-    const index_bits = (@as(u32, @intFromEnum(RegMap.tmp2)) << 16) |
-        (@as(u32, @intFromEnum(emit.Reg.x20)) << 5);
-    const native_add = 0x8B000000 | index_bits | @as(u32, @intFromEnum(RegMap.tmp0));
+    const index_bits = (@as(u32, @backingInt(RegMap.tmp2)) << 16) |
+        (@as(u32, @backingInt(emit.Reg.x20)) << 5);
+    const native_add = 0x8B000000 | index_bits | @as(u32, @backingInt(RegMap.tmp0));
 
     for (cases) |case| {
         const code = try compileAddressingLoadTest(allocator, case.spec, .{
@@ -15146,9 +15146,9 @@ test "store: checked memory32 offset zero uses every scalar register-offset form
         .{ .spec = .{ .size = 4 }, .opcode = 0xB8206800 },
         .{ .spec = .{ .size = 8, .value_type = .i64 }, .opcode = 0xF8206800 },
     };
-    const index_bits = (@as(u32, @intFromEnum(RegMap.tmp2)) << 16) |
-        (@as(u32, @intFromEnum(emit.Reg.x20)) << 5);
-    const native_add = 0x8B000000 | index_bits | @as(u32, @intFromEnum(RegMap.tmp0));
+    const index_bits = (@as(u32, @backingInt(RegMap.tmp2)) << 16) |
+        (@as(u32, @backingInt(emit.Reg.x20)) << 5);
+    const native_add = 0x8B000000 | index_bits | @as(u32, @backingInt(RegMap.tmp0));
 
     for (cases) |case| {
         const code = try compileAddressingStoreTest(allocator, case.spec, .{
@@ -15178,12 +15178,12 @@ test "store: spilled value reload preserves the checked register-offset index" {
 
     const spill_reload = 0xF9400000 |
         (@as(u32, 8) << 10) |
-        (@as(u32, @intFromEnum(emit.Reg.fp)) << 5) |
-        @as(u32, @intFromEnum(RegMap.tmp1));
+        (@as(u32, @backingInt(emit.Reg.fp)) << 5) |
+        @as(u32, @backingInt(RegMap.tmp1));
     const reg_store = 0xB8206800 |
-        (@as(u32, @intFromEnum(RegMap.tmp2)) << 16) |
-        (@as(u32, @intFromEnum(emit.Reg.x20)) << 5) |
-        @as(u32, @intFromEnum(RegMap.tmp1));
+        (@as(u32, @backingInt(RegMap.tmp2)) << 16) |
+        (@as(u32, @backingInt(emit.Reg.x20)) << 5) |
+        @as(u32, @backingInt(RegMap.tmp1));
     var reload_pos: ?usize = null;
     var store_pos: ?usize = null;
     var i: usize = 0;
@@ -15216,10 +15216,10 @@ test "load: register-offset form removes one ADD and keeps zero-extension before
 
     try std.testing.expectEqual(code_off.len, code_on.len + 4);
 
-    const index_bits = (@as(u32, @intFromEnum(RegMap.tmp2)) << 16) |
-        (@as(u32, @intFromEnum(emit.Reg.x20)) << 5);
+    const index_bits = (@as(u32, @backingInt(RegMap.tmp2)) << 16) |
+        (@as(u32, @backingInt(emit.Reg.x20)) << 5);
     const reg_load = 0xB8606800 | index_bits;
-    const native_add = 0x8B000000 | index_bits | @as(u32, @intFromEnum(RegMap.tmp0));
+    const native_add = 0x8B000000 | index_bits | @as(u32, @backingInt(RegMap.tmp0));
     try std.testing.expect(testCodeContainsMasked(code_on, 0xFFFFFFE0, reg_load));
     try std.testing.expect(!testCodeContainsWord(code_on, native_add));
     try std.testing.expect(testCodeContainsWord(code_off, native_add));
@@ -15261,9 +15261,9 @@ test "load: register-offset eligibility preserves offset and memory64-shaped fal
         .{ .has_shared_memory = true, .size = 4 },
         .{ .size = 4, .bounds_known = true },
     };
-    const index_bits = (@as(u32, @intFromEnum(RegMap.tmp2)) << 16) |
-        (@as(u32, @intFromEnum(emit.Reg.x20)) << 5);
-    const native_add = 0x8B000000 | index_bits | @as(u32, @intFromEnum(RegMap.tmp0));
+    const index_bits = (@as(u32, @backingInt(RegMap.tmp2)) << 16) |
+        (@as(u32, @backingInt(emit.Reg.x20)) << 5);
+    const native_add = 0x8B000000 | index_bits | @as(u32, @backingInt(RegMap.tmp0));
 
     for (cases) |spec| {
         const code = try compileAddressingLoadTest(allocator, spec, .{
@@ -15286,9 +15286,9 @@ test "store: register-offset eligibility preserves offset and memory64-shaped fa
         .{ .has_shared_memory = true, .size = 4 },
         .{ .size = 4, .bounds_known = true },
     };
-    const index_bits = (@as(u32, @intFromEnum(RegMap.tmp2)) << 16) |
-        (@as(u32, @intFromEnum(emit.Reg.x20)) << 5);
-    const native_add = 0x8B000000 | index_bits | @as(u32, @intFromEnum(RegMap.tmp0));
+    const index_bits = (@as(u32, @backingInt(RegMap.tmp2)) << 16) |
+        (@as(u32, @backingInt(emit.Reg.x20)) << 5);
+    const native_add = 0x8B000000 | index_bits | @as(u32, @backingInt(RegMap.tmp0));
 
     for (cases) |spec| {
         const code = try compileAddressingStoreTest(allocator, spec, .{
@@ -15323,9 +15323,9 @@ test "atomic load: shared-memory path keeps materialized address fallback" {
     });
     defer allocator.free(code);
 
-    const index_bits = (@as(u32, @intFromEnum(RegMap.tmp2)) << 16) |
-        (@as(u32, @intFromEnum(emit.Reg.x20)) << 5);
-    const native_add = 0x8B000000 | index_bits | @as(u32, @intFromEnum(RegMap.tmp0));
+    const index_bits = (@as(u32, @backingInt(RegMap.tmp2)) << 16) |
+        (@as(u32, @backingInt(emit.Reg.x20)) << 5);
+    const native_add = 0x8B000000 | index_bits | @as(u32, @backingInt(RegMap.tmp0));
     try std.testing.expect(testCodeContainsWord(code, native_add));
     try std.testing.expect(!testCodeContainsMasked(code, 0x3B200C00, 0x38200800));
 }

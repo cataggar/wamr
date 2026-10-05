@@ -3058,7 +3058,7 @@ fn buildSimdV128LoadSplatLane0Module(
     try appendI32Const(&instr, allocator, 0);
     try appendLoadSplatLane0I32(&instr, allocator, opcode, alignment, offset);
 
-    var data = [_]u8{0} ** 24;
+    var data = @as([24]u8, @splat(0));
     data[3] = 7;
     writeI16Lane(data[4..][0..2], 17);
     writeI32Lane(data[8..][0..4], 291);
@@ -3086,7 +3086,7 @@ fn buildSimdV128Load32ZeroLanesModule(allocator: Allocator) ![]u8 {
     try appendI32x4ExtractLane(&instr, allocator, 3);
     try appendI32Add(&instr, allocator);
 
-    var data = [_]u8{0xA5} ** 24;
+    var data = @as([24]u8, @splat(0xA5));
     writeI32Lane(data[4..][0..4], 291);
     return buildRunI32Module(allocator, instr.items, .{
         .memory_min = 1,
@@ -3115,7 +3115,7 @@ fn buildSimdV128Load64ZeroLanesModule(allocator: Allocator) ![]u8 {
     try appendI32WrapI64(&instr, allocator);
     try appendI32Add(&instr, allocator);
 
-    var data = [_]u8{0xA5} ** 32;
+    var data = @as([32]u8, @splat(0xA5));
     writeI64Lane(data[16..][0..8], (@as(u64, 17) << 32) | 7);
     return buildRunI32Module(allocator, instr.items, .{
         .memory_min = 1,
@@ -3171,7 +3171,7 @@ fn buildSimdV128LoadExtendLane0Module(
         else => unreachable,
     }
 
-    var data = [_]u8{0} ** 24;
+    var data = @as([24]u8, @splat(0));
     data[0] = 0x80;
     writeI16Lane(data[8..][0..2], 0x8001);
     writeI32Lane(data[16..][0..4], 0x8000_0002);
@@ -3190,7 +3190,7 @@ fn buildSimdLoad8Lane5Module(allocator: Allocator) ![]u8 {
     try appendSimdMemLaneOpcode(&instr, allocator, 0x54, 0, 3, 5);
     try appendI8x16ExtractLaneU(&instr, allocator, 5);
 
-    var data = [_]u8{0} ** 24;
+    var data = @as([24]u8, @splat(0));
     data[3] = 7;
     return buildRunI32Module(allocator, instr.items, .{
         .memory_min = 1,
@@ -3207,7 +3207,7 @@ fn buildSimdLoad16Lane2Module(allocator: Allocator) ![]u8 {
     try appendSimdMemLaneOpcode(&instr, allocator, 0x55, 1, 4, 2);
     try appendI16x8ExtractLaneU(&instr, allocator, 2);
 
-    var data = [_]u8{0} ** 24;
+    var data = @as([24]u8, @splat(0));
     writeI16Lane(data[4..][0..2], 17);
     return buildRunI32Module(allocator, instr.items, .{
         .memory_min = 1,
@@ -3224,7 +3224,7 @@ fn buildSimdLoad32Lane1Module(allocator: Allocator) ![]u8 {
     try appendSimdMemLaneOpcode(&instr, allocator, 0x56, 2, 8, 1);
     try appendI32x4ExtractLane(&instr, allocator, 1);
 
-    var data = [_]u8{0} ** 24;
+    var data = @as([24]u8, @splat(0));
     writeI32Lane(data[8..][0..4], 291);
     return buildRunI32Module(allocator, instr.items, .{
         .memory_min = 1,
@@ -3242,7 +3242,7 @@ fn buildSimdLoad64Lane1Module(allocator: Allocator) ![]u8 {
     try appendI64x2ExtractLane(&instr, allocator, 1);
     try appendI32WrapI64(&instr, allocator);
 
-    var data = [_]u8{0} ** 24;
+    var data = @as([24]u8, @splat(0));
     writeI64Lane(data[16..][0..8], 17_767);
     return buildRunI32Module(allocator, instr.items, .{
         .memory_min = 1,

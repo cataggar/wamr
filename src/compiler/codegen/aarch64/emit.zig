@@ -43,7 +43,7 @@ pub const Reg = enum(u5) {
     sp = 31, // stack pointer (also encodes as XZR in some contexts)
 
     pub fn encoding(self: Reg) u5 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 
@@ -368,7 +368,7 @@ pub const CodeBuffer = struct {
     /// B.cond imm19 (conditional branch)
     pub fn bCond(self: *CodeBuffer, cond: Cond, offset_words: i19) !void {
         const imm: u32 = @as(u32, @as(u19, @bitCast(offset_words)));
-        try self.emit32(0x54000000 | (imm << 5) | @intFromEnum(cond));
+        try self.emit32(0x54000000 | (imm << 5) | @backingInt(cond));
     }
 
     /// BLR Xn (branch to register with link / indirect call)
@@ -580,14 +580,14 @@ pub const CodeBuffer = struct {
 
     /// CSET Xd, cond — set Xd = 1 if cond else 0 (alias CSINC Xd, XZR, XZR, !cond).
     pub fn cset(self: *CodeBuffer, rd: Reg, cond: Cond) !void {
-        const inv: u4 = @intFromEnum(cond) ^ 1; // invert condition
+        const inv: u4 = @backingInt(cond) ^ 1; // invert condition
         // CSINC Xd, XZR, XZR, !cond: 1|0|0|11010100|Rm(11111)|cond|01|Rn(11111)|Rd
         try self.emit32(0x9A9F07E0 | (@as(u32, inv) << 12) | rd.encoding());
     }
 
     /// CSET Wd, cond — 32-bit variant (zero-extends into Xd).
     pub fn cset32(self: *CodeBuffer, rd: Reg, cond: Cond) !void {
-        const inv: u4 = @intFromEnum(cond) ^ 1;
+        const inv: u4 = @backingInt(cond) ^ 1;
         try self.emit32(0x1A9F07E0 | (@as(u32, inv) << 12) | rd.encoding());
     }
 
@@ -595,14 +595,14 @@ pub const CodeBuffer = struct {
     pub fn csel(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg, cond: Cond) !void {
         // 1|0|0|11010100|Rm|cond|00|Rn|Rd
         try self.emit32(0x9A800000 | (@as(u32, rm.encoding()) << 16) |
-            (@as(u32, @intFromEnum(cond)) << 12) |
+            (@as(u32, @backingInt(cond)) << 12) |
             (@as(u32, rn.encoding()) << 5) | rd.encoding());
     }
 
     /// CSEL Wd, Wn, Wm, cond — 32-bit variant.
     pub fn csel32(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg, cond: Cond) !void {
         try self.emit32(0x1A800000 | (@as(u32, rm.encoding()) << 16) |
-            (@as(u32, @intFromEnum(cond)) << 12) |
+            (@as(u32, @backingInt(cond)) << 12) |
             (@as(u32, rn.encoding()) << 5) | rd.encoding());
     }
 
@@ -748,7 +748,7 @@ pub const CodeBuffer = struct {
         //   ty: 00 = single (f32), 01 = double (f64), bit 22
         const ty: u32 = if (is_f64) 1 else 0;
         const base: u32 = 0x1E200800 | (ty << 22);
-        const opcode_bits: u32 = @as(u32, @intFromEnum(op)) << 12;
+        const opcode_bits: u32 = @as(u32, @backingInt(op)) << 12;
         try self.emit32(base | opcode_bits |
             (@as(u32, vm) << 16) |
             (@as(u32, vn) << 5) |
@@ -807,7 +807,7 @@ pub const CodeBuffer = struct {
     pub fn frintScalar(self: *CodeBuffer, is_f64: bool, mode: FRoundMode, vd: u5, vn: u5) !void {
         // 0001 1110 0 ty 1 001 <mode:3> 10000 Rn Rd
         const ty: u32 = if (is_f64) 1 else 0;
-        const m: u32 = @intFromEnum(mode);
+        const m: u32 = @backingInt(mode);
         try self.emit32(0x1E244000 | (ty << 22) | (m << 15) |
             (@as(u32, vn) << 5) | vd);
     }
@@ -1105,7 +1105,7 @@ pub const CodeBuffer = struct {
 
     /// AND/BIC/ORR/EOR Vd.16B, Vn.16B, Vm.16B.
     pub fn bitwise16b(self: *CodeBuffer, op: V128BitwiseOp, vd: u5, vn: u5, vm: u5) !void {
-        try self.emit32(@intFromEnum(op) |
+        try self.emit32(@backingInt(op) |
             (@as(u32, vm) << 16) |
             (@as(u32, vn) << 5) |
             vd);
@@ -1152,7 +1152,7 @@ pub const CodeBuffer = struct {
 
     /// Integer 4S binary vector op: ADD/SUB/MUL/SMIN/UMIN/SMAX/UMAX/CMEQ/CMGT/CMGE/CMHI/CMHS.
     pub fn i32x4Op(self: *CodeBuffer, op: I32x4Op, vd: u5, vn: u5, vm: u5) !void {
-        try self.emit32(@intFromEnum(op) |
+        try self.emit32(@backingInt(op) |
             (@as(u32, vm) << 16) |
             (@as(u32, vn) << 5) |
             vd);
@@ -1179,7 +1179,7 @@ pub const CodeBuffer = struct {
 
     /// Integer 16B binary vector op.
     pub fn i8x16Op(self: *CodeBuffer, op: I8x16Op, vd: u5, vn: u5, vm: u5) !void {
-        try self.emit32(@intFromEnum(op) |
+        try self.emit32(@backingInt(op) |
             (@as(u32, vm) << 16) |
             (@as(u32, vn) << 5) |
             vd);
@@ -1208,7 +1208,7 @@ pub const CodeBuffer = struct {
 
     /// Integer 8H binary vector op.
     pub fn i16x8Op(self: *CodeBuffer, op: I16x8Op, vd: u5, vn: u5, vm: u5) !void {
-        try self.emit32(@intFromEnum(op) |
+        try self.emit32(@backingInt(op) |
             (@as(u32, vm) << 16) |
             (@as(u32, vn) << 5) |
             vd);
@@ -1224,7 +1224,7 @@ pub const CodeBuffer = struct {
 
     /// Integer 2D binary vector op: ADD/SUB/CMEQ/CMGT/CMGE.
     pub fn i64x2Op(self: *CodeBuffer, op: I64x2Op, vd: u5, vn: u5, vm: u5) !void {
-        try self.emit32(@intFromEnum(op) |
+        try self.emit32(@backingInt(op) |
             (@as(u32, vm) << 16) |
             (@as(u32, vn) << 5) |
             vd);
@@ -1241,7 +1241,7 @@ pub const CodeBuffer = struct {
 
     /// Floating-point 4S binary vector op: FADD/FSUB/FMUL/FDIV/FMAX/FMIN.
     pub fn f32x4Op(self: *CodeBuffer, op: F32x4Op, vd: u5, vn: u5, vm: u5) !void {
-        try self.emit32(@intFromEnum(op) |
+        try self.emit32(@backingInt(op) |
             (@as(u32, vm) << 16) |
             (@as(u32, vn) << 5) |
             vd);
@@ -1268,7 +1268,7 @@ pub const CodeBuffer = struct {
 
     /// Floating-point 4S unary vector op: FABS/FNEG/FSQRT/FRINT*.
     pub fn f32x4UnOp(self: *CodeBuffer, op: F32x4UnaryOp, vd: u5, vn: u5) !void {
-        try self.emit32(@intFromEnum(op) |
+        try self.emit32(@backingInt(op) |
             (@as(u32, vn) << 5) |
             vd);
     }
@@ -1364,7 +1364,7 @@ pub const CodeBuffer = struct {
 
     /// Floating-point 2D unary vector op: FABS/FNEG/FSQRT/FRINT*.
     pub fn f64x2UnOp(self: *CodeBuffer, op: F64x2UnaryOp, vd: u5, vn: u5) !void {
-        try self.emit32(@intFromEnum(op) |
+        try self.emit32(@backingInt(op) |
             (@as(u32, vn) << 5) |
             vd);
     }
@@ -1417,7 +1417,7 @@ pub const CodeBuffer = struct {
 
     /// Floating-point 2D binary vector op: FADD/FSUB/FMUL/FDIV/FMAX/FMIN.
     pub fn f64x2Op(self: *CodeBuffer, op: F64x2Op, vd: u5, vn: u5, vm: u5) !void {
-        try self.emit32(@intFromEnum(op) |
+        try self.emit32(@backingInt(op) |
             (@as(u32, vm) << 16) |
             (@as(u32, vn) << 5) |
             vd);
@@ -1997,7 +1997,7 @@ pub const CodeBuffer = struct {
             8 => 0xF8E00000,
             else => return error.BadLseSize,
         };
-        try self.emit32(size_base | @intFromEnum(op) |
+        try self.emit32(size_base | @backingInt(op) |
             (@as(u32, rs.encoding()) << 16) |
             (@as(u32, rn.encoding()) << 5) |
             rt.encoding());
@@ -2390,8 +2390,8 @@ fn signedBits(value: u32, comptime bits: comptime_int) i32 {
 }
 
 fn decodeFrameMemory(word: u32) ?DecodedFrameMemory {
-    const rn: Reg = @enumFromInt(@as(u5, @truncate(word >> 5)));
-    const rt: Reg = @enumFromInt(@as(u5, @truncate(word)));
+    const rn: Reg = @fromBackingInt(@intCast(@as(u5, @truncate(word >> 5))));
+    const rt: Reg = @fromBackingInt(@intCast(@as(u5, @truncate(word))));
     const top = word & 0xFFC00000;
     const unsigned = switch (top) {
         0xF9400000 => .{ FrameAccessKind.load, @as(u8, 8), @as(u8, 8) },
@@ -2412,7 +2412,7 @@ fn decodeFrameMemory(word: u32) ?DecodedFrameMemory {
             .encoded_displacement = @intCast(imm12 * decoded[2]),
             .addressing_mode = .unsigned_scaled,
             .width = decoded[1],
-            .data_rt1 = @intFromEnum(rt),
+            .data_rt1 = @backingInt(rt),
             .data_register_class = .gpr,
             .load_rt1 = if (decoded[0] == .load) rt else null,
         };
@@ -2443,7 +2443,7 @@ fn decodeFrameMemory(word: u32) ?DecodedFrameMemory {
             .encoded_displacement = signedBits((word >> 12) & 0x1FF, 9),
             .addressing_mode = .signed_unscaled,
             .width = decoded[1],
-            .data_rt1 = @intFromEnum(rt),
+            .data_rt1 = @backingInt(rt),
             .data_register_class = if (unscaled_top == 0x3C800000 or
                 unscaled_top == 0x3CC00000 or
                 unscaled_top == 0xBC000000 or
@@ -2472,7 +2472,7 @@ fn decodeFrameMemory(word: u32) ?DecodedFrameMemory {
             0
         else
             byte_displacement;
-        const rt2: Reg = @enumFromInt(@as(u5, @truncate(word >> 10)));
+        const rt2: Reg = @fromBackingInt(@intCast(@as(u5, @truncate(word >> 10))));
         return .{
             .kind = decoded[0],
             .encoded_base = rn,
@@ -2480,8 +2480,8 @@ fn decodeFrameMemory(word: u32) ?DecodedFrameMemory {
             .addressing_mode = decoded[2],
             .width = decoded[1],
             .pair = true,
-            .data_rt1 = @intFromEnum(rt),
-            .data_rt2 = @intFromEnum(rt2),
+            .data_rt1 = @backingInt(rt),
+            .data_rt2 = @backingInt(rt2),
             .data_register_class = .gpr,
             .load_rt1 = if (decoded[0] == .load) rt else null,
             .load_rt2 = if (decoded[0] == .load) rt2 else null,
@@ -2504,7 +2504,7 @@ fn decodeFrameMemory(word: u32) ?DecodedFrameMemory {
             .encoded_displacement = 0,
             .addressing_mode = .simd_zero_offset,
             .width = decoded[1],
-            .data_rt1 = @intFromEnum(rt),
+            .data_rt1 = @backingInt(rt),
             .data_register_class = .simd,
         };
     }
@@ -2515,7 +2515,7 @@ fn decodeMoveWide(word: u32) ?struct { reg: Reg, value: u64, keep: bool, shift: 
     const top = word & 0xFF800000;
     if (top != 0xD2800000 and top != 0xF2800000) return null;
     return .{
-        .reg = @enumFromInt(@as(u5, @truncate(word))),
+        .reg = @fromBackingInt(@intCast(@as(u5, @truncate(word)))),
         .value = @as(u64, (word >> 5) & 0xFFFF),
         .keep = top == 0xF2800000,
         .shift = @intCast(((word >> 21) & 0x3) * 16),
@@ -2531,8 +2531,8 @@ fn decodeAddSubImmediate(word: u32) ?struct {
     const shift: u6 = if (((word >> 22) & 1) != 0) 12 else 0;
     const imm = @as(i64, (word >> 10) & 0xFFF) << shift;
     return .{
-        .rd = @enumFromInt(@as(u5, @truncate(word))),
-        .rn = @enumFromInt(@as(u5, @truncate(word >> 5))),
+        .rd = @fromBackingInt(@intCast(@as(u5, @truncate(word)))),
+        .rn = @fromBackingInt(@intCast(@as(u5, @truncate(word >> 5)))),
         .displacement = if (((word >> 30) & 1) != 0) -imm else imm,
     };
 }
@@ -2540,9 +2540,9 @@ fn decodeAddSubImmediate(word: u32) ?struct {
 fn decodeAddRegister(word: u32) ?struct { rd: Reg, rn: Reg, rm: Reg } {
     if ((word & 0xFFE0FC00) != 0x8B000000) return null;
     return .{
-        .rd = @enumFromInt(@as(u5, @truncate(word))),
-        .rn = @enumFromInt(@as(u5, @truncate(word >> 5))),
-        .rm = @enumFromInt(@as(u5, @truncate(word >> 16))),
+        .rd = @fromBackingInt(@intCast(@as(u5, @truncate(word)))),
+        .rn = @fromBackingInt(@intCast(@as(u5, @truncate(word >> 5)))),
+        .rm = @fromBackingInt(@intCast(@as(u5, @truncate(word >> 16)))),
     };
 }
 
@@ -2564,7 +2564,7 @@ fn relationForBase(
     _ = sp_from_fp;
     if (reg == .fp) return .{ .base = .fp, .displacement = 0 };
     if (reg == .sp) return .{ .base = .sp, .displacement = 0 };
-    return relations[@intFromEnum(reg)];
+    return relations[@backingInt(reg)];
 }
 
 /// Decode final emitted words, after peepholes, NOP patching, post-emission
@@ -2578,8 +2578,8 @@ pub fn traceFrameAccesses(
     var accesses: std.ArrayList(FrameAccess) = .empty;
     errdefer accesses.deinit(allocator);
 
-    var relations: [32]?FrameRelation = .{null} ** 32;
-    var constants: [32]?u64 = .{null} ** 32;
+    var relations: [32]?FrameRelation = @splat(null);
+    var constants: [32]?u64 = @splat(null);
     var sp_from_fp: ?i64 = null;
 
     var native_start: usize = 0;
@@ -2620,25 +2620,25 @@ pub fn traceFrameAccesses(
                 });
             }
             if (memory.load_rt1) |rt| {
-                relations[@intFromEnum(rt)] = null;
-                constants[@intFromEnum(rt)] = null;
+                relations[@backingInt(rt)] = null;
+                constants[@backingInt(rt)] = null;
             }
             if (memory.load_rt2) |rt| {
-                relations[@intFromEnum(rt)] = null;
-                constants[@intFromEnum(rt)] = null;
+                relations[@backingInt(rt)] = null;
+                constants[@backingInt(rt)] = null;
             }
             if (memory.writeback_delta) |delta| {
                 if (memory.encoded_base == .sp and sp_from_fp != null) {
                     sp_from_fp.? += delta;
                 }
-                relations[@intFromEnum(memory.encoded_base)] = null;
-                constants[@intFromEnum(memory.encoded_base)] = null;
+                relations[@backingInt(memory.encoded_base)] = null;
+                constants[@backingInt(memory.encoded_base)] = null;
             }
             continue;
         }
 
         if (decodeMoveWide(word)) |move| {
-            const idx = @intFromEnum(move.reg);
+            const idx = @backingInt(move.reg);
             if (move.keep) {
                 if (constants[idx]) |prior| {
                     const mask = ~(@as(u64, 0xFFFF) << move.shift);
@@ -2654,7 +2654,7 @@ pub fn traceFrameAccesses(
         }
 
         if (decodeAddSubImmediate(word)) |add| {
-            const rd_idx = @intFromEnum(add.rd);
+            const rd_idx = @backingInt(add.rd);
             if (add.rd == .fp and add.rn == .sp and add.displacement == 0) {
                 relations[rd_idx] = .{ .base = .fp, .displacement = 0 };
                 sp_from_fp = 0;
@@ -2674,20 +2674,20 @@ pub fn traceFrameAccesses(
         }
 
         if (decodeAddRegister(word)) |add| {
-            const rd_idx = @intFromEnum(add.rd);
+            const rd_idx = @backingInt(add.rd);
             const rn_relation = relationForBase(add.rn, &relations, sp_from_fp);
             const rm_relation = relationForBase(add.rm, &relations, sp_from_fp);
-            if (rn_relation != null and constants[@intFromEnum(add.rm)] != null) {
+            if (rn_relation != null and constants[@backingInt(add.rm)] != null) {
                 relations[rd_idx] = .{
                     .base = rn_relation.?.base,
                     .displacement = rn_relation.?.displacement +
-                        @as(i64, @intCast(constants[@intFromEnum(add.rm)].?)),
+                        @as(i64, @intCast(constants[@backingInt(add.rm)].?)),
                 };
-            } else if (rm_relation != null and constants[@intFromEnum(add.rn)] != null) {
+            } else if (rm_relation != null and constants[@backingInt(add.rn)] != null) {
                 relations[rd_idx] = .{
                     .base = rm_relation.?.base,
                     .displacement = rm_relation.?.displacement +
-                        @as(i64, @intCast(constants[@intFromEnum(add.rn)].?)),
+                        @as(i64, @intCast(constants[@backingInt(add.rn)].?)),
                 };
             } else {
                 relations[rd_idx] = null;

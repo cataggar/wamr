@@ -9261,29 +9261,29 @@ const default_passes_no_iv_no_unroll: []const PassFn = &.{
 };
 
 const x86_64_default_passes_no_iv: []const PassFn = &.{
-    &forwardLocalGet,            &constantFold,                     &algebraicSimplify,          &strengthReduceMul,
-    &strengthReduceMulShiftAdd,  &strengthReduceDivRem,             &foldConstantBranches,       &foldInverseCompareEqz,
-    &foldBranchOnEqz,            &threadChainedConditionalBranches, &tailDuplicateSmallJoins,    &foldSelectOnEqz,
-    &foldSignExtendingLoad,      &foldFloatUnaryIdempotents,        &foldWrapOfExtend,           &globalValueNumbering,
-    &hoistLoopInvariantCode,     &unrollSmallFixedLoops,            &foldCompoundLea,            &deadCodeAndLocalSetCleanup,
-    &hoistLoopBoundsChecks,      &elideRedundantBoundsChecks,       &foldLoadStoreOffset,
-};
-
-const x86_64_default_passes_no_unroll: []const PassFn = &.{
-    &forwardLocalGet,                 &constantFold,                     &algebraicSimplify,          &strengthReduceMul,
-    &strengthReduceMulShiftAdd,       &strengthReduceDivRem,             &foldConstantBranches,       &foldInverseCompareEqz,
-    &foldBranchOnEqz,                 &threadChainedConditionalBranches, &tailDuplicateSmallJoins,    &foldSelectOnEqz,
-    &foldSignExtendingLoad,           &foldFloatUnaryIdempotents,        &foldWrapOfExtend,           &globalValueNumbering,
-    &inductionVariableSimplification, &hoistLoopInvariantCode,           &foldCompoundLea,            &deadCodeAndLocalSetCleanup,
-    &hoistLoopBoundsChecks,           &elideRedundantBoundsChecks,       &foldLoadStoreOffset,
-};
-
-const x86_64_default_passes_no_iv_no_unroll: []const PassFn = &.{
     &forwardLocalGet,           &constantFold,                     &algebraicSimplify,       &strengthReduceMul,
     &strengthReduceMulShiftAdd, &strengthReduceDivRem,             &foldConstantBranches,    &foldInverseCompareEqz,
     &foldBranchOnEqz,           &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,
     &foldSignExtendingLoad,     &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,
-    &hoistLoopInvariantCode,    &foldCompoundLea,                  &deadCodeAndLocalSetCleanup, &hoistLoopBoundsChecks,
+    &hoistLoopInvariantCode,    &unrollSmallFixedLoops,            &foldCompoundLea,         &deadCodeAndLocalSetCleanup,
+    &hoistLoopBoundsChecks,     &elideRedundantBoundsChecks,       &foldLoadStoreOffset,
+};
+
+const x86_64_default_passes_no_unroll: []const PassFn = &.{
+    &forwardLocalGet,                 &constantFold,                     &algebraicSimplify,       &strengthReduceMul,
+    &strengthReduceMulShiftAdd,       &strengthReduceDivRem,             &foldConstantBranches,    &foldInverseCompareEqz,
+    &foldBranchOnEqz,                 &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,
+    &foldSignExtendingLoad,           &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,
+    &inductionVariableSimplification, &hoistLoopInvariantCode,           &foldCompoundLea,         &deadCodeAndLocalSetCleanup,
+    &hoistLoopBoundsChecks,           &elideRedundantBoundsChecks,       &foldLoadStoreOffset,
+};
+
+const x86_64_default_passes_no_iv_no_unroll: []const PassFn = &.{
+    &forwardLocalGet,            &constantFold,                     &algebraicSimplify,          &strengthReduceMul,
+    &strengthReduceMulShiftAdd,  &strengthReduceDivRem,             &foldConstantBranches,       &foldInverseCompareEqz,
+    &foldBranchOnEqz,            &threadChainedConditionalBranches, &tailDuplicateSmallJoins,    &foldSelectOnEqz,
+    &foldSignExtendingLoad,      &foldFloatUnaryIdempotents,        &foldWrapOfExtend,           &globalValueNumbering,
+    &hoistLoopInvariantCode,     &foldCompoundLea,                  &deadCodeAndLocalSetCleanup, &hoistLoopBoundsChecks,
     &elideRedundantBoundsChecks, &foldLoadStoreOffset,
 };
 
@@ -10815,7 +10815,7 @@ test "reorderBlocks: diamond CFG preserves RPO" {
     // Block 0 must be first (entry)
     try std.testing.expectEqual(@as(ir.BlockId, 0), order[0]);
     // All 4 blocks present
-    var seen = [_]bool{false} ** 4;
+    var seen = @as([4]bool, @splat(false));
     for (order) |bid| seen[bid] = true;
     for (seen) |s| try std.testing.expect(s);
     // Block 3 (merge) must come after both 1 and 2
@@ -12804,7 +12804,7 @@ test "unrollSmallFixedLoops: unsigned negative init preserves one-trip memory an
     defer case.func.deinit();
     var optimized = try case.func.clone(allocator);
     defer optimized.deinit();
-    const initial_memory = [_]u8{0} ** 4;
+    const initial_memory = @as([4]u8, @splat(0));
 
     var expected = try test_interp.run(allocator, &case.func, .{ .memory = &initial_memory });
     defer expected.deinit(allocator);
@@ -12842,7 +12842,7 @@ test "unrollSmallFixedLoops: widened eight-trip values unroll through i32 max bo
     defer case.func.deinit();
     var optimized = try case.func.clone(allocator);
     defer optimized.deinit();
-    const initial_memory = [_]u8{0} ** 4;
+    const initial_memory = @as([4]u8, @splat(0));
 
     var expected = try test_interp.run(allocator, &case.func, .{ .memory = &initial_memory });
     defer expected.deinit(allocator);
@@ -12879,7 +12879,7 @@ test "unrollSmallFixedLoops: signed terminating update overflow is skipped" {
     defer case.func.deinit();
     var optimized = try case.func.clone(allocator);
     defer optimized.deinit();
-    const initial_memory = [_]u8{0} ** 4;
+    const initial_memory = @as([4]u8, @splat(0));
 
     var expected = try test_interp.run(allocator, &case.func, .{ .memory = &initial_memory });
     defer expected.deinit(allocator);

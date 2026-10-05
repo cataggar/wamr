@@ -12,7 +12,7 @@ pub fn addTests(b: *std.Build, wamrc: *std.Build.Step.Compile, optimize: std.bui
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/jit_native_tests.zig"),
             .target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl }),
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .single_threaded = true,
         }),
         .filters = &.{"native JIT"},
@@ -35,7 +35,7 @@ fn workload(b: *std.Build) std.Build.LazyPath {
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/unikraft-jit/fixture.zig"),
             .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
         }),
     });
     wasm.entry = .disabled;
@@ -89,8 +89,8 @@ fn addBenchmark(b: *std.Build, wamrc: *std.Build.Step.Compile, wasm: std.Build.L
     step.dependOn(&b.addInstallFile(wasm, "native-jit-bench/matched.wasm").step);
     step.dependOn(&b.addInstallFile(aot, "native-jit-bench/matched.cwasm").step);
     const tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "scripts.test_native_jit_benchmark" });
-    tests.setEnvironmentVariable("WAMR_JIT_BENCH_AOT", b.getInstallPath(.bin, "wamr-native-jit-aot-compare"));
-    tests.setEnvironmentVariable("WAMR_JIT_BENCH_JIT", b.getInstallPath(.bin, "wamr-native-jit-bench"));
+    @import("environment.zig").setPath(tests, "WAMR_JIT_BENCH_AOT", .{ .relative = .{ .base = .install_bin, .sub_path = "wamr-native-jit-aot-compare" } });
+    @import("environment.zig").setPath(tests, "WAMR_JIT_BENCH_JIT", .{ .relative = .{ .base = .install_bin, .sub_path = "wamr-native-jit-bench" } });
     if (b.graph.host.result.cpu.arch != .x86_64)
         tests.setEnvironmentVariable("WAMR_JIT_BENCH_RUNNER", "qemu-x86_64 -cpu max");
     tests.step.dependOn(step);
@@ -186,7 +186,7 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         step.dependOn(&audit.step);
     }
     const archive_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "scripts.test_native_jit_benchmark.NativeEmbeddingArchiveTests" });
-    archive_tests.setEnvironmentVariable("WAMR_JIT_NATIVE_ARCHIVES", b.getInstallPath(.lib, ""));
+    @import("environment.zig").setPath(archive_tests, "WAMR_JIT_NATIVE_ARCHIVES", .{ .relative = .{ .base = .install_lib, .sub_path = "" } });
     archive_tests.step.dependOn(&install_library.step);
     archive_tests.step.dependOn(&install_compare.step);
     archive_tests.step.dependOn(step);

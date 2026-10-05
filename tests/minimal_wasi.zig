@@ -43,7 +43,7 @@ fn checkFixture(bytes: []const u8, expected_hash: []const u8) !void {
     const Signature = struct { params: []const u8, results: []const u8 };
     var types: std.ArrayList(Signature) = .empty;
     defer types.deinit(std.testing.allocator);
-    var seen = [_]bool{false} ** wasi.imports.len;
+    var seen = @as([wasi.imports.len]bool, @splat(false));
     var import_count: u32 = 0;
     while (module.offset < bytes.len) {
         const section_id = try module.byte();
@@ -71,8 +71,8 @@ fn checkFixture(bytes: []const u8, expected_hash: []const u8) !void {
                     try std.testing.expect(index < types.items.len);
                     const signature = types.items[index];
                     const function = wasi.resolve(namespace, name, signature.params, signature.results) orelse return error.UnexpectedImport;
-                    try std.testing.expect(!seen[@intFromEnum(function)]);
-                    seen[@intFromEnum(function)] = true;
+                    try std.testing.expect(!seen[@backingInt(function)]);
+                    seen[@backingInt(function)] = true;
                 }
                 try std.testing.expectEqual(section.bytes.len, section.offset);
             },

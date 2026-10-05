@@ -59,7 +59,7 @@ Requires [Zig](https://ziglang.org/) 0.16.x. No other dependencies.
 ```sh
 git clone https://github.com/cataggar/wamr
 cd wamr
-zig build -Doptimize=ReleaseSafe
+zig build -Doptimize=safe
 ```
 
 Binaries are written to `zig-out/bin/`.
@@ -73,7 +73,7 @@ directly in one step (no separate `wamrc` precompile), build from
 source with the flag added:
 
 ```sh
-zig build -Doptimize=ReleaseSafe -Djit=true
+zig build -Doptimize=safe -Djit=true
 ```
 
 See the [JIT mode section of the README](README.md#jit-mode) for what

@@ -81,7 +81,7 @@ test "native JIT guest sampler owns identities and tears down both presets befor
         try capture.writeRecord(&writer);
         try expect(std.mem.startsWith(u8, writer.buffered(), "WAMR_JIT_SAMPLE="));
         try expect(std.mem.endsWith(u8, writer.buffered(), "\n"));
-        try expect(std.mem.indexOf(u8, writer.buffered(), "\"request_sha256\":\"" ++ "a" ** 64 ++ "\"") != null);
+        try expect(std.mem.indexOf(u8, writer.buffered(), "\"request_sha256\":\"" ++ &@as([64:0]u8, @splat("a"[0])) ++ "\"") != null);
     }
 }
 
@@ -89,10 +89,10 @@ test "native JIT guest sampler preserves clock allocation and page failures with
     const guest = @import("bench/native_jit_guest.zig");
     var baseline: Pages = .{};
     var capture: guest.Capture = .{};
-    try guest.run(std.testing.allocator, baseline.platform(), wasm, .fast, "a" ** 64, 1, &capture);
+    try guest.run(std.testing.allocator, baseline.platform(), wasm, .fast, &@as([64:0]u8, @splat("a"[0])), 1, &capture);
     for ([_]usize{ 1, 2, 5, baseline.clock_reads - 1, baseline.clock_reads }) |fail_at| {
         var pages: Pages = .{ .fail_clock_at = fail_at };
-        try std.testing.expectError(error.ClockFailed, guest.run(std.testing.allocator, pages.platform(), wasm, .fast, "a" ** 64, 1, &capture));
+        try std.testing.expectError(error.ClockFailed, guest.run(std.testing.allocator, pages.platform(), wasm, .fast, &@as([64:0]u8, @splat("a"[0])), 1, &capture));
         try std.testing.expectEqualStrings("ClockFailed", capture.report.failure.?);
         try expect(capture.report.failure_stage != null);
         try equal(@as(usize, 0), pages.live);
@@ -102,17 +102,17 @@ test "native JIT guest sampler preserves clock allocation and page failures with
     for (0..baseline.transitions) |fail_at| {
         var pages: Pages = .{ .fail_at = fail_at };
         const expected_error = if (fail_at + 1 == baseline.transitions) error.UnexpectedGrowth else error.OutOfMemory;
-        try std.testing.expectError(expected_error, guest.run(std.testing.allocator, pages.platform(), wasm, .fast, "a" ** 64, 1, &capture));
+        try std.testing.expectError(expected_error, guest.run(std.testing.allocator, pages.platform(), wasm, .fast, &@as([64:0]u8, @splat("a"[0])), 1, &capture));
         try equal(@as(usize, 0), pages.live);
         try equal(@as(usize, 0), capture.report.caller_live_after_teardown);
         try equal(@as(usize, 0), capture.report.reserved_after_teardown);
     }
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    try std.testing.expectError(error.OutOfMemory, guest.run(failing.allocator(), baseline.platform(), wasm, .fast, "a" ** 64, 1, &capture));
+    try std.testing.expectError(error.OutOfMemory, guest.run(failing.allocator(), baseline.platform(), wasm, .fast, &@as([64:0]u8, @splat("a"[0])), 1, &capture));
     try std.testing.expectEqualStrings("compile", capture.report.failure_stage.?);
     try equal(@as(usize, 0), capture.report.caller_live_after_teardown);
-    try std.testing.expectError(error.InvalidArguments, guest.run(std.testing.allocator, baseline.platform(), wasm, .fast, "a" ** 64, 0, &capture));
-    try std.testing.expectError(error.InvalidArguments, guest.run(std.testing.allocator, baseline.platform(), wasm, .fast, "x" ** 64, 1, &capture));
+    try std.testing.expectError(error.InvalidArguments, guest.run(std.testing.allocator, baseline.platform(), wasm, .fast, &@as([64:0]u8, @splat("a"[0])), 0, &capture));
+    try std.testing.expectError(error.InvalidArguments, guest.run(std.testing.allocator, baseline.platform(), wasm, .fast, &@as([64:0]u8, @splat("x"[0])), 1, &capture));
     var buffer: [8192]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
     try capture.writeRecord(&writer);

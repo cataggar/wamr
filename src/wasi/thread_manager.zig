@@ -371,21 +371,21 @@ const GateState = enum(u8) {
 };
 
 const StartGate = struct {
-    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(GateState.closed)),
+    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@backingInt(GateState.closed)),
 
     fn open(self: *StartGate) void {
-        std.debug.assert(self.state.load(.monotonic) == @intFromEnum(GateState.closed));
-        self.state.store(@intFromEnum(GateState.run), .release);
+        std.debug.assert(self.state.load(.monotonic) == @backingInt(GateState.closed));
+        self.state.store(@backingInt(GateState.run), .release);
     }
 
     fn abort(self: *StartGate) void {
-        self.state.store(@intFromEnum(GateState.abort), .release);
+        self.state.store(@backingInt(GateState.abort), .release);
     }
 
     fn wait(self: *StartGate) bool {
         var spins: usize = 0;
         while (true) {
-            switch (@as(GateState, @enumFromInt(self.state.load(.acquire)))) {
+            switch (@as(GateState, @fromBackingInt(@intCast(self.state.load(.acquire))))) {
                 .closed => {
                     if (spins < 128) {
                         spins += 1;
@@ -419,7 +419,7 @@ const ThreadRecord = struct {
     cancellation_group: ?*TaskCancelGroup,
     start_gate: StartGate = .{},
     execution: std.atomic.Value(u8) =
-        std.atomic.Value(u8).init(@intFromEnum(ExecutionState.pending)),
+        std.atomic.Value(u8).init(@backingInt(ExecutionState.pending)),
 };
 
 const InterpThreadContext = struct {
@@ -1568,7 +1568,7 @@ fn parseTid(tid: i32) ?ParsedTid {
 }
 
 fn executionState(record: *const ThreadRecord) ExecutionState {
-    return @enumFromInt(record.execution.load(.acquire));
+    return @fromBackingInt(@intCast(record.execution.load(.acquire)));
 }
 
 fn yieldForLifecycle() void {
@@ -1584,7 +1584,7 @@ fn threadEntry(record: *ThreadRecord) void {
     const manager = record.manager;
     manager.noteThreadStarted();
     if (!record.start_gate.wait()) {
-        record.execution.store(@intFromEnum(ExecutionState.start_aborted), .release);
+        record.execution.store(@backingInt(ExecutionState.start_aborted), .release);
         return;
     }
 
@@ -1596,11 +1596,11 @@ fn threadEntry(record: *ThreadRecord) void {
     const outcome = record.backend_ops.run(record.backend_context);
     if (outcome == .trapped) {
         manager.signalTrap();
-        record.execution.store(@intFromEnum(ExecutionState.trapped), .release);
+        record.execution.store(@backingInt(ExecutionState.trapped), .release);
         return;
     }
     record.execution.store(
-        @intFromEnum(if (outcome == .cancelled)
+        @backingInt(if (outcome == .cancelled)
             ExecutionState.cancelled
         else
             ExecutionState.completed),

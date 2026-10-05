@@ -109,7 +109,7 @@ fn readTarget(section: *Reader, cpu_features: u64) Error!bool {
     const profile = try section.int(u32);
     if ((profile != abi.profile_flag and profile != abi.fuel_profile_flag) or
         try section.int(u32) != abi.contract_version) return error.UnsupportedTarget;
-    if (!std.mem.eql(u8, try section.take(16), "x86_64" ++ "\x00" ** 10)) return error.UnsupportedTarget;
+    if (!std.mem.eql(u8, try section.take(16), "x86_64" ++ &@as([10:0]u8, @splat(0)))) return error.UnsupportedTarget;
     const features = try section.int(u64);
     if (features != abi.cpu_features or features & ~cpu_features != 0) return error.UnsupportedTarget;
     return profile == abi.fuel_profile_flag;

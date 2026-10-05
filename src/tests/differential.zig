@@ -231,7 +231,7 @@ fn matchesNaNClass(comptime UInt: type, bits: UInt, expected: NaNClass) bool {
 }
 
 fn expectNaNClass(comptime Int: type, result: Int, expected: NaNClass, engine: []const u8) !void {
-    const UInt = std.meta.Int(.unsigned, @bitSizeOf(Int));
+    const UInt = @Int(.unsigned, @bitSizeOf(Int));
     const bits: UInt = @bitCast(result);
     const matches = matchesNaNClass(UInt, bits, expected);
     if (!matches) {
@@ -242,7 +242,7 @@ fn expectNaNClass(comptime Int: type, result: Int, expected: NaNClass, engine: [
 
 fn expectSimdSqrtNaN(
     comptime Int: type,
-    lanes: [128 / @bitSizeOf(Int)]std.meta.Int(.unsigned, @bitSizeOf(Int)),
+    lanes: [128 / @bitSizeOf(Int)]@Int(.unsigned, @bitSizeOf(Int)),
     lane: u8,
     expected: NaNClass,
 ) !void {
@@ -3181,7 +3181,7 @@ test "differential SIMD: v128.loadN_splat lane0 values" {
     try body.append(testing.allocator, 0x6A);
     try body.append(testing.allocator, 0x0B);
 
-    var data = [_]u8{0} ** 24;
+    var data = @as([24]u8, @splat(0));
     data[3] = 7;
     std.mem.writeInt(u16, data[4..][0..2], 17, .little);
     std.mem.writeInt(u32, data[8..][0..4], 291, .little);
@@ -3230,7 +3230,7 @@ test "differential SIMD: v128.loadNxM_s/u widening loads sign and zero extend" {
     try body.append(testing.allocator, 0x6A);
     try body.append(testing.allocator, 0x0B);
 
-    var data = [_]u8{0} ** 24;
+    var data = @as([24]u8, @splat(0));
     data[0] = 0x80;
     std.mem.writeInt(u16, data[8..][0..2], 0x8001, .little);
     writeI32Lane(data[16..][0..4], 0x8000_0002);
@@ -3258,7 +3258,7 @@ test "differential SIMD: v128.load32_zero loads low lane and zeroes high lanes" 
     try body.append(testing.allocator, 0x6A);
     try body.append(testing.allocator, 0x0B);
 
-    var data = [_]u8{0xA5} ** 24;
+    var data = @as([24]u8, @splat(0xA5));
     std.mem.writeInt(u32, data[4..][0..4], 291, .little);
 
     const wasm = try buildCustomMemoryModule(testing.allocator, body.items, data[0..]);
@@ -3289,7 +3289,7 @@ test "differential SIMD: v128.load64_zero loads low lane and zeroes high lane" {
     try body.append(testing.allocator, 0x6A);
     try body.append(testing.allocator, 0x0B);
 
-    var data = [_]u8{0xA5} ** 32;
+    var data = @as([32]u8, @splat(0xA5));
     std.mem.writeInt(u64, data[16..][0..8], (@as(u64, 17) << 32) | 7, .little);
 
     const wasm = try buildCustomMemoryModule(testing.allocator, body.items, data[0..]);
@@ -3348,7 +3348,7 @@ test "differential SIMD: v128.loadN_lane updates one lane and preserves others" 
     try body.append(testing.allocator, 0x6A);
     try body.append(testing.allocator, 0x0B);
 
-    var data = [_]u8{0} ** 24;
+    var data = @as([24]u8, @splat(0));
     data[3] = 7;
     std.mem.writeInt(u16, data[4..][0..2], 17, .little);
     std.mem.writeInt(u32, data[8..][0..4], 291, .little);

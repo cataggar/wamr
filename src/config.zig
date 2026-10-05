@@ -21,7 +21,7 @@ pub const unikraft_jit = opt("unikraft_jit", false);
 // ---------------------------------------------------------------------------
 
 /// True when building in Debug mode (mirrors C `BH_DEBUG`).
-pub const bh_debug = builtin.mode == .Debug;
+pub const bh_debug = builtin.mode == .debug;
 
 // ---------------------------------------------------------------------------
 // Architecture detection  (replaces BUILD_TARGET_* macros)
@@ -312,7 +312,7 @@ pub const tags = opt("tags", false);
 pub const component_model = opt("component_model", false);
 
 /// Enable strict canonical ABI ptr/len diagnostics.
-pub const wamr_strict_canon = opt("wamr_strict_canon", builtin.mode != .ReleaseFast);
+pub const wamr_strict_canon = opt("wamr_strict_canon", builtin.mode != .fast);
 
 /// Pass user data pointer to the memory allocator.
 pub const mem_alloc_with_user_data = opt("mem_alloc_with_user_data", false);

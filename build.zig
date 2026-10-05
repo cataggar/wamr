@@ -248,7 +248,7 @@ pub fn build(b: *std.Build) void {
     const skip_coldstart = b.option(bool, "skip-coldstart", "Skip cold-start budget tests (issue #395)") orelse false;
     const verify_ir_triage = b.option(bool, "verify-ir-triage", "Run differential tests with the IR verifier enabled and print per-test verifier failures (issue #627)") orelse false;
     const wamr_strict_canon = b.option(bool, "wamr-strict-canon", "Enable strict canonical ABI ptr/len diagnostics") orelse switch (optimize) {
-        .ReleaseFast => false,
+        .fast => false,
         else => true,
     };
     options.addOption(bool, "wamr_strict_canon", wamr_strict_canon);
@@ -452,7 +452,7 @@ pub fn build(b: *std.Build) void {
     // wabt's root.zig consumes).
     const wabt_dep = b.dependency("wabt", .{
         .target = target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
     });
 
     const wabt_build_options = b.addOptions();
@@ -461,14 +461,14 @@ pub fn build(b: *std.Build) void {
     const wabt_module = b.createModule(.{
         .root_source_file = wabt_dep.path("src/root.zig"),
         .target = target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
     });
     wabt_module.addImport("build_options", wabt_build_options.createModule());
 
     const wabt_host_module = b.createModule(.{
         .root_source_file = wabt_dep.path("src/root.zig"),
         .target = b.graph.host,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
     });
     wabt_host_module.addImport("build_options", wabt_build_options.createModule());
     @import("build/native_aot.zig").addTests(b, wamrc, lib_module, wabt_host_module);
@@ -476,7 +476,7 @@ pub fn build(b: *std.Build) void {
     const thread_fixture_generator_module = b.createModule(.{
         .root_source_file = b.path("tests/wasi-threads/generate.zig"),
         .target = b.graph.host,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
     });
     thread_fixture_generator_module.addImport("wabt", wabt_host_module);
     const thread_fixture_generator = b.addExecutable(.{
@@ -534,7 +534,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/wasi-threads/run_bounded.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .link_libc = if (b.graph.host.result.os.tag.isDarwin()) true else null,
         }),
     });
@@ -827,7 +827,7 @@ pub fn build(b: *std.Build) void {
     const spec_runner_module = b.createModule(.{
         .root_source_file = b.path("src/tests/run_spec_tests.zig"),
         .target = target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
     });
     spec_runner_module.addImport("config", config_module);
     spec_runner_module.addImport("wamr", lib_module);
@@ -892,8 +892,8 @@ pub fn build(b: *std.Build) void {
     });
     // Point the adapter at the freshly-installed wamr binary so we don't pick
     // up a stale system iwasm.
-    wasi_runner.setEnvironmentVariable("WAMR", b.getInstallPath(.bin, "wamr"));
-    wasi_runner.setEnvironmentVariable("WAMRC", b.getInstallPath(.bin, "wamrc"));
+    @import("build/environment.zig").setPath(wasi_runner, "WAMR", .{ .relative = .{ .base = .install_bin, .sub_path = "wamr" } });
+    @import("build/environment.zig").setPath(wasi_runner, "WAMRC", .{ .relative = .{ .base = .install_bin, .sub_path = "wamrc" } });
     wasi_runner.step.dependOn(b.getInstallStep());
     const wasi_testsuite_step = b.step(
         "wasi-testsuite",
@@ -922,8 +922,8 @@ pub fn build(b: *std.Build) void {
         "--expectations",
         "tests/wasi-p3-testsuite-expectations.toml",
     });
-    wasi_p3_runner.setEnvironmentVariable("WAMR", b.getInstallPath(.bin, "wamr"));
-    wasi_p3_runner.setEnvironmentVariable("WAMRC", b.getInstallPath(.bin, "wamrc"));
+    @import("build/environment.zig").setPath(wasi_p3_runner, "WAMR", .{ .relative = .{ .base = .install_bin, .sub_path = "wamr" } });
+    @import("build/environment.zig").setPath(wasi_p3_runner, "WAMRC", .{ .relative = .{ .base = .install_bin, .sub_path = "wamrc" } });
     wasi_p3_runner.step.dependOn(b.getInstallStep());
     const wasi_p3_testsuite_step = b.step(
         "wasi-p3-testsuite",
@@ -938,8 +938,8 @@ pub fn build(b: *std.Build) void {
         "python3",
         "tests/wasi-p3-unfiltered.py",
     });
-    wasi_p3_unfiltered_runner.setEnvironmentVariable("WAMR", b.getInstallPath(.bin, "wamr"));
-    wasi_p3_unfiltered_runner.setEnvironmentVariable("WAMRC", b.getInstallPath(.bin, "wamrc"));
+    @import("build/environment.zig").setPath(wasi_p3_unfiltered_runner, "WAMR", .{ .relative = .{ .base = .install_bin, .sub_path = "wamr" } });
+    @import("build/environment.zig").setPath(wasi_p3_unfiltered_runner, "WAMRC", .{ .relative = .{ .base = .install_bin, .sub_path = "wamrc" } });
     wasi_p3_unfiltered_runner.setEnvironmentVariable("WAMR_TESTSUITE_TIMEOUT", "30");
     wasi_p3_unfiltered_runner.step.dependOn(b.getInstallStep());
     const wasi_p3_unfiltered_step = b.step(
@@ -978,8 +978,8 @@ pub fn build(b: *std.Build) void {
             "--expectations",
             "tests/wasi-testsuite-expectations.toml",
         });
-        wasi_runner_jit.setEnvironmentVariable("WAMR", b.getInstallPath(.bin, "wamr"));
-        wasi_runner_jit.setEnvironmentVariable("WAMRC", b.getInstallPath(.bin, "wamrc"));
+        @import("build/environment.zig").setPath(wasi_runner_jit, "WAMR", .{ .relative = .{ .base = .install_bin, .sub_path = "wamr" } });
+        @import("build/environment.zig").setPath(wasi_runner_jit, "WAMRC", .{ .relative = .{ .base = .install_bin, .sub_path = "wamrc" } });
         wasi_runner_jit.setEnvironmentVariable("WAMR_JIT_TESTSUITE", "1");
         wasi_runner_jit.step.dependOn(b.getInstallStep());
         const wasi_testsuite_jit_step = b.step(
@@ -998,8 +998,8 @@ pub fn build(b: *std.Build) void {
             "--expectations",
             "tests/wasi-p3-testsuite-expectations.toml",
         });
-        wasi_p3_runner_jit.setEnvironmentVariable("WAMR", b.getInstallPath(.bin, "wamr"));
-        wasi_p3_runner_jit.setEnvironmentVariable("WAMRC", b.getInstallPath(.bin, "wamrc"));
+        @import("build/environment.zig").setPath(wasi_p3_runner_jit, "WAMR", .{ .relative = .{ .base = .install_bin, .sub_path = "wamr" } });
+        @import("build/environment.zig").setPath(wasi_p3_runner_jit, "WAMRC", .{ .relative = .{ .base = .install_bin, .sub_path = "wamrc" } });
         wasi_p3_runner_jit.setEnvironmentVariable("WAMR_JIT_TESTSUITE", "1");
         // JIT compiles every fixture from scratch on every invocation
         // (no cross-process cache like the `.cwasm` mtime check the
@@ -1020,8 +1020,8 @@ pub fn build(b: *std.Build) void {
             "python3",
             "tests/wasi-p3-unfiltered.py",
         });
-        wasi_p3_unfiltered_runner_jit.setEnvironmentVariable("WAMR", b.getInstallPath(.bin, "wamr"));
-        wasi_p3_unfiltered_runner_jit.setEnvironmentVariable("WAMRC", b.getInstallPath(.bin, "wamrc"));
+        @import("build/environment.zig").setPath(wasi_p3_unfiltered_runner_jit, "WAMR", .{ .relative = .{ .base = .install_bin, .sub_path = "wamr" } });
+        @import("build/environment.zig").setPath(wasi_p3_unfiltered_runner_jit, "WAMRC", .{ .relative = .{ .base = .install_bin, .sub_path = "wamrc" } });
         wasi_p3_unfiltered_runner_jit.setEnvironmentVariable("WAMR_JIT_TESTSUITE", "1");
         wasi_p3_unfiltered_runner_jit.setEnvironmentVariable("WAMR_TESTSUITE_TIMEOUT", "120");
         wasi_p3_unfiltered_runner_jit.step.dependOn(b.getInstallStep());
@@ -1074,14 +1074,13 @@ pub fn build(b: *std.Build) void {
     // then classifies deltas as regressions vs fixture/runtime bugs.
     // Output JSONs live under `zig-out/test-reports/` so CI can upload
     // them as artifacts on failure.
-    const reports_dir = b.pathJoin(&.{ b.install_path, "test-reports" });
     const parity_orchestrator = b.addSystemCommand(&.{
         "python3",
         "scripts/wasi-p3-parity.py",
         "--output-dir",
-        reports_dir,
     });
-    parity_orchestrator.setEnvironmentVariable("WAMR", b.getInstallPath(.bin, "wamr"));
+    parity_orchestrator.addDirectoryArg(.{ .relative = .{ .base = .install_prefix, .sub_path = "test-reports" } });
+    @import("build/environment.zig").setPath(parity_orchestrator, "WAMR", .{ .relative = .{ .base = .install_bin, .sub_path = "wamr" } });
     parity_orchestrator.step.dependOn(b.getInstallStep());
     const wasi_p3_parity_step = b.step(
         "wasi-p3-parity",
@@ -1384,7 +1383,7 @@ pub fn build(b: *std.Build) void {
         const smoke_out = wamrc_run_smoke.addOutputFileArg("noop.cwasm");
         _ = smoke_out;
         wamrc_run_smoke.addFileArg(b.path("tests/coldstart/noop.wasm"));
-        wamrc_run_smoke.setEnvironmentVariable("WAMR_BIN", b.getInstallPath(.bin, "wamr"));
+        @import("build/environment.zig").setPath(wamrc_run_smoke, "WAMR_BIN", .{ .relative = .{ .base = .install_bin, .sub_path = "wamr" } });
         wamrc_run_smoke.step.dependOn(b.getInstallStep());
         wamrc_run_smoke.expectExitCode(0);
         test_step.dependOn(&wamrc_run_smoke.step);
@@ -1477,7 +1476,7 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("tests/component-http-shutdown/driver.zig"),
                 .target = b.graph.host,
-                .optimize = .Debug,
+                .optimize = .debug,
             }),
         });
         const run_http_shutdown = b.addRunArtifact(http_shutdown_driver);
@@ -1515,7 +1514,7 @@ pub fn build(b: *std.Build) void {
             run.addArg("-o");
             _ = run.addOutputFileArg(b.fmt("760-{s}.cwasm", .{f.name}));
             run.addFileArg(b.path(b.fmt("tests/regressions/760-aot-cli-exit/{s}", .{f.name})));
-            run.setEnvironmentVariable("WAMR_BIN", b.getInstallPath(.bin, "wamr"));
+            @import("build/environment.zig").setPath(run, "WAMR_BIN", .{ .relative = .{ .base = .install_bin, .sub_path = "wamr" } });
             run.step.dependOn(b.getInstallStep());
             run.expectExitCode(f.expected_exit);
             test_step.dependOn(&run.step);
@@ -1534,7 +1533,7 @@ pub fn build(b: *std.Build) void {
         run.addArg("-o");
         _ = run.addOutputFileArg("1008-printf-decimal.cwasm");
         run.addFileArg(b.path("tests/regressions/1008-aot-magic-u32/printf-decimal.wasm"));
-        run.setEnvironmentVariable("WAMR_BIN", b.getInstallPath(.bin, "wamr"));
+        @import("build/environment.zig").setPath(run, "WAMR_BIN", .{ .relative = .{ .base = .install_bin, .sub_path = "wamr" } });
         run.step.dependOn(b.getInstallStep());
         run.expectExitCode(0);
         run.expectStdOutEqual(
@@ -1598,7 +1597,7 @@ pub fn build(b: *std.Build) void {
         const verify_no_wasmtime = b.addRunArtifact(wamrc);
         verify_no_wasmtime.addArgs(&.{ "verify", "--wasmtime-bin=/dev/null/nope-wamrc-757" });
         verify_no_wasmtime.addFileArg(b.path("tests/regressions/760-aot-cli-exit/exit-ok.wasm"));
-        verify_no_wasmtime.setEnvironmentVariable("WAMR_BIN", b.getInstallPath(.bin, "wamr"));
+        @import("build/environment.zig").setPath(verify_no_wasmtime, "WAMR_BIN", .{ .relative = .{ .base = .install_bin, .sub_path = "wamr" } });
         verify_no_wasmtime.step.dependOn(b.getInstallStep());
         verify_no_wasmtime.expectExitCode(2);
         test_step.dependOn(&verify_no_wasmtime.step);
@@ -1882,7 +1881,7 @@ pub fn build(b: *std.Build) void {
         const coldstart_test_module = b.createModule(.{
             .root_source_file = b.path("src/tests/coldstart_test.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
         });
         coldstart_test_module.addImport("wamr", lib_module);
         coldstart_test_module.addImport("coldstart_options", coldstart_options.createModule());
@@ -1914,7 +1913,7 @@ pub fn build(b: *std.Build) void {
     const bench_module = b.createModule(.{
         .root_source_file = b.path("src/bench_codegen.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = .fast,
         // Darwin's clock_gettime lives in libSystem; the timer needs libc
         // linked. Linux uses a raw syscall and Windows uses ntdll, so libc
         // is only required here.
@@ -1954,7 +1953,7 @@ pub fn build(b: *std.Build) void {
     const coremark_module = b.createModule(.{
         .root_source_file = b.path("src/tests/coremark_aot_runner.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = .fast,
     });
     coremark_module.addImport("wamr", lib_module);
 
@@ -1983,7 +1982,7 @@ pub fn build(b: *std.Build) void {
     const coremark_profile_module = b.createModule(.{
         .root_source_file = b.path("src/tests/coremark_profile_runner.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = .fast,
     });
     coremark_profile_module.addImport("wamr", lib_module);
 
@@ -2008,7 +2007,7 @@ pub fn build(b: *std.Build) void {
     const simd_bench_module = b.createModule(.{
         .root_source_file = b.path("src/tests/simd_bench_runner.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = .fast,
     });
     simd_bench_module.addImport("wamr", lib_module);
 
@@ -2026,7 +2025,7 @@ pub fn build(b: *std.Build) void {
         const run_simd_bench = b.addRunArtifact(simd_bench_exe);
         run_simd_bench.addArg("--iterations");
         run_simd_bench.addArg("10000");
-        if (b.args) |args| run_simd_bench.addArgs(args);
+        run_simd_bench.addPassthruArgs();
         simd_bench_step.dependOn(&run_simd_bench.step);
     }
 
@@ -2038,7 +2037,7 @@ pub fn build(b: *std.Build) void {
     const wasi_streams_bench_module = b.createModule(.{
         .root_source_file = b.path("tests/benchmarks/wasi-streams/microbench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = .fast,
     });
     wasi_streams_bench_module.addImport("wamr", lib_module);
     const wasi_streams_bench_exe = b.addExecutable(.{
@@ -2051,7 +2050,7 @@ pub fn build(b: *std.Build) void {
         "Run the wasi:streams zero-copy microbench (#583 B2)",
     );
     const run_wasi_streams_bench = b.addRunArtifact(wasi_streams_bench_exe);
-    if (b.args) |args| run_wasi_streams_bench.addArgs(args);
+    run_wasi_streams_bench.addPassthruArgs();
     wasi_streams_bench_step.dependOn(&run_wasi_streams_bench.step);
 
     // ── WASI host-path micro-bench / regression detector (#583 W11-6) ─
@@ -2067,7 +2066,7 @@ pub fn build(b: *std.Build) void {
     const wasi_microbench_module = b.createModule(.{
         .root_source_file = b.path("tests/benchmarks/wasi-microbench/microbench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = .fast,
     });
     wasi_microbench_module.addImport("wamr", lib_module);
     const wasi_microbench_exe = b.addExecutable(.{
@@ -2080,7 +2079,7 @@ pub fn build(b: *std.Build) void {
         "Run the WASI host-path microbench + regression check (#583 W11-6)",
     );
     const run_wasi_microbench = b.addRunArtifact(wasi_microbench_exe);
-    if (b.args) |args| run_wasi_microbench.addArgs(args);
+    run_wasi_microbench.addPassthruArgs();
     wasi_microbench_step.dependOn(&run_wasi_microbench.step);
 
     const fuzz_step = b.step("fuzz", "Build fuzz harnesses (loader, component-loader, interp, aot, diff, canon, wasi)");
@@ -2457,7 +2456,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/component-http-smoke/driver.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     const run_http_smoke = b.addRunArtifact(http_smoke_driver);
@@ -2509,7 +2508,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile, aot_br
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/component-http-petstore-smoke/driver.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     const run_petstore_smoke = b.addRunArtifact(petstore_smoke_driver);
@@ -2618,7 +2617,7 @@ fn addAotThreadFixtureExpected(
         run.addArg("--");
         run.addArg(b.fmt("--map-dir={s}", .{mapping}));
     }
-    run.setEnvironmentVariable("WAMR_BIN", b.getInstallPath(.bin, "wamr"));
+    @import("build/environment.zig").setPath(run, "WAMR_BIN", .{ .relative = .{ .base = .install_bin, .sub_path = "wamr" } });
     run.step.dependOn(b.getInstallStep());
     run.expectExitCode(expected_exit);
     if (expected_stdout) |stdout| run.expectStdOutEqual(stdout);
@@ -2646,11 +2645,12 @@ fn wireComponentRun(
 ) void {
     _ = wamr_exe;
     if (!opts.skip_wamr) {
-        const wamrc_path = b.getInstallPath(.bin, "wamrc");
-        const wamr_path = b.getInstallPath(.bin, "wamr");
-        const run = b.addSystemCommand(&.{ wamrc_path, "run" });
+        const run = b.addSystemCommand(&.{"wamrc"});
+        run.argv.clearRetainingCapacity();
+        run.addFileArg(.{ .relative = .{ .base = .install_bin, .sub_path = "wamrc" } });
+        run.addArg("run");
         run.addFileArg(component);
-        run.setEnvironmentVariable("WAMR_BIN", wamr_path);
+        @import("build/environment.zig").setPath(run, "WAMR_BIN", .{ .relative = .{ .base = .install_bin, .sub_path = "wamr" } });
         run.step.dependOn(b.getInstallStep());
         run.expectExitCode(expected_exit);
         run.expectStdOutEqual(expected_stdout);

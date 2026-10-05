@@ -20,7 +20,7 @@ pub const Handle = u32;
 pub const handle_index_bits = 24;
 pub const handle_generation_bits = @bitSizeOf(Handle) - handle_index_bits;
 pub const max_handle_index: Handle = (1 << handle_index_bits) - 1;
-pub const HandleGeneration = std.meta.Int(.unsigned, handle_generation_bits);
+pub const HandleGeneration = @Int(.unsigned, handle_generation_bits);
 
 pub fn handleIndex(handle: Handle) Handle {
     return handle & max_handle_index;
@@ -45,7 +45,7 @@ pub const LockRank = struct {
     pub const core_table: u16 = 300;
 };
 
-const debug_lock_tracking = builtin.mode == .Debug;
+const debug_lock_tracking = builtin.mode == .debug;
 const max_debug_lock_depth = 32;
 
 const DebugLockStack = struct {
@@ -421,14 +421,14 @@ pub fn StableHandleTableForStart(
             refs: RefCount = RefCount.init(1),
             state: if (enabled) std.atomic.Value(u8) else NodeState =
                 if (enabled)
-                    std.atomic.Value(u8).init(@intFromEnum(NodeState.published))
+                    std.atomic.Value(u8).init(@backingInt(NodeState.published))
                 else
                     .published,
             value: T,
 
             fn setState(self: *Node, new_state: NodeState) void {
                 if (comptime enabled) {
-                    self.state.store(@intFromEnum(new_state), .release);
+                    self.state.store(@backingInt(new_state), .release);
                 } else {
                     self.state = new_state;
                 }
@@ -436,7 +436,7 @@ pub fn StableHandleTableForStart(
 
             fn getState(self: *const Node) NodeState {
                 if (comptime enabled) {
-                    return @enumFromInt(self.state.load(.acquire));
+                    return @fromBackingInt(@intCast(self.state.load(.acquire)));
                 }
                 return self.state;
             }

@@ -34,7 +34,7 @@ pub fn getVerboseLevel() Level {
 /// When `config.log` is `false` the entire function body is compiled away.
 pub fn log(level: Level, comptime fmt: []const u8, args: anytype) void {
     if (!config.log) return;
-    if (@intFromEnum(level) > @intFromEnum(verbose_level)) return;
+    if (@backingInt(level) > @backingInt(verbose_level)) return;
 
     const prefix: []const u8 = switch (level) {
         .fatal => "[FATAL] ",
@@ -91,9 +91,9 @@ test "setVerboseLevel / getVerboseLevel round-trips" {
 }
 
 test "level enum ordinals match C LogLevel values" {
-    try std.testing.expectEqual(@as(u3, 0), @intFromEnum(Level.fatal));
-    try std.testing.expectEqual(@as(u3, 1), @intFromEnum(Level.err));
-    try std.testing.expectEqual(@as(u3, 2), @intFromEnum(Level.warning));
-    try std.testing.expectEqual(@as(u3, 3), @intFromEnum(Level.debug));
-    try std.testing.expectEqual(@as(u3, 4), @intFromEnum(Level.verbose));
+    try std.testing.expectEqual(@as(u3, 0), @backingInt(Level.fatal));
+    try std.testing.expectEqual(@as(u3, 1), @backingInt(Level.err));
+    try std.testing.expectEqual(@as(u3, 2), @backingInt(Level.warning));
+    try std.testing.expectEqual(@as(u3, 3), @backingInt(Level.debug));
+    try std.testing.expectEqual(@as(u3, 4), @backingInt(Level.verbose));
 }

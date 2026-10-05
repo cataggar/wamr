@@ -25,7 +25,7 @@ See `tests/fuzz/OSS_FUZZ.md` for the readiness analysis.
 
 | File | Role |
 | --- | --- |
-| `Dockerfile` | Mirrors `gcr.io/oss-fuzz-base/base-builder` and pins Zig 0.16.0 with a checksum. |
+| `Dockerfile` | Mirrors `gcr.io/oss-fuzz-base/base-builder` and pins Zig 0.17.0 with a checksum. |
 | `build.sh` | Runs `zig build fuzz-oss` and links the resulting `libfuzz-oss-*.a` archives against `$LIB_FUZZING_ENGINE` to produce libFuzzer binaries. Packages seed corpora as `*_seed_corpus.zip`. |
 
 The shim sources live next to the CLI harnesses:
@@ -46,7 +46,7 @@ The Zig side of the integration (the static archives) is reproducible
 without Docker:
 
 ```sh
-zig build fuzz-oss -Doptimize=ReleaseSafe
+zig build fuzz-oss -Doptimize=safe
 ls zig-out/lib/libfuzz-oss-*.a
 nm --defined-only zig-out/lib/libfuzz-oss-loader.a | grep LLVMFuzzer
 ```

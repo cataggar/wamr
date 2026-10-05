@@ -670,7 +670,7 @@ test "#894 lazy-JIT: concurrent first calls to the same lazy export compile exac
 
     var barrier = SpinBarrier{};
     var contexts: [ThreadCount]LazyCallThreadCtx = undefined;
-    var results: [ThreadCount]LazyCallThreadResult = [_]LazyCallThreadResult{.{}} ** ThreadCount;
+    var results: [ThreadCount]LazyCallThreadResult = @splat(.{});
     var threads: [ThreadCount]std.Thread = undefined;
 
     for (0..ThreadCount) |i| {
@@ -733,7 +733,7 @@ test "#894 lazy-JIT: failed contended compile resets the slot to pending so a wa
 
     var barrier = SpinBarrier{};
     var contexts: [ThreadCount]LazyCallThreadCtx = undefined;
-    var results: [ThreadCount]LazyCallThreadResult = [_]LazyCallThreadResult{.{}} ** ThreadCount;
+    var results: [ThreadCount]LazyCallThreadResult = @splat(.{});
     var threads: [ThreadCount]std.Thread = undefined;
 
     for (0..ThreadCount) |i| {
@@ -1059,7 +1059,7 @@ fn measureCompileMinNs(
 }
 
 const PassProbe = struct {
-    eager_counts: [4]usize = [_]usize{0} ** 4,
+    eager_counts: [4]usize = @as([4]usize, @splat(0)),
 
     fn callback(ctx: *anyopaque, info: passes.DumpInfo) !void {
         if (std.mem.eql(u8, info.pass_name, "inlineSmallFunctions")) return;

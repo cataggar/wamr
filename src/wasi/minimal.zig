@@ -240,7 +240,7 @@ pub const Context = struct {
     /// 32 bits. Validate the import signature with resolve before dispatching.
     pub fn dispatch(self: *Context, mem: []u8, function: Function, args: []const u64) error{InvalidArguments}!Outcome {
         if (self.exit_code) |code| return .{ .exited = code };
-        if (args.len != imports[@intFromEnum(function)].params.len) return error.InvalidArguments;
+        if (args.len != imports[@backingInt(function)].params.len) return error.InvalidArguments;
         const errno: Errno = switch (function) {
             .fd_prestat_get, .fd_prestat_dir_name => .badf,
             .environ_sizes_get => self.environSizesGet(mem, low(args[0]), low(args[1])),
@@ -302,7 +302,7 @@ pub fn resolve(namespace: []const u8, name: []const u8, params: []const u8, resu
             std.mem.eql(u8, name, entry.name) and
             std.mem.eql(u8, params, entry.params) and
             std.mem.eql(u8, results, entry.results))
-            return @enumFromInt(index);
+            return @fromBackingInt(@intCast(index));
     }
     return null;
 }
@@ -312,7 +312,7 @@ fn low(value: u64) u32 {
 }
 
 fn checkedErrno(errno: Errno) Errno {
-    return if (@intFromEnum(errno) <= 76) errno else .io;
+    return if (@backingInt(errno) <= 76) errno else .io;
 }
 
 fn span(mem: []u8, pointer: u32, length: u64) ?[]u8 {
