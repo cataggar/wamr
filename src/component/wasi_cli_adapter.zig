@@ -28,6 +28,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
+const net_io = @import("../wasi/net_io.zig");
 
 const build_options = @import("config");
 
@@ -930,7 +931,7 @@ fn httpP3BuildClientSendErrIv(
 ) !InterfaceValue {
     const err_payload = try allocator.create(InterfaceValue);
     err_payload.* = .{
-        .variant_val = .{ .discriminant = @intFromEnum(code), .payload = null },
+        .variant_val = .{ .discriminant = @backingInt(code), .payload = null },
     };
     return InterfaceValue{ .result_val = .{ .is_ok = false, .payload = err_payload } };
 }
@@ -2160,7 +2161,7 @@ fn lowerIpAddress(allocator: Allocator, addr: std.Io.net.IpAddress) !InterfaceVa
             errdefer allocator.destroy(tup);
             tup.* = .{ .tuple_val = octets };
             return .{ .variant_val = .{
-                .discriminant = @intFromEnum(IpAddressFamily.ipv4),
+                .discriminant = @backingInt(IpAddressFamily.ipv4),
                 .payload = tup,
             } };
         },
@@ -2177,7 +2178,7 @@ fn lowerIpAddress(allocator: Allocator, addr: std.Io.net.IpAddress) !InterfaceVa
             errdefer allocator.destroy(tup);
             tup.* = .{ .tuple_val = groups };
             return .{ .variant_val = .{
-                .discriminant = @intFromEnum(IpAddressFamily.ipv6),
+                .discriminant = @backingInt(IpAddressFamily.ipv6),
                 .payload = tup,
             } };
         },
@@ -2282,7 +2283,7 @@ fn lowerIpSocketAddress(allocator: Allocator, addr: std.Io.net.IpAddress) !Inter
             errdefer allocator.destroy(rec);
             rec.* = .{ .record_val = fields };
             return .{ .variant_val = .{
-                .discriminant = @intFromEnum(IpAddressFamily.ipv4),
+                .discriminant = @backingInt(IpAddressFamily.ipv4),
                 .payload = rec,
             } };
         },
@@ -2306,7 +2307,7 @@ fn lowerIpSocketAddress(allocator: Allocator, addr: std.Io.net.IpAddress) !Inter
             errdefer allocator.destroy(rec);
             rec.* = .{ .record_val = fields };
             return .{ .variant_val = .{
-                .discriminant = @intFromEnum(IpAddressFamily.ipv6),
+                .discriminant = @backingInt(IpAddressFamily.ipv6),
                 .payload = rec,
             } };
         },
@@ -2468,7 +2469,7 @@ fn bindAndGetsockname(
                 .family = std.posix.AF.INET,
                 .port = std.mem.nativeToBig(u16, v4.port),
                 .addr = @bitCast(v4.bytes),
-                .zero = [_]u8{0} ** 8,
+                .zero = @as([8]u8, @splat(0)),
             };
             addr_len = @sizeOf(std.posix.sockaddr.in);
         },
@@ -2523,7 +2524,7 @@ fn bindAndGetsockname(
 
 // ── Windows direct-Winsock externs (#583 A6) ────────────────────────
 //
-// `std.os.windows.ws2_32` in Zig 0.16.0 is a *types-and-constants*
+// `std.os.windows.ws2_32` in Zig 0.17.0 is a *types-and-constants*
 // namespace — it intentionally exposes none of the actual `ws2_32.dll`
 // procedure exports (`socket`, `bind`, `setsockopt`, `getsockname`,
 // `closesocket`, `WSAStartup`, `WSAGetLastError`) because the stdlib
@@ -2776,7 +2777,7 @@ fn ipAddressToPosixStorage(
                 .family = std.posix.AF.INET,
                 .port = std.mem.nativeToBig(u16, v4.port),
                 .addr = @bitCast(v4.bytes),
-                .zero = [_]u8{0} ** 8,
+                .zero = @as([8]u8, @splat(0)),
             };
             addr_len = @sizeOf(std.posix.sockaddr.in);
         },
@@ -2936,7 +2937,7 @@ fn sendUdpDatagram(
         // issues a `sendmsg` with an empty iovec and returns 0, which
         // equals `data.len`, so the length check below still passes.
         const chunks = [_][]const u8{data};
-        const sent = try io.vtable.netWrite(io.userdata, socket.handle, &.{}, &chunks, 1);
+        const sent = try net_io.write(io, socket.handle, &.{}, &chunks, 1);
         // Datagram sends are atomic: a success returns the whole
         // payload length. A short count should not happen for
         // SOCK_DGRAM, but if it ever did the datagram was truncated,
@@ -3199,7 +3200,7 @@ fn validateRemoteForSend(addr: std.Io.net.IpAddress, family: IpAddressFamily) ?S
         },
         .ip6 => |v6| {
             if (family != .ipv6) return .invalid_argument;
-            if (std.mem.eql(u8, &v6.bytes, &(.{0} ** 16))) return .invalid_argument;
+            if (std.mem.eql(u8, &v6.bytes, &@as([16]u8, @splat(0)))) return .invalid_argument;
             if (v6.port == 0) return .invalid_argument;
         },
     }
@@ -3618,7 +3619,7 @@ fn httpClientConnectWithTimeout(
     }
 
     var host_name_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-    const host = try uri.getHost(&host_name_buffer);
+    const host = try std.Io.net.HostName.fromUri(uri, &host_name_buffer);
     const port: u16 = uri.port orelse switch (protocol) {
         .plain => 80,
         .tls => 443,
@@ -4024,7 +4025,7 @@ fn httpClientLowLevelFetch(
             }
         }
 
-        const status_code: u16 = @intFromEnum(response.head.status);
+        const status_code: u16 = @backingInt(response.head.status);
 
         // Pre-body-read sync point: response head + headers captured;
         // bail before draining the body if the guest cancelled. Any
@@ -5005,7 +5006,7 @@ const InboundHttpResponseSession = struct {
     terminal_epoch: std.atomic.Value(u32) = .init(0),
     callback_epoch: std.atomic.Value(u32) = .init(0),
     terminal: std.atomic.Value(u32) =
-        .init(@intFromEnum(HttpLiveTerminal.running)),
+        .init(@backingInt(HttpLiveTerminal.running)),
     callbacks_accepting: std.atomic.Value(bool) = .init(true),
     callback_refs: std.atomic.Value(u32) = .init(0),
     output_started: std.atomic.Value(bool) = .init(false),
@@ -5096,7 +5097,7 @@ const InboundHttpResponseSession = struct {
     }
 
     fn currentTerminal(self: *const InboundHttpResponseSession) HttpLiveTerminal {
-        return @enumFromInt(self.terminal.load(.acquire));
+        return @fromBackingInt(@intCast(self.terminal.load(.acquire)));
     }
 
     fn hasOutputStarted(self: *const InboundHttpResponseSession) bool {
@@ -5138,7 +5139,7 @@ const InboundHttpResponseSession = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const code = self.response_error_code orelse .internal_error;
-        return WasiCliAdapter.httpStatusFromError(@intFromEnum(code));
+        return WasiCliAdapter.httpStatusFromError(@backingInt(code));
     }
 
     fn canReuseConnection(self: *InboundHttpResponseSession) bool {
@@ -5268,8 +5269,8 @@ const InboundHttpResponseSession = struct {
     ) bool {
         if (terminal == .running) return false;
         if (self.terminal.cmpxchgStrong(
-            @intFromEnum(HttpLiveTerminal.running),
-            @intFromEnum(terminal),
+            @backingInt(HttpLiveTerminal.running),
+            @backingInt(terminal),
             .acq_rel,
             .acquire,
         ) != null) return false;
@@ -5587,10 +5588,10 @@ const InboundHttpResponseSession = struct {
             .failed => {
                 self.mutex.lock();
                 self.response_error_code = if (trailers.error_code) |code|
-                    @enumFromInt(@min(
+                    @fromBackingInt(@intCast(@min(
                         code,
-                        @intFromEnum(HttpErrorCode.internal_error),
-                    ))
+                        @backingInt(HttpErrorCode.internal_error),
+                    )))
                 else
                     .HTTP_response_incomplete;
                 self.mutex.unlock();
@@ -5927,10 +5928,10 @@ const InboundHttpResponseSession = struct {
                 self.mutex.lock();
                 self.trailer_state = .failed;
                 self.response_error_code = if (snapshot.error_code) |code|
-                    @enumFromInt(@min(
+                    @fromBackingInt(@intCast(@min(
                         code,
-                        @intFromEnum(HttpErrorCode.internal_error),
-                    ))
+                        @backingInt(HttpErrorCode.internal_error),
+                    )))
                 else
                     .HTTP_response_incomplete;
                 self.mutex.unlock();
@@ -10672,8 +10673,8 @@ pub const WasiCliAdapter = struct {
         // but trapping the whole component over a log line would be
         // disproportionate. Mirror what real loggers do (drop + carry
         // on).
-        if (disc > @intFromEnum(WasiLogLevel.critical)) return;
-        const level: WasiLogLevel = @enumFromInt(disc);
+        if (disc > @backingInt(WasiLogLevel.critical)) return;
+        const level: WasiLogLevel = @fromBackingInt(@intCast(disc));
         const ctx_pl = switch (args[1]) {
             .string => |pl| pl,
             else => return error.InvalidArgs,
@@ -10685,7 +10686,7 @@ pub const WasiCliAdapter = struct {
         // Filter below threshold *before* reading guest memory — saves
         // the read on hot trace-level calls in release builds where
         // the filter is set to `.info` or higher.
-        if (@intFromEnum(level) < @intFromEnum(self.log_level)) return;
+        if (@backingInt(level) < @backingInt(self.log_level)) return;
         const ctx_bytes = ci.readGuestBytes(ctx_pl.ptr, ctx_pl.len) orelse
             return error.OutOfBoundsMemory;
         const msg_bytes = ci.readGuestBytes(msg_pl.ptr, msg_pl.len) orelse
@@ -10703,7 +10704,7 @@ pub const WasiCliAdapter = struct {
         message_bytes: []const u8,
         allocator: Allocator,
     ) !void {
-        if (@intFromEnum(level) < @intFromEnum(self.log_level)) return;
+        if (@backingInt(level) < @backingInt(self.log_level)) return;
         // Format once, then emit to both std.log and the adapter's
         // stderr sink. The `wasi_guest` scope tag lets embedders'
         // `std.log.logFn` filter / route guest log lines distinctly
@@ -11484,7 +11485,7 @@ pub const WasiCliAdapter = struct {
             }
             _ = setPendingHttpFutureState(
                 entry,
-                .{ .ready_err = @intFromEnum(HttpErrorCode.HTTP_request_denied) },
+                .{ .ready_err = @backingInt(HttpErrorCode.HTTP_request_denied) },
             );
             return;
         }
@@ -11495,7 +11496,7 @@ pub const WasiCliAdapter = struct {
                     freeOwnedHttpHeaders(self.allocator, s.headers);
                     _ = setPendingHttpFutureState(
                         entry,
-                        .{ .ready_err = @intFromEnum(HttpErrorCode.internal_error) },
+                        .{ .ready_err = @backingInt(HttpErrorCode.internal_error) },
                     );
                     return;
                 };
@@ -11513,7 +11514,7 @@ pub const WasiCliAdapter = struct {
                     self.allocator.destroy(resp_fields);
                     _ = setPendingHttpFutureState(
                         entry,
-                        .{ .ready_err = @intFromEnum(HttpErrorCode.internal_error) },
+                        .{ .ready_err = @backingInt(HttpErrorCode.internal_error) },
                     );
                     return;
                 };
@@ -11522,7 +11523,7 @@ pub const WasiCliAdapter = struct {
                     std.debug.assert(self.http_fields_table.remove(resp_fields_handle));
                     _ = setPendingHttpFutureState(
                         entry,
-                        .{ .ready_err = @intFromEnum(HttpErrorCode.internal_error) },
+                        .{ .ready_err = @backingInt(HttpErrorCode.internal_error) },
                     );
                     return;
                 };
@@ -11538,7 +11539,7 @@ pub const WasiCliAdapter = struct {
                     std.debug.assert(self.http_fields_table.remove(resp_fields_handle));
                     _ = setPendingHttpFutureState(
                         entry,
-                        .{ .ready_err = @intFromEnum(HttpErrorCode.internal_error) },
+                        .{ .ready_err = @backingInt(HttpErrorCode.internal_error) },
                     );
                     return;
                 };
@@ -11550,7 +11551,7 @@ pub const WasiCliAdapter = struct {
             .failure => |code| {
                 _ = setPendingHttpFutureState(
                     entry,
-                    .{ .ready_err = @intFromEnum(code) },
+                    .{ .ready_err = @backingInt(code) },
                 );
             },
         }
@@ -13958,7 +13959,7 @@ pub const WasiCliAdapter = struct {
     /// `error-code` variant `code`. Caller-owned via `allocator`.
     fn fsResultErr(allocator: Allocator, code: FsErrorCode) !InterfaceValue {
         const payload = try allocator.create(InterfaceValue);
-        payload.* = .{ .variant_val = .{ .discriminant = @intFromEnum(code), .payload = null } };
+        payload.* = .{ .variant_val = .{ .discriminant = @backingInt(code), .payload = null } };
         return .{ .result_val = .{ .is_ok = false, .payload = payload } };
     }
 
@@ -14054,7 +14055,7 @@ pub const WasiCliAdapter = struct {
             .file => .regular_file,
         };
         const variant = InterfaceValue{ .variant_val = .{
-            .discriminant = @intFromEnum(dt),
+            .discriminant = @backingInt(dt),
             .payload = null,
         } };
         results[0] = try fsResultOk(allocator, variant);
@@ -14132,7 +14133,7 @@ pub const WasiCliAdapter = struct {
         // Dir handle but `dir.stat` failed (or unsupported on this target).
         // Fall back to a minimal record with timestamps as `option::none`.
         const fields = try allocator.alloc(InterfaceValue, 6);
-        fields[0] = .{ .variant_val = .{ .discriminant = @intFromEnum(WasiCliAdapter.DescType.directory), .payload = null } };
+        fields[0] = .{ .variant_val = .{ .discriminant = @backingInt(WasiCliAdapter.DescType.directory), .payload = null } };
         fields[1] = .{ .u64 = 1 };
         fields[2] = .{ .u64 = 0 };
         fields[3] = .{ .option_val = .{ .is_some = false, .payload = null } };
@@ -15919,7 +15920,7 @@ pub const WasiCliAdapter = struct {
 
             const fields = try allocator.alloc(InterfaceValue, 2);
             fields[0] = .{ .variant_val = .{
-                .discriminant = @intFromEnum(dt),
+                .discriminant = @backingInt(dt),
                 .payload = null,
             } };
             fields[1] = .{ .string = .{ .ptr = name_ptr, .len = @intCast(entry_name.len) } };
@@ -16170,7 +16171,7 @@ pub const WasiCliAdapter = struct {
     /// payload. Owned by `ci.allocator`.
     fn fsP3UnitErrPayload(ci: *ComponentInstance, code: FsErrorCode) ![]u8 {
         var err_variant = InterfaceValue{ .variant_val = .{
-            .discriminant = @intFromEnum(code),
+            .discriminant = @backingInt(code),
             .payload = null,
         } };
         const val = InterfaceValue{ .result_val = .{ .is_ok = false, .payload = &err_variant } };
@@ -16857,7 +16858,7 @@ pub const WasiCliAdapter = struct {
                     // reader can synthesize a `NonNull::new_unchecked` UB
                     // on a string-payload variant that should have had a
                     // different disc.
-                    .discriminant = descTypeToP3Disc(@intFromEnum(dt)),
+                    .discriminant = descTypeToP3Disc(@backingInt(dt)),
                     .payload = null,
                 },
             };
@@ -16949,7 +16950,7 @@ pub const WasiCliAdapter = struct {
     /// error-code variant indices.
     fn socketResultErr(allocator: Allocator, code: SocketErrorCode) !InterfaceValue {
         const payload = try allocator.create(InterfaceValue);
-        payload.* = .{ .variant_val = .{ .discriminant = @intFromEnum(code), .payload = null } };
+        payload.* = .{ .variant_val = .{ .discriminant = @backingInt(code), .payload = null } };
         return .{ .result_val = .{ .is_ok = false, .payload = payload } };
     }
 
@@ -17073,7 +17074,7 @@ pub const WasiCliAdapter = struct {
                 const mutable_pl: *InterfaceValue = @constCast(pl);
                 switch (mutable_pl.*) {
                     .variant_val => |*vv| {
-                        const code: SocketErrorCode = @enumFromInt(vv.discriminant);
+                        const code: SocketErrorCode = @fromBackingInt(@intCast(vv.discriminant));
                         vv.discriminant = socketCodeToP3Disc(code);
                     },
                     else => {},
@@ -17421,12 +17422,12 @@ pub const WasiCliAdapter = struct {
         };
         var s_lease = self.lookupSocket(handle) orelse {
             // Unknown rep — default to ipv4 to keep the call total.
-            results[0] = .{ .enum_val = @intFromEnum(IpAddressFamily.ipv4) };
+            results[0] = .{ .enum_val = @backingInt(IpAddressFamily.ipv4) };
             return;
         };
         defer s_lease.release();
         const s = s_lease.value();
-        results[0] = .{ .enum_val = @intFromEnum(s.family) };
+        results[0] = .{ .enum_val = @backingInt(s.family) };
     }
 
     /// `[method]tcp-socket.is-listening: (borrow<tcp-socket>) -> bool`.
@@ -20180,7 +20181,7 @@ pub const WasiCliAdapter = struct {
         if (s.host_socket == null) {
             const wildcard: std.Io.net.IpAddress = switch (s.family) {
                 .ipv4 => .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
-                .ipv6 => .{ .ip6 = .{ .bytes = [_]u8{0} ** 16, .port = 0, .flow = 0 } },
+                .ipv6 => .{ .ip6 = .{ .bytes = @as([16]u8, @splat(0)), .port = 0, .flow = 0 } },
             };
             const host_socket = bindAndGetsockname(wildcard, .dgram, .udp) catch |err| {
                 results[0] = try socketResultErrP3(allocator, mapSocketBindError(err));
@@ -20649,7 +20650,7 @@ pub const WasiCliAdapter = struct {
         const io = std.Io.Threaded.global_single_threaded.io();
         var buf: [64 * 1024]u8 = undefined;
         var iovecs = [_][]u8{&buf};
-        const n = io.vtable.netRead(io.userdata, ctx.fd, &iovecs) catch return .err;
+        const n = net_io.read(io, ctx.fd, &iovecs) catch return .err;
         if (n == 0) return .eof;
         stream.buffer.appendSlice(allocator, buf[0..n]) catch return .err;
         return .progressed;
@@ -20713,7 +20714,7 @@ pub const WasiCliAdapter = struct {
         const cap = @min(dst.len, 64 * 1024);
         const io = std.Io.Threaded.global_single_threaded.io();
         var iovecs = [_][]u8{dst[0..cap]};
-        const n = io.vtable.netRead(io.userdata, ctx.fd, &iovecs) catch
+        const n = net_io.read(io, ctx.fd, &iovecs) catch
             return .{ .action = .err };
         if (n == 0) return .{ .action = .eof };
         return .{ .action = .progressed, .bytes_written = @intCast(n) };
@@ -20775,7 +20776,7 @@ pub const WasiCliAdapter = struct {
         defer parent.release();
         const io = std.Io.Threaded.global_single_threaded.io();
         const slices = [_][]const u8{src};
-        _ = io.vtable.netWrite(io.userdata, ctx.fd, &.{}, &slices, 1) catch {
+        _ = net_io.write(io, ctx.fd, &.{}, &slices, 1) catch {
             ctx.send_failed.store(true, .release);
             return .err;
         };
@@ -21201,7 +21202,7 @@ pub const WasiCliAdapter = struct {
             const local: std.Io.net.IpAddress = s.local_addr orelse switch (s.family) {
                 .ipv4 => std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
                 .ipv6 => std.Io.net.IpAddress{ .ip6 = .{
-                    .bytes = [_]u8{0} ** 16,
+                    .bytes = @as([16]u8, @splat(0)),
                     .port = 0,
                     .flow = 0,
                 } },
@@ -21359,7 +21360,7 @@ pub const WasiCliAdapter = struct {
                 defer detached.deinit(ci.allocator);
                 const io = std.Io.Threaded.global_single_threaded.io();
                 const slices = [_][]const u8{detached.items};
-                _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &slices, 1) catch |err| {
+                _ = net_io.write(io, stream.socket.handle, &.{}, &slices, 1) catch |err| {
                     if (ci.streams.acquire(stream_handle)) |failed_lease| {
                         var final_lease = failed_lease;
                         final_lease.value().read_closed = true;
@@ -21500,7 +21501,7 @@ pub const WasiCliAdapter = struct {
             const io = std.Io.Threaded.global_single_threaded.io();
             var buf: [64 * 1024]u8 = undefined;
             var iovecs = [_][]u8{&buf};
-            const n = io.vtable.netRead(io.userdata, stream.socket.handle, &iovecs) catch 0;
+            const n = net_io.read(io, stream.socket.handle, &iovecs) catch 0;
             if (n > 0) if (ci.streams.acquire(stream_h)) |initial_lease| {
                 var stream_lease = initial_lease;
                 defer stream_lease.release();
@@ -21616,7 +21617,7 @@ pub const WasiCliAdapter = struct {
         if (s.host_socket == null) {
             const wildcard: std.Io.net.IpAddress = switch (s.family) {
                 .ipv4 => .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
-                .ipv6 => .{ .ip6 = .{ .bytes = [_]u8{0} ** 16, .port = 0, .flow = 0 } },
+                .ipv6 => .{ .ip6 = .{ .bytes = @as([16]u8, @splat(0)), .port = 0, .flow = 0 } },
             };
             const host_socket = bindAndGetsockname(wildcard, .dgram, .udp) catch |err| {
                 results[0] = .{ .handle = try socketReadyResultFuture(ci, false, mapSocketBindError(err)) };
@@ -21934,14 +21935,14 @@ pub const WasiCliAdapter = struct {
     /// Build a `result<X, header-error>` err InterfaceValue (#538).
     fn httpHeaderErr(allocator: Allocator, code: HeaderErrorCode) !InterfaceValue {
         const payload = try allocator.create(InterfaceValue);
-        payload.* = .{ .variant_val = .{ .discriminant = @intFromEnum(code), .payload = null } };
+        payload.* = .{ .variant_val = .{ .discriminant = @backingInt(code), .payload = null } };
         return .{ .result_val = .{ .is_ok = false, .payload = payload } };
     }
 
     /// Build a `result<X, http error-code>` err InterfaceValue.
     fn httpResultErr(allocator: Allocator, code: HttpErrorCode) !InterfaceValue {
         const payload = try allocator.create(InterfaceValue);
-        payload.* = .{ .variant_val = .{ .discriminant = @intFromEnum(code), .payload = null } };
+        payload.* = .{ .variant_val = .{ .discriminant = @backingInt(code), .payload = null } };
         return .{ .result_val = .{ .is_ok = false, .payload = payload } };
     }
 
@@ -22248,7 +22249,7 @@ pub const WasiCliAdapter = struct {
         const f = try self.allocator.create(HttpFields);
         f.* = .{};
         if (lifted_entries.len > 0) {
-            f.entries = .{ .items = lifted_entries, .capacity = lifted_entries.len };
+            f.entries = .fromOwnedSlice(lifted_entries);
             lifted_entries = &.{}; // ownership transferred — disarm errdefer
         }
         errdefer {
@@ -22723,7 +22724,7 @@ pub const WasiCliAdapter = struct {
                     const value_copy = try self.allocator.dupe(u8, e.value);
                     copied[filled] = .{ .name = name_copy, .value = value_copy };
                 }
-                f.entries = .{ .items = copied, .capacity = copied.len };
+                f.entries = .fromOwnedSlice(copied);
             }
         }
 
@@ -24372,7 +24373,7 @@ pub const WasiCliAdapter = struct {
         };
         const inner = try allocator.create(InterfaceValue);
         inner.* = .{
-            .variant_val = .{ .discriminant = @intFromEnum(code), .payload = null },
+            .variant_val = .{ .discriminant = @backingInt(code), .payload = null },
         };
         results[0] = .{ .option_val = .{ .is_some = true, .payload = inner } };
     }
@@ -24639,7 +24640,7 @@ pub const WasiCliAdapter = struct {
         code: HttpErrorCode,
     ) anyerror!void {
         const fut = try self.allocator.create(FutureIncomingResponse);
-        fut.* = .{ .state = .{ .ready_err = @intFromEnum(code) } };
+        fut.* = .{ .state = .{ .ready_err = @backingInt(code) } };
         const h = try self.pushFutureResponse(fut);
         results[0] = try httpResultOk(allocator, .{ .handle = h });
     }
@@ -25163,7 +25164,7 @@ pub const WasiCliAdapter = struct {
     }
 
     fn httpStatusFromError(code: u32) u16 {
-        return switch (@as(HttpErrorCode, @enumFromInt(@min(code, @intFromEnum(HttpErrorCode.internal_error))))) {
+        return switch (@as(HttpErrorCode, @fromBackingInt(@intCast(@min(code, @backingInt(HttpErrorCode.internal_error)))))) {
             .HTTP_request_length_required => 411,
             .HTTP_request_body_size => 413,
             .HTTP_request_method_invalid,
@@ -27009,7 +27010,7 @@ pub const WasiCliAdapter = struct {
             // trampoline-shape requirement still holds for the
             // happy-deny path above.
             const err_payload = try self.allocator.create(InterfaceValue);
-            err_payload.* = .{ .variant_val = .{ .discriminant = @intFromEnum(code), .payload = null } };
+            err_payload.* = .{ .variant_val = .{ .discriminant = @backingInt(code), .payload = null } };
             results[0] = .{ .result_val = .{ .is_ok = false, .payload = err_payload } };
             return;
         };
@@ -27049,7 +27050,7 @@ pub const WasiCliAdapter = struct {
             const raw_payload: u32 = if (flat.len > 1)
                 flat[1]
             else
-                @intFromEnum(HttpErrorCode.internal_error);
+                @backingInt(HttpErrorCode.internal_error);
             const is_ok = disc == 0;
             const payload: u32 = if (is_ok)
                 executor_root.decodeResourceWire(raw_payload)
@@ -28472,7 +28473,7 @@ pub const WasiCliAdapter = struct {
         std.debug.assert(tag != .other);
         const err_payload = try allocator.create(InterfaceValue);
         err_payload.* = .{ .variant_val = .{
-            .discriminant = @intFromEnum(tag),
+            .discriminant = @backingInt(tag),
             .payload = null,
         } };
         return .{ .result_val = .{ .is_ok = false, .payload = err_payload } };
@@ -28491,7 +28492,7 @@ pub const WasiCliAdapter = struct {
         string_val.* = .{ .string = .{ .ptr = ptr, .len = @intCast(message.len) } };
         const err_payload = try allocator.create(InterfaceValue);
         err_payload.* = .{ .variant_val = .{
-            .discriminant = @intFromEnum(KeyvalueErrorTag.other),
+            .discriminant = @backingInt(KeyvalueErrorTag.other),
             .payload = string_val,
         } };
         return .{ .result_val = .{ .is_ok = false, .payload = err_payload } };
@@ -29015,12 +29016,12 @@ pub const WasiCliAdapter = struct {
         string_val.* = .{ .string = .{ .ptr = ptr, .len = @intCast(message.len) } };
         const inner_err = try allocator.create(InterfaceValue);
         inner_err.* = .{ .variant_val = .{
-            .discriminant = @intFromEnum(KeyvalueErrorTag.other),
+            .discriminant = @backingInt(KeyvalueErrorTag.other),
             .payload = string_val,
         } };
         const cas_err = try allocator.create(InterfaceValue);
         cas_err.* = .{ .variant_val = .{
-            .discriminant = @intFromEnum(KeyvalueCasErrorTag.store_error),
+            .discriminant = @backingInt(KeyvalueCasErrorTag.store_error),
             .payload = inner_err,
         } };
         return .{ .result_val = .{ .is_ok = false, .payload = cas_err } };
@@ -29035,12 +29036,12 @@ pub const WasiCliAdapter = struct {
         std.debug.assert(tag != .other);
         const inner_err = try allocator.create(InterfaceValue);
         inner_err.* = .{ .variant_val = .{
-            .discriminant = @intFromEnum(tag),
+            .discriminant = @backingInt(tag),
             .payload = null,
         } };
         const cas_err = try allocator.create(InterfaceValue);
         cas_err.* = .{ .variant_val = .{
-            .discriminant = @intFromEnum(KeyvalueCasErrorTag.store_error),
+            .discriminant = @backingInt(KeyvalueCasErrorTag.store_error),
             .payload = inner_err,
         } };
         return .{ .result_val = .{ .is_ok = false, .payload = cas_err } };
@@ -29155,7 +29156,7 @@ pub const WasiCliAdapter = struct {
         new_cas_handle.* = .{ .handle = cas_handle };
         const cas_err = try allocator.create(InterfaceValue);
         cas_err.* = .{ .variant_val = .{
-            .discriminant = @intFromEnum(KeyvalueCasErrorTag.cas_failed),
+            .discriminant = @backingInt(KeyvalueCasErrorTag.cas_failed),
             .payload = new_cas_handle,
         } };
         results[0] = .{ .result_val = .{ .is_ok = false, .payload = cas_err } };
@@ -29667,7 +29668,7 @@ pub const WasiCliAdapter = struct {
 
         const cwd = std.Io.Dir.cwd();
         const io = std.Io.Threaded.global_single_threaded.io();
-        const bytes = cwd.readFileAlloc(io, path, self.allocator, @enumFromInt(8 * 1024 * 1024)) catch |err| switch (err) {
+        const bytes = cwd.readFileAlloc(io, path, self.allocator, @fromBackingInt(@intCast(8 * 1024 * 1024))) catch |err| switch (err) {
             error.FileNotFound => return, // first run — leave snapshot empty
             else => return err,
         };
@@ -29977,7 +29978,7 @@ fn buildDescriptorStatRecord(
         else => .unknown,
     };
     const fields = try allocator.alloc(InterfaceValue, 6);
-    fields[0] = .{ .variant_val = .{ .discriminant = @intFromEnum(dt), .payload = null } };
+    fields[0] = .{ .variant_val = .{ .discriminant = @backingInt(dt), .payload = null } };
     fields[1] = .{ .u64 = @intCast(st.nlink) };
     fields[2] = .{ .u64 = st.size };
     fields[3] = try buildOptionalDatetime(allocator, st.atime);
@@ -31196,7 +31197,7 @@ pub const HttpsTlsConfig = struct {
         };
         if (bundle.bytes.items.len == 0) return error.TlsCertEmpty;
 
-        const key_bytes = cwd.readFileAlloc(io, key_path, allocator, @enumFromInt(1 * 1024 * 1024)) catch |err| switch (err) {
+        const key_bytes = cwd.readFileAlloc(io, key_path, allocator, @fromBackingInt(@intCast(1 * 1024 * 1024))) catch |err| switch (err) {
             error.FileNotFound => return error.TlsKeyFileNotFound,
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.TlsKeyReadFailed,
@@ -31208,7 +31209,7 @@ pub const HttpsTlsConfig = struct {
         // Re-read the cert bytes (the bundle parser above retained only the
         // decoded DER, not the source PEM) so the tls.zig CertKeyPair parser
         // can build its own bundle + parsed private key for the handshake.
-        const cert_bytes = cwd.readFileAlloc(io, cert_path, allocator, @enumFromInt(1 * 1024 * 1024)) catch |err| switch (err) {
+        const cert_bytes = cwd.readFileAlloc(io, cert_path, allocator, @fromBackingInt(@intCast(1 * 1024 * 1024))) catch |err| switch (err) {
             error.FileNotFound => return error.TlsCertFileNotFound,
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.TlsCertReadFailed,
@@ -31251,7 +31252,7 @@ pub const HttpsTlsConfig = struct {
 
         // Re-read the file to extract the private-key block (the
         // bundle parser ignores non-CERTIFICATE blocks).
-        const full_bytes = cwd.readFileAlloc(io, pem_path, allocator, @enumFromInt(2 * 1024 * 1024)) catch |err| switch (err) {
+        const full_bytes = cwd.readFileAlloc(io, pem_path, allocator, @fromBackingInt(@intCast(2 * 1024 * 1024))) catch |err| switch (err) {
             error.FileNotFound => return error.TlsCertFileNotFound,
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.TlsKeyReadFailed,
@@ -33820,7 +33821,7 @@ test "wasi:filesystem@0.3.0 open-at: missing path → future payload encodes err
     // builds the lift with `FsErrorCode.no_entry` (= 20 internally);
     // `fsP3LowerAsyncPayload` transcodes via `fsCodeToP3Disc` before
     // writing the payload bytes. (#564.)
-    try testing.expectEqual(@as(u8, @intCast(fsCodeToP3Disc(@intFromEnum(FsErrorCode.no_entry)))), fut.payload.?[4]);
+    try testing.expectEqual(@as(u8, @intCast(fsCodeToP3Disc(@backingInt(FsErrorCode.no_entry)))), fut.payload.?[4]);
 }
 
 test "wasi:filesystem@0.3.0 read-directory: enumerates a 3-entry tmp dir (#522)" {
@@ -33910,7 +33911,7 @@ test "wasi:filesystem@0.3.0 read-directory: not-a-directory → err(not-director
     // 0.3 wire disc for `not-directory` is 23 (host's `FsErrorCode.not_directory`
     // = 24 internally; transcoded via `fsCodeToP3Disc` to skip the
     // dropped 0.2 `would-block` slot). (#564.)
-    try testing.expectEqual(@as(u8, @intCast(fsCodeToP3Disc(@intFromEnum(FsErrorCode.not_directory)))), fut.payload.?[4]);
+    try testing.expectEqual(@as(u8, @intCast(fsCodeToP3Disc(@backingInt(FsErrorCode.not_directory)))), fut.payload.?[4]);
 }
 
 test "wasi:filesystem@0.3.0 stat-at: future payload decodes to result<descriptor-stat, error-code> (#522)" {
@@ -33967,7 +33968,7 @@ test "wasi:filesystem@0.3.0 stat-at: future payload decodes to result<descriptor
     // the 0.3 wire discriminant is 5 (host's `DescType.regular_file`
     // = 6 internally; transcoded via `descTypeToP3Disc` to skip the
     // dropped 0.2 `unknown` head). (#564.)
-    try testing.expectEqual(@as(u8, @intCast(descTypeToP3Disc(@intFromEnum(WasiCliAdapter.DescType.regular_file)))), fut.payload.?[8]);
+    try testing.expectEqual(@as(u8, @intCast(descTypeToP3Disc(@backingInt(WasiCliAdapter.DescType.regular_file)))), fut.payload.?[8]);
 
     // `size` field — third record member at offset 8 + 16 (type variant) + 8 (link-count u64) = 32.
     const size_val = std.mem.readInt(u64, fut.payload.?[8 + 16 + 8 ..][0..8], .little);
@@ -34328,7 +34329,7 @@ test "filesystem: set-times on dir descriptor returns not_permitted (#177)" {
     try testing.expect(results[0] == .result_val);
     try testing.expect(!results[0].result_val.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(FsErrorCode.not_permitted)),
+        @as(u32, @backingInt(FsErrorCode.not_permitted)),
         results[0].result_val.payload.?.*.variant_val.discriminant,
     );
 }
@@ -34384,7 +34385,7 @@ test "filesystem #571: set-times-at on missing path returns no-entry" {
     try testing.expect(results[0] == .result_val);
     try testing.expect(!results[0].result_val.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(FsErrorCode.no_entry)),
+        @as(u32, @backingInt(FsErrorCode.no_entry)),
         results[0].result_val.payload.?.*.variant_val.discriminant,
     );
 }
@@ -34476,7 +34477,7 @@ test "filesystem #475: read without read flag returns access" {
 
     try testing.expect(!results[0].result_val.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(FsErrorCode.access)),
+        @as(u32, @backingInt(FsErrorCode.access)),
         results[0].result_val.payload.?.*.variant_val.discriminant,
     );
 }
@@ -34607,7 +34608,7 @@ test "filesystem #475: write without write flag returns access" {
 
     try testing.expect(!results[0].result_val.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(FsErrorCode.access)),
+        @as(u32, @backingInt(FsErrorCode.access)),
         results[0].result_val.payload.?.*.variant_val.discriminant,
     );
 }
@@ -34918,7 +34919,7 @@ test "filesystem #475: metadata-hash-at on preopen sandbox-validates path" {
         defer results[0].deinit(testing.allocator);
         try testing.expect(!results[0].result_val.is_ok);
         try testing.expectEqual(
-            @as(u32, @intFromEnum(FsErrorCode.not_permitted)),
+            @as(u32, @backingInt(FsErrorCode.not_permitted)),
             results[0].result_val.payload.?.*.variant_val.discriminant,
         );
     }
@@ -34987,7 +34988,7 @@ test "filesystem #476: create-directory-at then stat-at confirms directory" {
     try testing.expect(stat_results[0].result_val.is_ok);
     const rec = stat_results[0].result_val.payload.?.*.record_val;
     try testing.expectEqual(
-        @as(u32, @intFromEnum(WasiCliAdapter.DescType.directory)),
+        @as(u32, @backingInt(WasiCliAdapter.DescType.directory)),
         rec[0].variant_val.discriminant,
     );
 }
@@ -35032,7 +35033,7 @@ test "filesystem #476: unlink-file-at removes a file" {
     defer stat_results[0].deinit(testing.allocator);
     try testing.expect(!stat_results[0].result_val.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(FsErrorCode.no_entry)),
+        @as(u32, @backingInt(FsErrorCode.no_entry)),
         stat_results[0].result_val.payload.?.*.variant_val.discriminant,
     );
 }
@@ -35066,7 +35067,7 @@ test "filesystem #476: remove-directory-at on non-empty dir returns not_empty" {
     defer results[0].deinit(testing.allocator);
     try testing.expect(!results[0].result_val.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(FsErrorCode.not_empty)),
+        @as(u32, @backingInt(FsErrorCode.not_empty)),
         results[0].result_val.payload.?.*.variant_val.discriminant,
     );
 }
@@ -35173,7 +35174,7 @@ test "filesystem #616: rename-at rejects dot components uniformly across hosts" 
         defer results[0].deinit(testing.allocator);
         try testing.expect(!results[0].result_val.is_ok);
         try testing.expectEqual(
-            @intFromEnum(FsErrorCode.invalid),
+            @backingInt(FsErrorCode.invalid),
             results[0].result_val.payload.?.variant_val.discriminant,
         );
     }
@@ -35198,7 +35199,7 @@ test "filesystem #616: rename-at rejects dot components uniformly across hosts" 
         defer results[0].deinit(testing.allocator);
         try testing.expect(!results[0].result_val.is_ok);
         try testing.expectEqual(
-            @intFromEnum(FsErrorCode.not_permitted),
+            @backingInt(FsErrorCode.not_permitted),
             results[0].result_val.payload.?.variant_val.discriminant,
         );
     }
@@ -35275,7 +35276,7 @@ test "filesystem #476: rename-at across two distinct descriptor handles" {
         try testing.expect(stat_r[0].result_val.is_ok);
     } else {
         try testing.expectEqual(
-            @as(u32, @intFromEnum(FsErrorCode.cross_device)),
+            @as(u32, @backingInt(FsErrorCode.cross_device)),
             results[0].result_val.payload.?.*.variant_val.discriminant,
         );
     }
@@ -35383,7 +35384,7 @@ test "filesystem #476: read-directory enumerates entries then yields option::non
         const rec = opt.payload.?.*.record_val;
         // type = regular_file for all three entries.
         try testing.expectEqual(
-            @as(u32, @intFromEnum(WasiCliAdapter.DescType.regular_file)),
+            @as(u32, @backingInt(WasiCliAdapter.DescType.regular_file)),
             rec[0].variant_val.discriminant,
         );
         const name_pl = rec[1].string;
@@ -35443,7 +35444,7 @@ test "filesystem #476: sandbox rejection on each path-taking method" {
         defer r[0].deinit(testing.allocator);
         try testing.expect(!r[0].result_val.is_ok);
         try testing.expectEqual(
-            @as(u32, @intFromEnum(FsErrorCode.not_permitted)),
+            @as(u32, @backingInt(FsErrorCode.not_permitted)),
             r[0].result_val.payload.?.*.variant_val.discriminant,
         );
     }
@@ -35459,7 +35460,7 @@ test "filesystem #476: sandbox rejection on each path-taking method" {
         // `validateSandboxPath` + the 0.3 filesystem-dotdot fixture
         // expectations. (#564.)
         try testing.expectEqual(
-            @as(u32, @intFromEnum(FsErrorCode.not_permitted)),
+            @as(u32, @backingInt(FsErrorCode.not_permitted)),
             r[0].result_val.payload.?.*.variant_val.discriminant,
         );
     }
@@ -35472,7 +35473,7 @@ test "filesystem #476: sandbox rejection on each path-taking method" {
         defer r[0].deinit(testing.allocator);
         try testing.expect(!r[0].result_val.is_ok);
         try testing.expectEqual(
-            @as(u32, @intFromEnum(FsErrorCode.access)),
+            @as(u32, @backingInt(FsErrorCode.access)),
             r[0].result_val.payload.?.*.variant_val.discriminant,
         );
     }
@@ -35491,7 +35492,7 @@ test "filesystem #476: sandbox rejection on each path-taking method" {
         defer r[0].deinit(testing.allocator);
         try testing.expect(!r[0].result_val.is_ok);
         try testing.expectEqual(
-            @as(u32, @intFromEnum(FsErrorCode.not_permitted)),
+            @as(u32, @backingInt(FsErrorCode.not_permitted)),
             r[0].result_val.payload.?.*.variant_val.discriminant,
         );
     }
@@ -35512,7 +35513,7 @@ test "filesystem #476: sandbox rejection on each path-taking method" {
         try testing.expect(!r[0].result_val.is_ok);
         // `..` rejection is `not-permitted` per the 0.3 expectation. (#564.)
         try testing.expectEqual(
-            @as(u32, @intFromEnum(FsErrorCode.not_permitted)),
+            @as(u32, @backingInt(FsErrorCode.not_permitted)),
             r[0].result_val.payload.?.*.variant_val.discriminant,
         );
     }
@@ -35530,7 +35531,7 @@ test "filesystem #476: sandbox rejection on each path-taking method" {
         defer r[0].deinit(testing.allocator);
         try testing.expect(!r[0].result_val.is_ok);
         try testing.expectEqual(
-            @as(u32, @intFromEnum(FsErrorCode.not_permitted)),
+            @as(u32, @backingInt(FsErrorCode.not_permitted)),
             r[0].result_val.payload.?.*.variant_val.discriminant,
         );
     }
@@ -35544,7 +35545,7 @@ test "filesystem #476: sandbox rejection on each path-taking method" {
         try testing.expect(!r[0].result_val.is_ok);
         // `..` rejection is `not-permitted` per the 0.3 expectation. (#564.)
         try testing.expectEqual(
-            @as(u32, @intFromEnum(FsErrorCode.not_permitted)),
+            @as(u32, @backingInt(FsErrorCode.not_permitted)),
             r[0].result_val.payload.?.*.variant_val.discriminant,
         );
     }
@@ -35601,7 +35602,7 @@ test "filesystem #476: mutate_directory enforcement on each mutating method" {
         defer r[0].deinit(testing.allocator);
         try testing.expect(!r[0].result_val.is_ok);
         try testing.expectEqual(
-            @as(u32, @intFromEnum(FsErrorCode.read_only)),
+            @as(u32, @backingInt(FsErrorCode.read_only)),
             r[0].result_val.payload.?.*.variant_val.discriminant,
         );
     }
@@ -35621,7 +35622,7 @@ test "filesystem #476: mutate_directory enforcement on each mutating method" {
         defer r[0].deinit(testing.allocator);
         try testing.expect(!r[0].result_val.is_ok);
         try testing.expectEqual(
-            @as(u32, @intFromEnum(FsErrorCode.read_only)),
+            @as(u32, @backingInt(FsErrorCode.read_only)),
             r[0].result_val.payload.?.*.variant_val.discriminant,
         );
     }
@@ -35640,7 +35641,7 @@ test "filesystem #476: mutate_directory enforcement on each mutating method" {
         defer r[0].deinit(testing.allocator);
         try testing.expect(!r[0].result_val.is_ok);
         try testing.expectEqual(
-            @as(u32, @intFromEnum(FsErrorCode.read_only)),
+            @as(u32, @backingInt(FsErrorCode.read_only)),
             r[0].result_val.payload.?.*.variant_val.discriminant,
         );
     }
@@ -35949,7 +35950,7 @@ test "sockets P3: access-denied helper is retained for sync stub callers (#486 /
     try testing.expect(results[0] == .result_val);
     try testing.expect(!results[0].result_val.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(SocketErrorCode.access_denied)),
+        @as(u32, @backingInt(SocketErrorCode.access_denied)),
         results[0].result_val.payload.?.variant_val.discriminant,
     );
 }
@@ -36194,7 +36195,7 @@ test "sockets P3: tcp loopback bind/listen/connect/send round-trip (#519)" {
     // ── Read the bytes off the accepted server stream ──────────────────
     var srv_buf: [64]u8 = undefined;
     var iovecs = [_][]u8{&srv_buf};
-    const n = try io.vtable.netRead(io.userdata, accepted_stream.socket.handle, &iovecs);
+    const n = try net_io.read(io, accepted_stream.socket.handle, &iovecs);
     accepted_stream.close(io);
     try testing.expectEqualStrings(send_data, srv_buf[0..n]);
 }
@@ -37441,7 +37442,7 @@ test "sockets P3 #535: tcp-receive stream driver yields multiple read cycles" {
     // Cycle 1: client writes chunk1, host driver drains it into FIFO.
     {
         const slices = [_][]const u8{chunk1};
-        _ = try io.vtable.netWrite(io.userdata, client.socket.handle, &.{}, &slices, 1);
+        _ = try net_io.write(io, client.socket.handle, &.{}, &slices, 1);
     }
     // Allow the kernel to deliver loopback bytes.
     var attempt: usize = 0;
@@ -37464,7 +37465,7 @@ test "sockets P3 #535: tcp-receive stream driver yields multiple read cycles" {
     // Cycle 2: another write — same stream, same driver, second drain.
     {
         const slices = [_][]const u8{chunk2};
-        _ = try io.vtable.netWrite(io.userdata, client.socket.handle, &.{}, &slices, 1);
+        _ = try net_io.write(io, client.socket.handle, &.{}, &slices, 1);
     }
     attempt = 0;
     while (attempt < 10_000) : (attempt += 1) {
@@ -37640,7 +37641,7 @@ test "sockets P3 (#583 follow-up): tcp-receive zero-copy driver returns .err mid
     const first_chunk = "first-tcp-chunk";
     {
         const slices = [_][]const u8{first_chunk};
-        _ = try io.vtable.netWrite(io.userdata, client.socket.handle, &.{}, &slices, 1);
+        _ = try net_io.write(io, client.socket.handle, &.{}, &slices, 1);
     }
     var attempt: usize = 0;
     while (attempt < 10_000) : (attempt += 1) {
@@ -37669,7 +37670,7 @@ test "sockets P3 (#583 follow-up): tcp-receive zero-copy driver returns .err mid
     const second_chunk = "second-tcp-chunk-would-be-drained";
     {
         const slices = [_][]const u8{second_chunk};
-        _ = try io.vtable.netWrite(io.userdata, client.socket.handle, &.{}, &slices, 1);
+        _ = try net_io.write(io, client.socket.handle, &.{}, &slices, 1);
     }
     attempt = 0;
     while (attempt < 10_000) : (attempt += 1) {
@@ -37983,7 +37984,7 @@ test "sockets P3 #535: tcp-send driver pushes write bytes straight to fd" {
     while (total < want and attempt < 10_000) : (attempt += 1) {
         if (WasiCliAdapter.fdPollReady(server_side.socket.handle, WasiCliAdapter.pollInEvents())) {
             var iovecs = [_][]u8{srv_buf[total..]};
-            const n = try io.vtable.netRead(io.userdata, server_side.socket.handle, &iovecs);
+            const n = try net_io.read(io, server_side.socket.handle, &iovecs);
             if (n == 0) break;
             total += n;
         }
@@ -38070,7 +38071,7 @@ test "sockets: tcp start-bind returns access-denied by default (#148)" {
     try testing.expect(results[0] == .result_val);
     try testing.expect(!results[0].result_val.is_ok);
     const err = results[0].result_val.payload.?.*;
-    try testing.expectEqual(@as(u32, @intFromEnum(SocketErrorCode.access_denied)), err.variant_val.discriminant);
+    try testing.expectEqual(@as(u32, @backingInt(SocketErrorCode.access_denied)), err.variant_val.discriminant);
 }
 
 test "sockets: tcp address-family reads rep family (#148)" {
@@ -38089,7 +38090,7 @@ test "sockets: tcp address-family reads rep family (#148)" {
     try WasiCliAdapter.socketAddressFamily(&adapter, &ci, &args, &results, testing.allocator);
 
     try testing.expect(results[0] == .enum_val);
-    try testing.expectEqual(@as(u32, @intFromEnum(IpAddressFamily.ipv6)), results[0].enum_val);
+    try testing.expectEqual(@as(u32, @backingInt(IpAddressFamily.ipv6)), results[0].enum_val);
 }
 
 test "sockets: ip-name-lookup smoke (#148)" {
@@ -38109,7 +38110,7 @@ test "sockets: ip-name-lookup smoke (#148)" {
     try testing.expect(!results[0].result_val.is_ok);
     const err = results[0].result_val.payload.?.*;
     try testing.expectEqual(
-        @as(u32, @intFromEnum(SocketErrorCode.name_unresolvable)),
+        @as(u32, @backingInt(SocketErrorCode.name_unresolvable)),
         err.variant_val.discriminant,
     );
 }
@@ -38121,7 +38122,7 @@ test "sockets DNS: lowerIpAddress lowers IPv4 as variant of tuple<u8 x 4> (#179)
     defer lifted.deinit(testing.allocator);
 
     try testing.expect(lifted == .variant_val);
-    try testing.expectEqual(@as(u32, @intFromEnum(IpAddressFamily.ipv4)), lifted.variant_val.discriminant);
+    try testing.expectEqual(@as(u32, @backingInt(IpAddressFamily.ipv4)), lifted.variant_val.discriminant);
     const tup = lifted.variant_val.payload.?.*;
     try testing.expect(tup == .tuple_val);
     try testing.expectEqual(@as(usize, 4), tup.tuple_val.len);
@@ -38142,7 +38143,7 @@ test "sockets DNS: lowerIpAddress lowers IPv6 as variant of tuple<u16 x 8> (#179
     defer lifted.deinit(testing.allocator);
 
     try testing.expect(lifted == .variant_val);
-    try testing.expectEqual(@as(u32, @intFromEnum(IpAddressFamily.ipv6)), lifted.variant_val.discriminant);
+    try testing.expectEqual(@as(u32, @backingInt(IpAddressFamily.ipv6)), lifted.variant_val.discriminant);
     const tup = lifted.variant_val.payload.?.*;
     try testing.expect(tup == .tuple_val);
     try testing.expectEqual(@as(usize, 8), tup.tuple_val.len);
@@ -38208,7 +38209,7 @@ test "sockets DNS: resolve-next-address pops IPv4 then exhausts (#179)" {
     const opt = r1[0].result_val.payload.?.*;
     try testing.expect(opt.option_val.is_some);
     const variant = opt.option_val.payload.?.*;
-    try testing.expectEqual(@as(u32, @intFromEnum(IpAddressFamily.ipv4)), variant.variant_val.discriminant);
+    try testing.expectEqual(@as(u32, @backingInt(IpAddressFamily.ipv4)), variant.variant_val.discriminant);
     const tup = variant.variant_val.payload.?.*;
     try testing.expectEqual(@as(u8, 127), tup.tuple_val[0].u8);
     try testing.expectEqual(@as(u8, 1), tup.tuple_val[3].u8);
@@ -38243,7 +38244,7 @@ test "sockets DNS: resolve-next-address mixed v4/v6 sequence (#179)" {
     try WasiCliAdapter.resolveNextAddress(&adapter, &ci, &args, &r1, testing.allocator);
     defer r1[0].deinit(testing.allocator);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(IpAddressFamily.ipv4)),
+        @as(u32, @backingInt(IpAddressFamily.ipv4)),
         r1[0].result_val.payload.?.option_val.payload.?.variant_val.discriminant,
     );
 
@@ -38251,7 +38252,7 @@ test "sockets DNS: resolve-next-address mixed v4/v6 sequence (#179)" {
     try WasiCliAdapter.resolveNextAddress(&adapter, &ci, &args, &r2, testing.allocator);
     defer r2[0].deinit(testing.allocator);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(IpAddressFamily.ipv6)),
+        @as(u32, @backingInt(IpAddressFamily.ipv6)),
         r2[0].result_val.payload.?.option_val.payload.?.variant_val.discriminant,
     );
 
@@ -38274,7 +38275,7 @@ test "sockets DNS: resolve-next-address rejects unknown handle (#179)" {
 
     try testing.expect(!results[0].result_val.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(SocketErrorCode.invalid_state)),
+        @as(u32, @backingInt(SocketErrorCode.invalid_state)),
         results[0].result_val.payload.?.variant_val.discriminant,
     );
 }
@@ -38303,7 +38304,7 @@ test "sockets DNS: resolve-addresses denies invalid hostname even when allow-lis
 
     try testing.expect(!results[0].result_val.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(SocketErrorCode.name_unresolvable)),
+        @as(u32, @backingInt(SocketErrorCode.name_unresolvable)),
         results[0].result_val.payload.?.variant_val.discriminant,
     );
 }
@@ -38325,7 +38326,7 @@ test "sockets DNS: resolve-addresses denies unknown network handle (#179)" {
 
     try testing.expect(!results[0].result_val.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(SocketErrorCode.name_unresolvable)),
+        @as(u32, @backingInt(SocketErrorCode.name_unresolvable)),
         results[0].result_val.payload.?.variant_val.discriminant,
     );
 }
@@ -39380,7 +39381,7 @@ test "wasi:http #616 A1: timeout maps to canonical P2 and P3 connection-timeout"
         p2_results[0].result_val.payload.?.handle,
     ).?.*;
     try testing.expectEqual(
-        @as(u32, @intFromEnum(HttpErrorCode.connection_timeout)),
+        @as(u32, @backingInt(HttpErrorCode.connection_timeout)),
         p2_future.state.ready_err,
     );
 
@@ -39389,7 +39390,7 @@ test "wasi:http #616 A1: timeout maps to canonical P2 and P3 connection-timeout"
     const decoded = decodeP3ClientSendBytes(p3_future.payload.?);
     try testing.expect(!decoded.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(HttpErrorCode.connection_timeout)),
+        @as(u32, @backingInt(HttpErrorCode.connection_timeout)),
         decoded.payload,
     );
 }
@@ -39433,7 +39434,7 @@ test "wasi:http/types@0.2 http-error-code: HTTP-origin io-error downcasts to typ
     // `connection-refused` is discriminant 6.
     try testing.expect(results[0].option_val.payload.?.* == .variant_val);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(HttpErrorCode.connection_refused)),
+        @as(u32, @backingInt(HttpErrorCode.connection_refused)),
         results[0].option_val.payload.?.variant_val.discriminant,
     );
     try testing.expectEqual(@as(u32, 6), results[0].option_val.payload.?.variant_val.discriminant);
@@ -40037,7 +40038,7 @@ test "http: outgoing-handler.handle returns ready future with denied (#149)" {
     const fut = adapter.http_future_responses.unsafeGetPtrForTest(fut_handle).?.*;
     try testing.expect(fut.state == .ready_err);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(HttpErrorCode.HTTP_request_denied)),
+        @as(u32, @backingInt(HttpErrorCode.HTTP_request_denied)),
         fut.state.ready_err,
     );
 
@@ -40057,7 +40058,7 @@ test "http: outgoing-handler.handle returns ready future with denied (#149)" {
     try testing.expect(!middle.result_val.is_ok); // inner err = the actual error
     const err_variant = middle.result_val.payload.?.*;
     try testing.expectEqual(
-        @as(u32, @intFromEnum(HttpErrorCode.HTTP_request_denied)),
+        @as(u32, @backingInt(HttpErrorCode.HTTP_request_denied)),
         err_variant.variant_val.discriminant,
     );
 
@@ -40183,7 +40184,7 @@ test "filesystem: open-at without mutate-directory denies writable child (#181)"
     try testing.expect(results[0] == .result_val);
     try testing.expect(!results[0].result_val.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(FsErrorCode.read_only)),
+        @as(u32, @backingInt(FsErrorCode.read_only)),
         results[0].result_val.payload.?.*.variant_val.discriminant,
     );
 }
@@ -40466,7 +40467,7 @@ test "filesystem #571: open-at(WRITE) on directory returns is-directory error" {
 
     try testing.expect(!results[0].result_val.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(FsErrorCode.is_directory)),
+        @as(u32, @backingInt(FsErrorCode.is_directory)),
         results[0].result_val.payload.?.*.variant_val.discriminant,
     );
 }
@@ -40506,7 +40507,7 @@ test "filesystem #571: open-at rejects symlink-follow that escapes sandbox" {
 
     try testing.expect(!results[0].result_val.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(FsErrorCode.not_permitted)),
+        @as(u32, @backingInt(FsErrorCode.not_permitted)),
         results[0].result_val.payload.?.*.variant_val.discriminant,
     );
 }
@@ -40546,7 +40547,7 @@ test "filesystem #571: intermediate symlink rejected by create-directory-at" {
     // preopen — `checkPathSymlinks` short-circuits with `not-permitted`
     // before the kernel runs the op.
     try testing.expectEqual(
-        @as(u32, @intFromEnum(FsErrorCode.not_permitted)),
+        @as(u32, @backingInt(FsErrorCode.not_permitted)),
         results[0].result_val.payload.?.*.variant_val.discriminant,
     );
 }
@@ -40746,7 +40747,7 @@ test "sockets #178: tcp start-bind denies without allow-list" {
 
     try testing.expect(!results[0].result_val.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(SocketErrorCode.access_denied)),
+        @as(u32, @backingInt(SocketErrorCode.access_denied)),
         results[0].result_val.payload.?.variant_val.discriminant,
     );
 }
@@ -40773,7 +40774,7 @@ test "sockets #178: tcp start-bind family mismatch is invalid_argument" {
 
             try std.testing.expect(!results[0].result_val.is_ok);
             try std.testing.expectEqual(
-                @as(u32, @intFromEnum(SocketErrorCode.invalid_argument)),
+                @as(u32, @backingInt(SocketErrorCode.invalid_argument)),
                 results[0].result_val.payload.?.variant_val.discriminant,
             );
         }
@@ -40807,7 +40808,7 @@ test "sockets #178: tcp finish-bind on idle socket is not_in_progress" {
     try WasiCliAdapter.tcpFinishBind(&adapter, &ci, &args, &results, testing.allocator);
     defer testing.allocator.destroy(results[0].result_val.payload.?);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(SocketErrorCode.not_in_progress)),
+        @as(u32, @backingInt(SocketErrorCode.not_in_progress)),
         results[0].result_val.payload.?.variant_val.discriminant,
     );
 }
@@ -40827,7 +40828,7 @@ test "sockets #178: tcp start-listen requires bound state" {
     try WasiCliAdapter.tcpStartListen(&adapter, &ci, &args, &results, testing.allocator);
     defer testing.allocator.destroy(results[0].result_val.payload.?);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(SocketErrorCode.invalid_state)),
+        @as(u32, @backingInt(SocketErrorCode.invalid_state)),
         results[0].result_val.payload.?.variant_val.discriminant,
     );
 }
@@ -40847,7 +40848,7 @@ test "sockets #178: tcp local-address on unbound returns invalid_state" {
     try WasiCliAdapter.tcpLocalAddress(&adapter, &ci, &args, &results, testing.allocator);
     defer testing.allocator.destroy(results[0].result_val.payload.?);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(SocketErrorCode.invalid_state)),
+        @as(u32, @backingInt(SocketErrorCode.invalid_state)),
         results[0].result_val.payload.?.variant_val.discriminant,
     );
 }
@@ -41279,7 +41280,7 @@ test "http #176: handle returns denied when allow-list empty" {
     const fut = adapter.http_future_responses.unsafeGetPtrForTest(fut_handle).?.*;
     try testing.expect(fut.state == .ready_err);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(HttpErrorCode.HTTP_request_denied)),
+        @as(u32, @backingInt(HttpErrorCode.HTTP_request_denied)),
         fut.state.ready_err,
     );
 }
@@ -41362,11 +41363,11 @@ test "wasi:http #521: https outgoing-handler proceeds past the TLS gate" {
     try testing.expect(fut.state == .ready_err);
     // The gate is gone — `HTTP_protocol_error` must never be the
     // result of a scheme check on `https://`.
-    try testing.expect(fut.state.ready_err != @as(u32, @intFromEnum(HttpErrorCode.HTTP_protocol_error)));
+    try testing.expect(fut.state.ready_err != @as(u32, @backingInt(HttpErrorCode.HTTP_protocol_error)));
     // Port 1 has no listener — TCP refuses before TLS can run, so
     // the refined mapping yields `connection_refused` (#583 A3).
     try testing.expectEqual(
-        @as(u32, @intFromEnum(HttpErrorCode.connection_refused)),
+        @as(u32, @backingInt(HttpErrorCode.connection_refused)),
         fut.state.ready_err,
     );
 }
@@ -41453,7 +41454,7 @@ const TestHttpServerCtx = struct {
         var total: usize = 0;
         while (total < req_buf.len) {
             var dests = [_][]u8{req_buf[total..]};
-            const n = io.vtable.netRead(io.userdata, stream.socket.handle, &dests) catch return;
+            const n = net_io.read(io, stream.socket.handle, &dests) catch return;
             if (n == 0) break;
             total += n;
             if (std.mem.indexOf(u8, req_buf[0..total], "\r\n\r\n") != null) break;
@@ -41465,9 +41466,9 @@ const TestHttpServerCtx = struct {
             "Connection: close\r\n" ++
             "\r\n", .{self.body.len}) catch return;
         const head_slices = [_][]const u8{resp_head};
-        _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &head_slices, 1) catch return;
+        _ = net_io.write(io, stream.socket.handle, &.{}, &head_slices, 1) catch return;
         const body_slices = [_][]const u8{self.body};
-        _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &body_slices, 1) catch return;
+        _ = net_io.write(io, stream.socket.handle, &.{}, &body_slices, 1) catch return;
     }
 };
 
@@ -41619,17 +41620,17 @@ const TestHttpHeaderServerCtx = struct {
         var total: usize = 0;
         while (total < req_buf.len) {
             var dests = [_][]u8{req_buf[total..]};
-            const n = io.vtable.netRead(io.userdata, stream.socket.handle, &dests) catch return;
+            const n = net_io.read(io, stream.socket.handle, &dests) catch return;
             if (n == 0) break;
             total += n;
             if (std.mem.indexOf(u8, req_buf[0..total], "\r\n\r\n") != null) break;
         }
 
         const head_slices = [_][]const u8{self.head};
-        _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &head_slices, 1) catch return;
+        _ = net_io.write(io, stream.socket.handle, &.{}, &head_slices, 1) catch return;
         if (self.body.len > 0) {
             const body_slices = [_][]const u8{self.body};
-            _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &body_slices, 1) catch return;
+            _ = net_io.write(io, stream.socket.handle, &.{}, &body_slices, 1) catch return;
         }
     }
 };
@@ -41912,11 +41913,11 @@ test "wasi:http #583 A2: outgoing-handler settles connect-refused as connection_
     try testing.expect(fut.state == .pending);
     p3DrainPendingHttpUntilSettled(&adapter, fut, 10_000);
     try testing.expect(fut.state == .ready_err);
-    try testing.expect(fut.state.ready_err != @as(u32, @intFromEnum(HttpErrorCode.HTTP_protocol_error)));
+    try testing.expect(fut.state.ready_err != @as(u32, @backingInt(HttpErrorCode.HTTP_protocol_error)));
     // POSIX `error.ConnectionRefused` → `connection_refused` via the
     // #583 A3 mapping; deterministic on Linux / macOS.
     try testing.expectEqual(
-        @as(u32, @intFromEnum(HttpErrorCode.connection_refused)),
+        @as(u32, @backingInt(HttpErrorCode.connection_refused)),
         fut.state.ready_err,
     );
 }
@@ -42142,7 +42143,7 @@ test "http #477: http outgoing-handler without allow-list returns HTTP_request_d
     const fut = adapter.http_future_responses.unsafeGetPtrForTest(fut_handle).?.*;
     try testing.expect(fut.state == .ready_err);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(HttpErrorCode.HTTP_request_denied)),
+        @as(u32, @backingInt(HttpErrorCode.HTTP_request_denied)),
         fut.state.ready_err,
     );
 }
@@ -42218,7 +42219,7 @@ test "sockets #178 UDP: start-bind denied without allow-list" {
     defer testing.allocator.destroy(results[0].result_val.payload.?);
     try testing.expect(!results[0].result_val.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(SocketErrorCode.access_denied)),
+        @as(u32, @backingInt(SocketErrorCode.access_denied)),
         results[0].result_val.payload.?.variant_val.discriminant,
     );
 }
@@ -42244,7 +42245,7 @@ test "sockets #178 UDP: start-bind family mismatch is invalid_argument" {
             defer std.testing.allocator.destroy(results[0].result_val.payload.?);
             try std.testing.expect(!results[0].result_val.is_ok);
             try std.testing.expectEqual(
-                @as(u32, @intFromEnum(SocketErrorCode.invalid_argument)),
+                @as(u32, @backingInt(SocketErrorCode.invalid_argument)),
                 results[0].result_val.payload.?.variant_val.discriminant,
             );
         }
@@ -42281,7 +42282,7 @@ test "sockets #178 UDP: start-bind second call is invalid_state" {
                 defer std.testing.allocator.destroy(results[0].result_val.payload.?);
                 try std.testing.expect(!results[0].result_val.is_ok);
                 try std.testing.expectEqual(
-                    @as(u32, @intFromEnum(SocketErrorCode.invalid_state)),
+                    @as(u32, @backingInt(SocketErrorCode.invalid_state)),
                     results[0].result_val.payload.?.variant_val.discriminant,
                 );
             }
@@ -42306,7 +42307,7 @@ test "sockets #178 UDP: finish-bind on idle socket is not_in_progress" {
     defer testing.allocator.destroy(results[0].result_val.payload.?);
     try testing.expect(!results[0].result_val.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(SocketErrorCode.not_in_progress)),
+        @as(u32, @backingInt(SocketErrorCode.not_in_progress)),
         results[0].result_val.payload.?.variant_val.discriminant,
     );
 }
@@ -42376,7 +42377,7 @@ test "sockets #178 UDP: stream on unbound socket is invalid_state" {
     defer testing.allocator.destroy(results[0].result_val.payload.?);
     try testing.expect(!results[0].result_val.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(SocketErrorCode.invalid_state)),
+        @as(u32, @backingInt(SocketErrorCode.invalid_state)),
         results[0].result_val.payload.?.variant_val.discriminant,
     );
 }
@@ -42693,7 +42694,7 @@ test "sockets #178 UDP: send unconnected + per-datagram none is invalid_argument
             defer send_results[0].deinit(a);
             try std.testing.expect(!send_results[0].result_val.is_ok);
             try std.testing.expectEqual(
-                @as(u32, @intFromEnum(SocketErrorCode.invalid_argument)),
+                @as(u32, @backingInt(SocketErrorCode.invalid_argument)),
                 send_results[0].result_val.payload.?.variant_val.discriminant,
             );
         }
@@ -42803,7 +42804,7 @@ test "sockets #178 UDP: generation invalidation — old stream returns invalid_s
                 defer recv_results[0].deinit(a);
                 try std.testing.expect(!recv_results[0].result_val.is_ok);
                 try std.testing.expectEqual(
-                    @as(u32, @intFromEnum(SocketErrorCode.invalid_state)),
+                    @as(u32, @backingInt(SocketErrorCode.invalid_state)),
                     recv_results[0].result_val.payload.?.variant_val.discriminant,
                 );
             }
@@ -42815,7 +42816,7 @@ test "sockets #178 UDP: generation invalidation — old stream returns invalid_s
                 defer cs_results[0].deinit(a);
                 try std.testing.expect(!cs_results[0].result_val.is_ok);
                 try std.testing.expectEqual(
-                    @as(u32, @intFromEnum(SocketErrorCode.invalid_state)),
+                    @as(u32, @backingInt(SocketErrorCode.invalid_state)),
                     cs_results[0].result_val.payload.?.variant_val.discriminant,
                 );
             }
@@ -42843,7 +42844,7 @@ test "sockets #178 UDP: remote-address returns invalid_state when unconnected" {
             defer ra_results[0].deinit(a);
             try std.testing.expect(!ra_results[0].result_val.is_ok);
             try std.testing.expectEqual(
-                @as(u32, @intFromEnum(SocketErrorCode.invalid_state)),
+                @as(u32, @backingInt(SocketErrorCode.invalid_state)),
                 ra_results[0].result_val.payload.?.variant_val.discriminant,
             );
         }
@@ -42876,7 +42877,7 @@ test "sockets #178 UDP: stream(some(remote)) validates wildcard/port-0/family" {
                 defer results[0].deinit(a);
                 try std.testing.expect(!results[0].result_val.is_ok);
                 try std.testing.expectEqual(
-                    @as(u32, @intFromEnum(SocketErrorCode.invalid_argument)),
+                    @as(u32, @backingInt(SocketErrorCode.invalid_argument)),
                     results[0].result_val.payload.?.variant_val.discriminant,
                 );
             }
@@ -42905,7 +42906,7 @@ test "sockets #178 UDP: stream(some(remote)) allow-list denied" {
             defer results[0].deinit(a);
             try std.testing.expect(!results[0].result_val.is_ok);
             try std.testing.expectEqual(
-                @as(u32, @intFromEnum(SocketErrorCode.access_denied)),
+                @as(u32, @backingInt(SocketErrorCode.access_denied)),
                 results[0].result_val.payload.?.variant_val.discriminant,
             );
         }
@@ -43235,7 +43236,7 @@ test "sockets #178 TCP-B: connect without allow-list is access_denied" {
 
     try testing.expect(!results[0].result_val.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(SocketErrorCode.access_denied)),
+        @as(u32, @backingInt(SocketErrorCode.access_denied)),
         results[0].result_val.payload.?.variant_val.discriminant,
     );
 }
@@ -43257,7 +43258,7 @@ test "sockets #178 TCP-B: finish-connect without start is not_in_progress" {
     defer testing.allocator.destroy(results[0].result_val.payload.?);
     try testing.expect(!results[0].result_val.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(SocketErrorCode.not_in_progress)),
+        @as(u32, @backingInt(SocketErrorCode.not_in_progress)),
         results[0].result_val.payload.?.variant_val.discriminant,
     );
 }
@@ -43303,7 +43304,7 @@ test "sockets #178 TCP-B: connect from bound state is invalid_state" {
                 defer std.testing.allocator.destroy(results[0].result_val.payload.?);
                 try std.testing.expect(!results[0].result_val.is_ok);
                 try std.testing.expectEqual(
-                    @as(u32, @intFromEnum(SocketErrorCode.invalid_state)),
+                    @as(u32, @backingInt(SocketErrorCode.invalid_state)),
                     results[0].result_val.payload.?.variant_val.discriminant,
                 );
             }
@@ -43512,7 +43513,7 @@ test "sockets #200: buffer-size on unbound socket returns invalid_state" {
         defer testing.allocator.destroy(results[0].result_val.payload.?);
         try testing.expect(!results[0].result_val.is_ok);
         try testing.expectEqual(
-            @as(u32, @intFromEnum(SocketErrorCode.invalid_state)),
+            @as(u32, @backingInt(SocketErrorCode.invalid_state)),
             results[0].result_val.payload.?.variant_val.discriminant,
         );
     }
@@ -43562,7 +43563,7 @@ test "sockets #200: set-listen-backlog-size on listening socket is invalid_state
             defer a.destroy(results[0].result_val.payload.?);
             try std.testing.expect(!results[0].result_val.is_ok);
             try std.testing.expectEqual(
-                @as(u32, @intFromEnum(SocketErrorCode.invalid_state)),
+                @as(u32, @backingInt(SocketErrorCode.invalid_state)),
                 results[0].result_val.payload.?.variant_val.discriminant,
             );
         }
@@ -43732,7 +43733,7 @@ test "sockets #561: each property setter rejects 0 with invalid_argument" {
         defer testing.allocator.destroy(results[0].result_val.payload.?);
         try testing.expect(!results[0].result_val.is_ok);
         try testing.expectEqual(
-            @as(u32, @intFromEnum(SocketErrorCode.invalid_argument)),
+            @as(u32, @backingInt(SocketErrorCode.invalid_argument)),
             results[0].result_val.payload.?.variant_val.discriminant,
         );
     }
@@ -44518,7 +44519,7 @@ test "WasiCliAdapter.cancelAllPendingAsyncOps: outbound HTTP fetch flips shared.
     const settled = adapter.http_future_responses.unsafeGetPtrForTest(fh).?.*;
     switch (settled.state) {
         .ready_err => |code| try testing.expectEqual(
-            @as(u32, @intFromEnum(HttpErrorCode.HTTP_request_denied)),
+            @as(u32, @backingInt(HttpErrorCode.HTTP_request_denied)),
             code,
         ),
         else => return error.UnexpectedHttpFutureState,
@@ -44601,7 +44602,7 @@ test "wasi:http #616 A1: P3 HTTP cancellation is scoped to ComponentInstance" {
     );
     try testing.expect(!decoded_a.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(HttpErrorCode.HTTP_request_denied)),
+        @as(u32, @backingInt(HttpErrorCode.HTTP_request_denied)),
         decoded_a.payload,
     );
     const decoded_b = decodeP3ClientSendBytes(
@@ -44609,7 +44610,7 @@ test "wasi:http #616 A1: P3 HTTP cancellation is scoped to ComponentInstance" {
     );
     try testing.expect(!decoded_b.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(HttpErrorCode.internal_error)),
+        @as(u32, @backingInt(HttpErrorCode.internal_error)),
         decoded_b.payload,
     );
 }
@@ -44707,14 +44708,14 @@ test "wasi:http #616 A7: dropping the readable end cancels the matching P3 fetch
     );
     try testing.expect(!decoded_dropped.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(HttpErrorCode.HTTP_request_denied)),
+        @as(u32, @backingInt(HttpErrorCode.HTTP_request_denied)),
         decoded_dropped.payload,
     );
     const decoded_kept = decodeP3ClientSendBytes(
         ci_a.futures.getPtr(kept.future_handle).?.payload.?,
     );
     try testing.expectEqual(
-        @as(u32, @intFromEnum(HttpErrorCode.internal_error)),
+        @as(u32, @backingInt(HttpErrorCode.internal_error)),
         decoded_kept.payload,
     );
 }
@@ -44863,7 +44864,7 @@ test "wasi:http #583 B1 follow-up: httpFetchWorker translates Cancelled to HTTP_
     const settled = adapter.http_future_responses.unsafeGetPtrForTest(fh).?.*;
     switch (settled.state) {
         .ready_err => |code| try testing.expectEqual(
-            @as(u32, @intFromEnum(HttpErrorCode.HTTP_request_denied)),
+            @as(u32, @backingInt(HttpErrorCode.HTTP_request_denied)),
             code,
         ),
         else => return error.UnexpectedHttpFutureState,
@@ -44960,7 +44961,7 @@ const TestHttpPhaseServerCtx = struct {
         var total: usize = 0;
         while (total < req_buf.len) {
             var dests = [_][]u8{req_buf[total..]};
-            const n = io.vtable.netRead(io.userdata, stream.socket.handle, &dests) catch return;
+            const n = net_io.read(io, stream.socket.handle, &dests) catch return;
             if (n == 0) break;
             total += n;
             if (std.mem.indexOf(u8, req_buf[0..total], "\r\n\r\n") != null) break;
@@ -44981,10 +44982,10 @@ const TestHttpPhaseServerCtx = struct {
         }
 
         const head_slices = [_][]const u8{self.head};
-        _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &head_slices, 1) catch return;
+        _ = net_io.write(io, stream.socket.handle, &.{}, &head_slices, 1) catch return;
         if (self.body_part1.len > 0) {
             const body_slices = [_][]const u8{self.body_part1};
-            _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &body_slices, 1) catch return;
+            _ = net_io.write(io, stream.socket.handle, &.{}, &body_slices, 1) catch return;
         }
 
         // Mid-body cancel test only: signal that the first chunk
@@ -45004,7 +45005,7 @@ const TestHttpPhaseServerCtx = struct {
             }
             if (self.body_part2.len > 0) {
                 const body_slices = [_][]const u8{self.body_part2};
-                _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &body_slices, 1) catch return;
+                _ = net_io.write(io, stream.socket.handle, &.{}, &body_slices, 1) catch return;
             }
         }
     }
@@ -45571,7 +45572,7 @@ const TestHttpRedirectServerCtx = struct {
             var total: usize = 0;
             while (total < req_buf.len) {
                 var dests = [_][]u8{req_buf[total..]};
-                const n = io.vtable.netRead(io.userdata, stream.socket.handle, &dests) catch break;
+                const n = net_io.read(io, stream.socket.handle, &dests) catch break;
                 if (n == 0) break;
                 total += n;
                 if (std.mem.indexOf(u8, req_buf[0..total], "\r\n\r\n") != null) break;
@@ -45601,7 +45602,7 @@ const TestHttpRedirectServerCtx = struct {
                 ) catch return;
 
             const slices = [_][]const u8{response};
-            _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &slices, 1) catch return;
+            _ = net_io.write(io, stream.socket.handle, &.{}, &slices, 1) catch return;
         }
     }
 };
@@ -46847,7 +46848,7 @@ test "wasi:http@0.3 (#487): client.send denies when allow-list empty" {
     const decoded = decodeP3ClientSendBytes(fut.payload.?);
     try testing.expect(!decoded.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(HttpErrorCode.HTTP_request_denied)),
+        @as(u32, @backingInt(HttpErrorCode.HTTP_request_denied)),
         decoded.payload,
     );
 }
@@ -46951,7 +46952,7 @@ test "wasi:http@0.3 #589: P3 client.send err-arm uses 0.3 error-code variant dis
         // The enum value and the WIT discriminant must agree —
         // protects against a future reorder of `HttpErrorCode`
         // away from the 0.3 WIT order.
-        try testing.expectEqual(@as(u32, c.disc), @intFromEnum(c.code));
+        try testing.expectEqual(@as(u32, c.disc), @backingInt(c.code));
     }
 }
 
@@ -47088,10 +47089,10 @@ test "wasi:http@0.3 #521: client.send proceeds past the TLS gate for https" {
     try testing.expect(!decoded.is_ok);
     // The scheme gate is gone — `HTTP_protocol_error` must not be the
     // outcome of a well-formed `https://` request.
-    try testing.expect(decoded.payload != @as(u32, @intFromEnum(HttpErrorCode.HTTP_protocol_error)));
+    try testing.expect(decoded.payload != @as(u32, @backingInt(HttpErrorCode.HTTP_protocol_error)));
     // Port 1 has no listener; TCP connect refuses before TLS runs,
     // which the #583 A3 mapping surfaces as `connection_refused`.
-    try testing.expectEqual(@as(u32, @intFromEnum(HttpErrorCode.connection_refused)), decoded.payload);
+    try testing.expectEqual(@as(u32, @backingInt(HttpErrorCode.connection_refused)), decoded.payload);
 }
 
 test "wasi:http #583 A3: mapHttpFetchError classifies connection-refused" {
@@ -47227,7 +47228,7 @@ test "wasi:http #583 A3: connect-refused end-to-end (P2 outgoing-handler, http)"
     p3DrainPendingHttpUntilSettled(&adapter, fut, 10_000);
     try testing.expect(fut.state == .ready_err);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(HttpErrorCode.connection_refused)),
+        @as(u32, @backingInt(HttpErrorCode.connection_refused)),
         fut.state.ready_err,
     );
 }
@@ -47288,7 +47289,7 @@ test "wasi:http@0.3 #583 A3: connect-refused end-to-end (P3 client.send, http)" 
     const decoded = decodeP3ClientSendBytes(fut.payload.?);
     try testing.expect(!decoded.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(HttpErrorCode.connection_refused)),
+        @as(u32, @backingInt(HttpErrorCode.connection_refused)),
         decoded.payload,
     );
 }
@@ -47456,7 +47457,7 @@ test "wasi:http@0.3 (#538): handler.handle host-import forwards to client.send" 
     const decoded = decodeP3ClientSendBytes(fut.payload.?);
     try testing.expect(!decoded.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(HttpErrorCode.HTTP_request_denied)),
+        @as(u32, @backingInt(HttpErrorCode.HTTP_request_denied)),
         decoded.payload,
     );
 }
@@ -48622,7 +48623,7 @@ fn encodeLiveTrailerResult(
         },
         .err => |code| blk: {
             error_value = .{ .variant_val = .{
-                .discriminant = @intFromEnum(code),
+                .discriminant = @backingInt(code),
                 .payload = null,
             } };
             break :blk InterfaceValue{ .result_val = .{
@@ -50368,7 +50369,7 @@ test "wasi:http #954 review: P2 finish reports content-length mismatch" {
     defer finish_results[0].deinit(testing.allocator);
     try testing.expect(!finish_results[0].result_val.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(HttpErrorCode.HTTP_response_body_size)),
+        @as(u32, @backingInt(HttpErrorCode.HTTP_response_body_size)),
         finish_results[0].result_val.payload.?.variant_val.discriminant,
     );
     try testing.expect(response.body_incomplete);
@@ -54650,11 +54651,11 @@ test "wasi:http@0.3 (#570): HandleP3Outcome.fromTaskReturnValues decodes Err bra
     const testing = std.testing;
     const HandleP3Outcome = WasiCliAdapter.HandleP3Outcome;
 
-    const flat_err = [_]u32{ 1, @intFromEnum(HttpErrorCode.HTTP_request_denied) };
+    const flat_err = [_]u32{ 1, @backingInt(HttpErrorCode.HTTP_request_denied) };
     const out = HandleP3Outcome.fromTaskReturnValues(&flat_err);
     try testing.expect(!out.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(HttpErrorCode.HTTP_request_denied)),
+        @as(u32, @backingInt(HttpErrorCode.HTTP_request_denied)),
         out.payload,
     );
 
@@ -54663,7 +54664,7 @@ test "wasi:http@0.3 (#570): HandleP3Outcome.fromTaskReturnValues decodes Err bra
     const out_short = HandleP3Outcome.fromTaskReturnValues(&flat_err_short);
     try testing.expect(!out_short.is_ok);
     try testing.expectEqual(
-        @as(u32, @intFromEnum(HttpErrorCode.internal_error)),
+        @as(u32, @backingInt(HttpErrorCode.internal_error)),
         out_short.payload,
     );
 
@@ -54962,7 +54963,7 @@ test "wasi:http@0.3 (#583 A5): oversize header section short-circuits with 431 w
         var name_buf: [40]u8 = undefined;
         const line = try std.fmt.bufPrint(&name_buf, "X-Pad-{d:0>4}: ", .{i});
         try wire.appendSlice(testing.allocator, line);
-        try wire.appendSlice(testing.allocator, "A" ** 100);
+        try wire.appendSlice(testing.allocator, &@as([100:0]u8, @splat("A"[0])));
         try wire.appendSlice(testing.allocator, "\r\n");
     }
     try wire.appendSlice(testing.allocator, "\r\n");
@@ -55109,12 +55110,12 @@ test "wasi:logging (#583 B5): every level projects to the expected std.log.Level
     // WIT discriminant order is contiguous 0..=5 — guards against
     // accidental enum reordering breaking the canonical-ABI
     // discriminant → variant mapping in `wasiLog`.
-    try testing.expectEqual(@as(u32, 0), @intFromEnum(WasiLogLevel.trace));
-    try testing.expectEqual(@as(u32, 1), @intFromEnum(WasiLogLevel.debug));
-    try testing.expectEqual(@as(u32, 2), @intFromEnum(WasiLogLevel.info));
-    try testing.expectEqual(@as(u32, 3), @intFromEnum(WasiLogLevel.warn));
-    try testing.expectEqual(@as(u32, 4), @intFromEnum(WasiLogLevel.err));
-    try testing.expectEqual(@as(u32, 5), @intFromEnum(WasiLogLevel.critical));
+    try testing.expectEqual(@as(u32, 0), @backingInt(WasiLogLevel.trace));
+    try testing.expectEqual(@as(u32, 1), @backingInt(WasiLogLevel.debug));
+    try testing.expectEqual(@as(u32, 2), @backingInt(WasiLogLevel.info));
+    try testing.expectEqual(@as(u32, 3), @backingInt(WasiLogLevel.warn));
+    try testing.expectEqual(@as(u32, 4), @backingInt(WasiLogLevel.err));
+    try testing.expectEqual(@as(u32, 5), @backingInt(WasiLogLevel.critical));
 }
 
 test "wasi:logging (#583 B5): emitWasiLog formats `[wasi_guest] [<level>] [<context>] <message>` and preserves context" {
@@ -55179,7 +55180,7 @@ test "wasi:logging (#583 B5): wasiLog reads guest-memory strings via ComponentIn
     const msg_ptr = ci.hostAllocAndWrite("served 200 in 4ms", 1).?;
 
     var args = [_]InterfaceValue{
-        .{ .enum_val = @intFromEnum(WasiLogLevel.info) },
+        .{ .enum_val = @backingInt(WasiLogLevel.info) },
         .{ .string = .{ .ptr = ctx_ptr, .len = @intCast("svc:web".len) } },
         .{ .string = .{ .ptr = msg_ptr, .len = @intCast("served 200 in 4ms".len) } },
     };
@@ -55466,7 +55467,7 @@ test "wasi:keyvalue/store: delete + exists semantics (#583 B4)" {
         defer get_results[0].deinit(testing.allocator);
         try testing.expect(!get_results[0].result_val.is_ok);
         try testing.expectEqual(
-            @as(u32, @intFromEnum(KeyvalueErrorTag.no_such_store)),
+            @as(u32, @backingInt(KeyvalueErrorTag.no_such_store)),
             get_results[0].result_val.payload.?.variant_val.discriminant,
         );
     }
@@ -55658,7 +55659,7 @@ test "wasi:keyvalue/atomics: increment positive / negative / overflow (#583 B4)"
         defer inc_results[0].deinit(testing.allocator);
         try testing.expect(!inc_results[0].result_val.is_ok);
         try testing.expectEqual(
-            @as(u32, @intFromEnum(KeyvalueErrorTag.other)),
+            @as(u32, @backingInt(KeyvalueErrorTag.other)),
             inc_results[0].result_val.payload.?.variant_val.discriminant,
         );
     }
@@ -56112,7 +56113,7 @@ test "wasi:keyvalue/atomics.swap: cas-failed when value changed (#583 B4 follow-
     // re-snapshotted handle (same handle, new snapshot).
     const cas_err = swap_results[0].result_val.payload.?.variant_val;
     try testing.expectEqual(
-        @as(u32, @intFromEnum(KeyvalueCasErrorTag.cas_failed)),
+        @as(u32, @backingInt(KeyvalueCasErrorTag.cas_failed)),
         cas_err.discriminant,
     );
     const returned_handle = cas_err.payload.?.handle;
@@ -56219,7 +56220,7 @@ test "wasi:keyvalue/atomics.swap: multi-CAS — first-swap-wins, second sees mis
         defer sr[0].deinit(testing.allocator);
         try testing.expect(!sr[0].result_val.is_ok);
         try testing.expectEqual(
-            @as(u32, @intFromEnum(KeyvalueCasErrorTag.cas_failed)),
+            @as(u32, @backingInt(KeyvalueCasErrorTag.cas_failed)),
             sr[0].result_val.payload.?.variant_val.discriminant,
         );
     }
@@ -57762,7 +57763,7 @@ test "adapter resource safety: concurrent socket scans never wait on nested clai
                 .port = 31_337,
             } };
             result.store(
-                @intFromEnum(target.bindWouldConflict(address, handle)),
+                @backingInt(target.bindWouldConflict(address, handle)),
                 .release,
             );
             lease.release();
@@ -57788,8 +57789,8 @@ test "adapter resource safety: concurrent socket scans never wait on nested clai
     first.join();
     second.join();
 
-    const busy = @intFromEnum(WasiCliAdapter.BindConflictCheck.busy);
-    const clear = @intFromEnum(WasiCliAdapter.BindConflictCheck.clear);
+    const busy = @backingInt(WasiCliAdapter.BindConflictCheck.busy);
+    const clear = @backingInt(WasiCliAdapter.BindConflictCheck.clear);
     const first_value = first_result.load(.acquire);
     const second_value = second_result.load(.acquire);
     try testing.expect(first_value == busy or first_value == clear);

@@ -401,25 +401,25 @@ pub fn executeSIMD(env: *ExecEnv, code: []const u8, ip: *usize) SimdError!void {
         },
 
         // ── Load/store lane ─────────────────────────────────────────
-        0x54 => try loadLane(env, code, ip, 1),   // v128.load8_lane
-        0x55 => try loadLane(env, code, ip, 2),   // v128.load16_lane
-        0x56 => try loadLane(env, code, ip, 4),   // v128.load32_lane
-        0x57 => try loadLane(env, code, ip, 8),   // v128.load64_lane
-        0x58 => try storeLane(env, code, ip, 1),  // v128.store8_lane
-        0x59 => try storeLane(env, code, ip, 2),  // v128.store16_lane
-        0x5A => try storeLane(env, code, ip, 4),  // v128.store32_lane
-        0x5B => try storeLane(env, code, ip, 8),  // v128.store64_lane
+        0x54 => try loadLane(env, code, ip, 1), // v128.load8_lane
+        0x55 => try loadLane(env, code, ip, 2), // v128.load16_lane
+        0x56 => try loadLane(env, code, ip, 4), // v128.load32_lane
+        0x57 => try loadLane(env, code, ip, 8), // v128.load64_lane
+        0x58 => try storeLane(env, code, ip, 1), // v128.store8_lane
+        0x59 => try storeLane(env, code, ip, 2), // v128.store16_lane
+        0x5A => try storeLane(env, code, ip, 4), // v128.store32_lane
+        0x5B => try storeLane(env, code, ip, 8), // v128.store64_lane
         0x5C => { // v128.load32_zero
             const ma = readMemarg(code, ip);
             const slice = try getMemSlice(env, ma, 4);
-            var bytes: [16]u8 = .{0} ** 16;
+            var bytes: [16]u8 = @splat(0);
             @memcpy(bytes[0..4], slice[0..4]);
             try pushV128(env, std.mem.readInt(u128, &bytes, .little));
         },
         0x5D => { // v128.load64_zero
             const ma = readMemarg(code, ip);
             const slice = try getMemSlice(env, ma, 8);
-            var bytes: [16]u8 = .{0} ** 16;
+            var bytes: [16]u8 = @splat(0);
             @memcpy(bytes[0..8], slice[0..8]);
             try pushV128(env, std.mem.readInt(u128, &bytes, .little));
         },
@@ -434,8 +434,8 @@ pub fn executeSIMD(env: *ExecEnv, code: []const u8, ip: *usize) SimdError!void {
         0x62 => try i8x16Popcnt(env),
         0x63 => try allTrue(I8x16, env),
         0x64 => try bitmask(I8x16, env),
-        0x65 => try narrowOp(I16x8, I8x16, env, true),   // i8x16.narrow_i16x8_s
-        0x66 => try narrowOp(I16x8, I8x16, env, false),  // i8x16.narrow_i16x8_u
+        0x65 => try narrowOp(I16x8, I8x16, env, true), // i8x16.narrow_i16x8_s
+        0x66 => try narrowOp(I16x8, I8x16, env, false), // i8x16.narrow_i16x8_u
         0x67 => try f32x4Unary(env, .ceil),
         0x68 => try f32x4Unary(env, .floor),
         0x69 => try f32x4Unary(env, .trunc),
@@ -585,14 +585,14 @@ pub fn executeSIMD(env: *ExecEnv, code: []const u8, ip: *usize) SimdError!void {
         0xF7 => try f64x2Binary(env, .pmax),
 
         // ── Conversions ─────────────────────────────────────────────
-        0xF8 => try i32x4TruncSatF32x4(env, true),   // i32x4.trunc_sat_f32x4_s
-        0xF9 => try i32x4TruncSatF32x4(env, false),  // i32x4.trunc_sat_f32x4_u
-        0xFA => try f32x4ConvertI32x4(env, true),     // f32x4.convert_i32x4_s
-        0xFB => try f32x4ConvertI32x4(env, false),    // f32x4.convert_i32x4_u
-        0xFC => try i32x4TruncSatF64x2Zero(env, true),  // i32x4.trunc_sat_f64x2_s_zero
+        0xF8 => try i32x4TruncSatF32x4(env, true), // i32x4.trunc_sat_f32x4_s
+        0xF9 => try i32x4TruncSatF32x4(env, false), // i32x4.trunc_sat_f32x4_u
+        0xFA => try f32x4ConvertI32x4(env, true), // f32x4.convert_i32x4_s
+        0xFB => try f32x4ConvertI32x4(env, false), // f32x4.convert_i32x4_u
+        0xFC => try i32x4TruncSatF64x2Zero(env, true), // i32x4.trunc_sat_f64x2_s_zero
         0xFD => try i32x4TruncSatF64x2Zero(env, false), // i32x4.trunc_sat_f64x2_u_zero
-        0xFE => try f64x2ConvertLowI32x4(env, true),    // f64x2.convert_low_i32x4_s
-        0xFF => try f64x2ConvertLowI32x4(env, false),   // f64x2.convert_low_i32x4_u
+        0xFE => try f64x2ConvertLowI32x4(env, true), // f64x2.convert_low_i32x4_s
+        0xFF => try f64x2ConvertLowI32x4(env, false), // f64x2.convert_low_i32x4_u
 
         // ── Relaxed SIMD ───────────────────────────────────────────
         0x100 => { // i8x16.relaxed_swizzle (same as swizzle but OOB returns 0)
@@ -604,19 +604,19 @@ pub fn executeSIMD(env: *ExecEnv, code: []const u8, ip: *usize) SimdError!void {
             try pushV128(env, @bitCast(result));
         },
         0x105 => try f32x4Ternary(env, false), // f32x4.relaxed_madd (a*b+c)
-        0x106 => try f32x4Ternary(env, true),  // f32x4.relaxed_nmadd (-a*b+c)
+        0x106 => try f32x4Ternary(env, true), // f32x4.relaxed_nmadd (-a*b+c)
         0x107 => try f64x2Ternary(env, false), // f64x2.relaxed_madd
-        0x108 => try f64x2Ternary(env, true),  // f64x2.relaxed_nmadd
+        0x108 => try f64x2Ternary(env, true), // f64x2.relaxed_nmadd
         0x109, 0x10A, 0x10B, 0x10C => { // relaxed_laneselect (bitselect)
             const c = try popV128(env);
             const b = try popV128(env);
             const a = try popV128(env);
             try pushV128(env, (a & c) | (b & ~c));
         },
-        0x10D => try f32x4Binary(env, .min),   // f32x4.relaxed_min
-        0x10E => try f32x4Binary(env, .max),   // f32x4.relaxed_max
-        0x10F => try f64x2Binary(env, .min),   // f64x2.relaxed_min
-        0x110 => try f64x2Binary(env, .max),   // f64x2.relaxed_max
+        0x10D => try f32x4Binary(env, .min), // f32x4.relaxed_min
+        0x10E => try f32x4Binary(env, .max), // f32x4.relaxed_max
+        0x10F => try f64x2Binary(env, .min), // f64x2.relaxed_min
+        0x110 => try f64x2Binary(env, .max), // f64x2.relaxed_max
         0x111 => try q15mulrSatS(env), // i16x8.relaxed_q15mulr_s
         0x112 => { // i16x8.relaxed_dot_i8x16_i7x16_s
             const b: U8x16 = @bitCast(try popV128(env));
@@ -810,7 +810,7 @@ fn cmpOp(comptime T: type, env: *ExecEnv, comptime kind: CmpKind) SimdError!void
     const a: T = @bitCast(try popV128(env));
     const lanes = comptime @typeInfo(T).vector.len;
     const Child = @typeInfo(T).vector.child;
-    const Signed = std.meta.Int(.signed, @bitSizeOf(Child));
+    const Signed = @Int(.signed, @bitSizeOf(Child));
     const SV = @Vector(lanes, Signed);
     const mask: @Vector(lanes, bool) = switch (kind) {
         .eq => a == b,
@@ -936,7 +936,7 @@ fn avgr(comptime T: type, env: *ExecEnv) SimdError!void {
     const a: T = @bitCast(try popV128(env));
     const lanes = @typeInfo(T).vector.len;
     const Child = @typeInfo(T).vector.child;
-    const Wide = std.meta.Int(.unsigned, @bitSizeOf(Child) * 2);
+    const Wide = @Int(.unsigned, @bitSizeOf(Child) * 2);
     var result: T = undefined;
     inline for (0..lanes) |i| {
         result[i] = @intCast((@as(Wide, a[i]) + @as(Wide, b[i]) + 1) / 2);
@@ -968,7 +968,7 @@ fn saturateTo(comptime DstChild: type, val: anytype, comptime signed: bool) DstC
         if (val > hi) return @intCast(hi);
         return @intCast(val);
     } else {
-        const UDst = std.meta.Int(.unsigned, @bitSizeOf(DstChild));
+        const UDst = @Int(.unsigned, @bitSizeOf(DstChild));
         const hi = std.math.maxInt(UDst);
         if (val < 0) return @bitCast(@as(UDst, 0));
         if (val > hi) return @bitCast(@as(UDst, hi));

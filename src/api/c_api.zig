@@ -216,7 +216,7 @@ test "c_api: full lifecycle — init, load, instantiate, lookup, teardown" {
 }
 
 test "c_api: load invalid wasm returns null with error message" {
-    var err_buf: [128]u8 = [_]u8{0} ** 128;
+    var err_buf: [128]u8 = @as([128]u8, @splat(0));
     const bad_data = [_]u8{ 0xDE, 0xAD };
     const result = wasm_runtime_load(&bad_data, bad_data.len, &err_buf, err_buf.len);
     try std.testing.expect(result == null);

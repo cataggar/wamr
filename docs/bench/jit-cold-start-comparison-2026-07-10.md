@@ -36,13 +36,13 @@ $ export ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-global-cache"
 $ python3 scripts/bench_jit_coldstart.py --wasmtime-path ~/.wasmtime/bin/wasmtime --out /tmp/jit_bench_report.md
 ```
 
-`scripts/bench_jit_coldstart.py` (new in this PR) builds a single `-Djit=true -Doptimize=ReleaseFast` binary — `-Djit=true` only *adds* the in-process compile+run path, so the same binary serves every row above, including the two-step AOT rows (verified byte-identical `.cwasm` output in #860). Cold-start timing wraps the noop module's subprocess wall time (20 samples, 3 warmup, discarded); CoreMark throughput parses the `Iterations/Sec` line from 3 runs per mode.
+`scripts/bench_jit_coldstart.py` (new in this PR) builds a single `-Djit=true -Doptimize=fast` binary — `-Djit=true` only *adds* the in-process compile+run path, so the same binary serves every row above, including the two-step AOT rows (verified byte-identical `.cwasm` output in #860). Cold-start timing wraps the noop module's subprocess wall time (20 samples, 3 warmup, discarded); CoreMark throughput parses the `Iterations/Sec` line from 3 runs per mode.
 
 ## Raw output
 
 ```text
 $ python3 scripts/bench_jit_coldstart.py --wasmtime-path ~/.wasmtime/bin/wasmtime
-[harness] building wamr/wamrc (-Djit=true -Doptimize=ReleaseFast)
+[harness] building wamr/wamrc (-Djit=true -Doptimize=fast)
 [harness] timing cold-start (20 samples, 3 warmup)...
 [harness] timing CoreMark throughput (3 runs per mode)...
 [harness]   run 1/3: 12231.7 iter/s

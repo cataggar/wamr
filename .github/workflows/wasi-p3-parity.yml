@@ -61,7 +61,7 @@ jobs:
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Configure Zig caches
@@ -93,10 +93,10 @@ jobs:
         # which the Debug interpreter cannot complete inside the
         # 5-second per-`wait` timeout. Safety checks still fire so a
         # real regression still trips the gate.
-        run: zig build -Doptimize=ReleaseSafe
+        run: zig build -Doptimize=safe
 
       - name: Run Wasmtime parity gate
-        run: zig build wasi-p3-parity -Doptimize=ReleaseSafe
+        run: zig build wasi-p3-parity -Doptimize=safe
 
       - name: Upload parity JSON reports
         if: always()

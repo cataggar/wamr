@@ -938,7 +938,7 @@ joined trapped outcome, and never detach or terminate the embedding host.
 2. Single-threaded performance baseline measured **before and after**
    the Wave-1 resource-table-mutex migration: `coremark` (or, lacking
    that, a stable wamr microbenchmark like `tests/perf/dispatch_loop`)
-   regression ≤ 2 % under `-Doptimize=ReleaseFast`,
+   regression ≤ 2 % under `-Doptimize=fast`,
    `-Dlib_wasi_threads=false`. Documented in the wave's PR body.
 3. Working `wasi.thread-spawn` interpreter and AOT gates:
    ```console

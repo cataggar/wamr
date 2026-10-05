@@ -27,12 +27,12 @@ pub const Reg = enum(u4) {
 
     /// Returns the low 3 bits of the register encoding.
     pub fn low3(self: Reg) u3 {
-        return @truncate(@intFromEnum(self));
+        return @truncate(@backingInt(self));
     }
 
     /// Returns true if the register requires a REX prefix (r8–r15).
     pub fn isExtended(self: Reg) bool {
-        return @intFromEnum(self) >= 8;
+        return @backingInt(self) >= 8;
     }
 };
 
@@ -171,8 +171,8 @@ pub const CodeBuffer = struct {
     fn rex(self: *CodeBuffer, w: bool, r: Reg, b: Reg) !void {
         const val: u8 = 0x40 |
             (@as(u8, if (w) 1 else 0) << 3) |
-            (@as(u8, @intFromEnum(r) >> 3) << 2) |
-            (@as(u8, @intFromEnum(b) >> 3));
+            (@as(u8, @backingInt(r) >> 3) << 2) |
+            (@as(u8, @backingInt(b) >> 3));
         if (val != 0x40) try self.emitByte(val);
     }
 
@@ -435,7 +435,7 @@ pub const CodeBuffer = struct {
     /// without touching any register — used by the #616 loop-header
     /// group-cancel poll, which must not disturb the allocator's state.
     pub fn cmpMem32Imm8(self: *CodeBuffer, base: Reg, disp: i32, imm: i8) !void {
-        if (@intFromEnum(base) >= 8) try self.emitByte(0x41);
+        if (@backingInt(base) >= 8) try self.emitByte(0x41);
         try self.emitByte(0x83);
         try self.modrm(0b10, 7, base.low3());
         if (base.low3() == 4) try self.emitByte(0x24); // SIB for RSP-based
@@ -474,7 +474,7 @@ pub const CodeBuffer = struct {
     /// (encodings 4–7) to distinguish them from AH/CH/DH/BH. We force
     /// the REX emission in that case even when no extension bits are set.
     pub fn setcc(self: *CodeBuffer, cc: u4, dst: Reg) !void {
-        const idx = @intFromEnum(dst);
+        const idx = @backingInt(dst);
         if (idx >= 4 and idx < 8) {
             try self.emitByte(0x40); // mandatory REX for SPL/BPL/SIL/DIL
         } else {
@@ -674,9 +674,9 @@ pub const CodeBuffer = struct {
     pub fn leaRegBaseIndexScaleDisp64(self: *CodeBuffer, dst: Reg, base: Reg, index: Reg, scale_log2: u2, disp: i32) !void {
         std.debug.assert(index != .rsp);
         const rex_byte: u8 = 0x48 |
-            (@as(u8, @intFromEnum(dst) >> 3) << 2) |
-            (@as(u8, @intFromEnum(index) >> 3) << 1) |
-            (@as(u8, @intFromEnum(base) >> 3));
+            (@as(u8, @backingInt(dst) >> 3) << 2) |
+            (@as(u8, @backingInt(index) >> 3) << 1) |
+            (@as(u8, @backingInt(base) >> 3));
         try self.emitByte(rex_byte);
         try self.emitSibLeaBody(dst, base, index, scale_log2, disp);
     }
@@ -687,9 +687,9 @@ pub const CodeBuffer = struct {
     pub fn leaRegBaseIndexScaleDisp32(self: *CodeBuffer, dst: Reg, base: Reg, index: Reg, scale_log2: u2, disp: i32) !void {
         std.debug.assert(index != .rsp);
         const rex_byte: u8 = 0x40 |
-            (@as(u8, @intFromEnum(dst) >> 3) << 2) |
-            (@as(u8, @intFromEnum(index) >> 3) << 1) |
-            (@as(u8, @intFromEnum(base) >> 3));
+            (@as(u8, @backingInt(dst) >> 3) << 2) |
+            (@as(u8, @backingInt(index) >> 3) << 1) |
+            (@as(u8, @backingInt(base) >> 3));
         if (rex_byte != 0x40) try self.emitByte(rex_byte);
         try self.emitSibLeaBody(dst, base, index, scale_log2, disp);
     }
@@ -1111,25 +1111,55 @@ pub const CodeBuffer = struct {
     }
 
     // ── f64 binary (ADDSD, SUBSD, MULSD, DIVSD) ──
-    pub fn addsd(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF2, 0x58, dst, src); }
-    pub fn subsd(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF2, 0x5C, dst, src); }
-    pub fn mulsd(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF2, 0x59, dst, src); }
-    pub fn divsd(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF2, 0x5E, dst, src); }
-    pub fn sqrtsd(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF2, 0x51, dst, src); }
-    pub fn minsd(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF2, 0x5D, dst, src); }
-    pub fn maxsd(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF2, 0x5F, dst, src); }
+    pub fn addsd(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.sseBinOp(0xF2, 0x58, dst, src);
+    }
+    pub fn subsd(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.sseBinOp(0xF2, 0x5C, dst, src);
+    }
+    pub fn mulsd(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.sseBinOp(0xF2, 0x59, dst, src);
+    }
+    pub fn divsd(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.sseBinOp(0xF2, 0x5E, dst, src);
+    }
+    pub fn sqrtsd(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.sseBinOp(0xF2, 0x51, dst, src);
+    }
+    pub fn minsd(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.sseBinOp(0xF2, 0x5D, dst, src);
+    }
+    pub fn maxsd(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.sseBinOp(0xF2, 0x5F, dst, src);
+    }
 
     // ── f32 binary (ADDSS, SUBSS, MULSS, DIVSS) ──
-    pub fn addss(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF3, 0x58, dst, src); }
-    pub fn subss(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF3, 0x5C, dst, src); }
-    pub fn mulss(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF3, 0x59, dst, src); }
-    pub fn divss(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF3, 0x5E, dst, src); }
-    pub fn sqrtss(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF3, 0x51, dst, src); }
-    pub fn minss(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF3, 0x5D, dst, src); }
-    pub fn maxss(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF3, 0x5F, dst, src); }
+    pub fn addss(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.sseBinOp(0xF3, 0x58, dst, src);
+    }
+    pub fn subss(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.sseBinOp(0xF3, 0x5C, dst, src);
+    }
+    pub fn mulss(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.sseBinOp(0xF3, 0x59, dst, src);
+    }
+    pub fn divss(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.sseBinOp(0xF3, 0x5E, dst, src);
+    }
+    pub fn sqrtss(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.sseBinOp(0xF3, 0x51, dst, src);
+    }
+    pub fn minss(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.sseBinOp(0xF3, 0x5D, dst, src);
+    }
+    pub fn maxss(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.sseBinOp(0xF3, 0x5F, dst, src);
+    }
 
     // ── Comparisons ──
-    pub fn ucomisd(self: *CodeBuffer, a: Reg, b: Reg) !void { try self.sseBinOp(0x66, 0x2E, a, b); }
+    pub fn ucomisd(self: *CodeBuffer, a: Reg, b: Reg) !void {
+        try self.sseBinOp(0x66, 0x2E, a, b);
+    }
     pub fn ucomiss(self: *CodeBuffer, a: Reg, b: Reg) !void {
         if (a.isExtended() or b.isExtended()) try self.rex(false, a, b);
         try self.emitSlice(&.{ 0x0F, 0x2E });
@@ -1202,16 +1232,24 @@ pub const CodeBuffer = struct {
     }
 
     /// CVTSD2SS xmm, xmm — convert f64 to f32
-    pub fn cvtsd2ss(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF2, 0x5A, dst, src); }
+    pub fn cvtsd2ss(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.sseBinOp(0xF2, 0x5A, dst, src);
+    }
 
     /// CVTSS2SD xmm, xmm — convert f32 to f64
-    pub fn cvtss2sd(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF3, 0x5A, dst, src); }
+    pub fn cvtss2sd(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.sseBinOp(0xF3, 0x5A, dst, src);
+    }
 
     // ── Bitwise XMM ──
     /// XORPD xmm, xmm — bitwise XOR for f64
-    pub fn xorpd(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0x66, 0x57, dst, src); }
+    pub fn xorpd(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.sseBinOp(0x66, 0x57, dst, src);
+    }
     /// ANDPD xmm, xmm — bitwise AND for f64
-    pub fn andpd(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0x66, 0x54, dst, src); }
+    pub fn andpd(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.sseBinOp(0x66, 0x54, dst, src);
+    }
 
     // ── Function prologue / epilogue ──────────────────────────────────
 
@@ -1289,7 +1327,8 @@ test "emitPrologue with nonzero frame size" {
     // REX.W sub rsp, 32 = 48 81 EC 20 00 00 00
     try hexEqual(buf.getCode(), &.{
         0x55, 0x48, 0x89, 0xE5,
-        0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00,
+        0x48, 0x81, 0xEC, 0x20,
+        0x00, 0x00, 0x00,
     });
 }
 
@@ -1333,7 +1372,10 @@ test "movRegImm64" {
     // 48 B8 F0 DE BC 9A 78 56 34 12
     try hexEqual(buf.getCode(), &.{
         0x48, 0xB8,
-        0xF0, 0xDE, 0xBC, 0x9A, 0x78, 0x56, 0x34, 0x12,
+        0xF0, 0xDE,
+        0xBC, 0x9A,
+        0x78, 0x56,
+        0x34, 0x12,
     });
 }
 
@@ -1895,8 +1937,6 @@ test "xorReg32 r8 (extended, 3 bytes)" {
     try hexEqual(buf.getCode(), &.{ 0x45, 0x31, 0xC0 });
 }
 
-
-
 test "leaRegBaseIndex64 rdx, rsi, rdi" {
     var buf = CodeBuffer.init(std.testing.allocator);
     defer buf.deinit();
@@ -1986,7 +2026,6 @@ test "leaRegBaseIndexScaleDisp32 r8d, [rsi + rdi*4] (REX.R only)" {
     // REX.R for r8 dst → 0x44. modrm reg=r8.low3=0 → 0x04.
     try hexEqual(buf.getCode(), &.{ 0x44, 0x8D, 0x04, 0xBE });
 }
-
 
 test "movRegReg elides self-move" {
     var buf = CodeBuffer.init(std.testing.allocator);

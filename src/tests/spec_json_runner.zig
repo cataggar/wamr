@@ -124,7 +124,7 @@ fn validateShouldReject(
         if (std.mem.eql(u8, mt, "text")) {
             const wat_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
             defer allocator.free(wat_path);
-            const wat_data = cwd.readFileAlloc(io, wat_path, allocator, @enumFromInt(10 * 1024 * 1024)) catch return .passed;
+            const wat_data = cwd.readFileAlloc(io, wat_path, allocator, @fromBackingInt(@intCast(10 * 1024 * 1024))) catch return .passed;
             defer allocator.free(wat_data);
             var wat_module = wabt.text.Parser.parseModule(allocator, wat_data) catch return .passed;
             defer wat_module.deinit();
@@ -142,7 +142,7 @@ fn validateShouldReject(
 
     const wasm_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
     defer allocator.free(wasm_path);
-    const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @enumFromInt(10 * 1024 * 1024)) catch return .passed;
+    const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @fromBackingInt(@intCast(10 * 1024 * 1024))) catch return .passed;
     defer allocator.free(wasm_data);
     var runtime = wamr.Runtime.init(allocator);
     defer runtime.deinit();
@@ -173,7 +173,7 @@ fn instantiateShouldReject(
 
     const wasm_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
     defer allocator.free(wasm_path);
-    const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @enumFromInt(10 * 1024 * 1024)) catch return .passed;
+    const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @fromBackingInt(@intCast(10 * 1024 * 1024))) catch return .passed;
     defer allocator.free(wasm_data);
 
     var runtime = wamr.Runtime.init(allocator);
@@ -244,7 +244,7 @@ const Command = struct {
     alternatives: ?[]const []const Arg = null,
     text: ?[]const u8 = null,
     module_type: ?[]const u8 = null,
-    @"as": ?[]const u8 = null,
+    as: ?[]const u8 = null,
     name: ?[]const u8 = null,
 };
 
@@ -671,7 +671,9 @@ fn freeImportContext(ctx: instance_mod.ImportContext, allocator: std.mem.Allocat
     if (ctx.memories.len > 0) allocator.free(ctx.memories);
     for (ctx.tables) |t| @constCast(t).release(allocator);
     if (ctx.tables.len > 0) allocator.free(ctx.tables);
-    for (ctx.globals) |g| { if (g.owned) allocator.destroy(g); }
+    for (ctx.globals) |g| {
+        if (g.owned) allocator.destroy(g);
+    }
     if (ctx.globals.len > 0) allocator.free(ctx.globals);
     if (ctx.functions.len > 0) allocator.free(ctx.functions);
     if (ctx.tags.len > 0) allocator.free(ctx.tags);
@@ -757,8 +759,12 @@ fn spectestFuncTypeMatches(name: []const u8, ft: types.FuncType) bool {
 
 fn funcTypesMatch(a: types.FuncType, b: types.FuncType) bool {
     if (a.params.len != b.params.len or a.results.len != b.results.len) return false;
-    for (a.params, b.params) |pa, pb| { if (pa.toNullable() != pb.toNullable()) return false; }
-    for (a.results, b.results) |ra, rb| { if (ra.toNullable() != rb.toNullable()) return false; }
+    for (a.params, b.params) |pa, pb| {
+        if (pa.toNullable() != pb.toNullable()) return false;
+    }
+    for (a.results, b.results) |ra, rb| {
+        if (ra.toNullable() != rb.toNullable()) return false;
+    }
     return true;
 }
 
@@ -920,7 +926,10 @@ fn crossModuleTypeIsSubtype(
 fn makeSpectestMemory(allocator: std.mem.Allocator) ?*types.MemoryInstance {
     const data = allocator.alloc(u8, types.MemoryInstance.page_size) catch return null;
     @memset(data, 0);
-    const mem = allocator.create(types.MemoryInstance) catch { allocator.free(data); return null; };
+    const mem = allocator.create(types.MemoryInstance) catch {
+        allocator.free(data);
+        return null;
+    };
     mem.* = .{
         .memory_type = .{ .limits = .{ .min = 1, .max = 2 } },
         .data = data,
@@ -933,7 +942,10 @@ fn makeSpectestMemory(allocator: std.mem.Allocator) ?*types.MemoryInstance {
 fn makeSpectestTable(allocator: std.mem.Allocator, is_table64: bool) ?*types.TableInstance {
     const elems = allocator.alloc(types.TableElement, 10) catch return null;
     for (elems) |*e| e.* = types.TableElement.nullForType(.funcref);
-    const tbl = allocator.create(types.TableInstance) catch { allocator.free(elems); return null; };
+    const tbl = allocator.create(types.TableInstance) catch {
+        allocator.free(elems);
+        return null;
+    };
     tbl.* = .{ .table_type = .{ .elem_type = .funcref, .limits = .{ .min = 10, .max = 20 }, .is_table64 = is_table64 }, .elements = elems };
     return tbl;
 }
@@ -983,7 +995,7 @@ fn makeDefaultTable(tt: ?types.TableType, allocator: std.mem.Allocator) ?types.T
 
 pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: std.Io) !SpecTestResult {
     const cwd = std.Io.Dir.cwd();
-    const json_data = try cwd.readFileAlloc(io, json_path, allocator, @enumFromInt(10 * 1024 * 1024));
+    const json_data = try cwd.readFileAlloc(io, json_path, allocator, @fromBackingInt(@intCast(10 * 1024 * 1024)));
     defer allocator.free(json_data);
 
     const parsed = try std.json.parseFromSlice(SpecJson, allocator, json_data, .{
@@ -1036,7 +1048,10 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
     defer {
         for (reg_instances.items) |*i| @constCast(i).deinit();
         reg_instances.deinit(allocator);
-        for (reg_mod_ptrs.items) |p| { p.deinit(); allocator.destroy(p); }
+        for (reg_mod_ptrs.items) |p| {
+            p.deinit();
+            allocator.destroy(p);
+        }
         reg_mod_ptrs.deinit(allocator);
         for (reg_wasm_data.items) |d| allocator.free(d);
         reg_wasm_data.deinit(allocator);
@@ -1053,7 +1068,7 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
             };
             const wasm_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
             defer allocator.free(wasm_path);
-            const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @enumFromInt(10 * 1024 * 1024)) catch {
+            const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @fromBackingInt(@intCast(10 * 1024 * 1024))) catch {
                 result.skipped += 1;
                 continue;
             };
@@ -1091,7 +1106,7 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
             const wasm_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
             defer allocator.free(wasm_path);
 
-            const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @enumFromInt(10 * 1024 * 1024)) catch |err| {
+            const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @fromBackingInt(@intCast(10 * 1024 * 1024))) catch |err| {
                 std.debug.print("  SKIP read {s} line {d}: {}\n", .{ filename, cmd.line, err });
                 result.skipped += 1;
                 continue;
@@ -1158,7 +1173,7 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
             }
             result.passed += 1;
         } else if (std.mem.eql(u8, cmd.type, "register")) {
-            const reg_name = cmd.@"as" orelse {
+            const reg_name = cmd.as orelse {
                 result.skipped += 1;
                 continue;
             };
@@ -1332,9 +1347,15 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
                         if (alt_vals.len != actual.len) continue;
                         var this_match = true;
                         for (actual, alt_vals) |a, e| {
-                            if (!valuesEqual(a, e)) { this_match = false; break; }
+                            if (!valuesEqual(a, e)) {
+                                this_match = false;
+                                break;
+                            }
                         }
-                        if (this_match) { alt_match = true; break; }
+                        if (this_match) {
+                            alt_match = true;
+                            break;
+                        }
                     }
                 }
                 if (alt_match) {
@@ -1400,7 +1421,7 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
                 if (std.mem.eql(u8, mt, "text")) {
                     const wat_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
                     defer allocator.free(wat_path);
-                    const wat_data = cwd.readFileAlloc(io, wat_path, allocator, @enumFromInt(10 * 1024 * 1024)) catch {
+                    const wat_data = cwd.readFileAlloc(io, wat_path, allocator, @fromBackingInt(@intCast(10 * 1024 * 1024))) catch {
                         result.passed += 1;
                         continue;
                     };
@@ -1433,7 +1454,7 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
             const wasm_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
             defer allocator.free(wasm_path);
 
-            const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @enumFromInt(10 * 1024 * 1024)) catch {
+            const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @fromBackingInt(@intCast(10 * 1024 * 1024))) catch {
                 result.passed += 1; // can't read = invalid, as expected
                 continue;
             };
@@ -1462,7 +1483,7 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
             const wasm_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
             defer allocator.free(wasm_path);
 
-            const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @enumFromInt(10 * 1024 * 1024)) catch {
+            const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @fromBackingInt(@intCast(10 * 1024 * 1024))) catch {
                 result.passed += 1;
                 continue;
             };
@@ -1525,7 +1546,7 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
             const wasm_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
             defer allocator.free(wasm_path);
 
-            const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @enumFromInt(10 * 1024 * 1024)) catch {
+            const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @fromBackingInt(@intCast(10 * 1024 * 1024))) catch {
                 result.passed += 1;
                 continue;
             };
@@ -1710,7 +1731,7 @@ fn runSpecTestFileAot(
     }
 
     const cwd = std.Io.Dir.cwd();
-    const json_data = try cwd.readFileAlloc(io, json_path, allocator, @enumFromInt(10 * 1024 * 1024));
+    const json_data = try cwd.readFileAlloc(io, json_path, allocator, @fromBackingInt(@intCast(10 * 1024 * 1024)));
     defer allocator.free(json_data);
 
     const parsed = try std.json.parseFromSlice(SpecJson, allocator, json_data, .{
@@ -1782,7 +1803,7 @@ fn runSpecTestFileAot(
     defer registered_names.deinit();
     for (parsed.value.commands) |pre| {
         if (std.mem.eql(u8, pre.type, "register")) {
-            if (pre.@"as") |rn| registered_names.put(rn, {}) catch {};
+            if (pre.as) |rn| registered_names.put(rn, {}) catch {};
         }
     }
 
@@ -1825,7 +1846,7 @@ fn runSpecTestFileAot(
             };
             const wasm_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
             defer allocator.free(wasm_path);
-            const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @enumFromInt(10 * 1024 * 1024)) catch {
+            const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @fromBackingInt(@intCast(10 * 1024 * 1024))) catch {
                 recordSkip("module_read_fail");
                 result.skipped += 1;
                 continue;
@@ -1855,7 +1876,7 @@ fn runSpecTestFileAot(
             };
             const wasm_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
             defer allocator.free(wasm_path);
-            const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @enumFromInt(10 * 1024 * 1024)) catch |err| {
+            const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @fromBackingInt(@intCast(10 * 1024 * 1024))) catch |err| {
                 std.debug.print("  SKIP aot read {s} line {d}: {}\n", .{ filename, cmd.line, err });
                 recordSkip("module_read_fail");
                 result.skipped += 1;
@@ -1919,7 +1940,7 @@ fn runSpecTestFileAot(
             // registration name so subsequent modules can import them.
             // Other kinds (memories, tables) still fall through as skips —
             // cross-module memory/table linking is TBD.
-            const reg_name = cmd.@"as" orelse {
+            const reg_name = cmd.as orelse {
                 recordSkip("register_no_as");
                 result.skipped += 1;
                 continue;
@@ -2192,7 +2213,7 @@ fn runSpecTestFileAot(
                 const trap_filename = cmd.filename.?;
                 const trap_wasm_path = try std.fs.path.join(allocator, &.{ json_dir, trap_filename });
                 defer allocator.free(trap_wasm_path);
-                const trap_wasm = cwd.readFileAlloc(io, trap_wasm_path, allocator, @enumFromInt(10 * 1024 * 1024)) catch {
+                const trap_wasm = cwd.readFileAlloc(io, trap_wasm_path, allocator, @fromBackingInt(@intCast(10 * 1024 * 1024))) catch {
                     recordSkip("trap_module_read");
                     result.skipped += 1;
                     continue;

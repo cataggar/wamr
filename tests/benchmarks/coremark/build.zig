@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
-    const optimize: std.builtin.OptimizeMode = .ReleaseFast;
+    const optimize: std.builtin.OptimizeMode = .fast;
 
     const exe_ext = if (builtin.os.tag == .windows) ".exe" else "";
     const wamrc_default = "../../../zig-out/bin/wamrc" ++ exe_ext;

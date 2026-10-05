@@ -37,7 +37,7 @@ abort, or small-input OOM is a bug.
 Build all harnesses:
 
 ```sh
-zig build fuzz -Doptimize=ReleaseSafe
+zig build fuzz -Doptimize=safe
 ```
 
 Run a short smoke over the malformed corpus:
@@ -133,7 +133,7 @@ To reproduce a crash:
 
 1. Download the `fuzz-crashes-<target>` artifact from the failed workflow.
 2. Put `in-flight.wasm` or the named crasher in a clean corpus directory.
-3. Re-run the same target locally with a short duration and `-Doptimize=ReleaseSafe`.
+3. Re-run the same target locally with a short duration and `-Doptimize=safe`.
 4. Minimize or redact the reproducer before making it public if it may disclose
    an unfixed security issue. Use the private reporting flow in `SECURITY.md`
    and `SECURITY_PROCESS.md` for sensitive payloads.
@@ -144,7 +144,7 @@ Use `scripts/fuzz_reduce.py` to shrink a reproducer to a small deterministic
 form before triage:
 
 ```sh
-zig build fuzz -Doptimize=ReleaseSafe
+zig build fuzz -Doptimize=safe
 scripts/fuzz_reduce.py <target> <crasher.wasm> [--duration 2] [--extra --fuel --extra 100000]
 ```
 
@@ -187,7 +187,7 @@ confirms otherwise.
 `.github/workflows/fuzz.yml` runs on a daily schedule, on demand, and on PRs that
 touch runtime/compiler/component/fuzz code. The workflow:
 
-- builds all harnesses with `zig build fuzz -Doptimize=ReleaseSafe`;
+- builds all harnesses with `zig build fuzz -Doptimize=safe`;
 - seeds per-target corpora from `tests/malformed/fuzz`, `tests/spec-json`,
   and any committed regression seeds in `tests/fuzz/regression/<target>/`;
 - adds a generated minimal component seed for `fuzz-component-loader`;

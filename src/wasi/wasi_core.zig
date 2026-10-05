@@ -138,7 +138,7 @@ pub fn clockTimeGetCore(mem: []u8, clock_id: i32, time_ptr: u32) i32 {
         WASI_CLOCK_PROCESS_CPUTIME, WASI_CLOCK_THREAD_CPUTIME => if (comptime builtin.os.tag == .linux) blk: {
             const linux = std.os.linux;
             var ts: linux.timespec = undefined;
-            const id: linux.clockid_t = @enumFromInt(@as(u32, @intCast(clock_id)));
+            const id: linux.clockid_t = @fromBackingInt(@intCast(@as(u32, @intCast(clock_id))));
             const rc = linux.clock_gettime(id, &ts);
             if (linux.errno(rc) != .SUCCESS or ts.sec < 0 or ts.nsec < 0) {
                 return WASI_EINVAL;
@@ -217,7 +217,7 @@ pub fn procRaiseCore(sig: i32) i32 {
 
     if (comptime builtin.os.tag == .linux) {
         const linux = std.os.linux;
-        const sig_enum: linux.SIG = @enumFromInt(@as(u32, posix_sig));
+        const sig_enum: linux.SIG = @fromBackingInt(@intCast(@as(u32, posix_sig)));
         const rc = linux.kill(linux.getpid(), sig_enum);
         return switch (linux.errno(rc)) {
             .SUCCESS => WASI_ESUCCESS,
@@ -241,7 +241,7 @@ pub fn clockResGetCore(mem: []u8, clock_id: i32, resolution_ptr: u32) i32 {
     if (comptime builtin.os.tag == .linux) {
         const linux = std.os.linux;
         var ts: linux.timespec = undefined;
-        const id: linux.clockid_t = @enumFromInt(@as(u32, @intCast(clock_id)));
+        const id: linux.clockid_t = @fromBackingInt(@intCast(@as(u32, @intCast(clock_id))));
         const rc = linux.clock_getres(id, &ts);
         if (linux.errno(rc) != .SUCCESS) return WASI_EINVAL;
         const ns: u64 =
@@ -302,14 +302,14 @@ test "fdWriteCore: invalid fd returns EBADF" {
 }
 
 test "fdWriteCore: stdout with zero iovs succeeds" {
-    var mem = [_]u8{0} ** 64;
+    var mem = @as([64]u8, @splat(0));
     const result = fdWriteCore(&mem, 1, 0, 0, 60);
     try std.testing.expectEqual(WASI_ESUCCESS, result);
     try std.testing.expectEqual(@as(u32, 0), memReadU32(&mem, 60).?);
 }
 
 test "fdWriteCore: stdout writes correct byte count" {
-    var mem = [_]u8{0} ** 64;
+    var mem = @as([64]u8, @splat(0));
     // Set up one iov: buf_ptr=16, buf_len=5
     std.mem.writeInt(u32, mem[0..4], 16, .little); // iov[0].buf_ptr
     std.mem.writeInt(u32, mem[4..8], 5, .little); // iov[0].buf_len
@@ -336,18 +336,18 @@ test "fdCloseCore: other fds return EBADF" {
 }
 
 test "fdFdstatGetCore: invalid fd returns EBADF" {
-    var mem = [_]u8{0} ** 64;
+    var mem = @as([64]u8, @splat(0));
     try std.testing.expectEqual(WASI_EBADF, fdFdstatGetCore(&mem, 3, 0));
     try std.testing.expectEqual(WASI_EBADF, fdFdstatGetCore(&mem, -1, 0));
 }
 
 test "fdFdstatGetCore: out-of-bounds returns EINVAL" {
-    var mem = [_]u8{0} ** 16;
+    var mem = @as([16]u8, @splat(0));
     try std.testing.expectEqual(WASI_EINVAL, fdFdstatGetCore(&mem, 1, 0));
 }
 
 test "fdFdstatGetCore: stdout fills struct correctly" {
-    var mem = [_]u8{0} ** 64;
+    var mem = @as([64]u8, @splat(0));
     const result = fdFdstatGetCore(&mem, 1, 0);
     try std.testing.expectEqual(WASI_ESUCCESS, result);
     // fs_filetype = 2 (character device)
@@ -366,7 +366,7 @@ test "fdPrestatDirNameCore: returns EBADF" {
 }
 
 test "clockTimeGetCore: realtime succeeds" {
-    var mem = [_]u8{0} ** 16;
+    var mem = @as([16]u8, @splat(0));
     const result = clockTimeGetCore(&mem, WASI_CLOCK_REALTIME, 0);
     try std.testing.expectEqual(WASI_ESUCCESS, result);
     const nanos = std.mem.readInt(u64, mem[0..8], .little);
@@ -374,13 +374,13 @@ test "clockTimeGetCore: realtime succeeds" {
 }
 
 test "clockTimeGetCore: monotonic succeeds" {
-    var mem = [_]u8{0} ** 16;
+    var mem = @as([16]u8, @splat(0));
     const result = clockTimeGetCore(&mem, WASI_CLOCK_MONOTONIC, 0);
     try std.testing.expectEqual(WASI_ESUCCESS, result);
 }
 
 test "clockTimeGetCore: CPU clocks succeed on Linux" {
-    var mem = [_]u8{0} ** 16;
+    var mem = @as([16]u8, @splat(0));
     for ([_]i32{
         WASI_CLOCK_PROCESS_CPUTIME,
         WASI_CLOCK_THREAD_CPUTIME,
@@ -396,12 +396,12 @@ test "clockTimeGetCore: CPU clocks succeed on Linux" {
 }
 
 test "clockTimeGetCore: invalid clock returns EINVAL" {
-    var mem = [_]u8{0} ** 16;
+    var mem = @as([16]u8, @splat(0));
     try std.testing.expectEqual(WASI_EINVAL, clockTimeGetCore(&mem, 99, 0));
 }
 
 test "environSizesGetCore: writes zeroes" {
-    var mem = [_]u8{0xFF} ** 16;
+    var mem = @as([16]u8, @splat(0xFF));
     const result = environSizesGetCore(&mem, 0, 4);
     try std.testing.expectEqual(WASI_ESUCCESS, result);
     try std.testing.expectEqual(@as(u32, 0), memReadU32(&mem, 0).?);
@@ -413,7 +413,7 @@ test "environGetCore: returns ESUCCESS" {
 }
 
 test "argsSizesGetCore: writes zeroes" {
-    var mem = [_]u8{0xFF} ** 16;
+    var mem = @as([16]u8, @splat(0xFF));
     const result = argsSizesGetCore(&mem, 0, 4);
     try std.testing.expectEqual(WASI_ESUCCESS, result);
     try std.testing.expectEqual(@as(u32, 0), memReadU32(&mem, 0).?);
@@ -450,20 +450,20 @@ test "procRaiseCore: every in-range WASI signal maps under is_test" {
 }
 
 test "clockResGetCore: invalid clock_id returns EINVAL" {
-    var mem = [_]u8{0} ** 16;
+    var mem = @as([16]u8, @splat(0));
     try std.testing.expectEqual(WASI_EINVAL, clockResGetCore(&mem, -1, 0));
     try std.testing.expectEqual(WASI_EINVAL, clockResGetCore(&mem, 4, 0));
     try std.testing.expectEqual(WASI_EINVAL, clockResGetCore(&mem, 99, 0));
 }
 
 test "clockResGetCore: out-of-bounds resolution_ptr returns EINVAL" {
-    var mem = [_]u8{0} ** 8;
+    var mem = @as([8]u8, @splat(0));
     // resolution_ptr = 4 would write past the end (needs 8 bytes).
     try std.testing.expectEqual(WASI_EINVAL, clockResGetCore(&mem, WASI_CLOCK_MONOTONIC, 4));
 }
 
 test "clockResGetCore: monotonic success writes non-zero resolution" {
-    var mem = [_]u8{0xFF} ** 16;
+    var mem = @as([16]u8, @splat(0xFF));
     const result = clockResGetCore(&mem, WASI_CLOCK_MONOTONIC, 0);
     try std.testing.expectEqual(WASI_ESUCCESS, result);
     const ns = std.mem.readInt(u64, mem[0..8], .little);
@@ -471,7 +471,7 @@ test "clockResGetCore: monotonic success writes non-zero resolution" {
 }
 
 test "clockResGetCore: realtime success writes non-zero resolution" {
-    var mem = [_]u8{0xFF} ** 16;
+    var mem = @as([16]u8, @splat(0xFF));
     const result = clockResGetCore(&mem, WASI_CLOCK_REALTIME, 0);
     try std.testing.expectEqual(WASI_ESUCCESS, result);
     const ns = std.mem.readInt(u64, mem[0..8], .little);

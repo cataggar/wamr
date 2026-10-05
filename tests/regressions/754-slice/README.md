@@ -43,7 +43,7 @@ $JCO componentize test.js \
 ```sh
 unset ZIG_LOCAL_CACHE_DIR
 export ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-global-cache"
-zig build -Doptimize=ReleaseSafe
+zig build -Doptimize=safe
 
 # Bug requires MAX_SLOTS >= ~1000 because the standalone componentize-js
 # wasm has more wasi imports than the legacy 256-slot trampoline pool

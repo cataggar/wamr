@@ -11,13 +11,13 @@ interpreter, JIT, thread manager or hosted runtime is imported by the producer.
 ## Build and import
 
 ```sh
-zig build -Dprofile=unikraft-aot -Doptimize=ReleaseSafe -j2
+zig build -Dprofile=unikraft-aot -Doptimize=safe -j2
 zig build -Dprofile=unikraft-aot native-aot-guest-check \
-  -Doptimize=ReleaseFast -j2
+  -Doptimize=fast -j2
 
 # Hosted correctness tests using matching, actually emitted native bytes:
-zig build test-native-aot-guest -Doptimize=ReleaseSafe -j2
-zig build test-native-bench-unit -Doptimize=ReleaseSafe -j2
+zig build test-native-aot-guest -Doptimize=safe -j2
+zig build test-native-bench-unit -Doptimize=safe -j2
 ```
 
 `native-aot-guest-check` retains exported wrappers reaching `benchmark.run`,

@@ -117,10 +117,15 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
     while (pos < source.len) {
         pos = wr.skipWhitespaceAndComments(source, pos);
         if (pos >= source.len) break;
-        if (source[pos] != '(') { pos += 1; continue; }
+        if (source[pos] != '(') {
+            pos += 1;
+            continue;
+        }
 
         var line_num: u32 = 1;
-        for (source[0..pos]) |c| { if (c == '\n') line_num += 1; }
+        for (source[0..pos]) |c| {
+            if (c == '\n') line_num += 1;
+        }
 
         const sexpr = wr.extractSExpr(source, pos) orelse break;
         pos = sexpr.end;
@@ -456,7 +461,9 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
                     try w.print("{{\"type\":\"action\",\"line\":{d}}}", .{line_num});
                 }
             },
-            .unknown => { first = true; },
+            .unknown => {
+                first = true;
+            },
         }
     }
 
@@ -624,7 +631,9 @@ fn writeEitherAlternatives(w: anytype, text: []const u8) !void {
                     }
                 }
             } else break;
-        } else if (after[pos] == ')') break else { pos += 1; }
+        } else if (after[pos] == ')') break else {
+            pos += 1;
+        }
     }
     if (count <= 1) return; // No alternatives to emit
     // Skip first alternative (already in "expected"), emit rest
@@ -683,7 +692,10 @@ fn writeConstValues(w: anytype, text: []const u8) !void {
                 if (ch == '(') depth += 1;
                 if (ch == ')') {
                     depth -= 1;
-                    if (depth == 0) { either_end = idx + 1; break; }
+                    if (depth == 0) {
+                        either_end = idx + 1;
+                        break;
+                    }
                 }
             }
             const suffix = if (either_end < text.len) text[either_end..] else "";
@@ -855,7 +867,7 @@ fn writeV128Json(w: anytype, inner: []const u8) !void {
         }
     }
 
-    var bytes: [16]u8 = .{0} ** 16;
+    var bytes: [16]u8 = @splat(0);
     if (std.mem.eql(u8, shape, "i8x16")) {
         for (0..@min(lane_count, 16)) |i| {
             const val = parseWatI32(lane_strs[i]) orelse 0;
@@ -1128,7 +1140,7 @@ fn extractModuleName(text: []const u8) ?[]const u8 {
     return text[name_start..name_end];
 }
 
-const ConstResult= struct { value: []const u8, len: usize };
+const ConstResult = struct { value: []const u8, len: usize };
 
 fn parseConst(text: []const u8, prefix: []const u8, _: []const u8) ?ConstResult {
     // Match "(i32.const VALUE)"

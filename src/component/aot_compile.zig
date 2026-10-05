@@ -507,7 +507,7 @@ pub fn compileCoreWasmCached(
         if (exp.kind == .tag) continue;
         exports.append(ea, .{
             .name = exp.name,
-            .kind = @enumFromInt(@intFromEnum(exp.kind)),
+            .kind = @fromBackingInt(@intCast(@backingInt(exp.kind))),
             .index = exp.index,
         }) catch return error.OutOfMemory;
     }
@@ -603,9 +603,9 @@ pub fn compileCoreWasmCached(
             continue;
         }
         const params_bytes = ea.alloc(u8, ft.params.len) catch return error.OutOfMemory;
-        for (ft.params, 0..) |p, j| params_bytes[j] = @intFromEnum(p);
+        for (ft.params, 0..) |p, j| params_bytes[j] = @backingInt(p);
         const results_bytes = ea.alloc(u8, ft.results.len) catch return error.OutOfMemory;
-        for (ft.results, 0..) |r, j| results_bytes[j] = @intFromEnum(r);
+        for (ft.results, 0..) |r, j| results_bytes[j] = @backingInt(r);
         func_type_entries.append(ea, .{ .params = params_bytes, .results = results_bytes }) catch return error.OutOfMemory;
     }
 
@@ -641,7 +641,7 @@ pub fn compileCoreWasmCached(
         gi.* = .{ .global_type = gt, .value = val };
         tmp_globals.append(allocator, gi) catch return error.OutOfMemory;
         global_entries.append(ea, .{
-            .val_type = @intFromEnum(gt.val_type),
+            .val_type = @backingInt(gt.val_type),
             .mutability = if (gt.mutability == .mutable) @as(u8, 1) else @as(u8, 0),
             .init_i64 = valueToI64(val),
             .init_v128 = valueToV128(val),
@@ -659,7 +659,7 @@ pub fn compileCoreWasmCached(
         gi.* = .{ .global_type = g.global_type, .value = val };
         tmp_globals.append(allocator, gi) catch return error.OutOfMemory;
         global_entries.append(ea, .{
-            .val_type = @intFromEnum(g.global_type.val_type),
+            .val_type = @backingInt(g.global_type.val_type),
             .mutability = if (g.global_type.mutability == .mutable) @as(u8, 1) else @as(u8, 0),
             .init_i64 = valueToI64(val),
             .init_v128 = valueToV128(val),
@@ -961,7 +961,7 @@ pub fn setupLazyJit(
     const slot_states = try allocator.alloc(std.atomic.Value(u8), func_count);
     errdefer allocator.free(slot_states);
     for (slot_states) |*slot| {
-        slot.* = std.atomic.Value(u8).init(@intFromEnum(aot_runtime.LazyJitState.SlotState.inactive));
+        slot.* = std.atomic.Value(u8).init(@backingInt(aot_runtime.LazyJitState.SlotState.inactive));
     }
     const compiled = try allocator.alloc(?aot_runtime.LazyCompiledFunc, func_count);
     errdefer allocator.free(compiled);
@@ -992,7 +992,7 @@ pub fn setupLazyJit(
 
     for (lazy_out.lazy_local_indices, 0..) |idx, pos| {
         if (idx < slot_states.len) {
-            slot_states[idx].store(@intFromEnum(aot_runtime.LazyJitState.SlotState.pending), .monotonic);
+            slot_states[idx].store(@backingInt(aot_runtime.LazyJitState.SlotState.pending), .monotonic);
         }
 
         const needs_tramp = pos < lazy_out.needs_trampoline.len and lazy_out.needs_trampoline[pos];
@@ -1198,7 +1198,7 @@ pub fn precompileComponent(
             cwd.createDirPath(io, cd) catch {};
             // Best-effort load — any error degrades to full recompile
             // for this core, with the new cache written below.
-            const bytes_or = cwd.readFileAlloc(io, p, allocator, @enumFromInt(codegen_cache.max_cache_file_bytes));
+            const bytes_or = cwd.readFileAlloc(io, p, allocator, @fromBackingInt(@intCast(codegen_cache.max_cache_file_bytes)));
             if (bytes_or) |bytes| {
                 defer allocator.free(bytes);
                 if (codegen_cache.deserialize(bytes, allocator)) |c| {

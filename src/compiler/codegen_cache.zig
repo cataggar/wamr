@@ -198,8 +198,8 @@ pub fn hashModuleEpoch(inputs: ModuleEpochInputs) [32]u8 {
     w.writeBytes("epoch\x00");
     w.writeBytes(inputs.wamr_build_id);
     w.writeInt(u8, 0); // separator after variable-length build id
-    w.writeInt(u32, @intFromEnum(inputs.target_arch));
-    w.writeInt(u8, @intFromEnum(inputs.target_abi));
+    w.writeInt(u32, @backingInt(inputs.target_arch));
+    w.writeInt(u8, @backingInt(inputs.target_abi));
     w.writeInt(u32, inputs.import_count);
     w.writeInt(u8, @intFromBool(inputs.has_memory64));
     w.writeInt(u8, @intFromBool(inputs.has_shared_memory));
@@ -210,9 +210,9 @@ pub fn hashModuleEpoch(inputs: ModuleEpochInputs) [32]u8 {
     w.writeInt(u32, @intCast(inputs.func_types.len));
     for (inputs.func_types) |ft| {
         w.writeInt(u32, @intCast(ft.params.len));
-        for (ft.params) |p| w.writeInt(u32, @intFromEnum(p));
+        for (ft.params) |p| w.writeInt(u32, @backingInt(p));
         w.writeInt(u32, @intCast(ft.results.len));
-        for (ft.results) |r| w.writeInt(u32, @intFromEnum(r));
+        for (ft.results) |r| w.writeInt(u32, @backingInt(r));
     }
     w.writeInt(u32, @intCast(inputs.func_type_indices.len));
     for (inputs.func_type_indices) |i| w.writeInt(u32, i);
@@ -244,7 +244,7 @@ const HashWriter = struct {
         if (opt) |s| {
             self.writeInt(u8, 1);
             self.writeInt(u32, @intCast(s.len));
-            for (s) |e| self.writeInt(u32, @intFromEnum(e));
+            for (s) |e| self.writeInt(u32, @backingInt(e));
         } else {
             self.writeInt(u8, 0);
         }
@@ -335,7 +335,7 @@ const HashWriter = struct {
                 else => @compileError("unsupported float bits: " ++ @typeName(T)),
             },
             .bool => self.writeBool(value),
-            .@"enum" => self.writeInt(u64, @intFromEnum(value)),
+            .@"enum" => self.writeInt(u64, @backingInt(value)),
             .void => {},
             .optional => {
                 if (value) |v| {
@@ -359,13 +359,13 @@ const HashWriter = struct {
                 else => @compileError("unsupported pointer size " ++ @tagName(p.size) ++ " for " ++ @typeName(T)),
             },
             .@"struct" => |s| {
-                inline for (s.fields) |f| {
-                    self.writeAny(@field(value, f.name));
+                inline for (s.field_names) |name| {
+                    self.writeAny(@field(value, name));
                 }
             },
             .@"union" => |u| {
                 if (u.tag_type == null) @compileError("non-tagged unions not supported: " ++ @typeName(T));
-                self.writeInt(u32, @intFromEnum(std.meta.activeTag(value)));
+                self.writeInt(u32, @backingInt(std.meta.activeTag(value)));
                 switch (value) {
                     inline else => |payload| self.writeAny(payload),
                 }
@@ -414,8 +414,8 @@ pub fn serialize(cache: *const Cache, allocator: std.mem.Allocator) SerializeErr
     try appendU32(&buf, allocator, cache_format_version);
     try appendU32(&buf, allocator, @intCast(cache.wamr_build_id.len));
     try buf.appendSlice(allocator, cache.wamr_build_id);
-    try buf.append(allocator, @intFromEnum(cache.target_arch));
-    try buf.append(allocator, @intFromEnum(cache.target_abi));
+    try buf.append(allocator, @backingInt(cache.target_arch));
+    try buf.append(allocator, @backingInt(cache.target_abi));
     try buf.appendSlice(allocator, &cache.module_epoch);
     try appendU32(&buf, allocator, @intCast(cache.functions.len));
     for (cache.functions) |f| {
@@ -781,7 +781,7 @@ fn buildSampleCache(allocator: std.mem.Allocator) !Cache {
     var funcs = try allocator.alloc(CachedFunction, 2);
     errdefer allocator.free(funcs);
     funcs[0] = .{
-        .ir_sha256 = .{1} ** 32,
+        .ir_sha256 = @splat(1),
         // 8 bytes of placeholder code so a patch at offset 0 has
         // 4 bytes of room (0+4 <= 8) per the deserialiser's bounds
         // check.
@@ -795,7 +795,7 @@ fn buildSampleCache(allocator: std.mem.Allocator) !Cache {
         allocator.free(funcs[0].call_patches);
     }
     funcs[1] = .{
-        .ir_sha256 = .{2} ** 32,
+        .ir_sha256 = @splat(2),
         .code = try allocator.dupe(u8, &[_]u8{ 0x90, 0x90, 0x90, 0x90, 0xC3 }),
         .call_patches = try allocator.dupe(FuncCallPatch, &.{}),
     };
@@ -803,7 +803,7 @@ fn buildSampleCache(allocator: std.mem.Allocator) !Cache {
         .wamr_build_id = build_id,
         .target_arch = .x86_64,
         .target_abi = .x86_64_sysv,
-        .module_epoch = .{7} ** 32,
+        .module_epoch = @splat(7),
         .functions = funcs,
     };
 }
@@ -875,11 +875,11 @@ test "deserialize: rejects out-of-range patch_offset" {
     try buf.appendSlice(allocator, &cache_magic);
     try appendU32(&buf, allocator, cache_format_version);
     try appendU32(&buf, allocator, 0); // empty build id
-    try buf.append(allocator, @intFromEnum(passes.TargetArch.x86_64));
-    try buf.append(allocator, @intFromEnum(TargetAbi.x86_64_sysv));
-    try buf.appendSlice(allocator, &[_]u8{0} ** 32); // module_epoch
+    try buf.append(allocator, @backingInt(passes.TargetArch.x86_64));
+    try buf.append(allocator, @backingInt(TargetAbi.x86_64_sysv));
+    try buf.appendSlice(allocator, &@as([32]u8, @splat(0))); // module_epoch
     try appendU32(&buf, allocator, 1); // func_count
-    try buf.appendSlice(allocator, &[_]u8{0} ** 32); // ir_sha256
+    try buf.appendSlice(allocator, &@as([32]u8, @splat(0))); // ir_sha256
     try appendU32(&buf, allocator, 4); // code_len = 4
     try buf.appendSlice(allocator, &[_]u8{ 0, 0, 0, 0 });
     try appendU32(&buf, allocator, 1); // patches_cnt
@@ -895,13 +895,13 @@ test "deserialize: rejects target_func_idx >= func_count" {
     try buf.appendSlice(allocator, &cache_magic);
     try appendU32(&buf, allocator, cache_format_version);
     try appendU32(&buf, allocator, 0);
-    try buf.append(allocator, @intFromEnum(passes.TargetArch.x86_64));
-    try buf.append(allocator, @intFromEnum(TargetAbi.x86_64_sysv));
-    try buf.appendSlice(allocator, &[_]u8{0} ** 32);
+    try buf.append(allocator, @backingInt(passes.TargetArch.x86_64));
+    try buf.append(allocator, @backingInt(TargetAbi.x86_64_sysv));
+    try buf.appendSlice(allocator, &@as([32]u8, @splat(0)));
     try appendU32(&buf, allocator, 1); // func_count = 1
-    try buf.appendSlice(allocator, &[_]u8{0} ** 32);
+    try buf.appendSlice(allocator, &@as([32]u8, @splat(0)));
     try appendU32(&buf, allocator, 8);
-    try buf.appendSlice(allocator, &[_]u8{0} ** 8);
+    try buf.appendSlice(allocator, &@as([8]u8, @splat(0)));
     try appendU32(&buf, allocator, 1);
     try appendU32(&buf, allocator, 0);
     try appendU32(&buf, allocator, 5); // target_func_idx = 5 >= func_count

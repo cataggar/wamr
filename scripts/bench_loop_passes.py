@@ -17,6 +17,8 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from bench_optimize import zig_build_command
+
 PROFILE_COUNTS = {
     "authoritative": (2, 10),
     "ci": (0, 3),
@@ -171,7 +173,7 @@ def build_ref(
             f"[harness] building {label} {ref} ({sha[:12]}, {optimize})",
             file=sys.stderr,
         )
-        run(["zig", "build", f"-Doptimize={optimize}"], cwd=worktree, env=env)
+        run(zig_build_command(worktree, optimize), cwd=worktree, env=env)
         wamrc = worktree / "zig-out/bin/wamrc"
         wamr = worktree / "zig-out/bin/wamr"
         compiled: dict[str, CompiledFixture] = {}

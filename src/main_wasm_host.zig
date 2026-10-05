@@ -138,7 +138,7 @@ fn runCore(
         init.io,
         path,
         allocator,
-        @enumFromInt(256 * 1024 * 1024),
+        @fromBackingInt(@intCast(256 * 1024 * 1024)),
     ) catch |err| {
         std.debug.print("error: cannot read '{s}': {s}\n", .{ path, @errorName(err) });
         return 1;

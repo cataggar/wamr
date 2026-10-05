@@ -36,14 +36,14 @@ jobs:
         with:
           version: v0.68.3
 
-      - name: Install Zig 0.16.0
+      - name: Install Zig 0.17.0
         uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
         env:
           GH_TOKEN: ${{ github.token }}
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Configure Zig caches
@@ -56,15 +56,15 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ env.ZIG_GLOBAL_CACHE_DIR }}
-          key: zig-cache-${{ runner.os }}-0.16.0-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          key: zig-cache-${{ runner.os }}-0.17.0-${{ hashFiles('build.zig', 'build.zig.zon') }}
           restore-keys: |
-            zig-cache-${{ runner.os }}-0.16.0-
+            zig-cache-${{ runner.os }}-0.17.0-
 
       - name: Warm build (Debug + ReleaseSafe)
         continue-on-error: true
         run: |
           zig build
-          zig build -Doptimize=ReleaseSafe
+          zig build -Doptimize=safe
 
       - name: Smoke test
         continue-on-error: true

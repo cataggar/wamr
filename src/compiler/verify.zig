@@ -88,7 +88,7 @@ pub fn run(
     //    handed verbatim to both runtimes' CLIs.
     const io = init.io;
     const cwd = std.Io.Dir.cwd();
-    const wasm_data = cwd.readFileAlloc(io, options.wasm_path, allocator, @enumFromInt(256 * 1024 * 1024)) catch |err| {
+    const wasm_data = cwd.readFileAlloc(io, options.wasm_path, allocator, @fromBackingInt(@intCast(256 * 1024 * 1024))) catch |err| {
         std.debug.print("[verify] error: failed to read '{s}': {s}\n", .{ options.wasm_path, @errorName(err) });
         return 2;
     };
@@ -573,17 +573,17 @@ fn emitJson(
     try w.print(
         ",\"wasmtime\":{{\"stdout_len\":{d},\"stderr_len\":{d},\"exit\":{d},\"term\":\"{s}\",\"elapsed_ms\":{d}}}",
         .{
-            oracle.stdout.len,           oracle.stderr.len,
-            if (oracle.exit_code) |c| @as(i32, c) else -1,
-            oracle.term_tag.name(),      oracle.elapsed_ms,
+            oracle.stdout.len,                             oracle.stderr.len,
+            if (oracle.exit_code) |c| @as(i32, c) else -1, oracle.term_tag.name(),
+            oracle.elapsed_ms,
         },
     );
     try w.print(
         ",\"wamr\":{{\"stdout_len\":{d},\"stderr_len\":{d},\"exit\":{d},\"term\":\"{s}\",\"elapsed_ms\":{d}}}",
         .{
-            subject.stdout.len,           subject.stderr.len,
-            if (subject.exit_code) |c| @as(i32, c) else -1,
-            subject.term_tag.name(),      subject.elapsed_ms,
+            subject.stdout.len,                             subject.stderr.len,
+            if (subject.exit_code) |c| @as(i32, c) else -1, subject.term_tag.name(),
+            subject.elapsed_ms,
         },
     );
     if (stdout_div) |off| try w.print(",\"stdout_first_diff\":{d}", .{off});

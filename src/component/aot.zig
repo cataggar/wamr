@@ -149,7 +149,6 @@ pub const LoadedManifest = struct {
     }
 };
 
-
 /// Options controlling `precompileComponent`. Today only the target
 /// arch is exposed; future options (opt level, dump-ir hooks, …) slot
 /// in here without breaking the API.
@@ -190,7 +189,7 @@ pub fn loadManifest(
     var dir = cwd.openDir(io, parent, .{}) catch return error.ManifestNotFound;
     defer dir.close(io);
 
-    const json_bytes = dir.readFileAlloc(io, filename, allocator, @enumFromInt(4 * 1024 * 1024)) catch
+    const json_bytes = dir.readFileAlloc(io, filename, allocator, @fromBackingInt(@intCast(4 * 1024 * 1024))) catch
         return error.ManifestNotFound;
     defer allocator.free(json_bytes);
 
@@ -234,7 +233,7 @@ pub fn loadManifest(
     }
 
     for (parsed.modules, 0..) |mod, i| {
-        const buf = dir.readFileAlloc(io, mod.path, allocator, @enumFromInt(256 * 1024 * 1024)) catch
+        const buf = dir.readFileAlloc(io, mod.path, allocator, @fromBackingInt(@intCast(256 * 1024 * 1024))) catch
             return error.CwasmReadFailed;
         cwasm_buffers[i] = buf;
         loaded += 1;

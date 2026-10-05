@@ -21,7 +21,7 @@ test "minimal WASI exact argument and environment string tables" {
         .output = null,
         .clock = null,
     });
-    var mem = [_]u8{0xaa} ** 128;
+    var mem = @as([128]u8, @splat(0xaa));
     try testing.expectEqual(.success, ctx.argsSizesGet(&mem, 0, 4));
     try testing.expectEqual(@as(u32, 3), get32(&mem, 0));
     try testing.expectEqual(@as(u32, 14), get32(&mem, 4));
@@ -48,7 +48,7 @@ test "minimal WASI rejects invalid strings and atomically checks output ranges" 
         .clock = null,
     }));
     var ctx = context();
-    var mem = [_]u8{0xaa} ** 64;
+    var mem = @as([64]u8, @splat(0xaa));
     try testing.expectEqual(.success, ctx.argsSizesGet(&mem, 0, 4));
     try testing.expectEqual(@as(u32, 0), get32(&mem, 0));
     try testing.expectEqual(@as(u32, 0), get32(&mem, 4));
@@ -94,7 +94,7 @@ const Sink = struct {
 };
 
 fn ioMemory() [64]u8 {
-    var mem = [_]u8{0xaa} ** 64;
+    var mem = @as([64]u8, @splat(0xaa));
     put32(&mem, 0, 32);
     put32(&mem, 4, 3);
     put32(&mem, 8, 40);
@@ -133,9 +133,9 @@ test "minimal WASI descriptor rights lifecycle and absent preopens" {
     for (0..3) |whence| try testing.expectEqual(.notcapable, ctx.fdSeek(&mem, 1, -3, @intCast(whence), 16));
     try testing.expectEqual(.inval, ctx.fdSeek(&mem, 1, 0, 3, 16));
     try testing.expectEqual(.fault, ctx.fdSeek(&mem, 1, 0, 2, 0xffff_ffff));
-    try testing.expectEqual(@as(u32, 0), @intFromEnum(wasi.LegacyWhence.cur));
-    try testing.expectEqual(@as(u32, 1), @intFromEnum(wasi.LegacyWhence.end));
-    try testing.expectEqual(@as(u32, 2), @intFromEnum(wasi.LegacyWhence.set));
+    try testing.expectEqual(@as(u32, 0), @backingInt(wasi.LegacyWhence.cur));
+    try testing.expectEqual(@as(u32, 1), @backingInt(wasi.LegacyWhence.end));
+    try testing.expectEqual(@as(u32, 2), @backingInt(wasi.LegacyWhence.set));
     try testing.expectEqual(.success, ctx.fdClose(1));
     try testing.expectEqual(.badf, ctx.fdClose(1));
     try testing.expectEqual(.badf, ctx.fdFdstatGet(&mem, 1, 16));
@@ -179,7 +179,7 @@ test "minimal WASI fd_write preserves exact bytes partial zero and failed writes
     try testing.expectEqual(wasi.Errno.pipe, ctx.takeWriteError(1).?);
     sink = .{ .overreport = true };
     try testing.expectEqual(.io, ctx.fdWrite(&mem, 1, 0, 2, 16));
-    sink = .{ .fail_call = 1, .failure = @enumFromInt(65535) };
+    sink = .{ .fail_call = 1, .failure = @fromBackingInt(@intCast(65535)) };
     try testing.expectEqual(.success, ctx.fdWrite(&mem, 1, 0, 2, 16));
     try testing.expectEqual(@as(u32, 3), get32(&mem, 16));
     try testing.expectEqual(wasi.Errno.io, ctx.takeWriteError(1).?);
@@ -312,7 +312,7 @@ const TestClock = struct {
 };
 
 test "minimal WASI platform clock capabilities precision errors and checked output" {
-    var mem = [_]u8{0xaa} ** 16;
+    var mem = @as([16]u8, @splat(0xaa));
     var clock: TestClock = .{};
     var ctx = context();
     try testing.expectEqual(.notsup, ctx.clockTimeGet(&mem, 1, 0, 0));
@@ -328,7 +328,7 @@ test "minimal WASI platform clock capabilities precision errors and checked outp
     try testing.expectEqual(@as(u64, 123_456_789), std.mem.readInt(u64, mem[8..16], .little));
     try testing.expectEqual(wasi.ClockId.monotonic, clock.id);
     try testing.expectEqual(@as(u64, 999), clock.precision);
-    for ([_]wasi.Errno{ .io, .intr, .success, @enumFromInt(65535) }) |errno| {
+    for ([_]wasi.Errno{ .io, .intr, .success, @fromBackingInt(@intCast(65535)) }) |errno| {
         clock.result = .{ .failure = errno };
         try testing.expectEqual(if (errno == .intr) wasi.Errno.intr else wasi.Errno.io, ctx.clockTimeGet(&mem, 1, 0, 0));
         try testing.expectEqual(@as(u64, 0xaaaa_aaaa_aaaa_aaaa), std.mem.readInt(u64, mem[0..8], .little));
@@ -337,12 +337,12 @@ test "minimal WASI platform clock capabilities precision errors and checked outp
 
 test "minimal WASI exact import resolution and terminal zero nonzero exits" {
     for (wasi.imports, 0..) |entry, index| {
-        try testing.expectEqual(@as(wasi.Function, @enumFromInt(index)), wasi.resolve(entry.namespace, entry.name, entry.params, entry.results).?);
+        try testing.expectEqual(@as(wasi.Function, @fromBackingInt(@intCast(index))), wasi.resolve(entry.namespace, entry.name, entry.params, entry.results).?);
         try testing.expectEqual(null, wasi.resolve("wasi_snapshot_preview1", entry.name, entry.params, entry.results));
         try testing.expectEqual(null, wasi.resolve(entry.namespace, entry.name, "", entry.results));
         try testing.expectEqual(null, wasi.resolve(entry.namespace, entry.name, entry.params, "\x7e"));
     }
-    var mem = [_]u8{0} ** 8;
+    var mem = @as([8]u8, @splat(0));
     for ([_]u32{ 0, 7, 0xffff_ffff }) |code| {
         var ctx = context();
         try testing.expectError(error.InvalidArguments, ctx.dispatch(&mem, .proc_exit, &.{}));

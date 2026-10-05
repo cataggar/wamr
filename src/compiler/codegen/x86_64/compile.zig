@@ -460,11 +460,11 @@ const CachedStack = struct {
     /// Excludes RAX (scratch/return), RCX (shift count), RDX (div remainder).
     const cache_regs = [_]emit.Reg{ .r10, .r11, .rsi, .rdi, .r8, .r9 };
 
-    slots: [64]Slot = [_]Slot{.{}} ** 64,
+    slots: [64]Slot = @splat(.{}),
     depth: u32 = 0,
     /// Base offset from RBP (marks bottom of operand stack area).
     base: i32,
-    reg_used: [cache_regs.len]bool = [_]bool{false} ** cache_regs.len,
+    reg_used: [cache_regs.len]bool = @as([cache_regs.len]bool, @splat(false)),
 
     fn init(local_count: u32) CachedStack {
         const base_off = -@as(i32, @intCast((local_count + 1) * 8));
@@ -2084,7 +2084,7 @@ fn isFullCallClobber(op: ir.Inst.Op) bool {
 /// from ABI-fixed parameter registers.
 fn x86_64_alloc_idx(reg: emit.Reg) ?u8 {
     inline for (x86_64_alloc_regs, 0..) |phys, i| {
-        if (@intFromEnum(reg) == phys) return @intCast(i);
+        if (@backingInt(reg) == phys) return @intCast(i);
     }
     return null;
 }
@@ -3326,9 +3326,9 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
     // `emit` bucket (total − setup − liveness − regalloc).
     // Compute which caller-saved registers are actually used by this function.
     // Only these need to be saved/restored around call sites.
-    var used_caller_saved: [caller_saved_alloc.len]bool = .{false} ** caller_saved_alloc.len;
+    var used_caller_saved: [caller_saved_alloc.len]bool = @splat(false);
     // Track which callee-saved registers are used (for prologue/epilogue preservation).
-    var used_callee_saved: [callee_saved_alloc.len]bool = .{false} ** callee_saved_alloc.len;
+    var used_callee_saved: [callee_saved_alloc.len]bool = @splat(false);
     // rbx is permanently pinned to vmctx for the function body (issue
     // #465). It's at index 0 of `callee_saved_alloc` on both Win64 and
     // SysV, so always mark it used: the prologue must `push rbx` (to
@@ -3349,7 +3349,7 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
         while (it.next()) |entry| {
             switch (entry.value_ptr.*) {
                 .reg => |preg| {
-                    const reg: emit.Reg = @enumFromInt(preg);
+                    const reg: emit.Reg = @fromBackingInt(@intCast(preg));
                     for (caller_saved_alloc, 0..) |cs_reg, i| {
                         if (reg == cs_reg) used_caller_saved[i] = true;
                     }
@@ -3680,7 +3680,7 @@ fn useVReg(
     }
     const alloc = alloc_result.get(vreg) orelse return scratch;
     switch (alloc) {
-        .reg => |preg| return @as(emit.Reg, @enumFromInt(preg)),
+        .reg => |preg| return @as(emit.Reg, @fromBackingInt(@intCast(preg))),
         .stack => |offset| {
             try code.movRegMem(scratch, .rbp, offset);
             return scratch;
@@ -3851,7 +3851,7 @@ fn emitCallRegArgMoves(
             };
         } else if (alloc_result.get(args[i])) |a| switch (a) {
             .reg => |preg| infos[i] = .{
-                .source = @enumFromInt(preg),
+                .source = @fromBackingInt(@intCast(preg)),
                 .is_stack = false,
                 .stack_offset = 0,
                 .target = target,
@@ -3952,7 +3952,7 @@ fn writeDef(
     const alloc = alloc_result.get(dest) orelse return;
     switch (alloc) {
         .reg => |preg| {
-            const dst = @as(emit.Reg, @enumFromInt(preg));
+            const dst = @as(emit.Reg, @fromBackingInt(@intCast(preg)));
             if (dst != result_reg) try code.movRegReg(dst, result_reg);
         },
         .stack => |offset| {
@@ -3997,7 +3997,7 @@ fn writeDefTyped(
 fn regOf(alloc_result: *const regalloc.AllocResult, vreg: ir.VReg) ?emit.Reg {
     const alloc = alloc_result.get(vreg) orelse return null;
     return switch (alloc) {
-        .reg => |preg| @as(emit.Reg, @enumFromInt(preg)),
+        .reg => |preg| @as(emit.Reg, @fromBackingInt(@intCast(preg))),
         .stack => null,
     };
 }
@@ -6724,7 +6724,7 @@ test "compileModuleCached: warm cache reuses every function (byte-identical)" {
         .wamr_build_id = "x",
         .target_arch = .x86_64,
         .target_abi = .x86_64_sysv,
-        .module_epoch = .{0} ** 32,
+        .module_epoch = @splat(0),
         .functions = cold.cache_functions,
     };
 
@@ -6758,7 +6758,7 @@ test "compileModuleCached: per-function IR mismatch recompiles only that functio
         .wamr_build_id = "x",
         .target_arch = .x86_64,
         .target_abi = .x86_64_sysv,
-        .module_epoch = .{0} ** 32,
+        .module_epoch = @splat(0),
         .functions = cold.cache_functions,
     };
 
@@ -7573,7 +7573,7 @@ test "compileFunctionRA: large memory_fill emits REP STOSB" {
 
 test "x86_64 clobber mask for REP STOSB tracks rdi alloc index" {
     const rdi_idx = x86_64_alloc_idx(.rdi) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(regalloc.PhysReg, @intFromEnum(emit.Reg.rdi)), x86_64_alloc_regs[rdi_idx]);
+    try std.testing.expectEqual(@as(regalloc.PhysReg, @backingInt(emit.Reg.rdi)), x86_64_alloc_regs[rdi_idx]);
     try std.testing.expectEqual(@as(u64, 1) << @as(u6, @intCast(rdi_idx)), x86_64_reg_clobber_mask(.rdi));
 }
 
@@ -8437,8 +8437,8 @@ test "emitCallRegArgMoves: resolves arg[0]→p1 / arg[1]→p2 when arg[1] source
     const p2 = param_regs[2];
 
     var alloc_result = try makeAllocResult(allocator, &.{
-        .{ .vreg = 0, .reg = @intFromEnum(arg0_src) },
-        .{ .vreg = 1, .reg = @intFromEnum(p1) },
+        .{ .vreg = 0, .reg = @backingInt(arg0_src) },
+        .{ .vreg = 1, .reg = @backingInt(p1) },
     });
     defer alloc_result.deinit();
 
@@ -8466,9 +8466,9 @@ test "emitCallRegArgMoves: identity moves are elided" {
     // When every arg[i] is already in param_regs[i+1], no moves should be emitted.
     const allocator = std.testing.allocator;
     var alloc_result = try makeAllocResult(allocator, &.{
-        .{ .vreg = 0, .reg = @intFromEnum(param_regs[1]) },
-        .{ .vreg = 1, .reg = @intFromEnum(param_regs[2]) },
-        .{ .vreg = 2, .reg = @intFromEnum(param_regs[3]) },
+        .{ .vreg = 0, .reg = @backingInt(param_regs[1]) },
+        .{ .vreg = 1, .reg = @backingInt(param_regs[2]) },
+        .{ .vreg = 2, .reg = @backingInt(param_regs[3]) },
     });
     defer alloc_result.deinit();
 
@@ -8488,8 +8488,8 @@ test "emitCallRegArgMoves: breaks 2-cycle via r10 scratch" {
     const p2 = param_regs[2];
 
     var alloc_result = try makeAllocResult(allocator, &.{
-        .{ .vreg = 0, .reg = @intFromEnum(p2) }, // arg[0] in p2 (= arg[1]'s target)
-        .{ .vreg = 1, .reg = @intFromEnum(p1) }, // arg[1] in p1 (= arg[0]'s target)
+        .{ .vreg = 0, .reg = @backingInt(p2) }, // arg[0] in p2 (= arg[1]'s target)
+        .{ .vreg = 1, .reg = @backingInt(p1) }, // arg[1] in p1 (= arg[0]'s target)
     });
     defer alloc_result.deinit();
 
@@ -8536,8 +8536,8 @@ test "emitCallRegArgMoves: regression — arg[1] source equals arg[0] target (co
     const p2 = param_regs[2];
 
     var alloc_result = try makeAllocResult(allocator, &.{
-        .{ .vreg = 0, .reg = @intFromEnum(arg0_src) },
-        .{ .vreg = 1, .reg = @intFromEnum(p1) }, // the bug trigger
+        .{ .vreg = 0, .reg = @backingInt(arg0_src) },
+        .{ .vreg = 1, .reg = @backingInt(p1) }, // the bug trigger
     });
     defer alloc_result.deinit();
 

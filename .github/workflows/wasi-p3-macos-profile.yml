@@ -42,14 +42,14 @@ jobs:
         with:
           submodules: true
 
-      - name: Install Zig 0.16.0
+      - name: Install Zig 0.17.0
         uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
         env:
           GH_TOKEN: ${{ github.token }}
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Configure isolated Zig caches
@@ -86,9 +86,9 @@ jobs:
       - name: Build ReleaseSafe tools
         run: |
           if [ '${{ matrix.mode }}' = jit ]; then
-            zig build -Doptimize=ReleaseSafe -Djit=true
+            zig build -Doptimize=safe -Djit=true
           else
-            zig build -Doptimize=ReleaseSafe
+            zig build -Doptimize=safe
           fi
 
       - name: Measure ${{ matrix.mode }} — 5 cold and 10 warm unfiltered suites
@@ -125,7 +125,7 @@ jobs:
           set -euo pipefail
           OUT='wasi-p3-measure-${{ matrix.platform_id }}-${{ matrix.mode }}/microbench'
           mkdir -p "$OUT"
-          zig build wasi-microbench -Doptimize=ReleaseSafe -- \
+          zig build wasi-microbench -Doptimize=safe -- \
             --samples 10 \
             --warmup 2 \
             --no-budget \
@@ -195,14 +195,14 @@ jobs:
         with:
           submodules: true
 
-      - name: Install Zig 0.16.0
+      - name: Install Zig 0.17.0
         uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
         env:
           GH_TOKEN: ${{ github.token }}
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Configure isolated Zig caches
@@ -227,7 +227,7 @@ jobs:
           WAMR: ${{ github.workspace }}/zig-out/bin/wamr
           WAMRC: ${{ github.workspace }}/zig-out/bin/wamrc
         run: |
-          zig build -Doptimize=ReleaseSafe
+          zig build -Doptimize=safe
           python3 scripts/wasi_p3_profile.py profile \
             --mode aot \
             --selection aggregate/profile-selection.json \
@@ -238,7 +238,7 @@ jobs:
           WAMR: ${{ github.workspace }}/zig-out/bin/wamr
           WAMRC: ${{ github.workspace }}/zig-out/bin/wamrc
         run: |
-          zig build -Doptimize=ReleaseSafe -Djit=true
+          zig build -Doptimize=safe -Djit=true
           python3 scripts/wasi_p3_profile.py profile \
             --mode jit \
             --selection aggregate/profile-selection.json \

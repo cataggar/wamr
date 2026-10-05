@@ -48,7 +48,7 @@ pub const Task = struct {
     waitable_idx: ?u32 = null,
     /// Per-task `context.{get,set} i32` slots. Default-initialised to 0
     /// to match Wasmtime's behaviour for a freshly-started task.
-    context_slots: [N_CONTEXT_SLOTS]u32 = [_]u32{0} ** N_CONTEXT_SLOTS,
+    context_slots: [N_CONTEXT_SLOTS]u32 = @as([N_CONTEXT_SLOTS]u32, @splat(0)),
 };
 
 // ── Waitable Set ────────────────────────────────────────────────────────────
@@ -308,7 +308,7 @@ pub const TaskManager = struct {
             ws.setReady(
                 idx,
                 owned_allocator,
-                @intFromEnum(TaskState.returned),
+                @backingInt(TaskState.returned),
             );
         };
     }

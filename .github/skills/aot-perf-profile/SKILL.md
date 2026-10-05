@@ -92,7 +92,7 @@ host-side symbols; the generated AOT code is identical either way). Per
 cd <wamr>
 unset ZIG_LOCAL_CACHE_DIR
 export ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-global-cache"
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=fast
 ./zig-out/bin/wamr version    # expect: optimize ReleaseFast
 ```
 

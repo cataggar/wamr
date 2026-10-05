@@ -483,7 +483,7 @@ pub fn seekHostFile(io: Io, file: File, offset: i64, whence: Whence) !u64 {
     }
 
     if (comptime builtin.os.tag == .linux) {
-        const origin: usize = switch (whence) {
+        const origin: u32 = switch (whence) {
             .set => 0,
             .cur => 1,
             .end => 2,
@@ -1854,13 +1854,13 @@ test "clock_time_get returns increasing values" {
     const ctx = try WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
 
-    const t1 = try ctx.clock_time_get(@intFromEnum(ClockId.monotonic), 0);
+    const t1 = try ctx.clock_time_get(@backingInt(ClockId.monotonic), 0);
     // Small busy wait
     var i: usize = 0;
     while (i < 1000) : (i += 1) {
         std.mem.doNotOptimizeAway(i);
     }
-    const t2 = try ctx.clock_time_get(@intFromEnum(ClockId.monotonic), 0);
+    const t2 = try ctx.clock_time_get(@backingInt(ClockId.monotonic), 0);
     try std.testing.expect(t2 >= t1);
 }
 
@@ -1868,7 +1868,7 @@ test "clock_time_get realtime returns nonzero" {
     const ctx = try WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
 
-    const t = try ctx.clock_time_get(@intFromEnum(ClockId.realtime), 0);
+    const t = try ctx.clock_time_get(@backingInt(ClockId.realtime), 0);
     try std.testing.expect(t > 0);
 }
 
@@ -1884,7 +1884,7 @@ test "random_get fills buffer with non-zero bytes (probabilistic)" {
     const ctx = try WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
 
-    var buf = [_]u8{0} ** 64;
+    var buf = @as([64]u8, @splat(0));
     ctx.random_get(&buf);
 
     // It's astronomically unlikely that 64 random bytes are all zero
@@ -1916,27 +1916,27 @@ test "proc_exit with zero" {
 }
 
 test "Errno values match WASI spec" {
-    try std.testing.expectEqual(@as(u16, 0), @intFromEnum(Errno.success));
-    try std.testing.expectEqual(@as(u16, 1), @intFromEnum(Errno.toobig));
-    try std.testing.expectEqual(@as(u16, 2), @intFromEnum(Errno.acces));
-    try std.testing.expectEqual(@as(u16, 8), @intFromEnum(Errno.badf));
-    try std.testing.expectEqual(@as(u16, 28), @intFromEnum(Errno.inval));
-    try std.testing.expectEqual(@as(u16, 29), @intFromEnum(Errno.io));
-    try std.testing.expectEqual(@as(u16, 44), @intFromEnum(Errno.noent));
-    try std.testing.expectEqual(@as(u16, 48), @intFromEnum(Errno.nomem));
-    try std.testing.expectEqual(@as(u16, 52), @intFromEnum(Errno.nosys));
-    try std.testing.expectEqual(@as(u16, 63), @intFromEnum(Errno.perm));
-    try std.testing.expectEqual(@as(u16, 76), @intFromEnum(Errno.notcapable));
+    try std.testing.expectEqual(@as(u16, 0), @backingInt(Errno.success));
+    try std.testing.expectEqual(@as(u16, 1), @backingInt(Errno.toobig));
+    try std.testing.expectEqual(@as(u16, 2), @backingInt(Errno.acces));
+    try std.testing.expectEqual(@as(u16, 8), @backingInt(Errno.badf));
+    try std.testing.expectEqual(@as(u16, 28), @backingInt(Errno.inval));
+    try std.testing.expectEqual(@as(u16, 29), @backingInt(Errno.io));
+    try std.testing.expectEqual(@as(u16, 44), @backingInt(Errno.noent));
+    try std.testing.expectEqual(@as(u16, 48), @backingInt(Errno.nomem));
+    try std.testing.expectEqual(@as(u16, 52), @backingInt(Errno.nosys));
+    try std.testing.expectEqual(@as(u16, 63), @backingInt(Errno.perm));
+    try std.testing.expectEqual(@as(u16, 76), @backingInt(Errno.notcapable));
 }
 
 test "Signal values match WASI witx" {
-    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(Signal.none));
-    try std.testing.expectEqual(@as(u8, 6), @intFromEnum(Signal.abrt));
-    try std.testing.expectEqual(@as(u8, 9), @intFromEnum(Signal.kill));
-    try std.testing.expectEqual(@as(u8, 15), @intFromEnum(Signal.term));
-    try std.testing.expectEqual(@as(u8, 16), @intFromEnum(Signal.chld));
-    try std.testing.expectEqual(@as(u8, 27), @intFromEnum(Signal.winch));
-    try std.testing.expectEqual(@as(u8, 30), @intFromEnum(Signal.sys));
+    try std.testing.expectEqual(@as(u8, 0), @backingInt(Signal.none));
+    try std.testing.expectEqual(@as(u8, 6), @backingInt(Signal.abrt));
+    try std.testing.expectEqual(@as(u8, 9), @backingInt(Signal.kill));
+    try std.testing.expectEqual(@as(u8, 15), @backingInt(Signal.term));
+    try std.testing.expectEqual(@as(u8, 16), @backingInt(Signal.chld));
+    try std.testing.expectEqual(@as(u8, 27), @backingInt(Signal.winch));
+    try std.testing.expectEqual(@as(u8, 30), @backingInt(Signal.sys));
 }
 
 test "wasiSignalToPosix: known signals map to POSIX numbering" {

@@ -217,7 +217,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
     // 1. Read input wasm
     const io = init.io;
     const cwd = std.Io.Dir.cwd();
-    const wasm_data = cwd.readFileAlloc(io, in_path, allocator, @enumFromInt(64 * 1024 * 1024)) catch |err| {
+    const wasm_data = cwd.readFileAlloc(io, in_path, allocator, @fromBackingInt(@intCast(64 * 1024 * 1024))) catch |err| {
         wamr.utils.read_file.dieReadFileError(in_path, err);
     };
     defer allocator.free(wasm_data);
@@ -499,7 +499,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
     for (module.exports) |exp| {
         try exports.append(allocator, .{
             .name = exp.name,
-            .kind = @enumFromInt(@intFromEnum(exp.kind)),
+            .kind = @fromBackingInt(@intCast(@backingInt(exp.kind))),
             .index = exp.index,
         });
     }
@@ -630,7 +630,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
         gi.* = .{ .global_type = gt, .value = val };
         try tmp_globals.append(allocator, gi);
         try global_entries.append(allocator, .{
-            .val_type = @intFromEnum(gt.val_type),
+            .val_type = @backingInt(gt.val_type),
             .mutability = if (gt.mutability == .mutable) @as(u8, 1) else @as(u8, 0),
             .init_i64 = valueToI64(val),
             .init_v128 = valueToV128(val),
@@ -642,7 +642,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
         gi.* = .{ .global_type = g.global_type, .value = val };
         try tmp_globals.append(allocator, gi);
         try global_entries.append(allocator, .{
-            .val_type = @intFromEnum(g.global_type.val_type),
+            .val_type = @backingInt(g.global_type.val_type),
             .mutability = if (g.global_type.mutability == .mutable) @as(u8, 1) else @as(u8, 0),
             .init_i64 = valueToI64(val),
             .init_v128 = valueToV128(val),
@@ -703,9 +703,9 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
             continue;
         }
         const params_bytes = try allocator.alloc(u8, ft.params.len);
-        for (ft.params, 0..) |p, j| params_bytes[j] = @intFromEnum(p);
+        for (ft.params, 0..) |p, j| params_bytes[j] = @backingInt(p);
         const results_bytes = try allocator.alloc(u8, ft.results.len);
-        for (ft.results, 0..) |r, j| results_bytes[j] = @intFromEnum(r);
+        for (ft.results, 0..) |r, j| results_bytes[j] = @backingInt(r);
         try func_type_entries.append(allocator, .{ .params = params_bytes, .results = results_bytes });
     }
 
@@ -817,7 +817,7 @@ fn loadCacheCompat(
     expect: CacheLoadCheck,
 ) ?codegen_cache.Cache {
     const cwd = std.Io.Dir.cwd();
-    const bytes = cwd.readFileAlloc(io, path, allocator, @enumFromInt(codegen_cache.max_cache_file_bytes)) catch |err| switch (err) {
+    const bytes = cwd.readFileAlloc(io, path, allocator, @fromBackingInt(@intCast(codegen_cache.max_cache_file_bytes))) catch |err| switch (err) {
         error.FileNotFound => {
             std.debug.print("Codegen cache: no existing cache at {s} — full recompile\n", .{path});
             return null;
@@ -972,7 +972,7 @@ fn runCompileComponent(init: std.process.Init, allocator: std.mem.Allocator, sub
 
     const io = init.io;
     const cwd = std.Io.Dir.cwd();
-    const component_data = cwd.readFileAlloc(io, in_path, allocator, @enumFromInt(256 * 1024 * 1024)) catch |err| {
+    const component_data = cwd.readFileAlloc(io, in_path, allocator, @fromBackingInt(@intCast(256 * 1024 * 1024))) catch |err| {
         wamr.utils.read_file.dieReadFileError(in_path, err);
     };
     defer allocator.free(component_data);
@@ -1097,7 +1097,7 @@ fn compileAndSpawn(
 ) !void {
     const io = init.io;
     const cwd = std.Io.Dir.cwd();
-    const wasm_data = cwd.readFileAlloc(io, in_path, allocator, @enumFromInt(256 * 1024 * 1024)) catch |err| {
+    const wasm_data = cwd.readFileAlloc(io, in_path, allocator, @fromBackingInt(@intCast(256 * 1024 * 1024))) catch |err| {
         wamr.utils.read_file.dieReadFileError(in_path, err);
     };
     defer allocator.free(wasm_data);
@@ -1239,11 +1239,11 @@ fn compileAndSpawn(
     switch (term) {
         .exited => |code| std.process.exit(code),
         .signal => |sig| {
-            std.debug.print("error: `wamr` was killed by signal {d}\n", .{@intFromEnum(sig)});
+            std.debug.print("error: `wamr` was killed by signal {d}\n", .{@backingInt(sig)});
             std.process.exit(1);
         },
         .stopped => |sig| {
-            std.debug.print("error: `wamr` was stopped by signal {d}\n", .{@intFromEnum(sig)});
+            std.debug.print("error: `wamr` was stopped by signal {d}\n", .{@backingInt(sig)});
             std.process.exit(1);
         },
         .unknown => |code| {
@@ -1552,7 +1552,7 @@ fn coreArtifactFresh(
     // 2. Read + parse the sidecar.
     const sidecar_path = coreSidecarPathAlloc(allocator, artifact_path) catch return false;
     defer allocator.free(sidecar_path);
-    const json_bytes = cwd.readFileAlloc(io, sidecar_path, allocator, @enumFromInt(64 * 1024)) catch return false;
+    const json_bytes = cwd.readFileAlloc(io, sidecar_path, allocator, @fromBackingInt(@intCast(64 * 1024))) catch return false;
     defer allocator.free(json_bytes);
 
     var arena = std.heap.ArenaAllocator.init(allocator);

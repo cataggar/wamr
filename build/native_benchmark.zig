@@ -32,7 +32,7 @@ pub fn add(b: *std.Build, wamrc: *std.Build.Step.Compile, optimize: std.builtin.
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/unikraft-aot/benchmark_fixture.zig"),
             .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
         }),
     });
     wasm.entry = .disabled;
@@ -45,7 +45,7 @@ pub fn add(b: *std.Build, wamrc: *std.Build.Step.Compile, optimize: std.builtin.
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/unikraft-aot/benchmark_wasi_fixture.zig"),
             .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
         }),
     });
     wasi_wasm.entry = .disabled;
@@ -80,7 +80,7 @@ pub fn add(b: *std.Build, wamrc: *std.Build.Step.Compile, optimize: std.builtin.
     const generator_module = b.createModule(.{
         .root_source_file = b.path("tests/unikraft-aot/generate.zig"),
         .target = b.graph.host,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
     });
     generator_module.addImport("wabt", wabt);
     const generator = b.addExecutable(.{ .name = "generate-native-guest-fixture", .root_module = generator_module });
@@ -109,7 +109,7 @@ pub fn add(b: *std.Build, wamrc: *std.Build.Step.Compile, optimize: std.builtin.
     const test_root = b.createModule(.{
         .root_source_file = b.path("src/native_bench_tests.zig"),
         .target = target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .single_threaded = true,
     });
     test_root.addImport("minimal-wasi", wasi);
@@ -124,7 +124,7 @@ pub fn add(b: *std.Build, wamrc: *std.Build.Step.Compile, optimize: std.builtin.
     const guest_protocol_root = b.createModule(.{
         .root_source_file = b.path("src/native_guest_protocol_test.zig"),
         .target = target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .single_threaded = true,
     });
     guest_protocol_root.addImport("minimal-wasi", wasi);
@@ -133,7 +133,7 @@ pub fn add(b: *std.Build, wamrc: *std.Build.Step.Compile, optimize: std.builtin.
     const guest_protocol_exe = b.addExecutable(.{ .name = "native-guest-protocol-test", .root_module = guest_protocol_root });
     const guest_protocol = b.step("test-native-aot-guest-protocol", "Validate actual guest payloads using the existing host v2 schema");
     const guest_python = b.addSystemCommand(&.{ "python3", "-m", "unittest", "scripts.test_native_guest" });
-    guest_python.setEnvironmentVariable("WAMR_NATIVE_GUEST_TEST", b.getInstallPath(.prefix, "native-guest-tests/driver"));
+    @import("environment.zig").setPath(guest_python, "WAMR_NATIVE_GUEST_TEST", .{ .relative = .{ .base = .install_prefix, .sub_path = "native-guest-tests/driver" } });
     guest_python.setEnvironmentVariable("WAMR_NATIVE_GUEST_TEST_RUNNER", if (b.graph.host.result.cpu.arch == .x86_64) "" else "qemu-x86_64 -cpu max");
     guest_python.step.dependOn(&b.addInstallFile(guest_protocol_exe.getEmittedBin(), "native-guest-tests/driver").step);
     if (b.graph.host.result.os.tag == .linux) {
@@ -162,8 +162,8 @@ pub fn add(b: *std.Build, wamrc: *std.Build.Step.Compile, optimize: std.builtin.
         guest_step.dependOn(build_only);
     }
     const python = b.addSystemCommand(&.{ "python3", "-m", "unittest", "scripts.test_bench_coremark.NativeLinuxProducerTests" });
-    python.setEnvironmentVariable("WAMR_NATIVE_PRODUCER", b.getInstallPath(.bin, "wamr-native-bench"));
-    python.setEnvironmentVariable("WAMR_NATIVE_FIXTURE_DIR", b.getInstallPath(.prefix, "native-bench"));
+    @import("environment.zig").setPath(python, "WAMR_NATIVE_PRODUCER", .{ .relative = .{ .base = .install_bin, .sub_path = "wamr-native-bench" } });
+    @import("environment.zig").setPath(python, "WAMR_NATIVE_FIXTURE_DIR", .{ .relative = .{ .base = .install_prefix, .sub_path = "native-bench" } });
     if (b.graph.host.result.cpu.arch != .x86_64)
         python.setEnvironmentVariable("WAMR_NATIVE_PRODUCER_RUNNER", "qemu-x86_64 -cpu max");
     python.step.dependOn(producer);

@@ -40,6 +40,16 @@ const win_extern = if (is_windows) struct {
     ) callconv(.winapi) std.os.windows.BOOL;
 } else struct {};
 
+// POSIX extension functions not exposed by std.c.
+const libc_extern = struct {
+    extern "c" fn pthread_getattr_np(std.c.pthread_t, *std.c.pthread_attr_t) c_int;
+    extern "c" fn pthread_attr_getstack(*const std.c.pthread_attr_t, *?*anyopaque, *usize) c_int;
+    extern "c" fn pthread_attr_getguardsize(*const std.c.pthread_attr_t, *usize) c_int;
+    extern "c" fn pthread_get_stackaddr_np(std.c.pthread_t) ?*anyopaque;
+    extern "c" fn pthread_get_stacksize_np(std.c.pthread_t) usize;
+    extern "c" fn sys_icache_invalidate(*anyopaque, usize) void;
+};
+
 // ── 1. Memory mapping ───────────────────────────────────────────────────
 
 pub const MemProt = packed struct {
@@ -415,21 +425,16 @@ fn threadGetStackBoundaryWindows() ?[*]u8 {
 fn threadGetStackBoundaryLinux() ?[*]u8 {
     if (!is_linux) unreachable;
 
-    // Use pthread_attr_getstack via the libc interface.
-    const c = @cImport({
-        @cInclude("pthread.h");
-    });
-
-    var attr: c.pthread_attr_t = undefined;
-    if (c.pthread_getattr_np(c.pthread_self(), &attr) != 0) return null;
-    defer _ = c.pthread_attr_destroy(&attr);
+    var attr: std.c.pthread_attr_t = undefined;
+    if (libc_extern.pthread_getattr_np(std.c.pthread_self(), &attr) != 0) return null;
+    defer _ = std.c.pthread_attr_destroy(&attr);
 
     var stack_addr: ?*anyopaque = null;
     var stack_size: usize = 0;
-    if (c.pthread_attr_getstack(&attr, &stack_addr, &stack_size) != 0) return null;
+    if (libc_extern.pthread_attr_getstack(&attr, &stack_addr, &stack_size) != 0) return null;
 
     var guard_size: usize = 0;
-    _ = c.pthread_attr_getguardsize(&attr, &guard_size);
+    _ = libc_extern.pthread_attr_getguardsize(&attr, &guard_size);
 
     const base = @intFromPtr(stack_addr) + guard_size;
     return @ptrFromInt(base);
@@ -438,13 +443,9 @@ fn threadGetStackBoundaryLinux() ?[*]u8 {
 fn threadGetStackBoundaryMacos() ?[*]u8 {
     if (!is_macos) unreachable;
 
-    const c = @cImport({
-        @cInclude("pthread.h");
-    });
-
-    const self = c.pthread_self();
-    const stack_addr = @intFromPtr(c.pthread_get_stackaddr_np(self));
-    const stack_size = c.pthread_get_stacksize_np(self);
+    const self = std.c.pthread_self();
+    const stack_addr = @intFromPtr(libc_extern.pthread_get_stackaddr_np(self));
+    const stack_size = libc_extern.pthread_get_stacksize_np(self);
 
     if (stack_addr == 0 or stack_size == 0) return null;
 
@@ -714,10 +715,7 @@ pub fn mapExecutableCode(code: []const u8) ?[*]u8 {
 fn icacheFlushAarch64(start: [*]u8, len: usize) void {
     if (is_macos) {
         // macOS: use sys_icache_invalidate from libsystem.
-        const c = @cImport({
-            @cInclude("libkern/OSCacheControl.h");
-        });
-        c.sys_icache_invalidate(@ptrCast(start), len);
+        libc_extern.sys_icache_invalidate(@ptrCast(start), len);
     } else if (is_linux) {
         // Linux AArch64: clear d-cache and invalidate i-cache line by line.
         const cache_line: usize = 64;
@@ -729,8 +727,7 @@ fn icacheFlushAarch64(start: [*]u8, len: usize) void {
             asm volatile ("dc cvau, %[addr]"
                 :
                 : [addr] "r" (addr),
-                : .{ .memory = true }
-            );
+                : .{ .memory = true });
         }
         asm volatile ("dsb ish" ::: .{ .memory = true });
 
@@ -739,8 +736,7 @@ fn icacheFlushAarch64(start: [*]u8, len: usize) void {
             asm volatile ("ic ivau, %[addr]"
                 :
                 : [addr] "r" (addr),
-                : .{ .memory = true }
-            );
+                : .{ .memory = true });
         }
         asm volatile ("dsb ish" ::: .{ .memory = true });
         asm volatile ("isb" ::: .{ .memory = true });
@@ -753,7 +749,7 @@ fn icacheFlushArm(start: [*]u8, len: usize) void {
         const end_addr = base + len;
         // ARM Linux cacheflush syscall: syscall 0xf0002 (ARM_NR_cacheflush)
         _ = std.os.linux.syscall3(
-            @enumFromInt(0xf0002),
+            @fromBackingInt(@intCast(0xf0002)),
             base,
             end_addr,
             0,

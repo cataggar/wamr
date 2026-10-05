@@ -91,7 +91,7 @@ jobs:
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Configure Zig caches
@@ -99,7 +99,7 @@ jobs:
 
       - name: Build
         shell: bash
-        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} -Dstrip=true -Dstack-protector=true "-Dversion=$RELEASE_VERSION" -j4
+        run: zig build -Doptimize=fast -Dtarget=${{ matrix.target }} -Dstrip=true -Dstack-protector=true "-Dversion=$RELEASE_VERSION" -j4
 
       - name: Azure login (for signing)
         if: endsWith(matrix.target, '-windows')

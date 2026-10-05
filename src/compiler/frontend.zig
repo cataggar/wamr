@@ -442,7 +442,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
     while (ip < code.len) {
         const byte = code[ip];
         ip += 1;
-        const op: Opcode = @enumFromInt(byte);
+        const op: Opcode = @fromBackingInt(@intCast(byte));
         if (op == .ref_as_non_null) ir_func.has_ref_as_non_null = true;
 
         // In dead code, skip instructions until we reach a block boundary
@@ -1742,7 +1742,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
 
             // ── Saturating truncation (0xFC prefix) ────────────────────
             .misc_prefix => {
-                const sub_opcode: MiscOpcode = @enumFromInt(readU32(code, &ip));
+                const sub_opcode: MiscOpcode = @fromBackingInt(@intCast(readU32(code, &ip)));
                 switch (sub_opcode) {
                     .i32_trunc_sat_f32_s,
                     .i32_trunc_sat_f32_u,
@@ -1827,7 +1827,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         try ir_func.getBlock(current_block).append(.{ .op = .{ .elem_drop = seg_idx } });
                     },
                     else => {
-                        if (!@import("../config.zig").unikraft_jit) std.debug.print("wamrc: unsupported misc opcode 0xFC 0x{X:0>2}\n", .{@intFromEnum(sub_opcode)});
+                        if (!@import("../config.zig").unikraft_jit) std.debug.print("wamrc: unsupported misc opcode 0xFC 0x{X:0>2}\n", .{@backingInt(sub_opcode)});
                         return error.UnsupportedOpcode;
                     },
                 }
@@ -1835,7 +1835,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
 
             // ── Atomic operations (0xFE prefix) ───────────────────────
             .atomic_prefix => {
-                const sub_opcode: AtomicOpcode = @enumFromInt(readU32(code, &ip));
+                const sub_opcode: AtomicOpcode = @fromBackingInt(@intCast(readU32(code, &ip)));
                 switch (sub_opcode) {
                     .atomic_fence => {
                         _ = readU32(code, &ip);
@@ -2023,14 +2023,14 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     },
 
                     else => {
-                        if (!@import("../config.zig").unikraft_jit) std.debug.print("wamrc: unsupported atomic opcode 0xFE 0x{X:0>2}\n", .{@intFromEnum(sub_opcode)});
+                        if (!@import("../config.zig").unikraft_jit) std.debug.print("wamrc: unsupported atomic opcode 0xFE 0x{X:0>2}\n", .{@backingInt(sub_opcode)});
                         return error.UnsupportedOpcode;
                     },
                 }
             },
             .simd_prefix => {
                 const sub = readU32(code, &ip);
-                const simd_op: SimdOpcode = @enumFromInt(sub);
+                const simd_op: SimdOpcode = @fromBackingInt(@intCast(sub));
                 switch (simd_op) {
                     .v128_bitselect => {
                         const mask = safePop(&vreg_stack);
@@ -3462,7 +3462,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         try vreg_stack.append(allocator, dest);
                     },
                     else => {
-                        if (!@import("../config.zig").unikraft_jit) std.debug.print("wamrc: unsupported SIMD opcode 0x{X}\n", .{@intFromEnum(simd_op)});
+                        if (!@import("../config.zig").unikraft_jit) std.debug.print("wamrc: unsupported SIMD opcode 0x{X}\n", .{@backingInt(simd_op)});
                         return error.UnsupportedOpcode;
                     },
                 }
@@ -3976,7 +3976,7 @@ fn skipOperands(code: []const u8, ip: *usize, op: Opcode) void {
 
 fn skipSimdOperands(code: []const u8, ip: *usize) void {
     const sub = readU32(code, ip);
-    const simd_op: SimdOpcode = @enumFromInt(sub);
+    const simd_op: SimdOpcode = @fromBackingInt(@intCast(sub));
     switch (simd_op) {
         .v128_load,
         .v128_load8x8_s,
@@ -4657,7 +4657,7 @@ test "lower integer SIMD all_true opcodes produce i32" {
     const appendConst = struct {
         fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator) !void {
             try appendSimd(buf, alloc, 0x0C); // v128.const
-            for ([_]u8{ 1, 2, 3, 4 } ** 4) |byte| {
+            for ([_]u8{ 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4 }) |byte| {
                 try buf.append(alloc, byte);
             }
         }
@@ -4739,7 +4739,7 @@ test "lower integer SIMD bitmask opcodes produce i32" {
     const appendConst = struct {
         fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator) !void {
             try appendSimd(buf, alloc, 0x0C); // v128.const
-            for ([_]u8{ 0x80, 0, 0xFF, 1 } ** 4) |byte| {
+            for ([_]u8{ 0x80, 0, 0xFF, 1, 0x80, 0, 0xFF, 1, 0x80, 0, 0xFF, 1, 0x80, 0, 0xFF, 1 }) |byte| {
                 try buf.append(alloc, byte);
             }
         }
@@ -6174,7 +6174,7 @@ test "lower integer SIMD unary opcodes" {
     var code: std.ArrayList(u8) = .empty;
     defer code.deinit(allocator);
     try appendSimd(&code, allocator, 0x0C); // v128.const
-    for ([_]u8{ 0x80, 0x81, 0x7F, 0x01 } ** 4) |byte| {
+    for ([_]u8{ 0x80, 0x81, 0x7F, 0x01, 0x80, 0x81, 0x7F, 0x01, 0x80, 0x81, 0x7F, 0x01, 0x80, 0x81, 0x7F, 0x01 }) |byte| {
         try code.append(allocator, byte);
     }
     for (cases) |case| {
@@ -6440,7 +6440,7 @@ test "lower integer SIMD pairwise extended add opcodes" {
     var code: std.ArrayList(u8) = .empty;
     defer code.deinit(allocator);
     try appendSimd(&code, allocator, 0x0C); // v128.const
-    for ([_]u8{ 0x80, 0x7F, 0x01, 0xFF } ** 4) |byte| {
+    for ([_]u8{ 0x80, 0x7F, 0x01, 0xFF, 0x80, 0x7F, 0x01, 0xFF, 0x80, 0x7F, 0x01, 0xFF, 0x80, 0x7F, 0x01, 0xFF }) |byte| {
         try code.append(allocator, byte);
     }
     for (cases) |case| {
@@ -6514,11 +6514,11 @@ test "lower i32x4.dot_i16x8_s opcode" {
     var code: std.ArrayList(u8) = .empty;
     defer code.deinit(allocator);
     try appendSimd(&code, allocator, 0x0C); // v128.const
-    for ([_]u8{ 1, 0, 0xFE, 0xFF } ** 4) |byte| {
+    for ([_]u8{ 1, 0, 0xFE, 0xFF, 1, 0, 0xFE, 0xFF, 1, 0, 0xFE, 0xFF, 1, 0, 0xFE, 0xFF }) |byte| {
         try code.append(allocator, byte);
     }
     try appendSimd(&code, allocator, 0x0C); // v128.const
-    for ([_]u8{ 3, 0, 4, 0 } ** 4) |byte| {
+    for ([_]u8{ 3, 0, 4, 0, 3, 0, 4, 0, 3, 0, 4, 0, 3, 0, 4, 0 }) |byte| {
         try code.append(allocator, byte);
     }
     try appendSimd(&code, allocator, 0xBA); // i32x4.dot_i16x8_s
@@ -6605,7 +6605,7 @@ test "lower integer SIMD widening extend low/high opcodes" {
     var code: std.ArrayList(u8) = .empty;
     defer code.deinit(allocator);
     try appendSimd(&code, allocator, 0x0C); // v128.const
-    for ([_]u8{ 0x80, 0x7F, 0x01, 0xFF } ** 4) |byte| {
+    for ([_]u8{ 0x80, 0x7F, 0x01, 0xFF, 0x80, 0x7F, 0x01, 0xFF, 0x80, 0x7F, 0x01, 0xFF, 0x80, 0x7F, 0x01, 0xFF }) |byte| {
         try code.append(allocator, byte);
     }
     for (cases) |case| {
@@ -6697,7 +6697,7 @@ test "lower integer SIMD narrow opcodes" {
     var const_idx: usize = 0;
     while (const_idx < cases.len + 1) : (const_idx += 1) {
         try appendSimd(&code, allocator, 0x0C); // v128.const
-        for ([_]u8{ 0x80, 0x7F, 0x01, 0xFF } ** 4) |byte| {
+        for ([_]u8{ 0x80, 0x7F, 0x01, 0xFF, 0x80, 0x7F, 0x01, 0xFF, 0x80, 0x7F, 0x01, 0xFF, 0x80, 0x7F, 0x01, 0xFF }) |byte| {
             try code.append(allocator, byte);
         }
     }
@@ -7071,7 +7071,7 @@ test "lower integer SIMD widening multiply low/high opcodes" {
     var const_idx: usize = 0;
     while (const_idx < cases.len + 1) : (const_idx += 1) {
         try appendSimd(&code, allocator, 0x0C); // v128.const
-        for ([_]u8{ 0x80, 0x7F, 0x01, 0xFF } ** 4) |byte| {
+        for ([_]u8{ 0x80, 0x7F, 0x01, 0xFF, 0x80, 0x7F, 0x01, 0xFF, 0x80, 0x7F, 0x01, 0xFF, 0x80, 0x7F, 0x01, 0xFF }) |byte| {
             try code.append(allocator, byte);
         }
     }
@@ -8056,9 +8056,7 @@ test "lower try_table: emits begin/end and records clauses" {
     //   0x0B = end (function)
     const code = [_]u8{
         0x1F, 0x40, 0x01, 0x00, 0x00, 0x00,
-        0x01,
-        0x0B,
-        0x0B,
+        0x01, 0x0B, 0x0B,
     };
     const func = types.WasmFunction{
         .type_idx = 1,
