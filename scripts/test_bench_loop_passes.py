@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -8,6 +9,27 @@ import bench_loop_passes as bench
 
 
 class LoopPassBenchTests(unittest.TestCase):
+    def test_ref_build_uses_its_declared_compiler_generation(self):
+        with patch.object(Path, "read_text", return_value='.minimum_zig_version = "0.16.0"'):
+            self.assertEqual(
+                ["zig016", "build", "-Doptimize=ReleaseFast"],
+                bench.zig_build_command(Path("baseline"), "ReleaseFast"),
+            )
+        with patch.object(Path, "read_text", return_value='.minimum_zig_version = "0.17.0"'):
+            self.assertEqual(
+                ["zig", "build", "-Doptimize=fast"],
+                bench.zig_build_command(Path("target"), "ReleaseFast"),
+            )
+            self.assertEqual(
+                ["zig", "build", "-Doptimize=safe"],
+                bench.zig_build_command(Path("target"), "ReleaseSafe"),
+            )
+
+    def test_ref_build_refuses_unqualified_compiler_generation(self):
+        with patch.object(Path, "read_text", return_value='.minimum_zig_version = "0.18.0"'):
+            with self.assertRaisesRegex(ValueError, "Zig 0.16 or 0.17"):
+                bench.zig_build_command(Path("target"), "ReleaseFast")
+
     def test_tracked_fixture_checksums_are_pinned(self):
         repo = Path(__file__).resolve().parents[1]
         fixtures = bench.resolve_fixtures(repo)

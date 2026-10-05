@@ -40,7 +40,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from bench_optimize import OPTIMIZE_CHOICES, fmt_ratio, optimize_slug, parse_optimize_modes
+from bench_optimize import OPTIMIZE_CHOICES, fmt_ratio, optimize_slug, parse_optimize_modes, zig_build_command
 
 
 # Modules in the order they should appear in tables / JSON output.
@@ -131,7 +131,7 @@ def build_worktree(wt: Path, optimize: str) -> dict:
     """Build wamr/wamrc and return the env to reuse."""
     env = worktree_env(wt)
     print(f"[harness] building {wt.name} ({optimize})", file=sys.stderr)
-    run(["zig", "build", f"-Doptimize={optimize}"], cwd=wt, env=env)
+    run(zig_build_command(wt, optimize), cwd=wt, env=env)
     wamr = wt / "zig-out/bin/wamr"
     wamrc = wt / "zig-out/bin/wamrc"
     if not wamr.exists():

@@ -68,15 +68,15 @@ jobs:
           # Need the base commit to compare against, so deepen the checkout.
           fetch-depth: 0
 
-      - name: Install Zig 0.16.0
+      - name: Install Zig 0.17.0
         uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
         env:
           GH_TOKEN: ${{ github.token }}
         with:
           ghr-version: v0.8.1
-          tools: >-
-            cataggar/zig@v0.16.0
-            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+          tools: |
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.16.0 ?id=wamr-benchmark-zig016&alias=zig016 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Configure Zig caches
         uses: ./.github/actions/zig-cache

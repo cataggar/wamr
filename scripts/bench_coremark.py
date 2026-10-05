@@ -35,7 +35,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-from bench_optimize import OPTIMIZE_CHOICES, fmt_ratio, optimize_slug, parse_optimize_modes
+from bench_optimize import OPTIMIZE_CHOICES, fmt_ratio, optimize_slug, parse_optimize_modes, zig_build_command
 
 ITER_PATTERN = re.compile(r"Iterations/Sec\s*:\s*([0-9]+(?:\.[0-9]+)?)")
 VALIDATION_TEXT = "Correct operation validated."
@@ -751,7 +751,7 @@ def prepare_wamr(
 ) -> PreparedEngine:
     env = worktree_env(wt)
     print(f"[harness] building WAMR {ref} ({sha[:12]}, {optimize})", file=sys.stderr)
-    run(["zig", "build", f"-Doptimize={optimize}"], cwd=wt, env=env)
+    run(zig_build_command(wt, optimize), cwd=wt, env=env)
 
     wamrc = wt / "zig-out/bin/wamrc"
     wamr = wt / "zig-out/bin/wamr"

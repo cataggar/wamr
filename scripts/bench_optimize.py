@@ -2,8 +2,27 @@
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 OPTIMIZE_MODES = ("ReleaseFast", "ReleaseSafe")
 OPTIMIZE_CHOICES = OPTIMIZE_MODES + ("both",)
+
+
+def zig_build_command(worktree: Path, optimize: str) -> list[str]:
+    manifest = (worktree / "build.zig.zon").read_text()
+    match = re.search(r'\.minimum_zig_version\s*=\s*"0\.(16|17)\.[^"]*"', manifest)
+    if match is None:
+        raise ValueError("benchmark ref must declare Zig 0.16 or 0.17")
+    if match.group(1) == "16":
+        return ["zig016", "build", f"-Doptimize={optimize}"]
+    modes = {
+        "Debug": "debug",
+        "ReleaseFast": "fast",
+        "ReleaseSafe": "safe",
+        "ReleaseSmall": "small",
+    }
+    return ["zig", "build", f"-Doptimize={modes[optimize]}"]
 
 
 def parse_optimize_modes(value: str) -> list[str]:

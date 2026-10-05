@@ -25,7 +25,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from bench_optimize import OPTIMIZE_CHOICES, fmt_ratio, optimize_slug, parse_optimize_modes
+from bench_optimize import OPTIMIZE_CHOICES, fmt_ratio, optimize_slug, parse_optimize_modes, zig_build_command
 
 HARNESS_OVERLAY = (
     "build.zig",
@@ -165,7 +165,7 @@ def build_and_run(
     overlay_harness(source_repo, wt)
 
     print(f"[harness] building {wt.name} ({optimize})", file=sys.stderr)
-    run(["zig", "build", f"-Doptimize={optimize}"], cwd=wt, env=env)
+    run(zig_build_command(wt, optimize), cwd=wt, env=env)
 
     runner = wt / "zig-out/bin/simd-bench-runner"
     if not runner.exists():

@@ -328,7 +328,7 @@ pub fn setActivePool(pool: ?*TrampolinePool) void {
 // 65536 bits = 8 KB — too wide for the single-integer backing
 // `IntegerBitSet` uses. The bit set is reset only at process start,
 // so the 8 KB resident cost is negligible.
-var g_dispatch_warn_once: std.bit_set.ArrayBitSet(usize, MAX_SLOTS) = .initEmpty();
+var g_dispatch_warn_once: std.bit_set.ArrayBitSet(usize, MAX_SLOTS) = .empty;
 
 pub fn genericDispatcher(slot: u32, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64, a7: u64, a8: u64, a9: u64) callconv(.c) u64 {
     const pool = g_active_pool orelse {

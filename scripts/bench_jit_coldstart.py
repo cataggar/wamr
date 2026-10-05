@@ -163,8 +163,8 @@ def main() -> int:
         print("[harness] warning: wasmtime not found; wasmtime columns will be omitted", file=sys.stderr)
 
     env = worktree_env(REPO)
-    print("[harness] building wamr/wamrc (-Djit=true -Doptimize=ReleaseFast)", file=sys.stderr)
-    run(["zig", "build", "-Djit=true", "-Doptimize=ReleaseFast"], cwd=REPO, env=env)
+    print("[harness] building wamr/wamrc (-Djit=true -Doptimize=fast)", file=sys.stderr)
+    run(["zig", "build", "-Djit=true", "-Doptimize=fast"], cwd=REPO, env=env)
     wamr = REPO / "zig-out/bin/wamr"
     wamrc = REPO / "zig-out/bin/wamrc"
     assert wamr.exists() and wamrc.exists()

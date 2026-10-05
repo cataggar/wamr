@@ -210,6 +210,11 @@ class BenchCoremarkTests(unittest.TestCase):
             mock.patch.object(bench_coremark, "run", return_value=""),
             mock.patch.object(bench_coremark, "worktree_env", return_value={}),
             mock.patch.object(bench_coremark, "sha256_file", return_value="abc"),
+            mock.patch.object(
+                bench_coremark,
+                "zig_build_command",
+                return_value=["zig", "build", "-Doptimize=fast"],
+            ),
         ):
             wamr = bench_coremark.prepare_wamr(
                 Path("/worktree"),
