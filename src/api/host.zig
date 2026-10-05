@@ -100,17 +100,17 @@ pub fn HostImports(comptime descriptors: anytype) type {
             const info = @typeInfo(FnType).@"fn";
 
             // First param must be HostContext
-            if (info.params.len == 0)
+            if (info.param_types.len == 0)
                 @compileError("Host function must take HostContext as first parameter");
-            if (info.params[0].type.? != HostContext)
+            if (info.param_types[0].? != HostContext)
                 @compileError("First parameter of host function must be HostContext, got " ++
-                    @typeName(info.params[0].type.?));
+                    @typeName(info.param_types[0].?));
 
             // Remaining params must be wasm types
-            for (info.params[1..]) |p| {
-                if (!isWasmType(p.type.?))
+            for (info.param_types[1..]) |p| {
+                if (!isWasmType(p.?))
                     @compileError("Host function parameter must be i32, u32, i64, or u64, got " ++
-                        @typeName(p.type.?));
+                        @typeName(p.?));
             }
 
             // Return type must be void or a wasm type
@@ -155,7 +155,7 @@ pub fn HostImports(comptime descriptors: anytype) type {
 fn makeInterpAdapter(comptime func: anytype) types.HostFn {
     const FnType = @TypeOf(func);
     const info = @typeInfo(FnType).@"fn";
-    const wasm_param_count = info.params.len - 1; // exclude HostContext
+    const wasm_param_count = info.param_types.len - 1; // exclude HostContext
     const RetT = info.return_type.?;
 
     const S = struct {
@@ -170,7 +170,7 @@ fn makeInterpAdapter(comptime func: anytype) types.HostFn {
             comptime var i = wasm_param_count;
             inline while (i > 0) {
                 i -= 1;
-                const ParamT = info.params[i + 1].type.?;
+                const ParamT = info.param_types[i + 1].?;
                 args[i + 1] = if (ParamT == i64 or ParamT == u64)
                     @bitCast(env.popI64() catch return error.StackUnderflow)
                 else
@@ -198,7 +198,7 @@ fn makeAotAdapter(comptime func: anytype) *const anyopaque {
     const VmCtx = @import("../runtime/aot/runtime.zig").VmCtx;
     const FnType = @TypeOf(func);
     const info = @typeInfo(FnType).@"fn";
-    const wasm_param_count = info.params.len - 1;
+    const wasm_param_count = info.param_types.len - 1;
     const RetT = info.return_type.?;
     const AbiRet = if (RetT == void) void else if (RetT == i64 or RetT == u64) i64 else i32;
 
@@ -209,7 +209,7 @@ fn makeAotAdapter(comptime func: anytype) *const anyopaque {
             var args: std.meta.ArgsTuple(FnType) = undefined;
             args[0] = ctx;
             inline for (0..wasm_param_count) |i| {
-                const ParamT = info.params[i + 1].type.?;
+                const ParamT = info.param_types[i + 1].?;
                 args[i + 1] = if (ParamT == i64 or ParamT == u64)
                     @bitCast(raw[i])
                 else

@@ -28,6 +28,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
+const net_io = @import("../wasi/net_io.zig");
 
 const build_options = @import("config");
 
@@ -2936,7 +2937,7 @@ fn sendUdpDatagram(
         // issues a `sendmsg` with an empty iovec and returns 0, which
         // equals `data.len`, so the length check below still passes.
         const chunks = [_][]const u8{data};
-        const sent = try io.vtable.netWrite(io.userdata, socket.handle, &.{}, &chunks, 1);
+        const sent = try net_io.write(io, socket.handle, &.{}, &chunks, 1);
         // Datagram sends are atomic: a success returns the whole
         // payload length. A short count should not happen for
         // SOCK_DGRAM, but if it ever did the datagram was truncated,
@@ -3199,7 +3200,7 @@ fn validateRemoteForSend(addr: std.Io.net.IpAddress, family: IpAddressFamily) ?S
         },
         .ip6 => |v6| {
             if (family != .ipv6) return .invalid_argument;
-            if (std.mem.eql(u8, &v6.bytes, &(@splat(0)))) return .invalid_argument;
+            if (std.mem.eql(u8, &v6.bytes, &@as([16]u8, @splat(0)))) return .invalid_argument;
             if (v6.port == 0) return .invalid_argument;
         },
     }
@@ -3618,7 +3619,7 @@ fn httpClientConnectWithTimeout(
     }
 
     var host_name_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-    const host = try uri.getHost(&host_name_buffer);
+    const host = try std.Io.net.HostName.fromUri(uri, &host_name_buffer);
     const port: u16 = uri.port orelse switch (protocol) {
         .plain => 80,
         .tls => 443,
@@ -20649,7 +20650,7 @@ pub const WasiCliAdapter = struct {
         const io = std.Io.Threaded.global_single_threaded.io();
         var buf: [64 * 1024]u8 = undefined;
         var iovecs = [_][]u8{&buf};
-        const n = io.vtable.netRead(io.userdata, ctx.fd, &iovecs) catch return .err;
+        const n = net_io.read(io, ctx.fd, &iovecs) catch return .err;
         if (n == 0) return .eof;
         stream.buffer.appendSlice(allocator, buf[0..n]) catch return .err;
         return .progressed;
@@ -20713,7 +20714,7 @@ pub const WasiCliAdapter = struct {
         const cap = @min(dst.len, 64 * 1024);
         const io = std.Io.Threaded.global_single_threaded.io();
         var iovecs = [_][]u8{dst[0..cap]};
-        const n = io.vtable.netRead(io.userdata, ctx.fd, &iovecs) catch
+        const n = net_io.read(io, ctx.fd, &iovecs) catch
             return .{ .action = .err };
         if (n == 0) return .{ .action = .eof };
         return .{ .action = .progressed, .bytes_written = @intCast(n) };
@@ -20775,7 +20776,7 @@ pub const WasiCliAdapter = struct {
         defer parent.release();
         const io = std.Io.Threaded.global_single_threaded.io();
         const slices = [_][]const u8{src};
-        _ = io.vtable.netWrite(io.userdata, ctx.fd, &.{}, &slices, 1) catch {
+        _ = net_io.write(io, ctx.fd, &.{}, &slices, 1) catch {
             ctx.send_failed.store(true, .release);
             return .err;
         };
@@ -21359,7 +21360,7 @@ pub const WasiCliAdapter = struct {
                 defer detached.deinit(ci.allocator);
                 const io = std.Io.Threaded.global_single_threaded.io();
                 const slices = [_][]const u8{detached.items};
-                _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &slices, 1) catch |err| {
+                _ = net_io.write(io, stream.socket.handle, &.{}, &slices, 1) catch |err| {
                     if (ci.streams.acquire(stream_handle)) |failed_lease| {
                         var final_lease = failed_lease;
                         final_lease.value().read_closed = true;
@@ -21500,7 +21501,7 @@ pub const WasiCliAdapter = struct {
             const io = std.Io.Threaded.global_single_threaded.io();
             var buf: [64 * 1024]u8 = undefined;
             var iovecs = [_][]u8{&buf};
-            const n = io.vtable.netRead(io.userdata, stream.socket.handle, &iovecs) catch 0;
+            const n = net_io.read(io, stream.socket.handle, &iovecs) catch 0;
             if (n > 0) if (ci.streams.acquire(stream_h)) |initial_lease| {
                 var stream_lease = initial_lease;
                 defer stream_lease.release();
@@ -22248,7 +22249,7 @@ pub const WasiCliAdapter = struct {
         const f = try self.allocator.create(HttpFields);
         f.* = .{};
         if (lifted_entries.len > 0) {
-            f.entries = .{ .items = lifted_entries, .capacity = lifted_entries.len };
+            f.entries = .fromOwnedSlice(lifted_entries);
             lifted_entries = &.{}; // ownership transferred — disarm errdefer
         }
         errdefer {
@@ -22723,7 +22724,7 @@ pub const WasiCliAdapter = struct {
                     const value_copy = try self.allocator.dupe(u8, e.value);
                     copied[filled] = .{ .name = name_copy, .value = value_copy };
                 }
-                f.entries = .{ .items = copied, .capacity = copied.len };
+                f.entries = .fromOwnedSlice(copied);
             }
         }
 
@@ -36194,7 +36195,7 @@ test "sockets P3: tcp loopback bind/listen/connect/send round-trip (#519)" {
     // ── Read the bytes off the accepted server stream ──────────────────
     var srv_buf: [64]u8 = undefined;
     var iovecs = [_][]u8{&srv_buf};
-    const n = try io.vtable.netRead(io.userdata, accepted_stream.socket.handle, &iovecs);
+    const n = try net_io.read(io, accepted_stream.socket.handle, &iovecs);
     accepted_stream.close(io);
     try testing.expectEqualStrings(send_data, srv_buf[0..n]);
 }
@@ -37441,7 +37442,7 @@ test "sockets P3 #535: tcp-receive stream driver yields multiple read cycles" {
     // Cycle 1: client writes chunk1, host driver drains it into FIFO.
     {
         const slices = [_][]const u8{chunk1};
-        _ = try io.vtable.netWrite(io.userdata, client.socket.handle, &.{}, &slices, 1);
+        _ = try net_io.write(io, client.socket.handle, &.{}, &slices, 1);
     }
     // Allow the kernel to deliver loopback bytes.
     var attempt: usize = 0;
@@ -37464,7 +37465,7 @@ test "sockets P3 #535: tcp-receive stream driver yields multiple read cycles" {
     // Cycle 2: another write — same stream, same driver, second drain.
     {
         const slices = [_][]const u8{chunk2};
-        _ = try io.vtable.netWrite(io.userdata, client.socket.handle, &.{}, &slices, 1);
+        _ = try net_io.write(io, client.socket.handle, &.{}, &slices, 1);
     }
     attempt = 0;
     while (attempt < 10_000) : (attempt += 1) {
@@ -37640,7 +37641,7 @@ test "sockets P3 (#583 follow-up): tcp-receive zero-copy driver returns .err mid
     const first_chunk = "first-tcp-chunk";
     {
         const slices = [_][]const u8{first_chunk};
-        _ = try io.vtable.netWrite(io.userdata, client.socket.handle, &.{}, &slices, 1);
+        _ = try net_io.write(io, client.socket.handle, &.{}, &slices, 1);
     }
     var attempt: usize = 0;
     while (attempt < 10_000) : (attempt += 1) {
@@ -37669,7 +37670,7 @@ test "sockets P3 (#583 follow-up): tcp-receive zero-copy driver returns .err mid
     const second_chunk = "second-tcp-chunk-would-be-drained";
     {
         const slices = [_][]const u8{second_chunk};
-        _ = try io.vtable.netWrite(io.userdata, client.socket.handle, &.{}, &slices, 1);
+        _ = try net_io.write(io, client.socket.handle, &.{}, &slices, 1);
     }
     attempt = 0;
     while (attempt < 10_000) : (attempt += 1) {
@@ -37983,7 +37984,7 @@ test "sockets P3 #535: tcp-send driver pushes write bytes straight to fd" {
     while (total < want and attempt < 10_000) : (attempt += 1) {
         if (WasiCliAdapter.fdPollReady(server_side.socket.handle, WasiCliAdapter.pollInEvents())) {
             var iovecs = [_][]u8{srv_buf[total..]};
-            const n = try io.vtable.netRead(io.userdata, server_side.socket.handle, &iovecs);
+            const n = try net_io.read(io, server_side.socket.handle, &iovecs);
             if (n == 0) break;
             total += n;
         }
@@ -41453,7 +41454,7 @@ const TestHttpServerCtx = struct {
         var total: usize = 0;
         while (total < req_buf.len) {
             var dests = [_][]u8{req_buf[total..]};
-            const n = io.vtable.netRead(io.userdata, stream.socket.handle, &dests) catch return;
+            const n = net_io.read(io, stream.socket.handle, &dests) catch return;
             if (n == 0) break;
             total += n;
             if (std.mem.indexOf(u8, req_buf[0..total], "\r\n\r\n") != null) break;
@@ -41465,9 +41466,9 @@ const TestHttpServerCtx = struct {
             "Connection: close\r\n" ++
             "\r\n", .{self.body.len}) catch return;
         const head_slices = [_][]const u8{resp_head};
-        _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &head_slices, 1) catch return;
+        _ = net_io.write(io, stream.socket.handle, &.{}, &head_slices, 1) catch return;
         const body_slices = [_][]const u8{self.body};
-        _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &body_slices, 1) catch return;
+        _ = net_io.write(io, stream.socket.handle, &.{}, &body_slices, 1) catch return;
     }
 };
 
@@ -41619,17 +41620,17 @@ const TestHttpHeaderServerCtx = struct {
         var total: usize = 0;
         while (total < req_buf.len) {
             var dests = [_][]u8{req_buf[total..]};
-            const n = io.vtable.netRead(io.userdata, stream.socket.handle, &dests) catch return;
+            const n = net_io.read(io, stream.socket.handle, &dests) catch return;
             if (n == 0) break;
             total += n;
             if (std.mem.indexOf(u8, req_buf[0..total], "\r\n\r\n") != null) break;
         }
 
         const head_slices = [_][]const u8{self.head};
-        _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &head_slices, 1) catch return;
+        _ = net_io.write(io, stream.socket.handle, &.{}, &head_slices, 1) catch return;
         if (self.body.len > 0) {
             const body_slices = [_][]const u8{self.body};
-            _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &body_slices, 1) catch return;
+            _ = net_io.write(io, stream.socket.handle, &.{}, &body_slices, 1) catch return;
         }
     }
 };
@@ -44960,7 +44961,7 @@ const TestHttpPhaseServerCtx = struct {
         var total: usize = 0;
         while (total < req_buf.len) {
             var dests = [_][]u8{req_buf[total..]};
-            const n = io.vtable.netRead(io.userdata, stream.socket.handle, &dests) catch return;
+            const n = net_io.read(io, stream.socket.handle, &dests) catch return;
             if (n == 0) break;
             total += n;
             if (std.mem.indexOf(u8, req_buf[0..total], "\r\n\r\n") != null) break;
@@ -44981,10 +44982,10 @@ const TestHttpPhaseServerCtx = struct {
         }
 
         const head_slices = [_][]const u8{self.head};
-        _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &head_slices, 1) catch return;
+        _ = net_io.write(io, stream.socket.handle, &.{}, &head_slices, 1) catch return;
         if (self.body_part1.len > 0) {
             const body_slices = [_][]const u8{self.body_part1};
-            _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &body_slices, 1) catch return;
+            _ = net_io.write(io, stream.socket.handle, &.{}, &body_slices, 1) catch return;
         }
 
         // Mid-body cancel test only: signal that the first chunk
@@ -45004,7 +45005,7 @@ const TestHttpPhaseServerCtx = struct {
             }
             if (self.body_part2.len > 0) {
                 const body_slices = [_][]const u8{self.body_part2};
-                _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &body_slices, 1) catch return;
+                _ = net_io.write(io, stream.socket.handle, &.{}, &body_slices, 1) catch return;
             }
         }
     }
@@ -45571,7 +45572,7 @@ const TestHttpRedirectServerCtx = struct {
             var total: usize = 0;
             while (total < req_buf.len) {
                 var dests = [_][]u8{req_buf[total..]};
-                const n = io.vtable.netRead(io.userdata, stream.socket.handle, &dests) catch break;
+                const n = net_io.read(io, stream.socket.handle, &dests) catch break;
                 if (n == 0) break;
                 total += n;
                 if (std.mem.indexOf(u8, req_buf[0..total], "\r\n\r\n") != null) break;
@@ -45601,7 +45602,7 @@ const TestHttpRedirectServerCtx = struct {
                 ) catch return;
 
             const slices = [_][]const u8{response};
-            _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &slices, 1) catch return;
+            _ = net_io.write(io, stream.socket.handle, &.{}, &slices, 1) catch return;
         }
     }
 };

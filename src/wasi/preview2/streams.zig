@@ -6,6 +6,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const tls = @import("tls");
+const net_io = @import("../net_io.zig");
 
 // ── wasi:io/streams — input-stream ──────────────────────────────────────────
 
@@ -84,7 +85,7 @@ pub const InputStream = struct {
             .tcp_stream => |fd| {
                 const io = std.Io.Threaded.global_single_threaded.io();
                 var iovecs = [_][]u8{buf};
-                const n = io.vtable.netRead(io.userdata, fd, &iovecs) catch
+                const n = net_io.read(io, fd, &iovecs) catch
                     return .{ .err = .io_error };
                 if (n == 0) return .{ .closed = {} };
                 return .{ .ok = n };
@@ -260,7 +261,7 @@ pub const OutputStream = struct {
                 var sent: usize = 0;
                 while (sent < data.len) {
                     const slices = [_][]const u8{data[sent..]};
-                    const n = io.vtable.netWrite(io.userdata, fd, &.{}, &slices, 1) catch |err| return switch (err) {
+                    const n = net_io.write(io, fd, &.{}, &slices, 1) catch |err| return switch (err) {
                         // The peer went away. This is not an I/O fault: it
                         // is the ordinary way a client abandons a request,
                         // and callers must be able to tell the two apart so
