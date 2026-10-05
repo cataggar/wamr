@@ -23,5 +23,6 @@
         "build",
         "include",
         "src",
+        "tests/unikraft-jit/fixture.zig",
     },
 }
