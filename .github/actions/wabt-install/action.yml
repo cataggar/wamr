@@ -28,14 +28,15 @@ runs:
       env:
         GH_TOKEN: ${{ github.token }}
         WABT_VERSION: ${{ inputs.version }}
+        WABT_MINISIGN_KEY: RWSBnHWjwk/kkqdYc74cGupHMNVobpmF3lPc7b8RIllYMmYBr5G2EyF0
       run: |
         set -euo pipefail
         # ghr-bin is a tiny PyPI wrapper that downloads sha256-verified
         # GitHub release archives and links the chosen binary into
         # ~/.local/bin. pipx is preinstalled on ubuntu-latest; pip is
         # blocked by PEP 668. Pin both ghr-bin and the wabt release.
-        pipx install ghr-bin==0.1.6
-        ghr install "cataggar/wabt@${WABT_VERSION}"
+        pipx install ghr-bin==0.6.6
+        ghr install "cataggar/wabt@${WABT_VERSION}" "${WABT_MINISIGN_KEY}"
         echo "$HOME/.local/bin" >> "$GITHUB_PATH"
         "$HOME/.local/bin/wabt" version
         echo "::notice::cataggar/wabt ${WABT_VERSION} installed"
@@ -46,10 +47,11 @@ runs:
       env:
         GH_TOKEN: ${{ github.token }}
         WABT_VERSION: ${{ inputs.version }}
+        WABT_MINISIGN_KEY: RWSBnHWjwk/kkqdYc74cGupHMNVobpmF3lPc7b8RIllYMmYBr5G2EyF0
       run: |
         $ErrorActionPreference = "Stop"
-        pipx install ghr-bin==0.1.6
-        ghr install "cataggar/wabt@$env:WABT_VERSION"
+        pipx install ghr-bin==0.6.6
+        ghr install "cataggar/wabt@$env:WABT_VERSION" $env:WABT_MINISIGN_KEY
         Add-Content -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.local\bin"
         & "$env:USERPROFILE\.local\bin\wabt.exe" version
         Write-Host "::notice::cataggar/wabt $env:WABT_VERSION installed"
