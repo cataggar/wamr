@@ -78,6 +78,12 @@ def download_asset(release_version: str, platform_key: str) -> bytes:
     url = f"https://github.com/{WAMR_REPO}/releases/download/v{release_version}/{asset_name}"
     print(f"  Downloading {asset_name} ...")
     resp = requests.get(url, allow_redirects=True, timeout=300)
+    if resp.status_code == 404:
+        fallback = "3.0.0-dev.14"
+        asset_name = archive_name(fallback, platform_key)
+        url = f"https://github.com/{WAMR_REPO}/releases/download/v{fallback}/{asset_name}"
+        print(f"  v{release_version} not found upstream; falling back to {asset_name} ...")
+        resp = requests.get(url, allow_redirects=True, timeout=300)
     resp.raise_for_status()
     return resp.content
 
@@ -125,9 +131,10 @@ def build_wheel(
         f"Metadata-Version: 2.4\n"
         f"Name: wamr-bin\n"
         f"Version: {version}\n"
-        f"Summary: WebAssembly Micro Runtime — native CLI tools\n"
-        f"Home-page: https://github.com/cataggar/wamr\n"
+        f"Summary: DEPRECATED: Use 'ghr install cataggar/wamr' instead (https://cataggar.github.io/ghr/)\n"
+        f"Home-page: https://cataggar.github.io/ghr/\n"
         f"License: Apache-2.0\n"
+        f"Classifier: Development Status :: 7 - Inactive\n"
         f"Requires-Python: >=3.9\n"
         f"Description-Content-Type: text/markdown\n"
         f"\n"
