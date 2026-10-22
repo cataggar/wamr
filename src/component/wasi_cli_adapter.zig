@@ -51,6 +51,7 @@ const execution_context = @import("../runtime/common/execution_context.zig");
 const task_cancellation = @import("../runtime/common/task_cancellation.zig");
 const platform = @import("../platform/platform.zig");
 const parking_lot = @import("../platform/parking_lot.zig");
+pub const keyvalue_persistence = @import("keyvalue_persistence.zig");
 
 const tls = @import("tls");
 
@@ -7091,7 +7092,7 @@ pub const Cas = struct {
     }
 };
 
-/// `wasi:keyvalue` persistence-layer snapshot (#583 B4 follow-up).
+/// `wasi:keyvalue` persistence-layer snapshot (#583 B4 follow-up, #972).
 ///
 /// Mirrors the JSON file at `WasiCliAdapter.keyvalue_store_path` —
 /// keyed by bucket identifier, each entry holds the bucket's
@@ -7103,18 +7104,7 @@ pub const Cas = struct {
 /// The default in-memory adapter never touches this map — it's only
 /// populated when the CLI passes `--keyvalue-store=<path>` (or an
 /// embedder calls `setKeyvalueStorePath` directly).
-pub const PersistedBucket = struct {
-    entries: std.StringHashMapUnmanaged([]const u8) = .empty,
-
-    pub fn deinit(self: *PersistedBucket, allocator: Allocator) void {
-        var it = self.entries.iterator();
-        while (it.next()) |e| {
-            allocator.free(e.key_ptr.*);
-            allocator.free(e.value_ptr.*);
-        }
-        self.entries.deinit(allocator);
-    }
-};
+pub const PersistedBucket = keyvalue_persistence.PersistedBucket;
 
 /// `(string, string)` pair forwarded to
 /// `wasi:config/store@0.2.0-rc.1.{get, get-all}` (#583 B6). Same lifetime
@@ -8195,6 +8185,7 @@ pub const WasiCliAdapter = struct {
     /// `deinit` frees it. File format documented in
     /// `setKeyvalueStorePath`.
     keyvalue_store_path: ?[]const u8 = null,
+    keyvalue_flush_count: usize = 0,
     keyvalue_state_claim: stable_resource.ConditionalOperationClaim = .init,
     /// `wasi:io/poll.pollable` table. Pollables borrow their source
     /// resources and become ready if that source is dropped/closed, so the
@@ -28683,51 +28674,189 @@ pub const WasiCliAdapter = struct {
         results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
     }
 
+    const KeyvaluePairSlice = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
+    const KeyvalueMapUndoEntry = struct {
+        key: []const u8,
+        new_value: ?[]u8,
+        prev_kv: ?std.StringHashMapUnmanaged([]const u8).KV,
+    };
+
+    fn stageKeyvalueMapPut(
+        allocator: Allocator,
+        map: *std.StringHashMapUnmanaged([]const u8),
+        undo_log: *std.ArrayListUnmanaged(KeyvalueMapUndoEntry),
+        key: []const u8,
+        value: []const u8,
+    ) !void {
+        try undo_log.ensureUnusedCapacity(allocator, 1);
+        if (map.getEntry(key)) |existing| {
+            const new_value = try allocator.dupe(u8, value);
+            const prev_kv: std.StringHashMapUnmanaged([]const u8).KV = .{
+                .key = existing.key_ptr.*,
+                .value = existing.value_ptr.*,
+            };
+            existing.value_ptr.* = new_value;
+            undo_log.appendAssumeCapacity(.{
+                .key = existing.key_ptr.*,
+                .new_value = new_value,
+                .prev_kv = prev_kv,
+            });
+        } else {
+            const key_copy = try allocator.dupe(u8, key);
+            errdefer allocator.free(key_copy);
+            const new_value = try allocator.dupe(u8, value);
+            errdefer allocator.free(new_value);
+            try map.putNoClobber(allocator, key_copy, new_value);
+            undo_log.appendAssumeCapacity(.{
+                .key = key_copy,
+                .new_value = new_value,
+                .prev_kv = null,
+            });
+        }
+    }
+
+    fn stageKeyvalueMapRemove(
+        map: *std.StringHashMapUnmanaged([]const u8),
+        undo_log: *std.ArrayListUnmanaged(KeyvalueMapUndoEntry),
+        key: []const u8,
+    ) bool {
+        if (map.fetchRemove(key)) |removed| {
+            undo_log.appendAssumeCapacity(.{
+                .key = removed.key,
+                .new_value = null,
+                .prev_kv = removed,
+            });
+            return true;
+        }
+        return false;
+    }
+
+    fn commitKeyvalueMapUndo(
+        entries: []const KeyvalueMapUndoEntry,
+        allocator: Allocator,
+    ) void {
+        for (entries) |entry| {
+            if (entry.new_value != null) {
+                if (entry.prev_kv) |prev| {
+                    allocator.free(prev.value);
+                }
+            } else {
+                const prev = entry.prev_kv.?;
+                allocator.free(prev.key);
+                allocator.free(prev.value);
+            }
+        }
+    }
+
+    fn rollbackKeyvalueMapUndo(
+        map: *std.StringHashMapUnmanaged([]const u8),
+        entries: []const KeyvalueMapUndoEntry,
+        allocator: Allocator,
+    ) void {
+        var idx = entries.len;
+        while (idx > 0) {
+            idx -= 1;
+            const entry = entries[idx];
+            if (entry.new_value) |nv| {
+                if (entry.prev_kv) |prev| {
+                    map.getPtr(entry.key).?.* = prev.value;
+                    allocator.free(nv);
+                } else {
+                    if (map.fetchRemove(entry.key)) |removed| {
+                        allocator.free(removed.key);
+                        allocator.free(removed.value);
+                    }
+                }
+            } else {
+                const prev = entry.prev_kv.?;
+                map.putAssumeCapacityNoClobber(prev.key, prev.value);
+            }
+        }
+    }
+
+    fn bucketStoreEntries(
+        self: *WasiCliAdapter,
+        bucket: *KeyvalueBucket,
+        items: []const KeyvaluePairSlice,
+    ) !void {
+        if (items.len == 0) return;
+        var bucket_undo: std.ArrayListUnmanaged(KeyvalueMapUndoEntry) = .empty;
+        defer bucket_undo.deinit(self.allocator);
+        errdefer rollbackKeyvalueMapUndo(&bucket.entries, bucket_undo.items, self.allocator);
+        try bucket_undo.ensureTotalCapacityPrecise(self.allocator, items.len);
+
+        for (items) |item| {
+            try stageKeyvalueMapPut(self.allocator, &bucket.entries, &bucket_undo, item.key, item.value);
+        }
+
+        if (items.len == 1) {
+            try self.persistedStoreEntry(bucket.identifier, items[0].key, items[0].value);
+        } else {
+            try self.persistedStoreEntries(bucket.identifier, items);
+        }
+        commitKeyvalueMapUndo(bucket_undo.items, self.allocator);
+    }
+
     /// Insert `key` → `value` into `bucket`, replacing any existing
     /// entry. Both inputs are duplicated through the adapter's
-    /// allocator; the previous key+value (if any) are freed. Also
-    /// mirrors the write into the persistence snapshot (if any) +
-    /// flushes the snapshot to disk (#583 B4 follow-up).
+    /// allocator; the previous key+value (if any) are freed on commit.
+    /// Also mirrors the write into the persistence snapshot (if any) +
+    /// flushes the snapshot to disk (#583 B4 follow-up, #972), rolling
+    /// back both in-memory and persisted state if persistence fails.
     fn bucketStoreEntry(
         self: *WasiCliAdapter,
         bucket: *KeyvalueBucket,
         key: []const u8,
         value: []const u8,
     ) !void {
-        const new_value = try self.allocator.dupe(u8, value);
-        errdefer self.allocator.free(new_value);
-        const gop = try bucket.entries.getOrPut(self.allocator, key);
-        if (gop.found_existing) {
-            self.allocator.free(gop.value_ptr.*);
-            gop.value_ptr.* = new_value;
-        } else {
-            const key_copy = self.allocator.dupe(u8, key) catch |err| {
-                _ = bucket.entries.remove(key);
-                return err;
-            };
-            gop.key_ptr.* = key_copy;
-            gop.value_ptr.* = new_value;
+        try self.bucketStoreEntries(bucket, &.{.{ .key = key, .value = value }});
+    }
+
+    fn bucketRemoveEntries(
+        self: *WasiCliAdapter,
+        bucket: *KeyvalueBucket,
+        keys: []const []const u8,
+    ) !bool {
+        if (keys.len == 0) return false;
+        var bucket_undo: std.ArrayListUnmanaged(KeyvalueMapUndoEntry) = .empty;
+        defer bucket_undo.deinit(self.allocator);
+        errdefer rollbackKeyvalueMapUndo(&bucket.entries, bucket_undo.items, self.allocator);
+
+        const max_removals: u32 = @intCast(@min(keys.len, @as(usize, bucket.entries.count())));
+        try bucket.entries.ensureUnusedCapacity(self.allocator, max_removals);
+        try bucket_undo.ensureTotalCapacityPrecise(self.allocator, max_removals);
+
+        var any_present = false;
+        for (keys) |key| {
+            if (stageKeyvalueMapRemove(&bucket.entries, &bucket_undo, key)) {
+                any_present = true;
+            }
         }
-        try self.persistedStoreEntry(bucket.identifier, key, value);
+
+        if (keys.len == 1) {
+            try self.persistedRemoveEntry(bucket.identifier, keys[0]);
+        } else {
+            try self.persistedRemoveEntries(bucket.identifier, keys);
+        }
+        commitKeyvalueMapUndo(bucket_undo.items, self.allocator);
+        return any_present;
     }
 
     /// Remove `key` from `bucket`, freeing the owned key and value
-    /// byte slices. Returns whether the entry was present. Also
+    /// byte slices on commit. Returns whether the entry was present. Also
     /// mirrors the removal into the persistence snapshot (#583 B4
-    /// follow-up) — persistence flush is invoked unconditionally
-    /// so a no-op delete still produces a stable on-disk view.
+    /// follow-up, #972), rolling back both in-memory and persisted state
+    /// if persistence flush fails.
     fn bucketRemoveEntry(
         self: *WasiCliAdapter,
         bucket: *KeyvalueBucket,
         key: []const u8,
-    ) bool {
-        const present = if (bucket.entries.fetchRemove(key)) |entry| blk: {
-            self.allocator.free(entry.key);
-            self.allocator.free(entry.value);
-            break :blk true;
-        } else false;
-        self.persistedRemoveEntry(bucket.identifier, key) catch {};
-        return present;
+    ) !bool {
+        return self.bucketRemoveEntries(bucket, &.{key});
     }
 
     /// `[method]bucket.delete: (borrow<bucket>, key: string) -> result<_, error>`.
@@ -28763,7 +28892,7 @@ pub const WasiCliAdapter = struct {
                 return error.OutOfBoundsMemory;
         // Per WIT: "If the key does not exist in the store, it does
         // nothing." — succeed either way.
-        _ = bucketRemoveEntry(self, bucket, key_bytes);
+        _ = try bucketRemoveEntry(self, bucket, key_bytes);
         results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
     }
 
@@ -29423,12 +29552,18 @@ pub const WasiCliAdapter = struct {
         // Each `tuple<string, list<u8>>` is 16 bytes in linear memory.
         const stride: u32 = 16;
         const count = list_pl.len;
+        const list_bytes_len = std.math.mul(u32, count, stride) catch
+            return error.OutOfBoundsMemory;
         const list_bytes: []const u8 = if (count == 0)
             &.{}
         else
-            (ci.readGuestBytes(list_pl.ptr, count * stride) orelse
+            (ci.readGuestBytes(list_pl.ptr, list_bytes_len) orelse
                 return error.OutOfBoundsMemory);
 
+        const items = try allocator.alloc(KeyvaluePairSlice, count);
+        defer allocator.free(items);
+
+        // Validate all guest slices up front before mutating anything (#972 E4).
         var idx: u32 = 0;
         while (idx < count) : (idx += 1) {
             const off = idx * stride;
@@ -29444,8 +29579,9 @@ pub const WasiCliAdapter = struct {
                 @as([]const u8, "")
             else
                 ci.readGuestBytes(v_ptr, v_len) orelse return error.OutOfBoundsMemory;
-            try bucketStoreEntry(self, bucket, k_bytes, v_bytes);
+            items[idx] = .{ .key = k_bytes, .value = v_bytes };
         }
+        try self.bucketStoreEntries(bucket, items);
         results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
     }
 
@@ -29477,11 +29613,18 @@ pub const WasiCliAdapter = struct {
         defer bucket.operation_claim.release();
         const stride: u32 = 8;
         const count = keys_pl.len;
+        const keys_bytes_len = std.math.mul(u32, count, stride) catch
+            return error.OutOfBoundsMemory;
         const keys_bytes: []const u8 = if (count == 0)
             &.{}
         else
-            (ci.readGuestBytes(keys_pl.ptr, count * stride) orelse
+            (ci.readGuestBytes(keys_pl.ptr, keys_bytes_len) orelse
                 return error.OutOfBoundsMemory);
+
+        const keys = try allocator.alloc([]const u8, count);
+        defer allocator.free(keys);
+
+        // Validate all guest slices up front before mutating anything (#972 E4).
         var idx: u32 = 0;
         while (idx < count) : (idx += 1) {
             const off = idx * stride;
@@ -29491,12 +29634,13 @@ pub const WasiCliAdapter = struct {
                 @as([]const u8, "")
             else
                 ci.readGuestBytes(k_ptr, k_len) orelse return error.OutOfBoundsMemory;
-            _ = bucketRemoveEntry(self, bucket, k_bytes);
+            keys[idx] = k_bytes;
         }
+        _ = try self.bucketRemoveEntries(bucket, keys);
         results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
     }
 
-    // ── wasi:keyvalue persistence layer (#583 B4 follow-up) ─────────────
+    // ── wasi:keyvalue persistence layer (#583 B4 follow-up, #972) ───────
     //
     // Optional file-backed snapshot of every `KeyvalueBucket`. Enabled
     // by `setKeyvalueStorePath` (wired to the `--keyvalue-store=<path>`
@@ -29505,148 +29649,122 @@ pub const WasiCliAdapter = struct {
     // / `flushKeyvalueStore` are all no-ops and the runtime behaves
     // exactly like PR #601 (in-memory only).
     //
-    // File format — JSON object whose top-level keys are bucket
-    // identifiers; each value is itself an object mapping key strings
-    // to **base64-encoded** value bytes (so binary values survive a
-    // round-trip without forcing UTF-8 on the wire). Empty buckets are
-    // serialised as `"name": {}`.
-    //
-    //   ```json
-    //   {
-    //     "primary":  { "alpha": "dmFsdWU=", "beta": "YnVm" },
-    //     "counters": { "hits":  "AwAAAAAAAAA=" }
-    //   }
-    //   ```
-    //
-    // The serialiser writes the entire JSON document on every mutation
-    // — `set` / `delete` / successful `swap` / `increment` /
-    // `batch.set-many` / `batch.delete-many` all flush. This is the
-    // simplest correct MVP; an atomic-rename (write to `<path>.tmp`,
-    // then `rename`) is documented in `docs/wasi.md` as future
-    // hardening.
+    // File format — canonical deterministic JSON object whose top-level
+    // keys are sorted bucket identifiers; each value is itself an object
+    // mapping sorted key strings to **base64-encoded** value bytes.
+    // Flushes write a redo journal (`<path>.journal`) and then overwrite
+    // `<path>` in place so `<path>`'s inode and metadata are preserved.
 
     /// Lookup or lazily create a `PersistedBucket` for `identifier`.
     /// The identifier slice is copied into the adapter's allocator
     /// on first insert (so the caller can pass borrowed bytes); the
     /// returned pointer is stable for the lifetime of the adapter.
     fn persistedBucketGetOrCreate(self: *WasiCliAdapter, identifier: []const u8) !*PersistedBucket {
-        const gop = try self.keyvalue_persisted.getOrPut(self.allocator, identifier);
-        if (!gop.found_existing) {
-            const key_dup = self.allocator.dupe(u8, identifier) catch |err| {
-                _ = self.keyvalue_persisted.remove(identifier);
-                return err;
-            };
-            const bucket = self.allocator.create(PersistedBucket) catch |err| {
-                self.allocator.free(key_dup);
-                _ = self.keyvalue_persisted.remove(identifier);
-                return err;
-            };
-            bucket.* = .{};
-            gop.key_ptr.* = key_dup;
-            gop.value_ptr.* = bucket;
+        return keyvalue_persistence.getOrCreateBucket(&self.keyvalue_persisted, self.allocator, identifier);
+    }
+
+    fn persistedStoreEntries(
+        self: *WasiCliAdapter,
+        identifier: []const u8,
+        items: []const KeyvaluePairSlice,
+    ) !void {
+        self.keyvalue_state_claim.acquire();
+        defer self.keyvalue_state_claim.release();
+        if (self.keyvalue_store_path == null or items.len == 0) return;
+
+        const created_bucket = !self.keyvalue_persisted.contains(identifier);
+        const bucket = try self.persistedBucketGetOrCreate(identifier);
+        var undo_log: std.ArrayListUnmanaged(KeyvalueMapUndoEntry) = .empty;
+        defer undo_log.deinit(self.allocator);
+        errdefer {
+            rollbackKeyvalueMapUndo(&bucket.entries, undo_log.items, self.allocator);
+            if (created_bucket) {
+                if (self.keyvalue_persisted.fetchRemove(identifier)) |kv| {
+                    self.allocator.free(kv.key);
+                    kv.value.deinit(self.allocator);
+                    self.allocator.destroy(kv.value);
+                }
+            }
         }
-        return gop.value_ptr.*;
+        try undo_log.ensureTotalCapacityPrecise(self.allocator, items.len);
+
+        for (items) |item| {
+            try stageKeyvalueMapPut(self.allocator, &bucket.entries, &undo_log, item.key, item.value);
+        }
+        try self.flushKeyvalueStore();
+        commitKeyvalueMapUndo(undo_log.items, self.allocator);
     }
 
     /// Mirror a `bucketStoreEntry` write into the persistence
     /// snapshot. No-op when `keyvalue_store_path == null`. Synchronously
-    /// rewrites the file via `flushKeyvalueStore`.
+    /// rewrites the file via `flushKeyvalueStore`, rolling back the
+    /// persisted entry if the flush fails.
     fn persistedStoreEntry(
         self: *WasiCliAdapter,
         identifier: []const u8,
         key: []const u8,
         value: []const u8,
     ) !void {
+        try self.persistedStoreEntries(identifier, &.{.{ .key = key, .value = value }});
+    }
+
+    fn persistedRemoveEntries(
+        self: *WasiCliAdapter,
+        identifier: []const u8,
+        keys: []const []const u8,
+    ) !void {
         self.keyvalue_state_claim.acquire();
         defer self.keyvalue_state_claim.release();
-        if (self.keyvalue_store_path == null) return;
-        const bucket = try self.persistedBucketGetOrCreate(identifier);
-        const new_value = try self.allocator.dupe(u8, value);
-        errdefer self.allocator.free(new_value);
-        const gop = try bucket.entries.getOrPut(self.allocator, key);
-        if (gop.found_existing) {
-            self.allocator.free(gop.value_ptr.*);
-            gop.value_ptr.* = new_value;
-        } else {
-            const key_copy = self.allocator.dupe(u8, key) catch |err| {
-                _ = bucket.entries.remove(key);
-                return err;
-            };
-            gop.key_ptr.* = key_copy;
-            gop.value_ptr.* = new_value;
+        if (self.keyvalue_store_path == null or keys.len == 0) return;
+
+        var undo_log: std.ArrayListUnmanaged(KeyvalueMapUndoEntry) = .empty;
+        defer undo_log.deinit(self.allocator);
+        const bucket = self.keyvalue_persisted.get(identifier);
+        errdefer if (bucket) |b| {
+            rollbackKeyvalueMapUndo(&b.entries, undo_log.items, self.allocator);
+        };
+
+        if (bucket) |b| {
+            const max_removals: u32 = @intCast(@min(keys.len, @as(usize, b.entries.count())));
+            try b.entries.ensureUnusedCapacity(self.allocator, max_removals);
+            try undo_log.ensureTotalCapacityPrecise(self.allocator, max_removals);
+            for (keys) |key| {
+                _ = stageKeyvalueMapRemove(&b.entries, &undo_log, key);
+            }
         }
         try self.flushKeyvalueStore();
+        commitKeyvalueMapUndo(undo_log.items, self.allocator);
     }
 
     /// Mirror a `bucketRemoveEntry` into the persistence snapshot.
     /// No-op when `keyvalue_store_path == null`. Synchronously
-    /// rewrites the file via `flushKeyvalueStore`.
+    /// rewrites the file via `flushKeyvalueStore`, rolling back the
+    /// removal if the flush fails.
     fn persistedRemoveEntry(
         self: *WasiCliAdapter,
         identifier: []const u8,
         key: []const u8,
     ) !void {
-        self.keyvalue_state_claim.acquire();
-        defer self.keyvalue_state_claim.release();
-        if (self.keyvalue_store_path == null) return;
-        if (self.keyvalue_persisted.get(identifier)) |bucket| {
-            if (bucket.entries.fetchRemove(key)) |entry| {
-                self.allocator.free(entry.key);
-                self.allocator.free(entry.value);
-            }
-        }
-        try self.flushKeyvalueStore();
+        try self.persistedRemoveEntries(identifier, &.{key});
     }
 
-    /// Serialise `keyvalue_persisted` to `keyvalue_store_path` as
-    /// the JSON object documented above. Synchronous + non-atomic —
-    /// the file may be observed in a half-written state if the host
-    /// crashes mid-write; that's the documented MVP trade-off.
+    /// Serialise `keyvalue_persisted` to `keyvalue_store_path` via the
+    /// crash-safe redo journal + in-place overwrite helper (#972 A6).
     /// No-op when `keyvalue_store_path == null`.
     fn flushKeyvalueStore(self: *WasiCliAdapter) !void {
         const path = self.keyvalue_store_path orelse return;
-
-        var aw: std.Io.Writer.Allocating = .init(self.allocator);
-        defer aw.deinit();
-        var stringify: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
-        try stringify.beginObject();
-
-        // Stable iteration order isn't promised by the underlying
-        // HashMap; that's fine for the JSON consumer (we don't claim
-        // line-stable diffs as an MVP feature).
-        var bit = self.keyvalue_persisted.iterator();
-        while (bit.next()) |bkv| {
-            try stringify.objectField(bkv.key_ptr.*);
-            try stringify.beginObject();
-            var eit = bkv.value_ptr.*.entries.iterator();
-            while (eit.next()) |ekv| {
-                try stringify.objectField(ekv.key_ptr.*);
-                const value_bytes = ekv.value_ptr.*;
-                const enc_len = std.base64.standard.Encoder.calcSize(value_bytes.len);
-                const enc_buf = try self.allocator.alloc(u8, enc_len);
-                defer self.allocator.free(enc_buf);
-                const encoded = std.base64.standard.Encoder.encode(enc_buf, value_bytes);
-                try stringify.write(encoded);
-            }
-            try stringify.endObject();
-        }
-        try stringify.endObject();
-
-        const io = std.Io.Threaded.global_single_threaded.io();
-        try std.Io.Dir.cwd().writeFile(io, .{
-            .sub_path = path,
-            .data = aw.written(),
-        });
+        try keyvalue_persistence.flushSnapshot(self.allocator, path, &self.keyvalue_persisted);
+        self.keyvalue_flush_count += 1;
     }
 
     /// Enable the file-backed persistence layer (`--keyvalue-store=<path>`).
     ///
-    /// If `path` already exists, its JSON contents are parsed and
-    /// loaded into `keyvalue_persisted` so subsequent `open` calls
+    /// Recovers from any pending `<path>.journal` first, then parses and
+    /// loads `path` into `keyvalue_persisted` so subsequent `open` calls
     /// hydrate from the snapshot. A missing file is *not* an error —
     /// the persistence layer is activated empty and the file is
     /// created on the first flush. The path slice is duplicated
-    /// into the adapter's allocator. (#583 B4 follow-up)
+    /// into the adapter's allocator. (#583 B4 follow-up, #972 A6)
     ///
     /// Errors:
     ///   - `error.KeyvalueStoreInvalidJson` — file is not valid JSON
@@ -29657,67 +29775,21 @@ pub const WasiCliAdapter = struct {
     ///     string
     ///   - `error.KeyvalueStoreInvalidBase64` — a value isn't valid
     ///     base64
-    ///   - allocator failures bubble up unchanged.
+    ///   - allocator / I/O failures bubble up unchanged.
     pub fn setKeyvalueStorePath(self: *WasiCliAdapter, path: []const u8) !void {
         self.keyvalue_state_claim.acquire();
         defer self.keyvalue_state_claim.release();
         const path_dup = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(path_dup);
+
+        var loaded: keyvalue_persistence.PersistedStoreMap = .empty;
+        errdefer keyvalue_persistence.deinitPersistedStoreMap(&loaded, self.allocator);
+        try keyvalue_persistence.recoverAndLoadSnapshot(self.allocator, path, &loaded);
+
         if (self.keyvalue_store_path) |old| self.allocator.free(old);
         self.keyvalue_store_path = path_dup;
-
-        const cwd = std.Io.Dir.cwd();
-        const io = std.Io.Threaded.global_single_threaded.io();
-        const bytes = cwd.readFileAlloc(io, path, self.allocator, @fromBackingInt(@intCast(8 * 1024 * 1024))) catch |err| switch (err) {
-            error.FileNotFound => return, // first run — leave snapshot empty
-            else => return err,
-        };
-        defer self.allocator.free(bytes);
-
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, bytes, .{}) catch {
-            return error.KeyvalueStoreInvalidJson;
-        };
-        defer parsed.deinit();
-
-        switch (parsed.value) {
-            .object => |obj| {
-                var bit = obj.iterator();
-                while (bit.next()) |bkv| {
-                    const inner = switch (bkv.value_ptr.*) {
-                        .object => |o| o,
-                        else => return error.KeyvalueStoreInvalidBucket,
-                    };
-                    const bucket = try self.persistedBucketGetOrCreate(bkv.key_ptr.*);
-                    var eit = inner.iterator();
-                    while (eit.next()) |ekv| {
-                        const value_str = switch (ekv.value_ptr.*) {
-                            .string => |s| s,
-                            else => return error.KeyvalueStoreInvalidValueType,
-                        };
-                        const dec_len = std.base64.standard.Decoder.calcSizeForSlice(value_str) catch {
-                            return error.KeyvalueStoreInvalidBase64;
-                        };
-                        const value_dup = try self.allocator.alloc(u8, dec_len);
-                        errdefer self.allocator.free(value_dup);
-                        std.base64.standard.Decoder.decode(value_dup, value_str) catch {
-                            return error.KeyvalueStoreInvalidBase64;
-                        };
-                        const key_dup = try self.allocator.dupe(u8, ekv.key_ptr.*);
-                        errdefer self.allocator.free(key_dup);
-                        const gop = try bucket.entries.getOrPut(self.allocator, key_dup);
-                        if (gop.found_existing) {
-                            self.allocator.free(key_dup);
-                            self.allocator.free(gop.value_ptr.*);
-                            gop.value_ptr.* = value_dup;
-                        } else {
-                            gop.key_ptr.* = key_dup;
-                            gop.value_ptr.* = value_dup;
-                        }
-                    }
-                }
-            },
-            else => return error.KeyvalueStoreInvalidRoot,
-        }
+        keyvalue_persistence.deinitPersistedStoreMap(&self.keyvalue_persisted, self.allocator);
+        self.keyvalue_persisted = loaded;
     }
 
     // ── wasi:config/store@0.2.0-rc.1 — adapter (#583 B6) ────────────────
@@ -56405,6 +56477,381 @@ test "wasi:keyvalue persistence: set flushes through; second adapter reads it ba
         const list_pl = some.payload.?.list;
         const back = ci.readGuestBytes(list_pl.ptr, list_pl.len) orelse return error.IoError;
         try testing.expectEqualSlices(u8, "token-abcdef\x00\x01\x02", back);
+    }
+}
+
+test {
+    std.testing.refAllDecls(keyvalue_persistence);
+}
+
+test "wasi:keyvalue persistence #972: inode preservation and sorted JSON across set/delete/batch flushes" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const rel_path = try std.fmt.allocPrint(
+        testing.allocator,
+        ".zig-cache/tmp/{s}/kv-store.json",
+        .{tmp.sub_path[0..]},
+    );
+    defer testing.allocator.free(rel_path);
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    try adapter.setKeyvalueStorePath(rel_path);
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 32 * 1024);
+    defer ci.disableTestMem();
+
+    const open_args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "primary")};
+    var open_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueStoreOpen(&adapter, &ci, &open_args, &open_results, testing.allocator);
+    defer open_results[0].deinit(testing.allocator);
+    const bucket_handle = open_results[0].result_val.payload.?.handle;
+
+    // 1. Initial `set` creates kv-store.json and removes kv-store.json.journal.
+    {
+        const set_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "z-key"),
+            try testKeyvalueListArg(&ci, "z-val-initial-long-payload"),
+        };
+        var set_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketSet(&adapter, &ci, &set_args, &set_results, testing.allocator);
+        defer set_results[0].deinit(testing.allocator);
+        try testing.expect(set_results[0].result_val.is_ok);
+    }
+    const inode_initial = (try tmp.dir.statFile(io, "kv-store.json", .{})).inode;
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "kv-store.json.journal", .{}));
+    try testing.expectEqual(@as(usize, 1), adapter.keyvalue_flush_count);
+
+    // 2. `batch.set-many` with 3 items flushes exactly once and preserves the inode.
+    {
+        const stride: u32 = 16;
+        const count: u32 = 3;
+        const tup_ptr = ci.hostAllocGuest(count * stride, 4) orelse return error.OutOfMemory;
+        const dst = ci.writableGuestBytes(tup_ptr, count * stride) orelse return error.OutOfMemory;
+        const k1 = ci.hostAllocAndWrite("m-key", 1) orelse return error.OutOfMemory;
+        const v1 = ci.hostAllocAndWrite("m", 1) orelse return error.OutOfMemory;
+        const k2 = ci.hostAllocAndWrite("a-key", 1) orelse return error.OutOfMemory;
+        const v2 = ci.hostAllocAndWrite("a", 1) orelse return error.OutOfMemory;
+        const k3 = ci.hostAllocAndWrite("z-key", 1) orelse return error.OutOfMemory;
+        const v3 = ci.hostAllocAndWrite("z", 1) orelse return error.OutOfMemory;
+        const entries = [_]struct { kp: u32, kl: u32, vp: u32, vl: u32 }{
+            .{ .kp = k1, .kl = 5, .vp = v1, .vl = 1 },
+            .{ .kp = k2, .kl = 5, .vp = v2, .vl = 1 },
+            .{ .kp = k3, .kl = 5, .vp = v3, .vl = 1 },
+        };
+        for (entries, 0..) |e, i| {
+            const off = i * stride;
+            std.mem.writeInt(u32, dst[off..][0..4], e.kp, .little);
+            std.mem.writeInt(u32, dst[off + 4 ..][0..4], e.kl, .little);
+            std.mem.writeInt(u32, dst[off + 8 ..][0..4], e.vp, .little);
+            std.mem.writeInt(u32, dst[off + 12 ..][0..4], e.vl, .little);
+        }
+        const batch_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            .{ .list = .{ .ptr = tup_ptr, .len = count } },
+        };
+        var batch_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBatchSetMany(&adapter, &ci, &batch_args, &batch_results, testing.allocator);
+        defer batch_results[0].deinit(testing.allocator);
+        try testing.expect(batch_results[0].result_val.is_ok);
+    }
+    try testing.expectEqual(@as(usize, 2), adapter.keyvalue_flush_count);
+    try testing.expectEqual(inode_initial, (try tmp.dir.statFile(io, "kv-store.json", .{})).inode);
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "kv-store.json.journal", .{}));
+
+    const json_after_batch_set = try tmp.dir.readFileAlloc(
+        io,
+        "kv-store.json",
+        testing.allocator,
+        @fromBackingInt(@intCast(1024 * 1024)),
+    );
+    defer testing.allocator.free(json_after_batch_set);
+    try testing.expectEqualStrings(
+        "{\"primary\":{\"a-key\":\"YQ==\",\"m-key\":\"bQ==\",\"z-key\":\"eg==\"}}",
+        json_after_batch_set,
+    );
+
+    // 3. `batch.delete-many` with 2 keys flushes once and preserves the inode.
+    {
+        const stride: u32 = 8;
+        const dk_ptr = ci.hostAllocGuest(2 * stride, 4) orelse return error.OutOfMemory;
+        const dst = ci.writableGuestBytes(dk_ptr, 2 * stride) orelse return error.OutOfMemory;
+        const km = ci.hostAllocAndWrite("m-key", 1) orelse return error.OutOfMemory;
+        const kz = ci.hostAllocAndWrite("z-key", 1) orelse return error.OutOfMemory;
+        std.mem.writeInt(u32, dst[0..4], km, .little);
+        std.mem.writeInt(u32, dst[4..8], 5, .little);
+        std.mem.writeInt(u32, dst[8..12], kz, .little);
+        std.mem.writeInt(u32, dst[12..16], 5, .little);
+        const del_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            .{ .list = .{ .ptr = dk_ptr, .len = 2 } },
+        };
+        var del_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBatchDeleteMany(&adapter, &ci, &del_args, &del_results, testing.allocator);
+        defer del_results[0].deinit(testing.allocator);
+        try testing.expect(del_results[0].result_val.is_ok);
+    }
+    try testing.expectEqual(@as(usize, 3), adapter.keyvalue_flush_count);
+    try testing.expectEqual(inode_initial, (try tmp.dir.statFile(io, "kv-store.json", .{})).inode);
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "kv-store.json.journal", .{}));
+
+    // 4. Single `delete` preserves the inode as well.
+    {
+        const del_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "a-key"),
+        };
+        var del_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketDelete(&adapter, &ci, &del_args, &del_results, testing.allocator);
+        defer del_results[0].deinit(testing.allocator);
+        try testing.expect(del_results[0].result_val.is_ok);
+    }
+    try testing.expectEqual(@as(usize, 4), adapter.keyvalue_flush_count);
+    try testing.expectEqual(inode_initial, (try tmp.dir.statFile(io, "kv-store.json", .{})).inode);
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "kv-store.json.journal", .{}));
+}
+
+test "wasi:keyvalue persistence #972: setKeyvalueStorePath crash recovery from committed and uncommitted journals" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const rel_path = try std.fmt.allocPrint(
+        testing.allocator,
+        ".zig-cache/tmp/{s}/kv-store.json",
+        .{tmp.sub_path[0..]},
+    );
+    defer testing.allocator.free(rel_path);
+
+    // Case 1: Truncated/corrupted target + valid committed journal -> replays journal in place.
+    try tmp.dir.writeFile(io, .{ .sub_path = "kv-store.json", .data = "{\"half_written\":" });
+    const inode_before = (try tmp.dir.statFile(io, "kv-store.json", .{})).inode;
+
+    const committed_json = "{\"primary\":{\"k1\":\"cmVjb3ZlcmVk\"}}";
+    const committed_frame = try keyvalue_persistence.encodeJournalFrame(testing.allocator, committed_json);
+    defer testing.allocator.free(committed_frame);
+    try tmp.dir.writeFile(io, .{ .sub_path = "kv-store.json.journal", .data = committed_frame });
+
+    {
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        try adapter.setKeyvalueStorePath(rel_path);
+
+        try testing.expectEqual(inode_before, (try tmp.dir.statFile(io, "kv-store.json", .{})).inode);
+        try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "kv-store.json.journal", .{}));
+        try testing.expectEqualStrings(
+            "recovered",
+            adapter.keyvalue_persisted.get("primary").?.entries.get("k1").?,
+        );
+    }
+
+    // Case 2: Intact target + truncated/uncommitted journal -> discards journal and keeps target.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "kv-store.json.journal",
+        .data = committed_frame[0 .. committed_frame.len - 4],
+    });
+    {
+        var adapter = WasiCliAdapter.init(testing.allocator);
+        defer adapter.deinit();
+        try adapter.setKeyvalueStorePath(rel_path);
+
+        try testing.expectEqual(inode_before, (try tmp.dir.statFile(io, "kv-store.json", .{})).inode);
+        try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "kv-store.json.journal", .{}));
+        try testing.expectEqualStrings(
+            "recovered",
+            adapter.keyvalue_persisted.get("primary").?.entries.get("k1").?,
+        );
+    }
+}
+
+test "wasi:keyvalue persistence #972: atomic rollback on OOB guest slice and disk flush error" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const rel_path = try std.fmt.allocPrint(
+        testing.allocator,
+        ".zig-cache/tmp/{s}/kv-store.json",
+        .{tmp.sub_path[0..]},
+    );
+    defer testing.allocator.free(rel_path);
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    try adapter.setKeyvalueStorePath(rel_path);
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 16 * 1024);
+    defer ci.disableTestMem();
+
+    const open_args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "primary")};
+    var open_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.keyvalueStoreOpen(&adapter, &ci, &open_args, &open_results, testing.allocator);
+    defer open_results[0].deinit(testing.allocator);
+    const bucket_handle = open_results[0].result_val.payload.?.handle;
+    var bucket = adapter.lookupKeyvalueBucket(bucket_handle).?;
+    defer bucket.release();
+    const bucket_ptr = bucket.value().*;
+
+    // Seed "k1" = "v1".
+    {
+        const set_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "k1"),
+            try testKeyvalueListArg(&ci, "v1"),
+        };
+        var set_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.keyvalueBucketSet(&adapter, &ci, &set_args, &set_results, testing.allocator);
+        defer set_results[0].deinit(testing.allocator);
+        try testing.expect(set_results[0].result_val.is_ok);
+    }
+
+    // 1. Out-of-bounds second slice in `batch.set-many` must not partially mutate item 0.
+    {
+        const stride: u32 = 16;
+        const tup_ptr = ci.hostAllocGuest(2 * stride, 4) orelse return error.OutOfMemory;
+        const dst = ci.writableGuestBytes(tup_ptr, 2 * stride) orelse return error.OutOfMemory;
+        const k1 = ci.hostAllocAndWrite("k1", 1) orelse return error.OutOfMemory;
+        const v1_new = ci.hostAllocAndWrite("mutated", 1) orelse return error.OutOfMemory;
+        std.mem.writeInt(u32, dst[0..4], k1, .little);
+        std.mem.writeInt(u32, dst[4..8], 2, .little);
+        std.mem.writeInt(u32, dst[8..12], v1_new, .little);
+        std.mem.writeInt(u32, dst[12..16], 7, .little);
+        // Item 1 has an OOB value pointer.
+        std.mem.writeInt(u32, dst[16..20], k1, .little);
+        std.mem.writeInt(u32, dst[20..24], 2, .little);
+        std.mem.writeInt(u32, dst[24..28], 999_999, .little);
+        std.mem.writeInt(u32, dst[28..32], 10, .little);
+
+        const batch_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            .{ .list = .{ .ptr = tup_ptr, .len = 2 } },
+        };
+        var batch_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try testing.expectError(
+            error.OutOfBoundsMemory,
+            WasiCliAdapter.keyvalueBatchSetMany(&adapter, &ci, &batch_args, &batch_results, testing.allocator),
+        );
+        try testing.expectEqualStrings("v1", bucket_ptr.entries.get("k1").?);
+        try testing.expectEqualStrings("v1", adapter.keyvalue_persisted.get("primary").?.entries.get("k1").?);
+    }
+
+    // 2. Out-of-bounds second slice in `batch.delete-many` must not delete item 0.
+    {
+        const stride: u32 = 8;
+        const dk_ptr = ci.hostAllocGuest(2 * stride, 4) orelse return error.OutOfMemory;
+        const dst = ci.writableGuestBytes(dk_ptr, 2 * stride) orelse return error.OutOfMemory;
+        const k1 = ci.hostAllocAndWrite("k1", 1) orelse return error.OutOfMemory;
+        std.mem.writeInt(u32, dst[0..4], k1, .little);
+        std.mem.writeInt(u32, dst[4..8], 2, .little);
+        std.mem.writeInt(u32, dst[8..12], 999_999, .little);
+        std.mem.writeInt(u32, dst[12..16], 4, .little);
+
+        const del_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            .{ .list = .{ .ptr = dk_ptr, .len = 2 } },
+        };
+        var del_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try testing.expectError(
+            error.OutOfBoundsMemory,
+            WasiCliAdapter.keyvalueBatchDeleteMany(&adapter, &ci, &del_args, &del_results, testing.allocator),
+        );
+        try testing.expectEqualStrings("v1", bucket_ptr.entries.get("k1").?);
+        try testing.expectEqualStrings("v1", adapter.keyvalue_persisted.get("primary").?.entries.get("k1").?);
+    }
+
+    // 3. Force disk flush failure by placing a directory at `<path>.journal`
+    // and verify rollback for single `set`, `batch.set-many`, single `delete`, and `batch.delete-many`.
+    try tmp.dir.createDir(io, "kv-store.json.journal", .default_dir);
+    defer tmp.dir.deleteDir(io, "kv-store.json.journal") catch {};
+
+    {
+        const set_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "k1"),
+            try testKeyvalueListArg(&ci, "should-rollback"),
+        };
+        var set_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try testing.expectError(
+            error.IsDir,
+            WasiCliAdapter.keyvalueBucketSet(&adapter, &ci, &set_args, &set_results, testing.allocator),
+        );
+        try testing.expectEqualStrings("v1", bucket_ptr.entries.get("k1").?);
+        try testing.expectEqualStrings("v1", adapter.keyvalue_persisted.get("primary").?.entries.get("k1").?);
+    }
+
+    {
+        const stride: u32 = 16;
+        const tup_ptr = ci.hostAllocGuest(2 * stride, 4) orelse return error.OutOfMemory;
+        const dst = ci.writableGuestBytes(tup_ptr, 2 * stride) orelse return error.OutOfMemory;
+        const k1 = ci.hostAllocAndWrite("k1", 1) orelse return error.OutOfMemory;
+        const v1_new = ci.hostAllocAndWrite("v1-updated", 1) orelse return error.OutOfMemory;
+        const k2 = ci.hostAllocAndWrite("k2", 1) orelse return error.OutOfMemory;
+        const v2_new = ci.hostAllocAndWrite("v2-new", 1) orelse return error.OutOfMemory;
+        std.mem.writeInt(u32, dst[0..4], k1, .little);
+        std.mem.writeInt(u32, dst[4..8], 2, .little);
+        std.mem.writeInt(u32, dst[8..12], v1_new, .little);
+        std.mem.writeInt(u32, dst[12..16], 10, .little);
+        std.mem.writeInt(u32, dst[16..20], k2, .little);
+        std.mem.writeInt(u32, dst[20..24], 2, .little);
+        std.mem.writeInt(u32, dst[24..28], v2_new, .little);
+        std.mem.writeInt(u32, dst[28..32], 6, .little);
+
+        const batch_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            .{ .list = .{ .ptr = tup_ptr, .len = 2 } },
+        };
+        var batch_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try testing.expectError(
+            error.IsDir,
+            WasiCliAdapter.keyvalueBatchSetMany(&adapter, &ci, &batch_args, &batch_results, testing.allocator),
+        );
+        try testing.expectEqualStrings("v1", bucket_ptr.entries.get("k1").?);
+        try testing.expect(bucket_ptr.entries.get("k2") == null);
+        try testing.expectEqualStrings("v1", adapter.keyvalue_persisted.get("primary").?.entries.get("k1").?);
+        try testing.expect(adapter.keyvalue_persisted.get("primary").?.entries.get("k2") == null);
+    }
+
+    {
+        const del_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            try testKeyvalueStringArg(&ci, "k1"),
+        };
+        var del_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try testing.expectError(
+            error.IsDir,
+            WasiCliAdapter.keyvalueBucketDelete(&adapter, &ci, &del_args, &del_results, testing.allocator),
+        );
+        try testing.expectEqualStrings("v1", bucket_ptr.entries.get("k1").?);
+        try testing.expectEqualStrings("v1", adapter.keyvalue_persisted.get("primary").?.entries.get("k1").?);
+    }
+
+    {
+        const stride: u32 = 8;
+        const dk_ptr = ci.hostAllocGuest(1 * stride, 4) orelse return error.OutOfMemory;
+        const dst = ci.writableGuestBytes(dk_ptr, 1 * stride) orelse return error.OutOfMemory;
+        const k1 = ci.hostAllocAndWrite("k1", 1) orelse return error.OutOfMemory;
+        std.mem.writeInt(u32, dst[0..4], k1, .little);
+        std.mem.writeInt(u32, dst[4..8], 2, .little);
+
+        const del_args = [_]InterfaceValue{
+            .{ .handle = bucket_handle },
+            .{ .list = .{ .ptr = dk_ptr, .len = 1 } },
+        };
+        var del_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try testing.expectError(
+            error.IsDir,
+            WasiCliAdapter.keyvalueBatchDeleteMany(&adapter, &ci, &del_args, &del_results, testing.allocator),
+        );
+        try testing.expectEqualStrings("v1", bucket_ptr.entries.get("k1").?);
+        try testing.expectEqualStrings("v1", adapter.keyvalue_persisted.get("primary").?.entries.get("k1").?);
     }
 }
 
