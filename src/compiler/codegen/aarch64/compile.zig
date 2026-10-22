@@ -2422,6 +2422,15 @@ pub fn compileFunctionImpl(
                         if (pick_lhs) try cls_ctx.bumpFold(b.lhs);
                         if (pick_rhs) try cls_ctx.bumpFold(b.rhs);
                     },
+                    .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u => |b| {
+                        try cls_ctx.bumpTotal(b.lhs);
+                        try cls_ctx.bumpTotal(b.rhs);
+                        if (inst.type == .i32 or inst.type == .i64) {
+                            if (cls_ctx.cv.get(b.rhs)) |v| {
+                                if (encodeCmpImm(v) != null) try cls_ctx.bumpFold(b.rhs);
+                            }
+                        }
+                    },
                     else => {
                         try schedule.forEachUse(inst, &cls_ctx, Ctx.visitDefault);
                     },
@@ -2506,7 +2515,7 @@ pub fn compileFunctionImpl(
         if (range.type == .v128) {
             legacy_v128_spill_slots += 1;
             try v128_live_ranges.append(allocator, range);
-        } else {
+        } else if (!ctx.options.enable_xreg_alloc or !suppress_iconst.contains(range.vreg)) {
             try scalar_live_ranges.append(allocator, range);
         }
     }
@@ -2516,16 +2525,27 @@ pub fn compileFunctionImpl(
     defer if (alloc_result_storage) |*ar| ar.deinit();
     if (ctx.options.enable_xreg_alloc) {
         if (tmr) |t| t.begin();
+        const aarch64_reg_set = aarch64RegSetForSpillBase(spill_base);
+        var remat_candidates: ?std.AutoHashMap(ir.VReg, regalloc.RematDef) = if (scalar_live_ranges.items.len > aarch64_reg_set.alloc_regs.len)
+            try regalloc.classifyRematCandidates(allocator, func)
+        else
+            null;
+        defer if (remat_candidates) |*rc| rc.deinit();
+        const remat_ptr: ?*const std.AutoHashMap(ir.VReg, regalloc.RematDef) = if (remat_candidates) |*rc|
+            if (rc.count() > 0) rc else null
+        else
+            null;
         const trace_enabled = ctx.options.allocator_trace_func10 and ctx.options.module_idx == 0 and ctx.func_idx == 10;
         if (trace_enabled) {
             var trace: regalloc.AllocationTrace = .{};
             defer trace.deinit(allocator);
-            alloc_result_storage = try regalloc.allocateFromRangesWithHintsTraced(
+            alloc_result_storage = try regalloc.allocateFromRangesWithHintsRematTraced(
                 allocator,
-                aarch64RegSetForSpillBase(spill_base),
+                aarch64_reg_set,
                 clobbers.items,
                 scalar_live_ranges.items,
                 hint_points.items,
+                remat_ptr,
                 &trace,
             );
             trace.print(ctx.options.module_idx, ctx.func_idx);
@@ -2543,12 +2563,13 @@ pub fn compileFunctionImpl(
                 }
             }
         } else {
-            alloc_result_storage = try regalloc.allocateFromRangesWithHints(
+            alloc_result_storage = try regalloc.allocateFromRangesWithHintsRemat(
                 allocator,
-                aarch64RegSetForSpillBase(spill_base),
+                aarch64_reg_set,
                 clobbers.items,
                 scalar_live_ranges.items,
                 hint_points.items,
+                remat_ptr,
             );
         }
         if (tmr) |t| t.end(.regalloc);
@@ -4159,12 +4180,13 @@ fn compileInst(
             const dest = inst.dest orelse return;
             if (fctx.suppress_iconst_emit) |s| {
                 if (s.contains(dest)) {
-                    // All uses fold as immediates (#523). Skip the
-                    // `mov xN, #K` materialization but still call
-                    // `assign` so callee-save mask / spill bookkeeping
-                    // stays consistent. The allocated physreg is never
-                    // written; consumers encode the value directly.
-                    _ = try reg_map.assign(dest);
+                    // All uses fold as immediates (#523). When linear-scan
+                    // allocation is active, suppressed iconst vregs are
+                    // excluded from `scalar_live_ranges` so they consume no
+                    // physical register or callee-save slot.
+                    if (reg_map.alloc_result == null) {
+                        _ = try reg_map.assign(dest);
+                    }
                     return;
                 }
             }
@@ -4184,7 +4206,9 @@ fn compileInst(
             const dest = inst.dest orelse return;
             if (fctx.suppress_iconst_emit) |s| {
                 if (s.contains(dest)) {
-                    _ = try reg_map.assign(dest);
+                    if (reg_map.alloc_result == null) {
+                        _ = try reg_map.assign(dest);
+                    }
                     return;
                 }
             }
@@ -4308,7 +4332,7 @@ fn compileInst(
 
         // ── Comparisons ──────────────────────────────────────────────
         inline .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u => |bin, tag| {
-            try emitCmp(code, inst, bin, reg_map, comptime tagToCond(tag));
+            try emitCmp(code, inst, bin, reg_map, fctx, comptime tagToCond(tag));
         },
 
         .eqz => |vreg| try emitEqz(code, inst, vreg, reg_map),
@@ -6600,14 +6624,37 @@ fn emitEqz(
     try destCommit(code, reg_map, info);
 }
 
+fn encodeCmpImm(value: i64) ?u12 {
+    if (value >= 0 and value <= 4095) return @intCast(value);
+    return null;
+}
+
 fn emitCmp(
     code: *emit.CodeBuffer,
     inst: ir.Inst,
     bin: ir.Inst.BinOp,
     reg_map: *RegMap,
+    fctx: *const FuncCompileCtx,
     cond: emit.Cond,
 ) !void {
     const dest = inst.dest orelse return;
+    if ((inst.type == .i32 or inst.type == .i64) and fctx.const_vals != null) {
+        if (fctx.const_vals.?.get(bin.rhs)) |v| {
+            if (encodeCmpImm(v)) |imm12| {
+                const lhs = try useInto(code, reg_map, bin.lhs, RegMap.tmp0);
+                const info = try destBegin(reg_map, dest, RegMap.tmp2);
+                if (inst.type == .i32) {
+                    try code.cmpImm32(lhs, imm12);
+                    try code.cset32(info.reg, cond);
+                } else {
+                    try code.cmpImm(lhs, imm12);
+                    try code.cset(info.reg, cond);
+                }
+                try destCommit(code, reg_map, info);
+                return;
+            }
+        }
+    }
     const lhs = try useInto(code, reg_map, bin.lhs, RegMap.tmp0);
     const rhs = try useInto(code, reg_map, bin.rhs, RegMap.tmp1);
     const info = try destBegin(reg_map, dest, RegMap.tmp2);
@@ -6796,29 +6843,39 @@ fn emitParallelCopy(
     try emitParallelCopyFull(code, pairs, reg_map, allocator);
 }
 
+const ParallelCopyLoc = union(enum) {
+    reg: emit.Reg,
+    stack: u32,
+    remat: regalloc.RematDef,
+};
+
 /// True iff two locations (register or spill slot) are identical.
-fn locEq(a: RegMap.Location, b: RegMap.Location) bool {
+/// Rematerialised constants have no storage location and never alias.
+fn locEq(a: ParallelCopyLoc, b: ParallelCopyLoc) bool {
     return switch (a) {
         .reg => |ra| b == .reg and b.reg == ra,
         .stack => |sa| b == .stack and b.stack == sa,
+        .remat => false,
     };
 }
 
 /// Emit a single move `dst <- src` between any two locations.
 /// reg→reg: MOV; reg→stack: STR; stack→reg: LDR; stack→stack: LDR/STR via
-/// tmp0. Identity moves are elided. `tmp0` (X16) is non-allocatable scratch,
+/// tmp0; remat→reg: MOVZ/MOVK; remat→stack: MOVZ/MOVK via tmp0 + STR.
+/// Identity moves are elided. `tmp0` (X16) is non-allocatable scratch,
 /// so it never aliases a parallel-copy operand.
 fn emitLocMove(
     code: *emit.CodeBuffer,
     reg_map: *const RegMap,
-    dst: RegMap.Location,
-    src: RegMap.Location,
+    dst: ParallelCopyLoc,
+    src: ParallelCopyLoc,
 ) !void {
     if (locEq(dst, src)) return;
     switch (src) {
         .reg => |src_reg| switch (dst) {
             .reg => |dst_reg| try code.movRegReg(dst_reg, src_reg),
             .stack => |off| try frameStore(code, src_reg, reg_map.spillOffsetBytes(off)),
+            .remat => unreachable,
         },
         .stack => |src_off| switch (dst) {
             .reg => |dst_reg| try frameLoadReg(code, dst_reg, reg_map.spillOffsetBytes(src_off)),
@@ -6826,6 +6883,21 @@ fn emitLocMove(
                 try frameLoadReg(code, RegMap.tmp0, reg_map.spillOffsetBytes(src_off));
                 try frameStore(code, RegMap.tmp0, reg_map.spillOffsetBytes(dst_off));
             },
+            .remat => unreachable,
+        },
+        .remat => |rd| switch (dst) {
+            .reg => |dst_reg| switch (rd) {
+                .iconst_32 => |v| try code.movImm32(dst_reg, v),
+                .iconst_64 => |v| try code.movImm64(dst_reg, @bitCast(v)),
+            },
+            .stack => |dst_off| {
+                switch (rd) {
+                    .iconst_32 => |v| try code.movImm32(RegMap.tmp0, v),
+                    .iconst_64 => |v| try code.movImm64(RegMap.tmp0, @bitCast(v)),
+                }
+                try frameStore(code, RegMap.tmp0, reg_map.spillOffsetBytes(dst_off));
+            },
+            .remat => unreachable,
         },
     }
 }
@@ -6836,7 +6908,7 @@ fn emitParallelCopyFull(
     reg_map: *RegMap,
     allocator: std.mem.Allocator,
 ) !void {
-    const Loc = RegMap.Location;
+    const Loc = ParallelCopyLoc;
     const Resolved = struct {
         dst: Loc,
         src: Loc,
@@ -6847,8 +6919,23 @@ fn emitParallelCopyFull(
 
     for (pairs, 0..) |p, i| {
         const dst_loc = try reg_map.assign(p.dst);
-        const src_loc = reg_map.get(p.src) orelse return error.UnboundVReg;
-        resolved[i] = .{ .dst = dst_loc, .src = src_loc };
+        const src_loc: Loc = blk: {
+            if (reg_map.alloc_result) |ar| {
+                if (ar.getRemat(p.src)) |rd| break :blk .{ .remat = rd };
+            }
+            const loc = reg_map.get(p.src) orelse return error.UnboundVReg;
+            break :blk switch (loc) {
+                .reg => |r| .{ .reg = r },
+                .stack => |s| .{ .stack = s },
+            };
+        };
+        resolved[i] = .{
+            .dst = switch (dst_loc) {
+                .reg => |r| .{ .reg = r },
+                .stack => |s| .{ .stack = s },
+            },
+            .src = src_loc,
+        };
     }
 
     // General parallel-copy sequentialization over arbitrary locations
@@ -11692,13 +11779,13 @@ test "iconst suppress (#523): one foldable + one non-foldable use keeps MOVZ" {
     const sum = func.newVReg();
     const eq = func.newVReg();
     const out = func.newVReg();
-    // `k=7` is folded into ADD-imm12 (foldable use), but also feeds an
-    // EQ comparison which has no immediate-fold path on aarch64 — the
-    // cmp reads `k` as a register. Conjunctive rule keeps the mov.
+    // `k=7` is folded into ADD-imm12 (foldable use), but also feeds a
+    // MUL which has no immediate-fold path on aarch64 — the mul reads
+    // `k` as a register. Conjunctive rule keeps the mov.
     try block.append(.{ .op = .{ .local_get = 0 }, .dest = param, .type = .i32 });
     try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = k, .type = .i32 });
     try block.append(.{ .op = .{ .add = .{ .lhs = param, .rhs = k } }, .dest = sum, .type = .i32 });
-    try block.append(.{ .op = .{ .eq = .{ .lhs = sum, .rhs = k } }, .dest = eq, .type = .i32 });
+    try block.append(.{ .op = .{ .mul = .{ .lhs = sum, .rhs = k } }, .dest = eq, .type = .i32 });
     try block.append(.{ .op = .{ .add = .{ .lhs = sum, .rhs = eq } }, .dest = out, .type = .i32 });
     try block.append(.{ .op = .{ .ret = out } });
 
@@ -17696,4 +17783,109 @@ test "#781 aarch64 codegen timing is byte-identical to the untimed path" {
     try std.testing.expectEqualSlices(u32, plain.offsets, timed.offsets);
     try std.testing.expectEqual(plain.stats.recompiled, timed.stats.recompiled);
     try std.testing.expectEqual(plain.stats.reused, timed.stats.reused);
+}
+
+test "iconst suppress (#985): cmp imm12 folds and suppressed iconsts do not consume xreg live ranges" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const lt = try allocator.alloc(ir.IrType, 1);
+    lt[0] = .i32;
+    func.local_types = lt;
+    const bid = try func.newBlock();
+
+    const p0 = func.newVReg();
+    const c_cmp = func.newVReg();
+    const cmp = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .local_get = 0 }, .dest = p0, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 48 }, .dest = c_cmp, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .lt_u = .{ .lhs = p0, .rhs = c_cmp } }, .dest = cmp, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = cmp } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // Expect `CMP Wn, #48` (`SUBS WZR, Wn, #48`, mask 0xFFFFFC1F == 0x7100C01F)
+    // and no `MOVZ` (only CSET's CSINC is emitted for the boolean result).
+    try std.testing.expectEqual(@as(u32, 0), countMovzImm(code));
+    var found_cmp_imm48 = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFFF_FC1F) == (0x7100_001F | (48 << 10))) {
+            found_cmp_imm48 = true;
+        }
+    }
+    try std.testing.expect(found_cmp_imm48);
+}
+
+test "remat (#985): hoisted loop constants do not spill hot loop variables or break parallel_copy" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const lt = try allocator.alloc(ir.IrType, 1);
+    lt[0] = .i32;
+    func.local_types = lt;
+    const b_entry = try func.newBlock();
+    const b_loop = try func.newBlock();
+    const b_exit = try func.newBlock();
+
+    const p0 = func.newVReg();
+    try func.getBlock(b_entry).append(.{ .op = .{ .local_get = 0 }, .dest = p0, .type = .i32 });
+
+    // Define 25 non-foldable constants (negative values used by mul)
+    // in the preheader that stay live across the loop, exceeding the 23-GPR pool.
+    var consts: [25]ir.VReg = undefined;
+    for (&consts, 0..) |*cv, idx| {
+        cv.* = func.newVReg();
+        try func.getBlock(b_entry).append(.{
+            .op = .{ .iconst_32 = -@as(i32, @intCast(idx + 2)) },
+            .dest = cv.*,
+            .type = .i32,
+        });
+    }
+    const acc = func.newVReg();
+    const copy_entry = try allocator.alloc(ir.Inst.ParallelCopy, 1);
+    copy_entry[0] = .{ .dst = acc, .src = consts[0], .ty = .i32 };
+    try func.getBlock(b_entry).append(.{ .op = .{ .parallel_copy = copy_entry } });
+    try func.getBlock(b_entry).append(.{ .op = .{ .br = b_loop } });
+
+    var cur = acc;
+    for (consts) |cv| {
+        const next = func.newVReg();
+        try func.getBlock(b_loop).append(.{
+            .op = .{ .mul = .{ .lhs = cur, .rhs = cv } },
+            .dest = next,
+            .type = .i32,
+        });
+        cur = next;
+    }
+    const copy_back = try allocator.alloc(ir.Inst.ParallelCopy, 1);
+    copy_back[0] = .{ .dst = acc, .src = cur, .ty = .i32 };
+    try func.getBlock(b_loop).append(.{ .op = .{ .parallel_copy = copy_back } });
+    try func.getBlock(b_loop).append(.{
+        .op = .{ .br_if = .{ .cond = p0, .then_block = b_exit, .else_block = b_loop } },
+    });
+    try func.getBlock(b_exit).append(.{ .op = .{ .ret = acc } });
+
+    var pending_attr: ?PendingFrameAttribution = null;
+    defer if (pending_attr) |*r| r.deinit(allocator);
+    const code = try compileFunctionImpl(&func, .{
+        .allocator = allocator,
+        .options = .{ .enable_xreg_alloc = true },
+        .frame_attribution_ctx = .{
+            .output_prefix = "test",
+            .module_idx = 0,
+            .func_idx = 0,
+            .cwasm_aot_version = 1,
+            .compiler_build_id = "test",
+        },
+        .frame_attribution_out = &pending_attr,
+    }, allocator);
+    defer allocator.free(code);
+
+    // All excess pressure comes from rematerialisable iconst_32 values, so zero
+    // stack spill slots should be allocated.
+    try std.testing.expectEqual(@as(u32, 0), pending_attr.?.frame_layout.spill_slots);
+    try std.testing.expect(pending_attr.?.spill_metric.remat > 0);
 }

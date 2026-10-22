@@ -17,15 +17,21 @@ final FP offsets/slot indices. Register masks use indices in the AArch64
 includes busy registers; `free_idx` does not imply clobber safety.
 `clobbers` includes all modeled clobber points, not solely function calls.
 The trace describes the **pre-coalescing** scalar allocator decision. The
-`final` line reports the allocation's stack slot before optional coalescing
-(which only retargets physical register homes).
+`final` line reports the allocation's stack slot or physical register before
+optional coalescing (which only retargets physical register homes).
 
-With the checked-in fixture at main `49403b8e`, both intervals start at
-instruction 33, end at 152, and have depth 1. At their admission no register
-is free; all 23 are clobber-safe and there are no intervening clobbers. Every
-occupied register ends no later than the incoming range, so the allocator's
-strict `active.end > incoming.end` eviction rule rules out eviction. They
-receive scalar spill slots 1 and 2 (FP+248 and FP+256), respectively.
+Before #985 constant-pressure relief (`e96573c5`), both intervals started at
+instruction 33, ended at 152, and had depth 1. At their admission no register
+was free because 16 hoisted loop-preheader `iconst_32` intervals occupied
+physical registers across `[8..152]`, and the allocator's strict
+`active.end > incoming.end` rule prevented evicting equal-end constants,
+spilling `v200` and `v190` to scalar spill slots 1 and 2 (FP+248 and FP+256).
+
+After excluding suppressed immediate-folded `iconst_*` definitions from scalar
+live ranges, folding 12-bit comparison immediates into `CMP`/`SUBS`, and wiring
+rematerialisation-aware eviction on AArch64, 6 registers remain free at
+admission (`free_idx=0x7e0000` / `0x7c0000`) and `v200` and `v190` receive
+physical registers (`x23` and `x24`) with zero spills in `local_func=10`.
 These are **linear-scan interval summaries**, not dynamic use counts, proven
 IR def semantics, or performance predictions. The diagnostic makes no
 counterfactual codegen change. Repeat runs have identical trace text; with

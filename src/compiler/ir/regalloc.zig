@@ -761,7 +761,7 @@ pub fn allocateFromRangesWithHintsTraced(
     return allocateFromRangesWithHintsRematTraced(allocator, reg_set, clobbers, ranges, hints, null, trace);
 }
 
-fn allocateFromRangesWithHintsRematTraced(
+pub fn allocateFromRangesWithHintsRematTraced(
     allocator: std.mem.Allocator,
     reg_set: RegSet,
     clobbers: []const ClobberPoint,
@@ -808,7 +808,7 @@ fn allocateFromRangesWithHintsRematTraced(
         if (findSafeReg(reg_set, reg_free, range.start, range.end, clobbers, hint_idx)) |reg_idx| {
             if (trace) |t| {
                 if (isTracedVreg(range.vreg)) {
-                    try snapshotTrace(t, allocator, reg_set, clobbers, range, hint_idx, reg_free, active.items, reg_idx, null, null);
+                try snapshotTrace(t, allocator, reg_set, clobbers, range, hint_idx, reg_free, active.items, remat_candidates, reg_idx, null, null);
                 }
             }
             reg_free &= ~(@as(u64, 1) << @intCast(reg_idx));
@@ -849,14 +849,35 @@ fn allocateFromRangesWithHintsRematTraced(
             // we fall through to spilling the incoming range itself.
             const HOT_LOOP_THRESHOLD: u8 = 2;
             const range_in_hot_loop = range.max_loop_depth >= HOT_LOOP_THRESHOLD;
+            const range_is_remat = if (remat_candidates) |rc| rc.contains(range.vreg) else false;
             var best_evict: ?usize = null;
+            var best_evict_is_remat = false;
             for (active.items, 0..) |ai, idx| {
-                if (ai.end <= range.end) continue;
+                const ai_is_remat = if (remat_candidates) |rc| rc.contains(ai.vreg) else false;
+                // A rematerialisable newcomer must never evict a real
+                // (non-rematerialisable) active interval to a stack slot.
+                if (range_is_remat and !ai_is_remat) continue;
+                // A non-rematerialisable newcomer may evict a rematerialisable
+                // active interval even if `ai.end <= range.end` (e.g. both end
+                // at the same loop latch), because rematerialising a constant
+                // costs no stack slot or memory traffic whereas spilling
+                // `range` would. Otherwise require `ai.end > range.end`.
+                if (!(ai_is_remat and !range_is_remat) and ai.end <= range.end) continue;
                 if (!regSafeForRange(ai.reg_idx, range.start, range.end, clobbers)) continue;
-                if (range_in_hot_loop and ai.max_loop_depth > range.max_loop_depth) continue;
+                if (!ai_is_remat and range_in_hot_loop and ai.max_loop_depth > range.max_loop_depth) continue;
                 if (best_evict) |bi| {
+                    if (best_evict_is_remat and !ai_is_remat) continue;
+                    if (!best_evict_is_remat and ai_is_remat) {
+                        best_evict = idx;
+                        best_evict_is_remat = true;
+                        continue;
+                    }
                     const cur = active.items[bi];
-                    if (range_in_hot_loop) {
+                    if (ai_is_remat) {
+                        if (ai.end >= cur.end) {
+                            best_evict = idx;
+                        }
+                    } else if (range_in_hot_loop) {
                         if (ai.max_loop_depth < cur.max_loop_depth or
                             (ai.max_loop_depth == cur.max_loop_depth and ai.end > cur.end))
                         {
@@ -869,13 +890,15 @@ fn allocateFromRangesWithHintsRematTraced(
                     }
                 } else {
                     best_evict = idx;
+                    best_evict_is_remat = ai_is_remat;
                 }
             }
 
             if (best_evict) |evict_idx| {
                 if (trace) |t| {
                     if (isTracedVreg(range.vreg) or isTracedVreg(active.items[evict_idx].vreg)) {
-                        try snapshotTrace(t, allocator, reg_set, clobbers, range, hint_idx, reg_free, active.items, active.items[evict_idx].reg_idx, active.items[evict_idx].vreg, spill_slots_used);
+                        const trace_slot: ?u32 = if (best_evict_is_remat) null else spill_slots_used;
+                        try snapshotTrace(t, allocator, reg_set, clobbers, range, hint_idx, reg_free, active.items, remat_candidates, active.items[evict_idx].reg_idx, active.items[evict_idx].vreg, trace_slot);
                     }
                 }
                 const evicted = active.orderedRemove(evict_idx);
@@ -911,7 +934,8 @@ fn allocateFromRangesWithHintsRematTraced(
             } else {
                 if (trace) |t| {
                     if (isTracedVreg(range.vreg)) {
-                        try snapshotTrace(t, allocator, reg_set, clobbers, range, hint_idx, reg_free, active.items, null, null, spill_slots_used);
+                        const trace_slot: ?u32 = if (range_is_remat) null else spill_slots_used;
+                        try snapshotTrace(t, allocator, reg_set, clobbers, range, hint_idx, reg_free, active.items, remat_candidates, null, null, trace_slot);
                     }
                 }
                 // #542: rematerialise the new interval rather than
@@ -949,6 +973,7 @@ fn snapshotTrace(
     hint: ?u8,
     free: u64,
     active: []const ActiveInterval,
+    remat_candidates: ?*const std.AutoHashMap(ir.VReg, RematDef),
     chosen: ?u8,
     evicted: ?ir.VReg,
     next_slot: ?u32,
@@ -961,17 +986,22 @@ fn snapshotTrace(
             clobbered |= cp.regs_clobbered;
         }
     }
+    const range_is_remat = if (remat_candidates) |rc| rc.contains(range.vreg) else false;
     const start = trace.competitors.items.len;
     for (active) |ai| {
         const safe = regSafeForRange(ai.reg_idx, range.start, range.end, clobbers);
+        const ai_is_remat = if (remat_candidates) |rc| rc.contains(ai.vreg) else false;
+        const can_evict = !(range_is_remat and !ai_is_remat) and
+            ((ai_is_remat and !range_is_remat) or ai.end > range.end) and
+            safe and
+            (ai_is_remat or range.max_loop_depth < 2 or ai.max_loop_depth <= range.max_loop_depth);
         try trace.competitors.append(allocator, .{
             .vreg = ai.vreg,
             .end = ai.end,
             .depth = ai.max_loop_depth,
             .reg = reg_set.alloc_regs[ai.reg_idx],
             .safe_for_incoming = safe,
-            .eviction_eligible = ai.end > range.end and safe and
-                (range.max_loop_depth < 2 or ai.max_loop_depth <= range.max_loop_depth),
+            .eviction_eligible = can_evict,
         });
     }
     var safe_regs: u64 = 0;
@@ -2411,4 +2441,78 @@ test "remat: tiny functions skip classification (coldstart guard)" {
     // next_vreg (1) ≤ alloc_regs.len (9): classification is skipped,
     // and the iconst gets a register, not remat.
     try std.testing.expectEqual(@as(u32, 0), result.remat.count());
+}
+
+test "remat: non-remat incoming evicts equal-end remat active instead of spilling (#985)" {
+    const allocator = std.testing.allocator;
+    const one_reg: RegSet = .{
+        .alloc_regs = &.{19},
+        .callee_saved_indices = &.{0},
+        .caller_saved_indices = &.{},
+        .spill_base = 248,
+        .spill_stride = 8,
+    };
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 9, .start = 8, .end = 152, .type = .i32, .max_loop_depth = 1 },
+        .{ .vreg = 200, .start = 33, .end = 152, .type = .i32, .max_loop_depth = 1 },
+    };
+    var remats = std.AutoHashMap(ir.VReg, RematDef).init(allocator);
+    defer remats.deinit();
+    try remats.put(9, .{ .iconst_32 = 48 });
+
+    var trace: AllocationTrace = .{};
+    defer trace.deinit(allocator);
+    var result = try allocateFromRangesWithHintsRematTraced(
+        allocator,
+        one_reg,
+        &.{},
+        &ranges,
+        &.{},
+        &remats,
+        &trace,
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(Allocation{ .reg = 19 }, result.get(200).?);
+    try std.testing.expect(result.get(9) == null);
+    try std.testing.expect(result.isRemat(9));
+    try std.testing.expectEqual(@as(u32, 0), result.spill_count);
+    try std.testing.expectEqual(@as(usize, 1), trace.events.items.len);
+    const event = trace.events.items[0];
+    try std.testing.expectEqual(@as(?ir.VReg, 9), event.evicted);
+    try std.testing.expectEqual(@as(?i32, null), event.spill_offset);
+    try std.testing.expect(trace.competitors.items[event.competitor_start].eviction_eligible);
+}
+
+test "remat: remat incoming never evicts non-remat active (#985)" {
+    const allocator = std.testing.allocator;
+    const one_reg: RegSet = .{
+        .alloc_regs = &.{19},
+        .callee_saved_indices = &.{0},
+        .caller_saved_indices = &.{},
+        .spill_base = 248,
+        .spill_stride = 8,
+    };
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 200, .start = 0, .end = 100, .type = .i32, .max_loop_depth = 0 },
+        .{ .vreg = 9, .start = 10, .end = 20, .type = .i32, .max_loop_depth = 2 },
+    };
+    var remats = std.AutoHashMap(ir.VReg, RematDef).init(allocator);
+    defer remats.deinit();
+    try remats.put(9, .{ .iconst_32 = 48 });
+
+    var result = try allocateFromRangesWithHintsRemat(
+        allocator,
+        one_reg,
+        &.{},
+        &ranges,
+        &.{},
+        &remats,
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(Allocation{ .reg = 19 }, result.get(200).?);
+    try std.testing.expect(result.get(9) == null);
+    try std.testing.expect(result.isRemat(9));
+    try std.testing.expectEqual(@as(u32, 0), result.spill_count);
 }
