@@ -1734,8 +1734,16 @@ class DurationCrossCohortTests(unittest.TestCase):
         self.assertIn("wasi-thread-duration-cross-readiness-arm-", workflow)
         self.assertIn("Neoverse-N2", workflow)
         self.assertNotIn("mlugg/setup-zig", workflow)
-        self.assertIn("zig-x86_64-linux-0.16.0.tar.xz", workflow)
-        self.assertIn("zig-aarch64-linux-0.16.0.tar.xz", workflow)
+        self.assertNotIn("ziglang.org/download", workflow)
+        self.assertIn(
+            "cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e",
+            workflow,
+        )
+        self.assertIn("cataggar/zig@v0.17.0", workflow)
+        self.assertIn(
+            "cataggar/zig@v0.16.0 ?id=wamr-benchmark-zig016&alias=zig:zig016",
+            workflow,
+        )
         self.assertIn("${{ github.run_attempt }}", workflow)
         self.assertIn("/d/wamr-duration-cross/", workflow)
         self.assertNotIn("~/.cache", workflow)
