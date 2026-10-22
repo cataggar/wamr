@@ -29,7 +29,12 @@ from bench_coremark import (
 
 VERSION = 2
 PHASE_CONTRACT = "wamr-embedding-v2"
-UNIKRAFT_NATIVE_SDK_COMMIT = "a53205d77be3b880eb8f8b96679512ba58e2331a"
+UNIKRAFT_NATIVE_SDK_COMMIT = "bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20"
+HISTORICAL_UNIKRAFT_NATIVE_SDK_COMMIT = "a53205d77be3b880eb8f8b96679512ba58e2331a"
+SUPPORTED_UNIKRAFT_NATIVE_SDK_COMMITS = frozenset({
+    UNIKRAFT_NATIVE_SDK_COMMIT,
+    HISTORICAL_UNIKRAFT_NATIVE_SDK_COMMIT,
+})
 PREFIX = "WAMR_BENCH_RESULT="
 COREMARK_TICKS_PER_SECOND = 1000
 FIXTURES = {
@@ -302,7 +307,7 @@ def validate_manifest(manifest, *, allow_synthetic=False):
     for name in ("source", "compiler", "options", "platform", "execution_lifecycle"):
         require(linux[name] == unikraft[name], f"unmatched {name}")
     if manifest["evidence_kind"] == "measurement":
-        require(unikraft["source"]["commit"] == UNIKRAFT_NATIVE_SDK_COMMIT,
+        require(unikraft["source"]["commit"] in SUPPORTED_UNIKRAFT_NATIVE_SDK_COMMITS,
                 "unsupported Unikraft native SDK commit")
     compatibility = manifest["abi_compatibility"]
     keys(compatibility, workloads, "abi compatibility")

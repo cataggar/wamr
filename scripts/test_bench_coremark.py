@@ -1534,13 +1534,24 @@ Correct operation validated. See README.md for run and reporting rules.
             target["image_receipt"]["compiler"]["source"]["commit"] = "d" * 40
         with self.assertRaisesRegex(ValueError, "unsupported Unikraft native SDK commit"):
             native_benchmark.validate_manifest(manifest)
-        for target in manifest["targets"].values():
-            target["source"]["commit"] = native_benchmark.UNIKRAFT_NATIVE_SDK_COMMIT
-            target["compiler"]["source"]["commit"] = native_benchmark.UNIKRAFT_NATIVE_SDK_COMMIT
-            target["image_receipt"]["source"]["commit"] = native_benchmark.UNIKRAFT_NATIVE_SDK_COMMIT
-            target["image_receipt"]["compiler"]["source"]["commit"] = (
-                native_benchmark.UNIKRAFT_NATIVE_SDK_COMMIT)
-        native_benchmark.validate_manifest(manifest)
+        for commit in (native_benchmark.UNIKRAFT_NATIVE_SDK_COMMIT,
+                       native_benchmark.HISTORICAL_UNIKRAFT_NATIVE_SDK_COMMIT):
+            with self.subTest(commit=commit):
+                for target in manifest["targets"].values():
+                    source = {**target["source"], "commit": commit}
+                    target["source"] = source
+                    target["compiler"]["source"] = copy.deepcopy(source)
+                    target["image_receipt"]["source"] = copy.deepcopy(source)
+                    target["image_receipt"]["compiler"]["source"] = copy.deepcopy(source)
+                native_benchmark.validate_manifest(manifest)
+        linux = manifest["targets"]["linux"]
+        linux_source = {**linux["source"], "commit": native_benchmark.UNIKRAFT_NATIVE_SDK_COMMIT}
+        linux["source"] = linux_source
+        linux["compiler"]["source"] = copy.deepcopy(linux_source)
+        linux["image_receipt"]["source"] = copy.deepcopy(linux_source)
+        linux["image_receipt"]["compiler"]["source"] = copy.deepcopy(linux_source)
+        with self.assertRaisesRegex(ValueError, "unmatched source"):
+            native_benchmark.validate_manifest(manifest)
 
     def test_native_plan_checks_exact_image_bytes_and_receipt(self):
         image = Path(self.config["targets"]["unikraft"]["image_path"])

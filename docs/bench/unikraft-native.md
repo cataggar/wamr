@@ -196,8 +196,13 @@ SKU and region must match. Source/build settings or guest CPU counts that cannot
 be established are pending evidence, not `"unknown"` measurements.
 For measurement plans, both targets must use the currently supported native
 Unikraft SDK WAMR source commit
-`a53205d77be3b880eb8f8b96679512ba58e2331a` (the pin consumed by
-cataggar/unikraft#163). A different WAMR revision requires a separately qualified
+`bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20` (the Zig 0.17.0 compatibility pin
+published by `cataggar/wamr#1081` and consumed by `cataggar/unikraft#270`
+`support/apps/wamr-aot/build-tool-contract.zig`), or the preserved historical
+Zig 0.16.0 pin `a53205d77be3b880eb8f8b96679512ba58e2331a` (the pin consumed by
+cataggar/unikraft#163). Both targets and both compilers in a campaign must
+still report the exact same commit; mixing the current Zig 0.17.0 and
+historical Zig 0.16.0 pins across targets is rejected. A different WAMR revision requires a separately qualified
 native image integration and an explicit adapter pin update; matching two
 unsupported revisions is not sufficient. The commit check validates a declared
 source identity against the supported SDK, not the actual build or deployed image:
@@ -625,3 +630,50 @@ The tests pin all four tracked fixtures, execute an explicitly synthetic Linux
 producer subprocess, exercise timeouts and retained raw evidence, and reject
 duplicate/stale/partial records, mode/identity/clock/memory mismatches and ambiguous
 CoreMark output. They are software validation, not native measurements.
+
+## Local Linux vs Unikraft x86_64 KVM correctness comparison (Zig 0.17.0)
+
+Local side-by-side correctness validation on Zig `0.17.0` (`cataggar/wamr`
+`bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20` + `cataggar/unikraft` `47ef7f85` /
+[#331](https://github.com/cataggar/unikraft/pull/331), `correctness-only`, not a
+cloud `Standard_D2s_v5` performance claim) confirms byte-identical `.cwasm`
+compilation, runtime heap/code/page commitment, and execution results across the
+Linux producer (`wamr-native-bench`, `wamr-native-jit-aot-compare`,
+`wamr-native-jit-bench`) and the Unikraft Hyper-V EFI guest under x86_64 KVM:
+
+### Matched AOT / `fast` JIT / `full` JIT sampler (`matched.wasm`)
+
+Both Linux (`scripts.native_jit_benchmark`, `CLOCK_MONOTONIC` `1 ns` resolution)
+and Unikraft x86_64 KVM (`support/apps/wamr-aot/sampler.zig`, Hyper-V reference
+monotonic `100 ns` resolution) execute the `309` B `matched.wasm` fixture
+(`135511ae68829ab7feeff41de03451ba860906f5fc1cd053ec8d6f3a7e1dd9e5`, workload
+`volatile-compute-memory-2000`, expected `2241491208`, `growth_previous_pages = 2`):
+
+| Metric | Linux `aot` | Unikraft KVM `sample-aot` | Linux `fast` | Unikraft KVM `fast` | Linux `full` | Unikraft KVM `full` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `.cwasm` bytes (`sha256` prefix) | `1,156` B (`d6a89bd3...`) | `1,156` B (`d6a89bd3...`) | `1,331` B (`6ccddd51...`) | `1,331` B (`6ccddd51...`) | `1,324` B (`47dc8f33...`) | `1,324` B (`47dc8f33...`) |
+| `compile_ns` (`parse`/`lower`/`opt`/`cg`/`emit`) | `null` | `null` | `533,040` (`57,256`/`40,481`/`250,736`/`140,731`/`9,214`) | `1,658,400` (`245,800`/`234,600`/`543,900`/`545,100`/`60,200`) | `613,570` (`43,024`/`31,478`/`362,534`/`121,462`/`6,760`) | `2,019,000` (`246,100`/`245,300`/`891,700`/`543,300`/`62,200`) |
+| `compiler_polls` / `fuel_per_invocation` | `0` / `null` | `0` / `null` | `332` / `100,000` | `316` / `100,000` | `534` / `100,000` | `494` / `100,000` |
+| `load_ns` / `instantiate_ns` / `start_ns` / `growth_ns` | `15,012` / `68,193` / `60` / `24,587` | `60,800` / `15,200` / `100` / `7,300` | `14,342` / `69,905` / `30` / `19,880` | `37,900` / `15,400` / `100` / `6,500` | `12,008` / `66,460` / `30` / `23,215` | `39,400` / `16,300` / `100` / `6,600` |
+| `invocations[0..3].ns` (`value = 2241491208`) | `5,719` / `3,886` / `3,766` / `3,765` | `4,000` / `3,600` / `3,600` / `3,500` | `19,539` / `3,756` / `3,615` / `3,606` | `3,900` / `3,400` / `3,300` / `3,300` | `6,330` / `6,129` / `6,009` / `5,989` | `6,500` / `5,900` / `5,800` / `5,800` |
+| `compiler_peak_bytes` / `compiler_retained_bytes` | `0` / `0` B | `0` / `0` B | `203,835` / `1,331` B | `230,051` / `1,331` B | `329,882` / `1,324` B | `339,036` / `1,324` B |
+| `caller_peak_bytes` | `2,980` B | `2,980` B | `203,835` B | `230,051` B | `329,882` B | `339,036` B |
+| Runtime `heap_peak_bytes` / `code_bytes` (`reserved`) | `2,980` / `815` B (`4,096` B) | `2,980` / `815` B (`4,096` B) | `3,242` / `990` B (`4,096` B) | `3,242` / `990` B (`4,096` B) | `3,232` / `983` B (`4,096` B) | `3,232` / `983` B (`4,096` B) |
+| Linear memory committed `before -> after` (`reserved`) | `131,072 -> 196,608` B (`524,288` B) | `131,072 -> 196,608` B (`524,288` B) | `131,072 -> 196,608` B (`524,288` B) | `131,072 -> 196,608` B (`524,288` B) | `131,072 -> 196,608` B (`524,288` B) | `131,072 -> 196,608` B (`524,288` B) |
+| Post-teardown live / reserved bytes | `0` / `0` B | `0` / `0` B | `0` / `0` B | `0` / `0` B | `0` / `0` B | `0` / `0` B |
+
+### Matched AOT snapshot-replay producer (`wamr-native-bench --check`)
+
+On the four pinned v2 workloads (`unikraft-x86_64` profile, `snapshot-replay`
+lifecycle, 100-iteration correctness check for CoreMark), the Linux producer
+and Unikraft x86_64 KVM guest consume identical `.cwasm` artifacts and produce
+matching CRCs (`seedcrc=0xe9f5`, `crclist=0xe714`, `crcmatrix=0x1fd7`,
+`crcstate=0x8e3a`, `crcfinal=0x988c`):
+
+| Workload | `.cwasm` bytes (`sha256` prefix) | `load_ticks` (ns) | `instantiate_ticks` (ns) | `lifecycle_setup_ticks` (ns) | `first_invocation_ticks` (ns) | `steady_state_ticks` (ns) | `reset_events` (ns) | Reserved / committed (`after_first`) | Caller peak / post-release |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `compute` (`unroll4.wasm`) | `819` B (`cec63990...`) | `15,543` | `27,662` | `481` | `172,207,932` | `167,396,782`, `164,394,266` | `751`, `731` | `4,096` / `4,096` B | `3,194` / `0` B |
+| `memory` (`iv_store.wasm`) | `646` B (`b347ba32...`) | `15,173` | `71,377` | `44,406` | `799,401,924` | `775,941,080`, `744,231,572` | `7,701`, `7,972` | `16,781,312` / `135,168` B | `199,604` / `0` B |
+| `coremark` (`coremark_wasi.wasm`, 100 iter) | `170,318` B (`f342cdfc...`) | `103,345` | `145,178` | `50,937` | `6,517,371` | `5,841,647`, `5,598,122` | `17,266`, `16,915` | `16,941,056` / `360,448` B | `455,054` / `0` B |
+| `coremark-nofp` (`coremark_wasi_nofp.wasm`, 100 iter) | `168,866` B (`4741c445...`) | `77,246` | `121,833` | `46,770` | `5,605,642` | `5,593,615`, `5,572,363` | `11,828`, `8,803` | `16,941,056` / `360,448` B | `452,837` / `0` B |
+
