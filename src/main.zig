@@ -238,6 +238,7 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
     // no override (adapter keeps its built-in default of `.trace`,
     // which admits every level).
     var log_level: ?wamr.wasi_cli_adapter.WasiLogLevel = null;
+    var log_format: ?wamr.wasi_cli_adapter.WasiLogFormat = null;
     var benchmark_wasi_thread_manager_enabled = true;
     var past_options = false;
 
@@ -316,6 +317,22 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                         .{spec},
                     );
                     return 2;
+                };
+            } else if (std.mem.eql(u8, arg, "--log-format") or std.mem.startsWith(u8, arg, "--log-format=")) {
+                const spec = if (std.mem.eql(u8, arg, "--log-format")) blk: {
+                    i += 1;
+                    if (i >= run_args.len) {
+                        std.debug.print("error: --log-format requires <text|json>\n", .{});
+                        return 1;
+                    }
+                    break :blk run_args[i];
+                } else arg["--log-format=".len..];
+                log_format = wamr.wasi_cli_adapter.WasiLogFormat.fromName(spec) orelse {
+                    std.debug.print(
+                        "error: --log-format value '{s}' is not one of text|json\n",
+                        .{spec},
+                    );
+                    return 1;
                 };
             } else if (std.mem.eql(u8, arg, "--config-store") or std.mem.startsWith(u8, arg, "--config-store=")) {
                 if (config_store_path != null) {
@@ -479,6 +496,13 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                 };
                 break :blk parsed;
             };
+            const effective_log_format = resolveLogFormat(log_format, init.environ_map) catch {
+                std.debug.print(
+                    "error: WAMR_LOG_FORMAT='{s}' is not one of text|json\n",
+                    .{init.environ_map.get("WAMR_LOG_FORMAT") orelse ""},
+                );
+                return 1;
+            };
             // #583 B6: assemble `wasi:config/store` from layered sources.
             // The arena owns the JSON-parsed strings and lower-cased env
             // keys; the resulting slice's lifetime equals the arena's
@@ -505,7 +529,7 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
             if (manifest_rc != 0) return manifest_rc;
             const component_core_opts = loaded_manifest.?.instantiationOptions();
 
-            return runComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, map_dirs.items, allow_net.items, effective_log_level, cfg_entries, keyvalue_store_path, component_core_opts);
+            return runComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, map_dirs.items, allow_net.items, effective_log_level, effective_log_format, cfg_entries, keyvalue_store_path, component_core_opts);
         }
     }
 
@@ -606,6 +630,7 @@ fn runServe(init: std.process.Init, allocator: std.mem.Allocator, serve_args: []
     var tls_key_path: ?[]const u8 = null;
     var tls_pem_path: ?[]const u8 = null;
     var log_level: ?wamr.wasi_cli_adapter.WasiLogLevel = null;
+    var log_format: ?wamr.wasi_cli_adapter.WasiLogFormat = null;
     var precompiled_manifest: ?[]const u8 = null;
     var past_options = false;
 
@@ -714,6 +739,22 @@ fn runServe(init: std.process.Init, allocator: std.mem.Allocator, serve_args: []
                     );
                     return 2;
                 };
+            } else if (std.mem.eql(u8, arg, "--log-format") or std.mem.startsWith(u8, arg, "--log-format=")) {
+                const spec = if (std.mem.eql(u8, arg, "--log-format")) blk: {
+                    i += 1;
+                    if (i >= serve_args.len) {
+                        std.debug.print("error: --log-format requires <text|json>\n", .{});
+                        return 1;
+                    }
+                    break :blk serve_args[i];
+                } else arg["--log-format=".len..];
+                log_format = wamr.wasi_cli_adapter.WasiLogFormat.fromName(spec) orelse {
+                    std.debug.print(
+                        "error: --log-format value '{s}' is not one of text|json\n",
+                        .{spec},
+                    );
+                    return 1;
+                };
             } else if (std.mem.eql(u8, arg, "--precompiled-manifest") or std.mem.startsWith(u8, arg, "--precompiled-manifest=")) {
                 if (precompiled_manifest != null) {
                     std.debug.print("error: --precompiled-manifest specified more than once\n", .{});
@@ -816,6 +857,13 @@ fn runServe(init: std.process.Init, allocator: std.mem.Allocator, serve_args: []
         };
         break :blk parsed;
     };
+    const effective_log_format = resolveLogFormat(log_format, init.environ_map) catch {
+        std.debug.print(
+            "error: WAMR_LOG_FORMAT='{s}' is not one of text|json\n",
+            .{init.environ_map.get("WAMR_LOG_FORMAT") orelse ""},
+        );
+        return 1;
+    };
 
     var loaded_manifest: ?ComponentCoresSource = null;
     defer if (loaded_manifest) |*lm| lm.deinit();
@@ -842,7 +890,7 @@ fn runServe(init: std.process.Init, allocator: std.mem.Allocator, serve_args: []
 
     // Default to wasmtime's `127.0.0.1:8080` when `--addr` is omitted.
     const bind_addr = addr orelse (std.Io.net.IpAddress.parse("127.0.0.1", 8080) catch unreachable);
-    return runHttpComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, bind_addr, effective_log_level, if (tls_config) |*c| c else null, component_core_opts);
+    return runHttpComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, bind_addr, effective_log_level, effective_log_format, if (tls_config) |*c| c else null, component_core_opts);
 }
 
 fn parseMapDir(spec: []const u8) !MapDir {
@@ -1130,6 +1178,16 @@ fn loadComponentConfigStore(
     return merged.items;
 }
 
+fn resolveLogFormat(
+    cli_format: ?wamr.wasi_cli_adapter.WasiLogFormat,
+    env: *const std.process.Environ.Map,
+) error{InvalidLogFormat}!?wamr.wasi_cli_adapter.WasiLogFormat {
+    if (cli_format) |fmt| return fmt;
+    const raw = env.get("WAMR_LOG_FORMAT") orelse return null;
+    if (raw.len == 0) return null;
+    return wamr.wasi_cli_adapter.WasiLogFormat.fromName(raw) orelse error.InvalidLogFormat;
+}
+
 fn runComponent(
     data: []const u8,
     allocator: std.mem.Allocator,
@@ -1139,6 +1197,7 @@ fn runComponent(
     map_dirs: []const MapDir,
     allow_net_cidrs: []const []const u8,
     log_level: ?wamr.wasi_cli_adapter.WasiLogLevel,
+    log_format: ?wamr.wasi_cli_adapter.WasiLogFormat,
     config_store: []const wamr.wasi_cli_adapter.ConfigEntry,
     keyvalue_store_path: ?[]const u8,
     component_core_opts: wamr.component_core_backend.Options,
@@ -1186,6 +1245,7 @@ fn runComponent(
     // (`null` here) leaves the adapter at `.trace`, which admits
     // every level — matches the README "verbose by default" stance.
     if (log_level) |lvl| adapter.setLogLevel(lvl);
+    if (log_format) |fmt| adapter.setLogFormat(fmt);
 
     // Seed the WASI sockets allow-list from `--allow-net=CIDR` flags
     // (default deny-all). (#520 wave 2)
@@ -1297,6 +1357,7 @@ fn runHttpComponent(
     env_vars: []const wamr.wasi_cli_adapter.EnvVar,
     listen_address: std.Io.net.IpAddress,
     log_level: ?wamr.wasi_cli_adapter.WasiLogLevel,
+    log_format: ?wamr.wasi_cli_adapter.WasiLogFormat,
     tls_config: ?*wamr.wasi_cli_adapter.HttpsTlsConfig,
     component_core_opts: wamr.component_core_backend.Options,
 ) u8 {
@@ -1314,6 +1375,7 @@ fn runHttpComponent(
     adapter.setArguments(argv_buf);
     adapter.setEnvironment(env_vars);
     if (log_level) |lvl| adapter.setLogLevel(lvl);
+    if (log_format) |fmt| adapter.setLogFormat(fmt);
 
     // See `runComponent` for the rationale behind the arena wrapper —
     // same loader/instance allocation story applies on the HTTP path.
@@ -1963,6 +2025,11 @@ const run_usage_options =
     \\                           error|critical (default: trace = admit all).
     \\                           Falls back to the WAMR_LOG_LEVEL env var
     \\                           when this flag is absent.
+    \\  --log-format NAME        For components: format `wasi:logging` records
+    \\                           as `text` (`[wasi_guest] [<level>] [<context>]
+    \\                           <message>`) or single-line `json` NDJSON
+    \\                           (default: text). Falls back to the
+    \\                           WAMR_LOG_FORMAT env var when absent.
     \\  --config-store PATH      For components: load layered `wasi:config/store`
     \\                           values from a JSON file with a flat
     \\                           {"key":"value",...} object. Combined with
@@ -2067,6 +2134,10 @@ const serve_usage_options =
     \\                           of trace|debug|info|warn|error|critical
     \\                           (default: trace = admit all). Falls back to
     \\                           the WAMR_LOG_LEVEL env var when absent.
+    \\  --log-format NAME        Format `wasi:logging` records as `text` or
+    \\                           single-line `json` NDJSON (default: text).
+    \\                           Falls back to the WAMR_LOG_FORMAT env var
+    \\                           when absent.
     \\  --tls-cert PATH          PEM-encoded certificate chain (leaf first).
     \\                           Terminates HTTPS on each connection. Requires
     \\                           a matching --tls-key.
@@ -2375,3 +2446,34 @@ test "tlsLoadErrorMessage covers every load-error arm (#583 follow-up / #609)" {
         tlsLoadErrorMessage(error.TlsKeyFileNotFound),
     ));
 }
+
+test "resolveLogFormat: CLI flag wins over WAMR_LOG_FORMAT and invalid env fails (#972 E5)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var env_map = std.process.Environ.Map.init(arena.allocator());
+
+    // Default unset -> null (adapter stays at .text).
+    try std.testing.expectEqual(@as(?wamr.wasi_cli_adapter.WasiLogFormat, null), try resolveLogFormat(null, &env_map));
+
+    // Env fallback -> .json / .text (case-insensitive).
+    try env_map.put("WAMR_LOG_FORMAT", "JSON");
+    try std.testing.expectEqual(@as(?wamr.wasi_cli_adapter.WasiLogFormat, .json), try resolveLogFormat(null, &env_map));
+
+    // CLI flag overrides WAMR_LOG_FORMAT.
+    try std.testing.expectEqual(@as(?wamr.wasi_cli_adapter.WasiLogFormat, .text), try resolveLogFormat(.text, &env_map));
+
+    // Invalid WAMR_LOG_FORMAT returns error.InvalidLogFormat when CLI flag is absent,
+    // but CLI flag still wins when explicitly provided.
+    try env_map.put("WAMR_LOG_FORMAT", "yaml");
+    try std.testing.expectError(error.InvalidLogFormat, resolveLogFormat(null, &env_map));
+    try std.testing.expectEqual(@as(?wamr.wasi_cli_adapter.WasiLogFormat, .json), try resolveLogFormat(.json, &env_map));
+
+    // Invalid CLI --log-format returns exit code 1.
+    try std.testing.expectEqual(@as(u8, 1), try runRun(undefined, std.testing.allocator, &.{ "--log-format=yaml", "dummy.wasm" }));
+    try std.testing.expectEqual(@as(u8, 1), try runRun(undefined, std.testing.allocator, &.{"--log-format"}));
+
+    // Help texts document --log-format NAME.
+    try std.testing.expect(std.mem.indexOf(u8, run_usage_options, "--log-format NAME") != null);
+    try std.testing.expect(std.mem.indexOf(u8, serve_usage_options, "--log-format NAME") != null);
+}
+
