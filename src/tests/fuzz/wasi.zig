@@ -57,7 +57,7 @@ const Op = enum(u8) {
     drop_stream,
 };
 
-const op_count: u8 = @intCast(@typeInfo(Op).@"enum".fields.len);
+const op_count: u8 = @intCast(std.enums.values(Op).len);
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -137,13 +137,10 @@ fn runOnce(
     // pass a duplicate handle and null the slot before adapter.deinit
     // to avoid double-close.
     const preopen_handle = adapter.addPreopen("/sandbox", preopen_dir_io) catch return;
-    _ = preopen_handle;
     defer {
-        // Replace the preopen slot with null so adapter.deinit doesn't
+        // Withdraw the preopen slot so adapter.deinit doesn't
         // try to close the shared dir handle.
-        if (adapter.fs_descriptor_table.items.len > 0) {
-            adapter.fs_descriptor_table.items[0] = null;
-        }
+        _ = adapter.fs_descriptor_table.withdraw(preopen_handle);
     }
 
     // Pre-register `wasi:filesystem/types` + `wasi:filesystem/preopens`
@@ -189,23 +186,12 @@ fn runOnce(
         .imports = &.{},
         .exports = &.{},
     };
-    var ci: ComponentInstance = .{
-        .component = &stub_component,
-        .core_instances = &core_instances,
-        .resource_tables = .empty,
-        .exported_funcs = .empty,
-        .imports = .empty,
-        .module_arena = std.heap.ArenaAllocator.init(allocator),
-        .allocator = allocator,
-    };
-    defer ci.module_arena.deinit();
+    const ci = try ci_mod.instantiate(&stub_component, allocator);
     defer {
-        var rt_it = ci.resource_tables.valueIterator();
-        while (rt_it.next()) |rt| rt.deinit(allocator);
-        ci.resource_tables.deinit(allocator);
-        ci.exported_funcs.deinit(allocator);
-        ci.imports.deinit(allocator);
+        ci.core_instances = &.{};
+        ci.deinit();
     }
+    ci.core_instances = &core_instances;
 
     // Op stream: bytewise.
     var cursor: usize = 0;
@@ -214,7 +200,7 @@ fn runOnce(
         const op_byte = input[cursor];
         cursor += 1;
         const op = std.enums.fromInt(Op, op_byte % op_count) orelse continue;
-        cursor = dispatch(&adapter, &ci, &memory_bytes, op, input, cursor, allocator, io) catch |e| switch (e) {
+        cursor = dispatch(&adapter, ci, &memory_bytes, op, input, cursor, allocator, io) catch |e| switch (e) {
             error.OutOfMemory => return e,
             else => cursor, // tolerate any typed error from the binding
         };
@@ -348,7 +334,7 @@ fn invokeIface(
 /// towards valid handles when possible. If the table only has the
 /// preopen, returns 0; otherwise mods the byte to pick any slot.
 fn pickHandle(adapter: *WasiCliAdapter, input: []const u8, cursor: *usize) ?u32 {
-    const len = adapter.fs_descriptor_table.items.len;
+    const len = adapter.fs_descriptor_table.entries.items.len;
     if (len == 0) return null;
     if (cursor.* >= input.len) return 0;
     const b = input[cursor.*];

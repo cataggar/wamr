@@ -7,6 +7,10 @@ on:
     branches: [zig, main]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
   attestations: read
@@ -538,7 +542,7 @@ jobs:
     name: Build & Test
     runs-on: ubuntu-22.04
     needs: [build-and-test, wasi-test, wasi-testsuite, component-examples, wasi-p2-testsuite, wasi-p3-testsuite, wasi-p3-testsuite-arm64, lazy-jit]
-    if: always()
+    if: always() && !cancelled()
     steps:
       - name: Check results
         run: |
