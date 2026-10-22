@@ -301,6 +301,46 @@ peaks and reservation teardown through wrappers around the caller's actual
 capabilities. Infallible `Platform.unmap` remains an adapter obligation; the
 wrapper's zero reservation count is **not** independent physical-release proof.
 The serial writer receives at most 8192 bytes, including prefix and newline.
+
+### Local Unikraft x86_64 KVM correctness qualification
+
+In `cataggar/unikraft` (`origin/zig` `47ef7f85`), `support/apps/wamr-aot` integrates
+the compiler-free AOT comparator (`--variant sample-aot`), the in-process fast JIT
+(`--variant jit --jit-mode fast`), and the in-process full JIT
+(`--variant jit --jit-mode full`) against WAMR revision
+`bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20` (source-tree SHA256
+`738653da735ff6d23539310302e7a8a400771e30d38a04d9faf456fb7481b51d`, Zig `0.17.0`)
+on `matched.wasm` (`309` B, SHA256
+`135511ae68829ab7feeff41de03451ba860906f5fc1cd053ec8d6f3a7e1dd9e5`, workload
+`volatile-compute-memory-2000`, expected `2241491208`).
+
+Each variant was prepared (`uk-wamr-aot-build prepare` + `verify` + `olddefconfig`
++ `native-images`), packaged (`wamr-ci-package`), booted on local x86_64 KVM/OVMF
+(`uk-hyperv-local-boot`, `scope: "public_local_qemu_only"`,
+`acceptance: "not_established"`, `passed: true`), and validated by
+`uk-wamr-log-validate workload --mode {aot|fast|full} --output json-v1` (plus
+`--variant snapshot` validated via `--mode snapshot`). These runs verify native
+Unikraft build/link/boot/validator correctness and measure local image and
+allocator/frame deltas; they are not cloud or hardware performance qualification.
+
+| Metric | `sample-aot` (compiler-free) | `jit --jit-mode fast` | `jit --jit-mode full` |
+| --- | --- | --- | --- |
+| Staged consumer archive (`build/artifacts/libwamr-aot.a`) | `103,406` B (`c7baaf86...`) | `1,518,658` B (`3345b470...`, `+1,415,252` B) | `1,518,658` B (`3345b470...`, `+1,415,252` B) |
+| Hyper-V EFI image (`wamr_hyperv-x86_64-efi`) | `1,431,360` B (`d8ad5fcb...`) | `2,451,264` B (`c078f0d0...`, `+1,019,904` B / `+71.25%`) | `2,451,264` B (`d647959c...`, `+1,019,904` B / `+71.25%`) |
+| Debug ELF (`wamr_hyperv-x86_64-efi.dbg`) | `2,833,144` B (`f134b403...`) | `3,901,272` B (`90d4fe2f...`, `+1,068,128` B) | `3,901,264` B (`f9da4b48...`, `+1,068,120` B) |
+| Artifact `.cwasm` bytes / SHA256 | `1,156` B (`d6a89bd3...`) | `1,331` B (`6ccddd51...`) | `1,324` B (`47dc8f33...`) |
+| `compile_ns` (`parse` / `lower` / `optimize` / `codegen` / `emit`) | `null` (`compiler_embedded: false`) | `1,658,400` ns (`245,800` / `234,600` / `543,900` / `545,100` / `60,200`) | `2,019,000` ns (`246,100` / `245,300` / `891,700` / `543,300` / `62,200`) |
+| `compiler_polls` / `fuel_per_invocation` | `0` / `null` | `316` / `100,000` | `494` / `100,000` |
+| `load_ns` / `instantiate_ns` / `start_ns` / `growth_ns` | `60,800` / `15,200` / `100` / `7,300` ns | `37,900` / `15,400` / `100` / `6,500` ns | `39,400` / `16,300` / `100` / `6,600` ns |
+| First call (`invocations[0].ns`) | `4,000` ns (`2241491208`) | `3,900` ns (`2241491208`) | `6,500` ns (`2241491208`) |
+| Steady calls (`invocations[1..3].ns`) | `3,600` / `3,600` / `3,500` ns | `3,400` / `3,300` / `3,300` ns | `5,900` / `5,800` / `5,800` ns |
+| `compiler_peak_bytes` / `compiler_retained_bytes` | `0` B / `0` B | `230,051` B / `1,331` B | `339,036` B / `1,324` B |
+| `caller_peak_bytes` / `observed_max_allocation_bytes` | `2,980` B / `5,252` B | `230,051` B / `230,051` B | `339,036` B / `339,036` B |
+| Runtime `heap_peak_bytes` / `code_bytes` (`code_reserved_bytes`) | `2,980` B / `815` B (`4,096` B) | `3,242` B / `990` B (`4,096` B) | `3,232` B / `983` B (`4,096` B) |
+| Linear memory committed before -> after growth (`reserved`) | `131,072` -> `196,608` B (`524,288` B) | `131,072` -> `196,608` B (`524,288` B) | `131,072` -> `196,608` B (`524,288` B) |
+| `observed_max_frame_bytes` / `observed_max_reserved_bytes` | `200,704` B / `528,384` B | `200,704` B / `528,384` B | `200,704` B / `528,384` B |
+| Post-teardown (`caller_live`, `reserved`, `frame`, `allocation`) | `0` / `0` / `0` / `0` B | `0` / `0` / `0` / `0` B | `0` / `0` / `0` / `0` B |
+| Raw serial log bytes / SHA256 (`uk.wamr.log-validation`) | `5,362` B (`0386e717...`) | `5,449` B (`084839f9...`) | `5,449` B (`aa6a3868...`) |
 Propagate write errors and sampler failures to the adapter's capture status.
 
 The fixed sampler caps, verification mode, workload, four invocations, and real
