@@ -106,6 +106,8 @@ const Header = struct {
     body: []const u8,
 };
 
+const primitive_kind_count: u8 = @intCast(std.enums.values(PrimitiveKind).len);
+
 fn parseHeader(input: []const u8) ?Header {
     if (input.len < 11) return null;
     const mode_byte = input[0];
@@ -113,7 +115,7 @@ fn parseHeader(input: []const u8) ?Header {
     const ptr = std.mem.readInt(u32, input[2..6], .little);
     const len = std.mem.readInt(u32, input[6..10], .little);
     const mode = std.enums.fromInt(Mode, mode_byte) orelse return null;
-    const prim = std.enums.fromInt(PrimitiveKind, prim_byte % @as(u8, @intCast(@typeInfo(PrimitiveKind).@"enum".fields.len))) orelse return null;
+    const prim = std.enums.fromInt(PrimitiveKind, prim_byte % primitive_kind_count) orelse return null;
     return .{ .mode = mode, .ptr = ptr, .len = len, .primitive = prim, .body = input[10..] };
 }
 
