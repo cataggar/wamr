@@ -1701,7 +1701,19 @@ class DurationCrossCohortTests(unittest.TestCase):
         self.assertIn("group: wasi-thread-duration-cross-diagnostic", workflow)
         self.assertIn("cancel-in-progress: false", workflow)
         self.assertIn("needs: x86", workflow)
-        self.assertIn("runs-on: wamr-temp-20260906", workflow)
+        self.assertIn("runs-on: ubuntu-22.04", workflow)
+        self.assertNotIn("wamr-temp-20260906", workflow)
+        self.assertNotIn("vm31e-wamr-temp-20260906", workflow)
+        self.assertNotIn("--runner-environment self-hosted", workflow)
+        hosted_x86 = synthetic_report(
+            platform="ubuntu-22.04-x86_64", sequence=1
+        )
+        hosted_x86["metadata"]["host"] = {
+            "runner_environment": "github-hosted",
+            "runner_name": "GitHub Actions 42",
+            "cpu": "AMD EPYC 7763 64-Core Processor",
+        }
+        duration.validate_report(hosted_x86)
         self.assertIn(
             'run: python3 "$ROOT/source/scripts/test_wasi_thread_duration_cross.py"',
             workflow,

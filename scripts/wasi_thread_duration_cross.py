@@ -1431,11 +1431,20 @@ def validate_report(document: dict[str, Any]) -> None:
     host = metadata.get("host")
     require(isinstance(host, dict), "metadata.host")
     if platform_id == "ubuntu-22.04-x86_64":
-        require(
-            host.get("runner_name") == TRUSTED_X86_RUNNER_NAME
-            and host.get("cpu") == X86_CPU_CLASS,
-            "trusted x86 runner identity",
-        )
+        if host.get("runner_environment") == "github-hosted":
+            require(
+                isinstance(host.get("runner_name"), str)
+                and bool(host["runner_name"])
+                and isinstance(host.get("cpu"), str)
+                and bool(host["cpu"]),
+                "trusted x86 runner identity",
+            )
+        else:
+            require(
+                host.get("runner_name") == TRUSTED_X86_RUNNER_NAME
+                and host.get("cpu") == X86_CPU_CLASS,
+                "trusted x86 runner identity",
+            )
     else:
         require(
             isinstance(host.get("cpu"), str) and ARM_CPU_CLASS in host["cpu"],
@@ -1939,14 +1948,17 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     cpu_placement = discover_cpu_placement(thread_counts)
     host = host_metadata(args.runner_environment)
     if args.platform_id == "ubuntu-22.04-x86_64":
-        if os.getenv("GITHUB_ACTIONS") == "true" and host["runner_name"] != TRUSTED_X86_RUNNER_NAME:
-            raise HarnessError(
-                f"trusted x86 runner must be {TRUSTED_X86_RUNNER_NAME!r}"
-            )
-        if os.getenv("GITHUB_ACTIONS") == "true" and host["cpu"] != X86_CPU_CLASS:
-            raise HarnessError(
-                f"trusted x86 CPU must be {X86_CPU_CLASS!r}, got {host['cpu']!r}"
-            )
+        if args.runner_environment == "self-hosted":
+            if os.getenv("GITHUB_ACTIONS") == "true" and host["runner_name"] != TRUSTED_X86_RUNNER_NAME:
+                raise HarnessError(
+                    f"trusted x86 runner must be {TRUSTED_X86_RUNNER_NAME!r}"
+                )
+            if os.getenv("GITHUB_ACTIONS") == "true" and host["cpu"] != X86_CPU_CLASS:
+                raise HarnessError(
+                    f"trusted x86 CPU must be {X86_CPU_CLASS!r}, got {host['cpu']!r}"
+                )
+        elif not host["cpu"]:
+            raise HarnessError("hosted x86 duration-cross requires a non-empty CPU model")
     elif ARM_CPU_CLASS not in host["cpu"]:
         raise HarnessError(
             f"Arm duration-cross requires {ARM_CPU_CLASS} class, got {host['cpu']!r}"

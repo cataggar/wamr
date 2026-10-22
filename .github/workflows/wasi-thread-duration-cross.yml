@@ -39,9 +39,9 @@ permissions:
 
 jobs:
   x86:
-    name: Trusted x86 duration-cross
+    name: Hosted x86 duration-cross
     if: ${{ !inputs.preflight_only || inputs.preflight_platform == 'x86' }}
-    runs-on: wamr-temp-20260906
+    runs-on: ubuntu-22.04
     timeout-minutes: 720
     permissions:
       contents: read
@@ -63,11 +63,15 @@ jobs:
           PREFLIGHT_PLATFORM: ${{ inputs.preflight_platform }}
         run: |
           set -euo pipefail
+          sudo mkdir -p /d/wamr-duration-cross
+          sudo chown "$USER":"$(id -gn)" /d /d/wamr-duration-cross
           case "$ROOT:$HOME:$TMPDIR:$XDG_CACHE_HOME:$ZIG_GLOBAL_CACHE_DIR:$ZIG_LOCAL_CACHE_DIR" in
             /d/*:/d/*:/d/*:/d/*:/d/*:/d/*) ;;
             *) echo "all diagnostic paths must remain under /d" >&2; exit 2 ;;
           esac
-          test "$RUNNER_NAME" = vm31e-wamr-temp-20260906
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+          grep -q 'model name' /proc/cpuinfo
           test "$GITHUB_RUN_ATTEMPT" = 1
           test "$(find /proc/[0-9]*/comm -type f -exec cat {} \; 2>/dev/null | grep -c '^Runner.Worker$')" = 1
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
@@ -84,9 +88,6 @@ jobs:
           [[ "$GITHUB_REF" =~ ^refs/tags/wasi-thread-duration-cross-[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
           test "$GITHUB_SHA" = "$SOURCE_SHA"
           mkdir -p "$ROOT"/{home,tmp,xdg-cache,zig-global-cache,zig-local-cache,zig,output,source}
-          AVAILABLE_KIB="$(df --output=avail -k /d | tail -n 1 | tr -d ' ')"
-          [[ "$AVAILABLE_KIB" =~ ^[0-9]+$ ]]
-          (( AVAILABLE_KIB >= 80 * 1024 * 1024 ))
 
       - name: Fetch and validate immutable trusted source
         env:
@@ -136,7 +137,7 @@ jobs:
             --platform-id ubuntu-22.04-x86_64 \
             --report-sequence "$REPORT_SEQUENCE" \
             --cohort-id "$COHORT_ID" \
-            --runner-environment self-hosted \
+            --runner-environment github-hosted \
             --host-pair-id "github:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}:ubuntu-22.04-x86_64" \
             --timeout 180
           cat "$ROOT/output/report.md" >> "$GITHUB_STEP_SUMMARY"
@@ -155,7 +156,7 @@ jobs:
             --platform-id ubuntu-22.04-x86_64 \
             --report-sequence 1 \
             --cohort-id "$COHORT_ID" \
-            --runner-environment self-hosted \
+            --runner-environment github-hosted \
             --host-pair-id "github:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}:ubuntu-22.04-x86_64" \
             --timeout 180 \
             --preflight-only

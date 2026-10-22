@@ -708,11 +708,13 @@ Manual dispatch requires lowercase immutable baseline and candidate SHAs,
 purpose, profile, warmup/sample counts, and a runner target. The
 `trusted-calibration` target is restricted to `workflow_dispatch` on `main`,
 accepts only same-SHA `noise-calibration`, and verifies on a GitHub-hosted
-preparation job that the target is commit history reachable from `main`. Only
-its x86 job can select the repository-scoped `wamr-temp-20260906` label;
-AArch64 remains `ubuntu-24.04-arm`. Both trusted-calibration jobs explicitly
-enable the same fixed scheduler/barrier quality preflight; ordinary hosted
-PR/push diagnostics do not enable it.
+preparation job that the target is commit history reachable from `main`. After
+the temporary `wamr-temp-20260906` (`vm31e-wamr-temp-20260906`) self-hosted x86
+runner was retired and deregistered (#1082), both `trusted-calibration-x86` and
+the `wasi-thread-duration-cross.yml` `x86` job fall back to GitHub-hosted
+`ubuntu-22.04` while AArch64 remains `ubuntu-24.04-arm`. Both
+trusted-calibration jobs explicitly enable the same fixed scheduler/barrier
+quality preflight; ordinary hosted PR/push diagnostics do not enable it.
 
 The preflight runs before any warmup or measured record. For each selected
 thread count it runs exactly four AOT `hot` invocations with the explicit
