@@ -39,12 +39,13 @@ permissions:
 
 jobs:
   x86:
-    name: Trusted x86 duration-cross
+    name: Hosted x86 duration-cross
     if: ${{ !inputs.preflight_only || inputs.preflight_platform == 'x86' }}
-    runs-on: wamr-temp-20260906
+    runs-on: ubuntu-22.04
     timeout-minutes: 720
     permissions:
       contents: read
+      attestations: read
     env:
       ROOT: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86
       HOME: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86/home
@@ -63,11 +64,15 @@ jobs:
           PREFLIGHT_PLATFORM: ${{ inputs.preflight_platform }}
         run: |
           set -euo pipefail
+          sudo mkdir -p /d/wamr-duration-cross
+          sudo chown "$USER":"$(id -gn)" /d /d/wamr-duration-cross
           case "$ROOT:$HOME:$TMPDIR:$XDG_CACHE_HOME:$ZIG_GLOBAL_CACHE_DIR:$ZIG_LOCAL_CACHE_DIR" in
             /d/*:/d/*:/d/*:/d/*:/d/*:/d/*) ;;
             *) echo "all diagnostic paths must remain under /d" >&2; exit 2 ;;
           esac
-          test "$RUNNER_NAME" = vm31e-wamr-temp-20260906
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+          grep -q 'model name' /proc/cpuinfo
           test "$GITHUB_RUN_ATTEMPT" = 1
           test "$(find /proc/[0-9]*/comm -type f -exec cat {} \; 2>/dev/null | grep -c '^Runner.Worker$')" = 1
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
@@ -84,9 +89,6 @@ jobs:
           [[ "$GITHUB_REF" =~ ^refs/tags/wasi-thread-duration-cross-[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
           test "$GITHUB_SHA" = "$SOURCE_SHA"
           mkdir -p "$ROOT"/{home,tmp,xdg-cache,zig-global-cache,zig-local-cache,zig,output,source}
-          AVAILABLE_KIB="$(df --output=avail -k /d | tail -n 1 | tr -d ' ')"
-          [[ "$AVAILABLE_KIB" =~ ^[0-9]+$ ]]
-          (( AVAILABLE_KIB >= 80 * 1024 * 1024 ))
 
       - name: Fetch and validate immutable trusted source
         env:
@@ -102,21 +104,15 @@ jobs:
           git -C "$ROOT/source" merge-base --is-ancestor "$SOURCE_SHA" origin/main
           test -z "$(git -C "$ROOT/source" status --porcelain)"
 
-      - name: Install pinned Zig 0.16.0 under /d
-        run: |
-          set -euo pipefail
-          ARCHIVE="$ROOT/tmp/zig-x86_64-linux-0.16.0.tar.xz"
-          curl --fail --location --silent --show-error \
-            --connect-timeout 30 --max-time 300 \
-            https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz \
-            --output "$ARCHIVE"
-          echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  $ARCHIVE" \
-            | sha256sum --check --strict
-          tar --extract --xz --file "$ARCHIVE" --directory "$ROOT/zig" \
-            --strip-components=1
-          test "$("$ROOT/zig/zig" version)" = 0.16.0
-          echo "$ROOT/zig" >> "$GITHUB_PATH"
-          rm -- "$ARCHIVE"
+      - name: Install Zig 0.17.0
+        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: v0.8.1
+          tools: |
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.16.0 ?id=wamr-benchmark-zig016&alias=zig:zig016 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Test diagnostic harness
         run: python3 "$ROOT/source/scripts/test_wasi_thread_duration_cross.py"
@@ -136,7 +132,7 @@ jobs:
             --platform-id ubuntu-22.04-x86_64 \
             --report-sequence "$REPORT_SEQUENCE" \
             --cohort-id "$COHORT_ID" \
-            --runner-environment self-hosted \
+            --runner-environment github-hosted \
             --host-pair-id "github:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}:ubuntu-22.04-x86_64" \
             --timeout 180
           cat "$ROOT/output/report.md" >> "$GITHUB_STEP_SUMMARY"
@@ -155,7 +151,7 @@ jobs:
             --platform-id ubuntu-22.04-x86_64 \
             --report-sequence 1 \
             --cohort-id "$COHORT_ID" \
-            --runner-environment self-hosted \
+            --runner-environment github-hosted \
             --host-pair-id "github:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}:ubuntu-22.04-x86_64" \
             --timeout 180 \
             --preflight-only
@@ -212,6 +208,7 @@ jobs:
     timeout-minutes: 720
     permissions:
       contents: read
+      attestations: read
     env:
       ROOT: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-arm
       HOME: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-arm/home
@@ -270,21 +267,15 @@ jobs:
           git -C "$ROOT/source" merge-base --is-ancestor "$SOURCE_SHA" origin/main
           test -z "$(git -C "$ROOT/source" status --porcelain)"
 
-      - name: Install pinned Zig 0.16.0 under /d
-        run: |
-          set -euo pipefail
-          ARCHIVE="$ROOT/tmp/zig-aarch64-linux-0.16.0.tar.xz"
-          curl --fail --location --silent --show-error \
-            --connect-timeout 30 --max-time 300 \
-            https://ziglang.org/download/0.16.0/zig-aarch64-linux-0.16.0.tar.xz \
-            --output "$ARCHIVE"
-          echo "ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17  $ARCHIVE" \
-            | sha256sum --check --strict
-          tar --extract --xz --file "$ARCHIVE" --directory "$ROOT/zig" \
-            --strip-components=1
-          test "$("$ROOT/zig/zig" version)" = 0.16.0
-          echo "$ROOT/zig" >> "$GITHUB_PATH"
-          rm -- "$ARCHIVE"
+      - name: Install Zig 0.17.0
+        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: v0.8.1
+          tools: |
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.16.0 ?id=wamr-benchmark-zig016&alias=zig:zig016 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Test diagnostic harness
         if: ${{ inputs.preflight_only }}

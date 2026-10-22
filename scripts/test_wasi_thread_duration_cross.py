@@ -1701,7 +1701,19 @@ class DurationCrossCohortTests(unittest.TestCase):
         self.assertIn("group: wasi-thread-duration-cross-diagnostic", workflow)
         self.assertIn("cancel-in-progress: false", workflow)
         self.assertIn("needs: x86", workflow)
-        self.assertIn("runs-on: wamr-temp-20260906", workflow)
+        self.assertIn("runs-on: ubuntu-22.04", workflow)
+        self.assertNotIn("wamr-temp-20260906", workflow)
+        self.assertNotIn("vm31e-wamr-temp-20260906", workflow)
+        self.assertNotIn("--runner-environment self-hosted", workflow)
+        hosted_x86 = synthetic_report(
+            platform="ubuntu-22.04-x86_64", sequence=1
+        )
+        hosted_x86["metadata"]["host"] = {
+            "runner_environment": "github-hosted",
+            "runner_name": "GitHub Actions 42",
+            "cpu": "AMD EPYC 7763 64-Core Processor",
+        }
+        duration.validate_report(hosted_x86)
         self.assertIn(
             'run: python3 "$ROOT/source/scripts/test_wasi_thread_duration_cross.py"',
             workflow,
@@ -1722,8 +1734,16 @@ class DurationCrossCohortTests(unittest.TestCase):
         self.assertIn("wasi-thread-duration-cross-readiness-arm-", workflow)
         self.assertIn("Neoverse-N2", workflow)
         self.assertNotIn("mlugg/setup-zig", workflow)
-        self.assertIn("zig-x86_64-linux-0.16.0.tar.xz", workflow)
-        self.assertIn("zig-aarch64-linux-0.16.0.tar.xz", workflow)
+        self.assertNotIn("ziglang.org/download", workflow)
+        self.assertIn(
+            "cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e",
+            workflow,
+        )
+        self.assertIn("cataggar/zig@v0.17.0", workflow)
+        self.assertIn(
+            "cataggar/zig@v0.16.0 ?id=wamr-benchmark-zig016&alias=zig:zig016",
+            workflow,
+        )
         self.assertIn("${{ github.run_attempt }}", workflow)
         self.assertIn("/d/wamr-duration-cross/", workflow)
         self.assertNotIn("~/.cache", workflow)

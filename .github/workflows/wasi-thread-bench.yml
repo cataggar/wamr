@@ -388,26 +388,8 @@ jobs:
     permissions:
       contents: read
       attestations: read
-    runs-on: wamr-temp-20260906
+    runs-on: ubuntu-22.04
     steps:
-      - name: Require runner work directories under /d
-        run: |
-          set -euo pipefail
-          case "$GITHUB_WORKSPACE:$RUNNER_TEMP" in
-            /d/*:/d/*) ;;
-            *) echo "self-hosted workspace and temp paths must remain under /d" >&2; exit 2 ;;
-          esac
-          AVAILABLE_KIB="$(df --output=avail -k "$RUNNER_TEMP" | tail -n 1 | tr -d ' ')"
-          [[ "$AVAILABLE_KIB" =~ ^[0-9]+$ ]] || {
-            echo "could not determine available runner storage" >&2
-            exit 2
-          }
-          MIN_AVAILABLE_KIB=$((80 * 1024 * 1024))
-          (( AVAILABLE_KIB >= MIN_AVAILABLE_KIB )) || {
-            echo "trusted calibration requires at least 80 GiB free under /d" >&2
-            exit 2
-          }
-
       - name: Check out baseline
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -436,7 +418,6 @@ jobs:
         run: |
           set -euo pipefail
           EXPECTED_ROOT="$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-x86"
-          case "$EXPECTED_ROOT" in /d/*) ;; *) exit 2 ;; esac
           mkdir -p "$EXPECTED_ROOT"/{tmp,xdg-cache,zig-global-cache,zig-local-cache,output}
           {
             echo "WASI_THREAD_ROOT=$EXPECTED_ROOT"
@@ -504,7 +485,7 @@ jobs:
             --timeout 90 \
             --platform-id ubuntu-22.04-x86_64 \
             --host-pair-id "github:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}:ubuntu-22.04-x86_64" \
-            --runner-environment self-hosted \
+            --runner-environment github-hosted \
             --output-dir "$WASI_THREAD_OUTPUT" \
             --trusted-calibration-preflight \
             --no-budget
@@ -537,7 +518,6 @@ jobs:
             "$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-x86") ;;
             *) exit 2 ;;
           esac
-          case "$EXPECTED_ROOT" in /d/*) ;; *) exit 2 ;; esac
           rm -rf -- "$EXPECTED_ROOT"
 
   trusted-calibration-arm:

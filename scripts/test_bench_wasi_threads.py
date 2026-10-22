@@ -5630,7 +5630,8 @@ class ThreadBenchmarkTests(unittest.TestCase):
         workflow = (
             ROOT / ".github/workflows/wasi-thread-bench.yml"
         ).read_text(encoding="UTF-8")
-        self.assertEqual(workflow.count("wamr-temp-20260906"), 1)
+        self.assertNotIn("wamr-temp-20260906", workflow)
+        self.assertNotIn("vm31e-wamr-temp-20260906", workflow)
         start = workflow.index("\n  trusted-calibration-x86:")
         end = workflow.index("\n  trusted-calibration-arm:", start)
         trusted_x86 = workflow[start:end]
@@ -5660,12 +5661,8 @@ class ThreadBenchmarkTests(unittest.TestCase):
             "trusted calibration revisions must equal the calibration tag commit",
             workflow,
         )
-        self.assertIn("MIN_AVAILABLE_KIB=$((80 * 1024 * 1024))", trusted_x86)
-        self.assertIn(
-            "trusted calibration requires at least 80 GiB free under /d",
-            trusted_x86,
-        )
-        self.assertIn("runs-on: wamr-temp-20260906", trusted_x86)
+        self.assertIn("runs-on: ubuntu-22.04", trusted_x86)
+        self.assertIn("--runner-environment github-hosted", trusted_x86)
         self.assertNotIn("runs-on: [", trusted_x86)
         self.assertNotIn("runs-on: self-hosted", trusted_x86)
         self.assertNotIn("pull_request", trusted_x86)
