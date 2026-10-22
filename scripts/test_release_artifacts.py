@@ -372,10 +372,7 @@ class ReleaseArtifactTests(unittest.TestCase):
         for name in release.TARGETS:
             self.assertIn(f"name: {name}\n", workflow)
         for filename in ("pypi.yml", "pypi-wamrc.yml"):
-            follower = (release.REPO / ".github/workflows" / filename).read_text()
-            build = follower.split("  publish:", 1)[0]
-            self.assertIn("github.event.workflow_run.event == 'push'", build)
-            self.assertIn("startsWith(github.event.workflow_run.head_branch, 'v')", build)
+            self.assertFalse((release.REPO / ".github/workflows" / filename).exists())
 
 
 class WheelBuilderTests(unittest.TestCase):
