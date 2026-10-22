@@ -1517,9 +1517,9 @@ pub const ComponentInstance = struct {
     /// canonical ABI sees a `(ptr, len)` PtrLen.
     pub fn hostAllocGuest(self: *ComponentInstance, size: u32, align_: u32) ?u32 {
         if (self.test_mem) |tm| return tm.alloc(size, align_);
-        const saved_may_leave = self.may_leave;
-        self.may_leave = false;
-        defer self.may_leave = saved_may_leave;
+        const saved_may_leave = @atomicLoad(bool, &self.may_leave, .acquire);
+        @atomicStore(bool, &self.may_leave, false, .release);
+        defer @atomicStore(bool, &self.may_leave, saved_may_leave, .release);
         const a: u32 = if (align_ == 0) 1 else align_;
         // Honor the in-flight canon-lower's `(realloc $f)` when set.
         // This is required for wit-component's preview1 adapter, which
@@ -2327,6 +2327,7 @@ pub const ComponentInstance = struct {
     }
 
     pub fn deinit(self: *ComponentInstance) void {
+        _ = self.threads.joinSharedThreads();
         if (comptime config.lib_wasi_threads) self.thread_manager.deinit();
         // The cached `cabi_realloc` ExecEnv must be freed before the
         // core instances it points at (#538).
@@ -3396,6 +3397,17 @@ pub fn instantiateWithOptions(
     if (comptime config.lib_wasi_threads) {
         var threaded_memory: ?*core_types.MemoryInstance = null;
         for (inst.core_instances) |entry| {
+            if (entry.module_inst) |mi| {
+                mi.thread_manager = &inst.thread_manager;
+                if (mi.memories.len > 0 and mi.memories[0].shared_control != null) {
+                    inst.thread_manager.bindSharedMemory(mi.memories[0]);
+                }
+            }
+            if (entry.aot_inst) |ai| {
+                if (ai.memories.len > 0 and ai.memories[0].shared_control != null) {
+                    inst.thread_manager.bindSharedMemory(ai.memories[0]);
+                }
+            }
             const memory: *core_types.MemoryInstance = blk: {
                 if (entry.aot_inst) |ai| {
                     if (!aot_runtime.usesWasiThreads(ai.module)) continue;

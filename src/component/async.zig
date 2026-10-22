@@ -538,6 +538,30 @@ pub const ComponentThread = struct {
     target: ComponentThreadTarget,
     is_shared: bool = false,
     in_flight: bool = false,
+    os_thread: ?std.Thread = null,
+};
+
+/// Thread-local active component thread index for OS-thread-backed
+/// shared-everything component threads (`thread.spawn-ref` / `thread.spawn-indirect`
+/// with `is_shared = true`). When non-zero, `thread.index` returns this OS
+/// worker thread's own 1-based handle index; when zero (on the main/cooperative
+/// thread), callers fall back to `ComponentThreadTable.current_thread_idx`.
+pub threadlocal var tls_component_thread_idx: u32 = 0;
+
+/// Lightweight spinlock mutex protecting `ComponentThreadTable` against
+/// concurrent access from shared-everything OS worker threads.
+pub const ThreadTableMutex = struct {
+    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+
+    pub fn lock(self: *ThreadTableMutex) void {
+        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    pub fn unlock(self: *ThreadTableMutex) void {
+        self.state.store(0, .release);
+    }
 };
 
 /// Per-component-instance explicit thread table (1-based indices).
@@ -545,8 +569,12 @@ pub const ComponentThread = struct {
 /// zero-thread components incur no heap allocations. Explicit threads created
 /// via `thread.new-indirect` / `thread.spawn-*` occupy 1-based indices `>= 2`.
 pub const ComponentThreadTable = struct {
+    mutex: ThreadTableMutex = .{},
     entries: std.ArrayListUnmanaged(?ComponentThread) = .empty,
     ready_queue: std.ArrayListUnmanaged(u32) = .empty,
+    os_threads: std.ArrayListUnmanaged(std.Thread) = .empty,
+    active_shared_workers: usize = 0,
+    shared_trap_err: ?anyerror = null,
     implicit_main_entry: ?ComponentThread = .{
         .state = .running,
         .target = .implicit_main,
@@ -555,18 +583,31 @@ pub const ComponentThreadTable = struct {
     current_thread_idx: u32 = 1,
 
     pub fn deinit(self: *ComponentThreadTable, allocator: std.mem.Allocator) void {
+        _ = self.joinSharedThreads();
+        self.os_threads.deinit(allocator);
         self.entries.deinit(allocator);
         self.ready_queue.deinit(allocator);
         self.* = .{};
     }
 
+    pub fn activeThreadIdx(self: *ComponentThreadTable) u32 {
+        if (tls_component_thread_idx != 0) return tls_component_thread_idx;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.current_thread_idx;
+    }
+
     pub fn resetForTaskEntry(self: *ComponentThreadTable) void {
+        _ = self.joinSharedThreads();
+        self.mutex.lock();
+        defer self.mutex.unlock();
         self.implicit_main_entry = .{
             .state = .running,
             .target = .implicit_main,
             .in_flight = true,
         };
         self.current_thread_idx = 1;
+        self.shared_trap_err = null;
     }
 
     pub fn allocThread(
@@ -575,28 +616,145 @@ pub const ComponentThreadTable = struct {
         target: ComponentThreadTarget,
         is_shared: bool,
     ) !u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.allocThreadLocked(allocator, target, is_shared, .suspended, false);
+    }
+
+    pub fn allocSharedThread(
+        self: *ComponentThreadTable,
+        allocator: std.mem.Allocator,
+        target: ComponentThreadTarget,
+    ) !u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.os_threads.ensureUnusedCapacity(allocator, 1);
+        const idx = try self.allocThreadLocked(allocator, target, true, .running, true);
+        self.active_shared_workers += 1;
+        return idx;
+    }
+
+    pub fn rollbackSharedThreadSpawn(self: *ComponentThreadTable, thread_idx: u32) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.active_shared_workers > 0) {
+            self.active_shared_workers -= 1;
+        }
+        self.removeLocked(thread_idx);
+    }
+
+    pub fn registerSharedOsThread(
+        self: *ComponentThreadTable,
+        thread_idx: u32,
+        os_thread: std.Thread,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.getLocked(thread_idx)) |entry| {
+            entry.os_thread = os_thread;
+        }
+        self.os_threads.appendAssumeCapacity(os_thread);
+    }
+
+    pub fn finishSharedThread(self: *ComponentThreadTable, thread_idx: u32) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.getLocked(thread_idx)) |entry| {
+            entry.in_flight = false;
+        }
+        if (self.active_shared_workers > 0) {
+            self.active_shared_workers -= 1;
+        }
+    }
+
+    pub fn recordSharedTrap(self: *ComponentThreadTable, err: anyerror) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.shared_trap_err == null) {
+            self.shared_trap_err = err;
+        }
+    }
+
+    pub fn hasSharedTrap(self: *ComponentThreadTable) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.shared_trap_err != null;
+    }
+
+    pub fn hasActiveSharedThreads(self: *ComponentThreadTable) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.active_shared_workers > 0 or self.os_threads.items.len > 0;
+    }
+
+    /// Join all spawned shared-everything OS worker threads (including any
+    /// nested worker threads spawned transitively), reclaim their completed
+    /// table slots, and return any recorded worker trap error.
+    pub fn joinSharedThreads(self: *ComponentThreadTable) ?anyerror {
+        while (true) {
+            self.mutex.lock();
+            if (self.os_threads.items.len == 0) {
+                const active = self.active_shared_workers;
+                self.mutex.unlock();
+                if (active == 0) break;
+                std.Thread.yield() catch std.atomic.spinLoopHint();
+                continue;
+            }
+            const thread = self.os_threads.pop().?;
+            self.mutex.unlock();
+            thread.join();
+        }
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.entries.items) |*slot| {
+            if (slot.*) |entry| {
+                if (entry.is_shared and !entry.in_flight) {
+                    slot.* = null;
+                }
+            }
+        }
+        const err = self.shared_trap_err;
+        self.shared_trap_err = null;
+        return err;
+    }
+
+    fn allocThreadLocked(
+        self: *ComponentThreadTable,
+        allocator: std.mem.Allocator,
+        target: ComponentThreadTarget,
+        is_shared: bool,
+        initial_state: ComponentThreadState,
+        in_flight: bool,
+    ) !u32 {
         for (self.entries.items, 0..) |*slot, idx| {
             if (slot.* == null) {
                 slot.* = .{
-                    .state = .suspended,
+                    .state = initial_state,
                     .target = target,
                     .is_shared = is_shared,
-                    .in_flight = false,
+                    .in_flight = in_flight,
                 };
                 return @intCast(idx + 2);
             }
         }
         const idx = self.entries.items.len;
         try self.entries.append(allocator, .{
-            .state = .suspended,
+            .state = initial_state,
             .target = target,
             .is_shared = is_shared,
-            .in_flight = false,
+            .in_flight = in_flight,
         });
         return @intCast(idx + 2);
     }
 
     pub fn get(self: *ComponentThreadTable, thread_idx: u32) ?*ComponentThread {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.getLocked(thread_idx);
+    }
+
+    fn getLocked(self: *ComponentThreadTable, thread_idx: u32) ?*ComponentThread {
         if (thread_idx == 0) return null;
         if (thread_idx == 1) {
             if (self.implicit_main_entry != null) {
@@ -613,7 +771,13 @@ pub const ComponentThreadTable = struct {
     }
 
     pub fn remove(self: *ComponentThreadTable, thread_idx: u32) void {
-        self.removeFromReadyQueue(thread_idx);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.removeLocked(thread_idx);
+    }
+
+    fn removeLocked(self: *ComponentThreadTable, thread_idx: u32) void {
+        self.removeFromReadyQueueLocked(thread_idx);
         if (thread_idx == 1) {
             self.implicit_main_entry = null;
             return;
@@ -630,7 +794,9 @@ pub const ComponentThreadTable = struct {
         allocator: std.mem.Allocator,
         thread_idx: u32,
     ) !void {
-        const entry = self.get(thread_idx) orelse return error.InvalidThreadIndex;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const entry = self.getLocked(thread_idx) orelse return error.InvalidThreadIndex;
         entry.state = .ready;
         for (self.ready_queue.items) |existing| {
             if (existing == thread_idx) return;
@@ -639,6 +805,12 @@ pub const ComponentThreadTable = struct {
     }
 
     pub fn removeFromReadyQueue(self: *ComponentThreadTable, thread_idx: u32) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.removeFromReadyQueueLocked(thread_idx);
+    }
+
+    fn removeFromReadyQueueLocked(self: *ComponentThreadTable, thread_idx: u32) void {
         var i: usize = 0;
         while (i < self.ready_queue.items.len) {
             if (self.ready_queue.items[i] == thread_idx) {
@@ -650,10 +822,12 @@ pub const ComponentThreadTable = struct {
     }
 
     pub fn popReady(self: *ComponentThreadTable) ?u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         var i: usize = 0;
         while (i < self.ready_queue.items.len) {
             const idx = self.ready_queue.items[i];
-            if (self.get(idx)) |entry| {
+            if (self.getLocked(idx)) |entry| {
                 if (entry.state == .ready) {
                     if (!entry.in_flight) {
                         _ = self.ready_queue.orderedRemove(i);
