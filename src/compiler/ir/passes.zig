@@ -2311,6 +2311,8 @@ fn fitsSignedI32(c: i64) bool {
 /// non-constant (a `LEA` base/index is a register).
 pub fn foldCompoundLea(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
     var changed = false;
+    var func_constants = std.AutoHashMap(ir.VReg, i64).init(allocator);
+    defer func_constants.deinit();
     var constants = std.AutoHashMap(ir.VReg, i64).init(allocator);
     defer constants.deinit();
     var defs = std.AutoHashMap(ir.VReg, usize).init(allocator);
@@ -2319,6 +2321,18 @@ pub fn foldCompoundLea(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool
     defer use_counts.deinit();
     var consumed = std.AutoHashMap(ir.VReg, void).init(allocator);
     defer consumed.deinit();
+
+    for (func.blocks.items) |*block| {
+        for (block.instructions.items) |inst| {
+            if (inst.dest) |d| {
+                switch (inst.op) {
+                    .iconst_32 => |v| try func_constants.put(d, v),
+                    .iconst_64 => |v| try func_constants.put(d, v),
+                    else => {},
+                }
+            }
+        }
+    }
 
     for (func.blocks.items) |*block| {
         constants.clearRetainingCapacity();
@@ -2348,6 +2362,52 @@ pub fn foldCompoundLea(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool
             };
             const dest = inst.dest orelse continue;
             if (inst.type != .i32 and inst.type != .i64) continue;
+
+            // Reassociate single-use `add(add(x, c1), c2)` -> `add(x, c1 +% c2)`
+            // in place so unrolled loop accumulators collapse their constant
+            // step chain into one addition.
+            const outer_rhs_c = func_constants.get(bin.rhs);
+            const outer_lhs_c = func_constants.get(bin.lhs);
+            if ((outer_lhs_c != null) != (outer_rhs_c != null)) {
+                const c2 = outer_rhs_c orelse outer_lhs_c.?;
+                const p_vreg = if (outer_rhs_c != null) bin.lhs else bin.rhs;
+                if (func_constants.get(p_vreg) == null and (use_counts.get(p_vreg) orelse 0) == 1) {
+                    if (defs.get(p_vreg)) |p_di| {
+                        const p_inst = block.instructions.items[p_di];
+                        if (p_inst.type == inst.type and p_inst.op == .add) {
+                            const p_bin = p_inst.op.add;
+                            const inner_rhs_c = func_constants.get(p_bin.rhs);
+                            const inner_lhs_c = func_constants.get(p_bin.lhs);
+                            if ((inner_lhs_c != null) != (inner_rhs_c != null)) {
+                                const c1 = inner_rhs_c orelse inner_lhs_c.?;
+                                const x_vreg = if (inner_rhs_c != null) p_bin.lhs else p_bin.rhs;
+                                const raw_sum = c1 +% c2;
+                                const sum: i64 = if (inst.type == .i64)
+                                    raw_sum
+                                else
+                                    @as(i64, @as(i32, @truncate(raw_sum)));
+                                if (fitsSignedI32(sum) and sum != 0) {
+                                    block.instructions.items[p_di].op = if (inst.type == .i64)
+                                        .{ .iconst_64 = sum }
+                                    else
+                                        .{ .iconst_32 = @truncate(sum) };
+                                    try constants.put(p_vreg, sum);
+                                    try func_constants.put(p_vreg, sum);
+                                    _ = defs.remove(p_vreg);
+                                    block.instructions.items[i].op = .{ .add = .{
+                                        .lhs = x_vreg,
+                                        .rhs = p_vreg,
+                                    } };
+                                    block.instructions.items[i].dest = dest;
+                                    try defs.put(dest, i);
+                                    changed = true;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             // Outer add(P, C): identify the constant operand C and the
             // non-constant intermediate P = add(base, S).
@@ -5212,6 +5272,9 @@ pub fn unrollSmallFixedLoops(func: *ir.IrFunction, allocator: std.mem.Allocator)
 
         remapLoopLiveOuts(func, loop, final_map.items);
         ph_block.instructions.items[insert_at].op = .{ .br = exit_info.exit };
+        var dead_loop_block = &func.blocks.items[loop.blocks[0]];
+        dead_loop_block.instructions.clearRetainingCapacity();
+        try dead_loop_block.append(.{ .op = .@"unreachable" });
         return true;
     }
     return false;
@@ -12791,6 +12854,8 @@ test "unrollSmallFixedLoops: trip count four fully unrolled" {
 
     try std.testing.expect(try unrollSmallFixedLoops(&func, allocator));
     try std.testing.expectEqual(ir.Inst.Op{ .br = b2 }, func.getBlock(b0).instructions.items[func.getBlock(b0).instructions.items.len - 1].op);
+    try std.testing.expectEqual(@as(usize, 1), func.getBlock(b1).instructions.items.len);
+    try std.testing.expectEqual(ir.Inst.Op.@"unreachable", func.getBlock(b1).instructions.items[0].op);
     var dom = try analysis.computeDominators(&func, allocator);
     defer dom.deinit();
     var lf = try analysis.computeLoops(&func, &dom, allocator);
@@ -14877,6 +14942,45 @@ test "foldCompoundLea: end-to-end via pipeline removes dead shl/add" {
     const lea = found orelse return error.NoLea;
     try std.testing.expectEqual(@as(u8, 4), lea.scale);
     try std.testing.expectEqual(@as(i32, 16), lea.disp);
+}
+
+test "foldCompoundLea: reassociates single-use constant add chain in place" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const base = func.newVReg();
+    const c1 = func.newVReg();
+    const c2 = func.newVReg();
+    const c3 = func.newVReg();
+    const a1 = func.newVReg();
+    const a2 = func.newVReg();
+    const result = func.newVReg();
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = base, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = c1, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = base, .rhs = c1 } }, .dest = a1, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 2 }, .dest = c2, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = a1, .rhs = c2 } }, .dest = a2, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = c3, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = a2, .rhs = c3 } }, .dest = result, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = result } });
+
+    try std.testing.expect(try foldCompoundLea(&func, allocator));
+    _ = try deadCodeElimination(&func, allocator);
+
+    var add_count: usize = 0;
+    var final_const: ?i32 = null;
+    for (block.instructions.items) |inst| {
+        switch (inst.op) {
+            .iconst_32 => |v| final_const = v,
+            .add => add_count += 1,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), add_count);
+    try std.testing.expectEqual(@as(?i32, 6), final_const);
 }
 
 test "strengthReduceDivRem: div_u by 5 uses reciprocal multiply" {
