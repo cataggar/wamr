@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Audit retained #986 sample-level provenance without reclassifying unknowns.
+"""Audit retained #986 sample-level provenance and terminal-sink exhaustion.
 
-The profile's sampled instruction rows and per-engine totals are the input,
-not a new perf capture. This does not independently rerun native disassembly
-or prove semantics absent from the original classifier.
+Validates the retained profile's sampled instruction partitions, groups the
+uncertain samples into deterministic unknown-reason clusters, and when the
+retained Wasmtime disassembly (`wasmtime-objdump.txt`) is provided, reruns
+the native AArch64 classifier and join/cycle-unblocked terminal-sink
+exhaustion analysis to prove whether conservative headroom can clear +5.00 pp.
 """
 
 import argparse
@@ -45,7 +47,108 @@ def audit_rows(analysis, *, engine):
     )
 
 
-def reanalyze(report, cwasm_bytes, benchmark_bytes):
+def _reanalyze_wasmtime_native_exhaustion(analyses, wasmtime_objdump_text):
+    wasmtime_saved = analyses["wasmtime"]
+    aot = profile.load_aot_helper(Path(__file__).resolve().parents[1])
+    insts = profile.compare_hot_function.parse_disassembly(
+        wasmtime_objdump_text, wasmtime_wasm_index=15
+    )
+    address_base = profile._wasmtime_function_address_base(
+        wasmtime_objdump_text, 15
+    )
+    adapter = [
+        aot.Instruction(
+            address=item.offset,
+            offset=item.offset,
+            size=item.size,
+            text=item.text,
+        )
+        for item in insts
+    ]
+    broad_classes_list = aot.classify_instruction_stream(
+        adapter, architecture="aarch64"
+    )
+    inst_by_offset = {int(inst.offset): inst for inst in insts}
+    samples_by_offset = {}
+    for row in wasmtime_saved["common_gating_universe"]["sampled_instructions"]:
+        offset = int(row["offset"])
+        if offset not in inst_by_offset:
+            raise ValueError(
+                f"wasmtime sampled offset {offset} is absent from native disassembly"
+            )
+        inst = inst_by_offset[offset]
+        expected_text = str(inst.text).strip()
+        if row["instruction"] != expected_text:
+            raise ValueError(
+                f"wasmtime sampled instruction at offset {offset} "
+                f"({row['instruction']!r}) differs from native disassembly "
+                f"({expected_text!r})"
+            )
+        samples_by_offset[offset] = int(row["samples"])
+
+    total_run_samples = int(wasmtime_saved["total_run_samples"])
+    global_attributed = int(
+        wasmtime_saved["global_sample_mapping"]["attributed_samples"]
+    )
+    rerun = provenance.analyze_instruction_stream(
+        insts,
+        broad_classes=broad_classes_list,
+        samples_by_offset=samples_by_offset,
+        total_run_samples=total_run_samples,
+        address_base=address_base,
+        global_attributed_samples=global_attributed,
+    )
+    for key in (
+        "categories",
+        "coverage",
+        "common_gating_universe",
+        "cfg",
+        "sampled_instructions",
+        "reason_counts",
+    ):
+        if rerun[key] != wasmtime_saved[key]:
+            raise ValueError(
+                f"retained Wasmtime {key} differs from native disassembly rerun"
+            )
+
+    exhaustion = provenance.analyze_terminal_sink_exhaustion(
+        insts,
+        broad_classes=broad_classes_list,
+        samples_by_offset=samples_by_offset,
+        total_run_samples=total_run_samples,
+        address_base=address_base,
+        global_attributed_samples=global_attributed,
+    )
+    exhaustion_gate = provenance.compare_terminal_sink_exhaustion(
+        analyses["wamr"],
+        wasmtime_saved,
+        wasmtime_exhaustion=exhaustion,
+        threshold_pct=5.0,
+    )
+    sink_summary = {
+        sink: {
+            "samples": data["samples"],
+            "percent_of_run": data["percent_of_run"],
+            "percent_of_common_universe": data["percent_of_common_universe"],
+            "static_instructions": data["static_instructions"],
+            "top_sampled_instructions": data["sampled_instructions"][:10],
+        }
+        for sink, data in exhaustion["sink_classes"].items()
+    }
+    return {
+        "verified_retained_provenance": True,
+        "address_base": address_base,
+        "static_instructions": len(insts),
+        "common_static_instructions": exhaustion["common_static_instructions"],
+        "sink_classes": sink_summary,
+        "reclassified_from_unknown": exhaustion["reclassified_from_unknown"],
+        "exhaustion_gate": exhaustion_gate,
+    }
+
+
+def reanalyze(
+    report, cwasm_bytes, benchmark_bytes, *, wasmtime_objdump_text=None
+):
     profile.validate_report(report)
     artifact = report["retained_analysis_artifacts"]["wamr_cwasm"]
     if artifact["path"] != "wamr-profiled.cwasm.gz" or len(cwasm_bytes) != artifact["source_size_bytes"]:
@@ -66,12 +169,18 @@ def reanalyze(report, cwasm_bytes, benchmark_bytes):
     analyses = target["alu_provenance"]
     ranked = {engine: audit_rows(analyses[engine], engine=engine)
               for engine in ("wamr", "wasmtime")}
+    clusters = {
+        engine: provenance.classify_unknown_reason_clusters(
+            analyses[engine], name=engine
+        )
+        for engine in ("wamr", "wasmtime")
+    }
     gate = provenance.compare_engine_analyses(
         analyses["wamr"], analyses["wasmtime"], threshold_pct=5.0
     )
     if gate != analyses["gate"] or gate != report["alu_provenance"]["gate"]:
         raise ValueError("retained conservative gate differs from recomputed gate")
-    return {
+    result = {
         "source_commit": report["provenance"]["analysis_sources"]["commit"],
         "cwasm_sha256": report["wamr"]["cwasm_sha256"],
         "function": "core_bench_list",
@@ -85,16 +194,47 @@ def reanalyze(report, cwasm_bytes, benchmark_bytes):
             engine: analyses[engine]["common_gating_universe"]["categories"]
             for engine in ("wamr", "wasmtime")
         },
+        "unknown_reason_clusters": {
+            engine: {
+                "uncertain_samples": clusters[engine]["uncertain_samples"],
+                "uncertain_percent_of_run": clusters[engine][
+                    "uncertain_percent_of_run"
+                ],
+                "clusters": {
+                    name: {
+                        "samples": item["samples"],
+                        "percent_of_run": item["percent_of_run"],
+                        "percent_of_uncertain": item["percent_of_uncertain"],
+                        "sampled_instruction_count": item[
+                            "sampled_instruction_count"
+                        ],
+                        "top_sampled_instructions": item[
+                            "sampled_instructions"
+                        ][:5],
+                    }
+                    for name, item in clusters[engine]["clusters"].items()
+                },
+            }
+            for engine in ("wamr", "wasmtime")
+        },
         "top_uncertain_paths": {
             engine: ranked[engine][:20] for engine in ("wamr", "wasmtime")
         },
         "gate": gate,
         "scope": (
-            "Audits retained sampled instruction partitions and recomputes "
-            "the conservative gate; does not independently rerun the native "
-            "classifier or turn unknown control/escape paths into addresses."
+            "Audits retained sampled instruction partitions, groups uncertain "
+            "samples by reason cluster, recomputes the conservative gate, and "
+            "when native Wasmtime disassembly is supplied, verifies terminal-"
+            "sink exhaustion across CFG joins and cycles."
         ),
     }
+    if wasmtime_objdump_text is not None:
+        result["wasmtime_native_exhaustion"] = (
+            _reanalyze_wasmtime_native_exhaustion(
+                analyses, wasmtime_objdump_text
+            )
+        )
+    return result
 
 
 def main():
@@ -104,10 +244,15 @@ def main():
     args = parser.parse_args()
     root = args.artifact_dir
     report = json.loads((root / "profile.json").read_text())
+    objdump_path = root / "wasmtime-objdump.txt"
+    wasmtime_objdump_text = (
+        objdump_path.read_text() if objdump_path.is_file() else None
+    )
     result = reanalyze(
         report,
         gzip.decompress((root / "wamr-profiled.cwasm.gz").read_bytes()),
         (root / "benchmark-report.json").read_bytes(),
+        wasmtime_objdump_text=wasmtime_objdump_text,
     )
     output = json.dumps(result, indent=2) + "\n"
     if args.json_out:

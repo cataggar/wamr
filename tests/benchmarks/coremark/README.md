@@ -218,24 +218,49 @@ COREMARK_986_ARTIFACT_DIR=.cache/issue-986 \
 
 The audit checks the benchmark report hash/ID, exact uncompressed cwasm
 SHA-256, nonduplicate sampled instruction offsets, category sample totals,
-and the recomputed >=5 pp conservative gate. `top_uncertain_paths` ranks the
-sampled `unknown`/`mixed` instructions and their recorded def-use evidence for
-each engine. This is **not** an independent native disassembly or a rerun of
-the historical classifier. In particular, WAMR offset 708 (`add x17, x15,
-#4`, 5129 samples) reaches a compare at 716, but the control path does not
-prove a bounds check; Wasmtime offsets 176 (`cmp w2, w3`, 1318 samples) and
-284 (`mov x3, x19`, 1495 samples) respectively have unproven control and a
-multiple-definition join. Neither engine's unknowns can be reassigned from
-register names or adjacency. The retained reference unknowns and global
-unattributed samples keep the address-generation conservative headroom at
-**-7.4314 pp**, below the +5 pp gate. A new matched semantic/path proof
-(and independent verification against the recorded analysis sources) is
-required before an optimizer can be authorized.
+deterministic `unknown_reason_clusters` partitions, and the recomputed >=5 pp
+conservative gate. `top_uncertain_paths` ranks the sampled `unknown`/`mixed`
+instructions and their recorded def-use evidence for each engine:
+
+- **WAMR (`13,027` uncertain common-universe samples = `11,724` `unknown` + `1,303` `mixed`, `18.9214%` of run)**:
+  `non_trap_control` = `8,769` samples (`12.7368%` of run, led by offset 708 `add x17, x15, #4` with `5,129` samples whose out-of-bounds branch targets an indirect call `blr x16` before `brk #0x0`), `ambiguous_cfg_join` = `2,879` samples (`4.1817%`), `mixed_categories` = `1,303` samples (`1.8926%`), `untyped_escape` = `66` samples (`0.0959%`), `opaque_or_call_boundary` = `9` samples (`0.0131%`), and `dead_or_unconsumed` = `1` sample (`0.0015%`).
+- **Wasmtime (`5,740` uncertain common-universe samples = `5,740` `unknown` + `0` `mixed`, `17.3314%` of run)**:
+  `non_trap_control` = `3,411` samples (`10.2992%` of run, led by offset 176 `cmp w2, w3` with `1,318` samples), `ambiguous_cfg_join` = `2,025` samples (`6.1143%`, led by offset 284 `mov x3, x19` with `1,495` samples), `untyped_escape` = `216` samples (`0.6522%`), `opaque_or_call_boundary` = `76` samples (`0.2295%`), and `combined_memory_writeback` = `12` samples (`0.0362%`).
+
+When `wasmtime-objdump.txt` is present in `--artifact-dir`, `reanalyze_coremark_986.py`
+also reruns the native AArch64 classifier on Wasmtime's `core_bench_list`
+(`wasm_index=15`, `address_base=0x600`, `410` static instructions, `208`
+common-universe candidates) to verify 100% reproduction of `profile.json` and
+executes `analyze_terminal_sink_exhaustion` / `compare_terminal_sink_exhaustion`
+across all multi-definition CFG joins, loop cycles, and `cmp -> nzcv -> cset/csel`
+flag chains (`wasmtime_native_exhaustion`):
+
+- Unblocking CFG joins and loop cycles reclassifies only **`2` Wasmtime samples**
+  (`0.0060%` of run, at offsets `540` `mov x28, x19` and `1224` `mov x3, x19`)
+  from `unknown` (`5,740 -> 5,738`) into `pure_address` (`254 -> 256` samples,
+  `0.7730%` of run) and **`0` samples** into `pure_structural_guard` or
+  `pure_algorithmic` (Wasmtime `core_bench_list` emits zero `udf`/`brk` traps).
+- The remaining `5,738` Wasmtime common-universe samples terminate in
+  `non_trap_control` (`3,555` samples, `10.7340%`), `untyped_escape` (`1,735`
+  samples, `5.2387%`, led by offset `284` `mov x3, x19` storing guest list
+  pointers via `str w3, [x24, w19, uxtw]`),
+  `mixed_address_and_control_or_escape` (`336` samples, `1.0145%`),
+  `opaque_or_call_boundary` (`100` samples, `0.3019%`), and
+  `combined_memory_writeback` (`12` samples, `0.0362%`).
+- Because moving `2` Wasmtime samples from `unknown` to `pure_address` leaves
+  `unblocked_wasmtime_samples + wasmtime_remaining_upper_bound_samples`
+  invariant at `256 + 5,738 + 38 = 6,032` (`18.2131%` of run), conservative
+  `address_generation` headroom remains **`-7.4314 pp`** (and **`-5.5388 pp`**
+  even if all `1,303` WAMR `mixed` samples were credited to WAMR
+  `address_generation`), proving that the `+5.00 pp` conservative gate is
+  exhausted (`status: "exhausted"`, `proven_exhausted: true`).
+
 The optional artifact-backed test also rejects modified benchmark/cwasm bytes,
-changed sample partitions, and gate tampering; without the environment variable
-it skips only that test. The downloaded archive extracts the three required
-files (`profile.json`, `benchmark-report.json`, `wamr-profiled.cwasm.gz`)
-directly into the specified directory.
+tampered `wasmtime-objdump.txt` disassembly, changed sample partitions, and
+gate tampering; without the environment variable it skips only that test. The
+downloaded archive extracts `profile.json`, `benchmark-report.json`,
+`wamr-profiled.cwasm.gz`, and `wasmtime-objdump.txt` directly into the
+specified directory.
 
 Exact frame-origin attribution is opt-in: pass `--frame-func 10` to the
 profiler, or set the workflow's `frame_func` input to `10`, for
