@@ -1,0 +1,65 @@
+/// Types used by blobstore
+interface types {
+    use wasi:io/streams@0.2.0.{input-stream, output-stream};
+
+    /// name of a container, a collection of objects.
+    /// The container name may be any valid UTF-8 string.
+    type container-name = string;
+
+    /// name of an object within a container
+    /// The object name may be any valid UTF-8 string.
+    type object-name = string;
+
+    /// time in seconds since epoch
+    type timestamp = u64;
+
+    /// size of an object, in bytes
+    type object-size = u64;
+
+    /// A blobstore error. This is currently an alias for `string`,
+    /// which may be changed to a richer error type in the future.
+    type error = string;
+
+    /// information about a container
+    record container-metadata {
+        /// the container's name
+        name: container-name,
+        /// date and time container was created
+        created-at: timestamp,
+    }
+
+    /// information about an object
+    record object-metadata {
+        /// the object's name
+        name: object-name,
+        /// the object's parent container
+        container: container-name,
+        /// date and time the object was created
+        created-at: timestamp,
+        /// size of the object, in bytes
+        size: object-size,
+    }
+
+    /// identifier for an object that includes both container and object name
+    record object-id {
+        container: container-name,
+        object: object-name,
+    }
+
+    /// A data-blob resource for writing an object to a blobstore.
+    resource outgoing-value {
+        new-outgoing-value: static func() -> outgoing-value;
+        outgoing-value-write-body: func() -> result<output-stream>;
+        finish: static func(this: outgoing-value) -> result<_, error>;
+    }
+
+    type incoming-value-sync-body = list<u8>;
+    type incoming-value-async-body = input-stream;
+
+    /// A data-blob resource for receiving an object from a blobstore.
+    resource incoming-value {
+        incoming-value-consume-sync: func() -> result<incoming-value-sync-body, error>;
+        incoming-value-consume-async: func() -> result<incoming-value-async-body, error>;
+        size: func() -> u64;
+    }
+}

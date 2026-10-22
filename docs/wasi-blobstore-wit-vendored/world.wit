@@ -1,0 +1,7 @@
+package wasi:blobstore@0.2.0-draft;
+
+world imports {
+    import blobstore;
+    import container;
+    import types;
+}
