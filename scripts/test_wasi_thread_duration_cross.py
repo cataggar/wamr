@@ -1185,6 +1185,60 @@ class DurationCrossReportTests(unittest.TestCase):
         with self.assertRaisesRegex(BenchmarkDataError, "pilot-derived|count admission"):
             duration.validate_report(report)
 
+    def test_spawn_join_doubled_lifecycle_cap_admits_faster_x86_and_fails_below_floor(
+        self,
+    ) -> None:
+        report = synthetic_report(platform="ubuntu-22.04-x86_64", sequence=1)
+        plan = copy.deepcopy(report["plan"])
+        pilots = copy.deepcopy(plan["pilots"])
+        for pilot in pilots:
+            if pilot["workload"] == "spawn-join":
+                pilot["guest_elapsed_ns"] = 1_158_470_432
+                pilot["raw_guest_elapsed_ns"] = 1_158_470_432
+                pilot["host_wall_elapsed_ns"] = 1_161_395_591
+        counts, admission = duration.resolve_counts(
+            plan, pilots, duration.INVOCATION_TIMEOUT_SECONDS
+        )
+        self.assertEqual(
+            counts["runtime/spawn-join/1"],
+            {"interpreter": 13_500, "aot": 13_500},
+        )
+        self.assertEqual(
+            counts["runtime/spawn-join/2"],
+            {"interpreter": 6_750, "aot": 6_750},
+        )
+        self.assertEqual(
+            counts["runtime/spawn-join/8"],
+            {"interpreter": 1_687, "aot": 1_687},
+        )
+        spawn_cells = {
+            cell["key"]: cell
+            for cell in admission["sizing_cells"]
+            if cell["workload"] == "spawn-join"
+        }
+        for key, cell in spawn_cells.items():
+            with self.subTest(key=key):
+                self.assertLessEqual(
+                    cell["doubled_iterations"], cell["effective_iteration_cap"]
+                )
+                self.assertEqual(
+                    cell["selected_sources"],
+                    ["spawn-join-doubled-lifecycle-cap"],
+                )
+
+        too_fast_pilots = copy.deepcopy(pilots)
+        for pilot in too_fast_pilots:
+            if pilot["workload"] == "spawn-join" and pilot["threads"] == 1:
+                pilot["guest_elapsed_ns"] = 900_000_000
+                pilot["raw_guest_elapsed_ns"] = 900_000_000
+                pilot["host_wall_elapsed_ns"] = 901_000_000
+        with self.assertRaisesRegex(
+            HarnessError, "doubled count.*cannot be admitted|current arm cannot be admitted"
+        ):
+            duration.resolve_counts(
+                plan, too_fast_pilots, duration.INVOCATION_TIMEOUT_SECONDS
+            )
+
     def test_schema_files_pin_diagnostic_identity(self) -> None:
         report_schema = json.loads(
             (
@@ -1689,6 +1743,20 @@ class DurationCrossCohortTests(unittest.TestCase):
         unexpected["observations"][0]["platform"] = "unexpected-platform"
         with self.assertRaisesRegex(HarnessError, "membership"):
             cohort.validate_cohort_document(unexpected)
+        mixed_cpu = synthetic_cohort()
+        for observation in mixed_cpu["observations"]:
+            if (
+                observation["platform"] == "ubuntu-22.04-x86_64"
+                and observation["sequence"] == 20
+            ):
+                observation["cpu_class"] = "AMD EPYC 7763 64-Core Processor"
+        with self.assertRaisesRegex(HarnessError, "mixed.*cpu_class"):
+            cohort.validate_cohort_document(mixed_cpu)
+        hosted_cohort = synthetic_cohort()
+        for observation in hosted_cohort["observations"]:
+            if observation["platform"] == "ubuntu-22.04-x86_64":
+                observation["cpu_class"] = "AMD EPYC 7763 64-Core Processor"
+        cohort.validate_cohort_document(hosted_cohort)
 
     def test_workflow_is_manual_minimal_and_path_bounded(self) -> None:
         workflow = (

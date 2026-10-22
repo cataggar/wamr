@@ -54,7 +54,7 @@ RUNNER_ENVIRONMENTS = {
         "ubuntu-24.04-aarch64": "github-hosted",
     },
     "trusted-calibration": {
-        "ubuntu-22.04-x86_64": "self-hosted",
+        "ubuntu-22.04-x86_64": "github-hosted",
         "ubuntu-24.04-aarch64": "github-hosted",
     },
 }
@@ -179,8 +179,20 @@ def preflight_runner_inventory(
     repository: str,
     runner_target: str,
     timeout_seconds: float | None = None,
+    *,
+    x86_runner_environment: str | None = None,
 ) -> None:
-    if runner_target != "trusted-calibration":
+    resolved_x86_env = (
+        RUNNER_ENVIRONMENTS.get(runner_target, {}).get(
+            TRUSTED_X86_PLATFORM, "github-hosted"
+        )
+        if x86_runner_environment is None
+        else x86_runner_environment
+    )
+    if (
+        runner_target != "trusted-calibration"
+        or resolved_x86_env != "self-hosted"
+    ):
         return
     response = require_api_object(
         gh_json(
@@ -1041,6 +1053,7 @@ def validate_paired_documents(
     host_cpus: dict[str, Counter[str]] = defaultdict(Counter)
     runner_images: dict[str, Counter[str]] = defaultdict(Counter)
     runner_names: dict[str, set[str]] = defaultdict(set)
+    runner_environments: dict[str, set[str]] = defaultdict(set)
     selected_counts: dict[str, dict[str, Counter[str]]] = defaultdict(
         lambda: defaultdict(Counter)
     )
@@ -1090,10 +1103,17 @@ def validate_paired_documents(
             raise HarnessError(f"{path}: baseline SHA does not match dispatch")
         if revisions["candidate"]["commit"] != expected["candidate_sha"]:
             raise HarnessError(f"{path}: candidate SHA does not match dispatch")
-        expected_environment = RUNNER_ENVIRONMENTS[expected["runner_target"]][
-            platform_id
-        ]
-        if host.get("runner_environment") != expected_environment:
+        runner_environment = host.get("runner_environment")
+        allowed_environments = (
+            ("github-hosted", "self-hosted")
+            if expected["runner_target"] == "trusted-calibration"
+            and platform_id == TRUSTED_X86_PLATFORM
+            else (RUNNER_ENVIRONMENTS[expected["runner_target"]][platform_id],)
+        )
+        if runner_environment not in allowed_environments:
+            raise HarnessError(f"{path}: mixed or unexpected runner environment")
+        runner_environments[platform_id].add(str(runner_environment))
+        if len(runner_environments[platform_id]) > 1:
             raise HarnessError(f"{path}: mixed or unexpected runner environment")
         fingerprint = host["host_fingerprint"]["sha256"]
         if metadata["host_pair"]["host_fingerprint_sha256"] != fingerprint:
@@ -1191,7 +1211,10 @@ def validate_paired_documents(
         raise HarnessError("cohort has mixed fixture identity")
     if len(measurement_plan_identities) != 1:
         raise HarnessError("cohort has mixed measurement plan identity")
-    if expected["runner_target"] == "trusted-calibration":
+    if (
+        expected["runner_target"] == "trusted-calibration"
+        and runner_environments[TRUSTED_X86_PLATFORM] == {"self-hosted"}
+    ):
         if runner_names[TRUSTED_X86_PLATFORM] != {TRUSTED_X86_RUNNER_NAME}:
             raise HarnessError(
                 f"trusted x86 reports must all come from runner "
@@ -1303,6 +1326,7 @@ def validate_paired_documents(
                     }
                     if expected["runner_target"] == "trusted-calibration"
                     and platform_id == TRUSTED_X86_PLATFORM
+                    and runner_environments[platform_id] == {"self-hosted"}
                     else {}
                 ),
             }
@@ -1937,6 +1961,11 @@ def validate_calibration_cohort(
         self_hosted_x86 = (
             runner_target == "trusted-calibration"
             and platform == TRUSTED_X86_PLATFORM
+            and (
+                not runner_images
+                or "trusted_runner_name" in platforms[platform]
+                or "host_fingerprint_sha256" in platforms[platform]
+            )
         )
         if (
             not isinstance(runner_images, dict)
@@ -2380,10 +2409,26 @@ def derive_budget_documents(
         runner_target = validated["dispatch"].get("runner_target")
         if runner_target not in RUNNER_ENVIRONMENTS:
             raise HarnessError("validated cohort runner target is unknown")
+        self_hosted_x86 = (
+            runner_target == "trusted-calibration"
+            and platform == TRUSTED_X86_PLATFORM
+            and (
+                not validated["platforms"][platform].get(
+                    "runner_image_distribution"
+                )
+                or "trusted_runner_name" in validated["platforms"][platform]
+                or "host_fingerprint_sha256"
+                in validated["platforms"][platform]
+            )
+        )
         platform_budgets[platform] = {
             "host_system": system,
             "host_machine": machine,
-            "runner_environment": RUNNER_ENVIRONMENTS[runner_target][platform],
+            "runner_environment": (
+                "self-hosted"
+                if self_hosted_x86
+                else RUNNER_ENVIRONMENTS[runner_target][platform]
+            ),
             "accepted_cpu_classes": accepted_classes,
             "comparisons": comparison_budget,
             "ratio_of_ratios": ratio_budget,

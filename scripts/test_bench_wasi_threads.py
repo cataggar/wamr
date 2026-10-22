@@ -5325,11 +5325,19 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 }
             ],
         }
+        with mock.patch.object(cohort, "gh_json") as gh_json:
+            cohort.preflight_runner_inventory(
+                "cataggar/wamr", "trusted-calibration", 30
+            )
+        gh_json.assert_not_called()
         with mock.patch.object(
             cohort, "gh_json", return_value=inventory
         ) as gh_json:
             cohort.preflight_runner_inventory(
-                "cataggar/wamr", "trusted-calibration", 30
+                "cataggar/wamr",
+                "trusted-calibration",
+                30,
+                x86_runner_environment="self-hosted",
             )
         gh_json.assert_called_once_with(
             [
@@ -5425,7 +5433,10 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 self.assertRaisesRegex(bench.HarnessError, message),
             ):
                 cohort.preflight_runner_inventory(
-                    "cataggar/wamr", "trusted-calibration", 30
+                    "cataggar/wamr",
+                    "trusted-calibration",
+                    30,
+                    x86_runner_environment="self-hosted",
                 )
             gh_json.assert_called_once()
 
@@ -5452,6 +5463,10 @@ class ThreadBenchmarkTests(unittest.TestCase):
             output=self.scratch / "dispatch.json",
         )
         with (
+            mock.patch.dict(
+                cohort.RUNNER_ENVIRONMENTS["trusted-calibration"],
+                {"ubuntu-22.04-x86_64": "self-hosted"},
+            ),
             mock.patch.object(
                 cohort,
                 "gh_json",
@@ -5485,24 +5500,11 @@ class ThreadBenchmarkTests(unittest.TestCase):
             lookup_seconds=0,
             output=self.scratch / "dispatch.json",
         )
-        inventory = {
-            "total_count": 1,
-            "runners": [
-                {
-                    "name": "vm31e-wamr-temp-20260906",
-                    "status": "online",
-                    "busy": False,
-                    "labels": [
-                        {"name": "wamr-temp-20260906", "type": "custom"}
-                    ],
-                }
-            ],
-        }
         with (
             mock.patch.object(
                 cohort,
                 "gh_json",
-                side_effect=[inventory, {"sha": "b" * 40}],
+                return_value={"sha": "b" * 40},
             ),
             mock.patch.object(cohort.subprocess, "check_output") as check_output,
             self.assertRaisesRegex(bench.HarnessError, "must equal.*tag commit"),

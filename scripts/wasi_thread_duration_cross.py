@@ -788,6 +788,7 @@ def resolve_counts(
     cell_counts: dict[str, dict[str, int]] = {}
     sizing_cells: list[dict[str, Any]] = []
     selected_by_sizing_key: dict[tuple[str, str, str, int], int] = {}
+    uncapped_by_sizing_key: dict[tuple[str, str, str, int], int] = {}
     for key, values in sorted(grouped.items()):
         fastest = min(values, key=lambda item: item["guest_elapsed_ns"])
         candidates = sizing_candidates_for_cell(
@@ -797,15 +798,22 @@ def resolve_counts(
             fastest["iterations"],
             fastest["guest_elapsed_ns"],
         )
-        current = candidates["selected_iterations"]
-        doubled = current * 2
+        uncapped = candidates["selected_iterations"]
         cap = effective_sizing_cap(key[1], key[3])
+        selected_sources = list(candidates["selected_sources"])
+        if key[1] == "spawn-join" and uncapped <= cap and uncapped * 2 > cap:
+            current = cap // 2
+            selected_sources = ["spawn-join-doubled-lifecycle-cap"]
+        else:
+            current = uncapped
+        doubled = current * 2
         if doubled > cap or doubled > MASK64 // key[3]:
             raise HarnessError(
                 f"duration-cross {key} doubled count {doubled} cannot be admitted "
                 f"under frozen cap {cap}; counts must not be shortened"
             )
         selected_by_sizing_key[key] = current
+        uncapped_by_sizing_key[key] = uncapped
         sizing_cells.append(
             {
                 "key": f"{key[0]}/{key[1]}/{key[3]}",
@@ -819,7 +827,7 @@ def resolve_counts(
                 "current_iterations": current,
                 "doubled_iterations": doubled,
                 "effective_iteration_cap": cap,
-                "selected_sources": candidates["selected_sources"],
+                "selected_sources": selected_sources,
             }
         )
 
@@ -842,10 +850,15 @@ def resolve_counts(
             host = math.ceil(
                 pilot["host_wall_elapsed_ns"] * selected / pilot["iterations"]
             )
-            if (
-                guest
-                < projected_duration_floor_for_cell(key[0], key[2], key[3])
+            floor_ns = (
+                MINIMUM_INTERVAL_NS * multiplier
+                if key[1] == "spawn-join"
+                and current < uncapped_by_sizing_key[key]
+                else projected_duration_floor_for_cell(key[0], key[2], key[3])
                 * multiplier
+            )
+            if (
+                guest < floor_ns
                 or 99 * pilot["timing_overhead_ns"] >= guest
                 or guest >= timeout_ns
                 or host >= timeout_ns
