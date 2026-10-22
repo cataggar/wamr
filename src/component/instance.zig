@@ -690,6 +690,19 @@ pub const ComponentInstance = struct {
     else
         1,
 
+    /// Component instance backpressure counter (`backpressure.inc`,
+    /// `backpressure.dec`, `backpressure.set`, #972).
+    backpressure: u16 = 0,
+
+    /// Canonical ABI `may_leave` flag (#972). `false` while executing
+    /// `cabi_realloc` or `post-return` callbacks, during which leaving the
+    /// component instance via canonical built-ins traps.
+    may_leave: bool = true,
+
+    /// Per-instance explicit thread table (`thread.index`, `thread.new-indirect`,
+    /// `thread.resume-later`, `thread.suspend*`, `thread.yield*`, `thread.spawn*`, #972).
+    threads: async_mod.ComponentThreadTable = .{},
+
     /// Host-driven async-event driver hook (#551). Installed by
     /// `wasi:cli`-style host adapters that own background timers or other
     /// futures whose completion is not produced by guest code. Invoked
@@ -1281,6 +1294,45 @@ pub const ComponentInstance = struct {
         return null;
     }
 
+    /// Resolve a top-level core table indexspace index to the underlying
+    /// `(*ModuleInstance, *TableInstance)` or `(*AotInstance, table_idx)`
+    /// pair for `thread.new-indirect` and `thread.spawn-indirect` (#972).
+    pub fn resolveTopLevelTable(
+        self: *const ComponentInstance,
+        idx: u32,
+    ) ?struct {
+        mi: ?*core_types.ModuleInstance = null,
+        table: ?*core_types.TableInstance = null,
+        ai: ?*aot_runtime.AotInstance = null,
+        aot_table_idx: u32 = 0,
+    } {
+        if (indexspace.resolveCoreTable(self.component, idx)) |ref| {
+            const ie = self.component.aliases[ref.aliased].instance_export;
+            if (ie.instance_idx >= self.core_instances.len) return null;
+            const src_entry = self.core_instances[ie.instance_idx];
+            if (src_entry.module_inst) |src_mi| {
+                const exp = src_mi.module.findExport(ie.name, .table) orelse return null;
+                if (exp.index >= src_mi.tables.len) return null;
+                return .{ .mi = src_mi, .table = src_mi.tables[exp.index] };
+            }
+            if (src_entry.aot_inst) |ai| {
+                if (idx < ai.tables.len) {
+                    return .{ .ai = ai, .aot_table_idx = idx };
+                }
+                if (ai.tables.len > 0) {
+                    return .{ .ai = ai, .aot_table_idx = 0 };
+                }
+            }
+            return null;
+        }
+        if (self.firstModuleInst()) |mi| {
+            if (idx < mi.tables.len) {
+                return .{ .mi = mi, .table = mi.tables[idx] };
+            }
+        }
+        return null;
+    }
+
     /// Resolve a top-level core func indexspace index to a callable
     /// `(*ModuleInstance, local_func_idx)` pair, suitable for invoking
     /// from a host context (e.g. calling `cabi_realloc`). Only the
@@ -1465,6 +1517,9 @@ pub const ComponentInstance = struct {
     /// canonical ABI sees a `(ptr, len)` PtrLen.
     pub fn hostAllocGuest(self: *ComponentInstance, size: u32, align_: u32) ?u32 {
         if (self.test_mem) |tm| return tm.alloc(size, align_);
+        const saved_may_leave = self.may_leave;
+        self.may_leave = false;
+        defer self.may_leave = saved_may_leave;
         const a: u32 = if (align_ == 0) 1 else align_;
         // Honor the in-flight canon-lower's `(realloc $f)` when set.
         // This is required for wit-component's preview1 adapter, which
@@ -1603,6 +1658,9 @@ pub const ComponentInstance = struct {
             std.atomic.Value(u32).init(1)
         else
             1;
+        self.backpressure = 0;
+        self.may_leave = true;
+        self.threads = .{};
         self.allocator = allocator;
     }
 
@@ -1611,6 +1669,7 @@ pub const ComponentInstance = struct {
         self.streams.deinit() catch @panic("Stream leases outstanding");
         self.error_contexts.deinit() catch @panic("Error-context leases outstanding");
         self.waitable_sets.deinit() catch @panic("Waitable-set leases outstanding");
+        self.threads.deinit(self.allocator);
         self.deinitStreamTerminalWrites();
     }
 
@@ -2308,6 +2367,7 @@ pub const ComponentInstance = struct {
         self.streams.deinit() catch @panic("Stream leases outstanding");
         self.error_contexts.deinit() catch @panic("Error-context leases outstanding");
         self.waitable_sets.deinit() catch @panic("Waitable-set leases outstanding");
+        self.threads.deinit(self.allocator);
         self.deinitStreamTerminalWrites();
         for (self.trampoline_ctxs.items) |ctx| {
             ctx.deinit(self.allocator);
@@ -4708,7 +4768,7 @@ fn installCanonBuiltinBackedCrossInstanceThunk(
     if (ft.params.len + @intFromBool(has_retptr) > 9) return error.SignatureTooWide;
     if (ft.results.len > 10) return error.MultipleResultsUnsupported;
     for (ft.params) |ty| switch (ty) {
-        .i32, .i64, .f32, .f64 => {},
+        .i32, .i64, .f32, .f64, .funcref, .nonfuncref => {},
         else => return error.UnsupportedParamType,
     };
     for (ft.results) |ty| switch (ty) {

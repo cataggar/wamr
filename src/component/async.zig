@@ -511,6 +511,164 @@ const CurrentTaskBinding = struct {
 
 threadlocal var current_task_binding: ?CurrentTaskBinding = null;
 
+// ── Component Explicit Thread Table (#972) ──────────────────────────────────
+
+pub const ComponentThreadState = enum(u8) {
+    suspended,
+    ready,
+    running,
+};
+
+pub const ComponentThreadTarget = union(enum) {
+    implicit_main,
+    interp: struct {
+        module_inst_ptr: *anyopaque,
+        func_idx: u32,
+        context_arg: i32,
+    },
+    aot: struct {
+        aot_inst_ptr: *anyopaque,
+        func_idx: u32,
+        context_arg: i32,
+    },
+};
+
+pub const ComponentThread = struct {
+    state: ComponentThreadState,
+    target: ComponentThreadTarget,
+    is_shared: bool = false,
+    in_flight: bool = false,
+};
+
+/// Per-component-instance explicit thread table (1-based indices).
+/// Slot 1 is reserved in-line for the implicit main task thread so that
+/// zero-thread components incur no heap allocations. Explicit threads created
+/// via `thread.new-indirect` / `thread.spawn-*` occupy 1-based indices `>= 2`.
+pub const ComponentThreadTable = struct {
+    entries: std.ArrayListUnmanaged(?ComponentThread) = .empty,
+    ready_queue: std.ArrayListUnmanaged(u32) = .empty,
+    implicit_main_entry: ?ComponentThread = .{
+        .state = .running,
+        .target = .implicit_main,
+        .in_flight = true,
+    },
+    current_thread_idx: u32 = 1,
+
+    pub fn deinit(self: *ComponentThreadTable, allocator: std.mem.Allocator) void {
+        self.entries.deinit(allocator);
+        self.ready_queue.deinit(allocator);
+        self.* = .{};
+    }
+
+    pub fn resetForTaskEntry(self: *ComponentThreadTable) void {
+        self.implicit_main_entry = .{
+            .state = .running,
+            .target = .implicit_main,
+            .in_flight = true,
+        };
+        self.current_thread_idx = 1;
+    }
+
+    pub fn allocThread(
+        self: *ComponentThreadTable,
+        allocator: std.mem.Allocator,
+        target: ComponentThreadTarget,
+        is_shared: bool,
+    ) !u32 {
+        for (self.entries.items, 0..) |*slot, idx| {
+            if (slot.* == null) {
+                slot.* = .{
+                    .state = .suspended,
+                    .target = target,
+                    .is_shared = is_shared,
+                    .in_flight = false,
+                };
+                return @intCast(idx + 2);
+            }
+        }
+        const idx = self.entries.items.len;
+        try self.entries.append(allocator, .{
+            .state = .suspended,
+            .target = target,
+            .is_shared = is_shared,
+            .in_flight = false,
+        });
+        return @intCast(idx + 2);
+    }
+
+    pub fn get(self: *ComponentThreadTable, thread_idx: u32) ?*ComponentThread {
+        if (thread_idx == 0) return null;
+        if (thread_idx == 1) {
+            if (self.implicit_main_entry != null) {
+                return &self.implicit_main_entry.?;
+            }
+            return null;
+        }
+        const slot_idx: usize = @intCast(thread_idx - 2);
+        if (slot_idx >= self.entries.items.len) return null;
+        if (self.entries.items[slot_idx] != null) {
+            return &self.entries.items[slot_idx].?;
+        }
+        return null;
+    }
+
+    pub fn remove(self: *ComponentThreadTable, thread_idx: u32) void {
+        self.removeFromReadyQueue(thread_idx);
+        if (thread_idx == 1) {
+            self.implicit_main_entry = null;
+            return;
+        }
+        if (thread_idx < 2) return;
+        const slot_idx: usize = @intCast(thread_idx - 2);
+        if (slot_idx < self.entries.items.len) {
+            self.entries.items[slot_idx] = null;
+        }
+    }
+
+    pub fn enqueueReady(
+        self: *ComponentThreadTable,
+        allocator: std.mem.Allocator,
+        thread_idx: u32,
+    ) !void {
+        const entry = self.get(thread_idx) orelse return error.InvalidThreadIndex;
+        entry.state = .ready;
+        for (self.ready_queue.items) |existing| {
+            if (existing == thread_idx) return;
+        }
+        try self.ready_queue.append(allocator, thread_idx);
+    }
+
+    pub fn removeFromReadyQueue(self: *ComponentThreadTable, thread_idx: u32) void {
+        var i: usize = 0;
+        while (i < self.ready_queue.items.len) {
+            if (self.ready_queue.items[i] == thread_idx) {
+                _ = self.ready_queue.orderedRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    pub fn popReady(self: *ComponentThreadTable) ?u32 {
+        var i: usize = 0;
+        while (i < self.ready_queue.items.len) {
+            const idx = self.ready_queue.items[i];
+            if (self.get(idx)) |entry| {
+                if (entry.state == .ready) {
+                    if (!entry.in_flight) {
+                        _ = self.ready_queue.orderedRemove(i);
+                        return idx;
+                    }
+                    i += 1;
+                    continue;
+                }
+            }
+            _ = self.ready_queue.orderedRemove(i);
+        }
+        return null;
+    }
+};
+
 // ── Futures ─────────────────────────────────────────────────────────────────
 
 /// A future represents a single async value (one-shot channel) parameterised

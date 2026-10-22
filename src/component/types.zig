@@ -216,6 +216,8 @@ pub const CoreValType = enum(u8) {
     i64 = 0x7E,
     f32 = 0x7D,
     f64 = 0x7C,
+    funcref = 0x70,
+    externref = 0x6F,
 };
 
 pub const CoreFuncType = struct {
@@ -527,6 +529,95 @@ pub const AsyncCanonOp = union(enum) {
     waitable_set_drop,
     /// `canon waitable.join` — tag `0x23`.
     waitable_join,
+    /// `canon backpressure.set` — tag `0x08` (core signature `[i32] -> []`).
+    backpressure_set,
+    /// `canon backpressure.inc` — tag `0x24` (core signature `[] -> []`).
+    backpressure_inc,
+    /// `canon backpressure.dec` — tag `0x25` (core signature `[] -> []`).
+    backpressure_dec,
+    /// `canon thread.index` — tag `0x26` (core signature `[] -> [i32]`).
+    thread_index,
+    /// `canon thread.new-indirect ft tbl` — tag `0x27` (core signature `[i32, i32] -> [i32]`).
+    thread_new_indirect: struct { func_type_idx: u32, table_idx: u32 },
+    /// `canon thread.resume-later` — tag `0x28` (core signature `[i32] -> []`).
+    thread_resume_later,
+    /// `canon thread.suspend cancel?` — tag `0x29` (core signature `[] -> [i32]`).
+    thread_suspend: struct { cancellable: bool },
+    /// `canon thread.suspend-then-resume cancel?` — tag `0x2a` (core signature `[i32] -> [i32]`).
+    thread_suspend_then_resume: struct { cancellable: bool },
+    /// `canon thread.yield-then-resume cancel?` — tag `0x2b` (core signature `[i32] -> [i32]`).
+    thread_yield_then_resume: struct { cancellable: bool },
+    /// `canon thread.suspend-then-promote cancel?` — tag `0x2c` (core signature `[i32] -> [i32]`).
+    thread_suspend_then_promote: struct { cancellable: bool },
+    /// `canon thread.yield-then-promote cancel?` — tag `0x2d` (core signature `[i32] -> [i32]`).
+    thread_yield_then_promote: struct { cancellable: bool },
+    /// `canon thread.spawn-ref sh? ft` — tag `0x40` (core signature `[funcref, i32] -> [i32]` or `[i32, i32] -> [i32]`).
+    thread_spawn_ref: struct { is_shared: bool, func_type_idx: u32 },
+    /// `canon thread.spawn-indirect sh? ft tbl` — tag `0x41` (core signature `[i32, i32] -> [i32]`).
+    thread_spawn_indirect: struct { is_shared: bool, func_type_idx: u32, table_idx: u32 },
+    /// `canon thread.available-parallelism sh?` — tag `0x42` (core signature `[] -> [i32]`).
+    thread_available_parallelism: struct { is_shared: bool },
+
+    /// Return the canonical core function signature for this async/thread canonical builtin.
+    pub fn coreSignature(self: AsyncCanonOp) CoreFuncType {
+        return switch (self) {
+            .task_cancel,
+            .backpressure_inc,
+            .backpressure_dec,
+            => .{ .params = &.{}, .results = &.{} },
+
+            .backpressure_set,
+            .subtask_drop,
+            .stream_drop_readable,
+            .stream_drop_writable,
+            .future_drop_readable,
+            .future_drop_writable,
+            .error_context_drop,
+            .waitable_set_drop,
+            .thread_resume_later,
+            => .{ .params = &.{.i32}, .results = &.{} },
+
+            .waitable_join,
+            .error_context_debug_message,
+            => .{ .params = &.{ .i32, .i32 }, .results = &.{} },
+
+            .waitable_set_new,
+            .thread_index,
+            .thread_suspend,
+            .thread_available_parallelism,
+            => .{ .params = &.{}, .results = &.{.i32} },
+
+            .stream_new,
+            .future_new,
+            => .{ .params = &.{}, .results = &.{.i64} },
+
+            .subtask_cancel,
+            .stream_cancel_read,
+            .stream_cancel_write,
+            .future_cancel_read,
+            .future_cancel_write,
+            .thread_suspend_then_resume,
+            .thread_yield_then_resume,
+            .thread_suspend_then_promote,
+            .thread_yield_then_promote,
+            => .{ .params = &.{.i32}, .results = &.{.i32} },
+
+            .future_read,
+            .future_write,
+            .error_context_new,
+            .waitable_set_wait,
+            .waitable_set_poll,
+            .thread_new_indirect,
+            .thread_spawn_indirect,
+            => .{ .params = &.{ .i32, .i32 }, .results = &.{.i32} },
+
+            .thread_spawn_ref => .{ .params = &.{ .funcref, .i32 }, .results = &.{.i32} },
+
+            .stream_read,
+            .stream_write,
+            => .{ .params = &.{ .i32, .i32, .i32 }, .results = &.{.i32} },
+        };
+    }
 };
 
 // ── Imports and exports ─────────────────────────────────────────────────────
