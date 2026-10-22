@@ -256,8 +256,10 @@ def validate_dispatch_plan(document: dict[str, Any], *, completed: bool) -> None
     require(
         isinstance(contract, dict)
         and contract.get("maximum_workflows_in_flight") == 1
-        and contract.get("trusted_x86_runner_name") == TRUSTED_X86_RUNNER_NAME
-        and contract.get("x86_cpu_class") == X86_CPU_CLASS
+        and isinstance(contract.get("trusted_x86_runner_name"), str)
+        and bool(contract["trusted_x86_runner_name"].strip())
+        and isinstance(contract.get("x86_cpu_class"), str)
+        and bool(contract["x86_cpu_class"].strip())
         and contract.get("arm_cpu_class") == ARM_CPU_CLASS
         and contract.get("runner_worker_count_at_start") == 1,
         "dispatch runner contract",
@@ -1048,6 +1050,8 @@ def build_validated_cohort(
     seen = set()
     source_identity = None
     platform_identity: dict[str, dict[str, Any]] = {}
+    platform_cpu_class: dict[str, str] = {}
+    platform_runner_environment: dict[str, str] = {}
     platform_counts: Counter[str] = Counter()
     partition_counts: dict[str, Counter[str]] = defaultdict(Counter)
     run_platforms: dict[str, set[str]] = defaultdict(set)
@@ -1108,17 +1112,44 @@ def build_validated_cohort(
             metadata["source_revision"]["commit"] == dispatch_document["source_sha"],
             f"{path}: report source differs from immutable dispatch source",
         )
-        cpu = metadata["host"]["cpu"]
+        host = metadata["host"]
+        cpu = host.get("cpu")
+        runner_environment = host.get("runner_environment", "self-hosted")
         if platform == "ubuntu-22.04-x86_64":
-            require(cpu == X86_CPU_CLASS, f"{path}: unexpected x86 CPU class {cpu!r}")
-            require(
-                metadata["host"]["runner_name"] == TRUSTED_X86_RUNNER_NAME,
-                f"{path}: trusted x86 runner identity changed",
-            )
+            if runner_environment == "github-hosted":
+                require(
+                    isinstance(cpu, str)
+                    and bool(cpu.strip())
+                    and isinstance(host.get("runner_name"), str)
+                    and bool(host["runner_name"].strip()),
+                    f"{path}: invalid hosted x86 runner or CPU identity",
+                )
+            else:
+                require(cpu == X86_CPU_CLASS, f"{path}: unexpected x86 CPU class {cpu!r}")
+                require(
+                    host.get("runner_name") == TRUSTED_X86_RUNNER_NAME,
+                    f"{path}: trusted x86 runner identity changed",
+                )
         else:
             require(
-                ARM_CPU_CLASS in cpu,
+                isinstance(cpu, str) and ARM_CPU_CLASS in cpu,
                 f"{path}: Arm CPU is not {ARM_CPU_CLASS} class: {cpu!r}",
+            )
+        if platform not in platform_runner_environment:
+            platform_runner_environment[platform] = str(runner_environment)
+        else:
+            require(
+                str(runner_environment) == platform_runner_environment[platform],
+                f"{path}: mixed {platform} runner environment",
+            )
+        if platform not in platform_cpu_class:
+            platform_cpu_class[platform] = cpu
+        else:
+            require(
+                cpu == platform_cpu_class[platform],
+                f"{path}: mixed {platform} CPU class {cpu!r} vs "
+                f"{platform_cpu_class[platform]!r}; different CPU classes "
+                "must not be pooled",
             )
         current_identity = report_identity(report)
         current_source = current_identity["source_revision"]
@@ -1295,6 +1326,7 @@ def validate_cohort_document(cohort: dict[str, Any]) -> None:
     report_hashes = set()
     artifact_ids: set[int] = set()
     artifact_zip_hashes: set[str] = set()
+    platform_cpu_class: dict[str, str] = {}
     for observation in observations:
         require(isinstance(observation, dict), "cohort observation object")
         key = (observation.get("sequence"), observation.get("platform"))
@@ -1309,6 +1341,24 @@ def validate_cohort_document(cohort: dict[str, Any]) -> None:
             sequence in PARTITIONS and platform in PLATFORM_CELLS,
             f"cohort observation {key} membership",
         )
+        cpu_class = observation.get("cpu_class")
+        require(
+            isinstance(cpu_class, str) and bool(cpu_class.strip()),
+            f"cohort observation {key} cpu_class",
+        )
+        if platform == "ubuntu-24.04-aarch64":
+            require(
+                ARM_CPU_CLASS in cpu_class,
+                f"cohort observation {key} Arm cpu_class",
+            )
+        if platform not in platform_cpu_class:
+            platform_cpu_class[platform] = cpu_class
+        else:
+            require(
+                cpu_class == platform_cpu_class[platform],
+                f"cohort observation {key} mixed {platform} cpu_class "
+                f"{cpu_class!r} vs {platform_cpu_class[platform]!r}",
+            )
         require(
             observation.get("run_id") == expected_run_ids.get(sequence)
             and observation.get("workflow_run_attempt") == "1",

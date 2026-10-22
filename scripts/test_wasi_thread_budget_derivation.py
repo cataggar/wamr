@@ -362,6 +362,23 @@ class BudgetDerivationTests(unittest.TestCase):
             {},
         )
 
+        hosted_trusted = synthetic_cohort()
+        hosted_trusted["dispatch"]["runner_target"] = "trusted-calibration"
+        hosted_budget, hosted_evidence, _ = cohort.derive_budget_documents(
+            hosted_trusted, synthetic_policy()
+        )
+        self.assertEqual(
+            hosted_budget["platforms"][cohort.TRUSTED_X86_PLATFORM][
+                "runner_environment"
+            ],
+            "github-hosted",
+        )
+        self.assertTrue(
+            hosted_evidence["platforms"][cohort.TRUSTED_X86_PLATFORM][
+                "runner_image_distribution"
+            ]
+        )
+
     def test_runner_image_and_trusted_x86_mutations_fail(self) -> None:
         hosted = synthetic_cohort()
         hosted["platforms"][cohort.TRUSTED_X86_PLATFORM][
