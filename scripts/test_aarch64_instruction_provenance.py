@@ -788,6 +788,162 @@ class AArch64InstructionProvenanceTests(unittest.TestCase):
                 total_run_samples=1,
             )
 
+    def test_classify_unknown_reason_clusters_partitions_all_uncertain_samples(self):
+        lines = [
+            "add x9, x1, #4",      # 0: pure address
+            "ldr w2, [x3, x9]",    # 4: memory consumer
+            "cmp w4, w5",          # 8: non_trap_control
+            "b.eq #0x1c",          # 12: branch to 28
+            "mov x10, x1",         # 16: ambiguous_cfg_join path 1
+            "b #0x20",             # 20: branch to 32
+            "nop",                 # 24
+            "mov x10, x2",         # 28: ambiguous_cfg_join path 2
+            "str w10, [x3]",       # 32: join consumer
+            "mov x11, x4",         # 36: dead_or_unconsumed
+            "mov x0, x5",          # 40: untyped_escape via ret
+            "ret",                 # 44
+        ]
+        result = analyze(
+            lines,
+            [0, 8, 16, 28, 36, 40],
+            {0: 10, 8: 20, 16: 15, 36: 5, 40: 7},
+            total=100,
+        )
+        clusters = provenance.classify_unknown_reason_clusters(result)
+        self.assertEqual(47, clusters["uncertain_samples"])
+        by_name = {
+            name: item["samples"]
+            for name, item in clusters["clusters"].items()
+        }
+        self.assertEqual(20, by_name["non_trap_control"])
+        self.assertEqual(15, by_name["ambiguous_cfg_join"])
+        self.assertEqual(7, by_name["untyped_escape"])
+        self.assertEqual(5, by_name["dead_or_unconsumed"])
+
+        tampered = copy.deepcopy(result)
+        tampered["common_gating_universe"]["sampled_instructions"][0]["samples"] += 1
+        with self.assertRaisesRegex(
+            provenance.ProvenanceError, "do not match"
+        ):
+            provenance.classify_unknown_reason_clusters(tampered)
+
+    def test_terminal_sink_exhaustion_traces_join_and_cycle_to_terminal_sinks(self):
+        lines = [
+            "cbz w0, #0xc",         # 0
+            "add x9, x1, #4",       # 4: join path 1 -> pure_address
+            "b #0x10",              # 8
+            "add x9, x1, #8",       # 12: join path 2 -> pure_address
+            "ldr w2, [x3, x9]",     # 16: join consumer (address)
+            "cmp w2, #0",           # 20: compare feeding cset
+            "cset w10, eq",         # 24: flag materialization
+            "cbz w10, #0x24",       # 28: non-trap control sink
+            "mov x0, x2",           # 32: escape sink
+            "ret",                  # 36
+        ]
+        insts = [instruction(i * 4, text) for i, text in enumerate(lines)]
+        broad_classes = [
+            "branch",
+            "alu",
+            "branch",
+            "alu",
+            "linear_memory",
+            "alu",
+            "alu",
+            "branch",
+            "alu",
+            "other",
+        ]
+        samples = {4: 3, 12: 5, 20: 7, 24: 2, 32: 4}
+        strict = provenance.analyze_instruction_stream(
+            insts,
+            broad_classes=broad_classes,
+            samples_by_offset=samples,
+            total_run_samples=100,
+        )
+        self.assertEqual(0, common_category(strict, "address_generation"))
+        self.assertEqual(21, common_category(strict, "unknown"))
+
+        exhaustion = provenance.analyze_terminal_sink_exhaustion(
+            insts,
+            broad_classes=broad_classes,
+            samples_by_offset=samples,
+            total_run_samples=100,
+        )
+        sinks = exhaustion["sink_classes"]
+        self.assertEqual(8, sinks["pure_address"]["samples"])
+        self.assertEqual(9, sinks["non_trap_control"]["samples"])
+        self.assertEqual(4, sinks["untyped_escape"]["samples"])
+        self.assertEqual(
+            8,
+            exhaustion["reclassified_from_unknown"]["pure_address"]["samples"],
+        )
+
+    def test_compare_terminal_sink_exhaustion_preserves_invariance_and_rejects_tampering(self):
+        wamr_lines = ["add x9, x1, #4", "ldr w0, [x2, x9]", "ret"]
+        wamr_insts = [instruction(i * 4, t) for i, t in enumerate(wamr_lines)]
+        wamr_ex = provenance.analyze_terminal_sink_exhaustion(
+            wamr_insts,
+            broad_classes=["alu", "linear_memory", "other"],
+            samples_by_offset={0: 10},
+            total_run_samples=100,
+        )
+        wt_lines = [
+            "cbz w0, #0xc",
+            "add x9, x1, #4",
+            "b #0x10",
+            "add x9, x1, #8",
+            "ldr w2, [x3, x9]",
+            "cmp w2, #0",
+            "b.eq #0x20",
+            "ret",
+            "ret",
+        ]
+        wt_insts = [instruction(i * 4, t) for i, t in enumerate(wt_lines)]
+        wt_ex = provenance.analyze_terminal_sink_exhaustion(
+            wt_insts,
+            broad_classes=[
+                "branch",
+                "alu",
+                "branch",
+                "alu",
+                "linear_memory",
+                "alu",
+                "branch",
+                "other",
+                "other",
+            ],
+            samples_by_offset={4: 2, 12: 3, 20: 15},
+            total_run_samples=100,
+        )
+        comparison = provenance.compare_terminal_sink_exhaustion(
+            wamr_ex["primary_analysis"],
+            wt_ex["primary_analysis"],
+            wasmtime_exhaustion=wt_ex,
+            wamr_exhaustion=wamr_ex,
+        )
+        addr = comparison["categories"]["address_generation"]
+        self.assertEqual(0, addr["strict_wasmtime_samples"])
+        self.assertEqual(5, addr["unblocked_wasmtime_samples"])
+        self.assertEqual(5, addr["wasmtime_reclassified_from_unknown_samples"])
+        self.assertEqual(15, addr["wasmtime_remaining_uncertain_common_samples"])
+        self.assertAlmostEqual(
+            addr["strict_conservative_headroom_percentage_points"],
+            addr["unblocked_conservative_headroom_percentage_points"],
+        )
+        self.assertTrue(comparison["proven_exhausted"])
+        self.assertFalse(comparison["optimization_authorized"])
+
+        tampered = copy.deepcopy(wt_ex)
+        tampered["reclassified_from_unknown"]["pure_address"]["samples"] += 1
+        with self.assertRaisesRegex(
+            provenance.ProvenanceError, "unblocked - strict delta"
+        ):
+            provenance.compare_terminal_sink_exhaustion(
+                wamr_ex["primary_analysis"],
+                wt_ex["primary_analysis"],
+                wasmtime_exhaustion=tampered,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -37,6 +37,27 @@ PROVEN_CATEGORIES = (
     "algorithmic_alu",
 )
 DEFAULT_GATE_THRESHOLD_PCT = 5.0
+UNKNOWN_REASON_CLUSTERS = (
+    "non_trap_control",
+    "ambiguous_cfg_join",
+    "cyclic_flow",
+    "untyped_escape",
+    "opaque_or_call_boundary",
+    "combined_memory_writeback",
+    "dead_or_unconsumed",
+    "mixed_categories",
+)
+TERMINAL_SINK_CLASSES = (
+    "pure_address",
+    "pure_structural_guard",
+    "pure_algorithmic",
+    "non_trap_control",
+    "untyped_escape",
+    "mixed_address_and_control_or_escape",
+    "opaque_or_call_boundary",
+    "combined_memory_writeback",
+    "dead_or_unconsumed",
+)
 CALLER_CLOBBERED = tuple(f"x{index}" for index in range(19)) + ("x30", "nzcv")
 POSSIBLE_CALL_ARGUMENTS = tuple(f"x{index}" for index in range(8))
 POSSIBLE_RETURN_VALUES = ("x0", "x1")
@@ -1578,4 +1599,775 @@ def compare_engine_analyses(
             "possible upper bound"
         ),
         "categories": categories,
+    }
+
+
+def _primary_unknown_reason_cluster(item: Mapping[str, Any]) -> str:
+    category = item.get("category")
+    if category == "mixed":
+        return "mixed_categories"
+    if category != "unknown":
+        raise ProvenanceError(
+            f"expected unknown or mixed category for cluster classification, got {category!r}"
+        )
+    reason = str(item.get("reason", ""))
+    if "control semantics are not proven bounds/check or algorithmic data" in reason:
+        return "non_trap_control"
+    if "consumer has multiple reaching definitions at a CFG join" in reason:
+        return "ambiguous_cfg_join"
+    if (
+        "cyclic producer-consumer path" in reason
+        or "value participates in cyclic data flow" in reason
+    ):
+        return "cyclic_flow"
+    if "value escapes through untyped memory or a signatureless return" in reason:
+        return "untyped_escape"
+    if (
+        "value reaches an opaque instruction or call boundary" in reason
+        or "instruction semantics are not recognized conservatively" in reason
+    ):
+        return "opaque_or_call_boundary"
+    if "combined memory and value-update costs cannot be isolated as pure ALU" in reason:
+        return "combined_memory_writeback"
+    if (
+        "definition has no proven consumer" in reason
+        or "value transformer has no proven live output" in reason
+        or "no terminal semantic consumer was proven" in reason
+        or "instruction is unreachable in the recovered CFG" in reason
+    ):
+        return "dead_or_unconsumed"
+    raise ProvenanceError(f"unrecognized unknown provenance reason: {reason!r}")
+
+
+def classify_unknown_reason_clusters(
+    analysis: Mapping[str, Any], *, name: str = "analysis"
+) -> dict[str, Any]:
+    """Partition common-universe unknown/mixed samples into deterministic reason clusters."""
+    validate_analysis_samples(analysis, name=name)
+    total = int(analysis["total_run_samples"])
+    common = analysis["common_gating_universe"]
+    common_categories = common["categories"]
+    sampled_instructions = common.get("sampled_instructions")
+    if not isinstance(sampled_instructions, Sequence):
+        raise ProvenanceError(
+            f"{name} common_gating_universe is missing sampled_instructions"
+        )
+
+    expected_proven_samples = sum(
+        int(common_categories[category]["samples"])
+        for category in PROVEN_CATEGORIES
+    )
+    expected_uncertain_samples = int(
+        common_categories["unknown"]["samples"]
+    ) + int(common_categories["mixed"]["samples"])
+
+    seen_offsets: set[int] = set()
+    observed_proven_samples = 0
+    cluster_samples = {cluster: 0 for cluster in UNKNOWN_REASON_CLUSTERS}
+    cluster_rows: dict[str, list[dict[str, Any]]] = {
+        cluster: [] for cluster in UNKNOWN_REASON_CLUSTERS
+    }
+
+    for item in sampled_instructions:
+        if not isinstance(item, Mapping):
+            raise ProvenanceError(
+                f"{name} common_gating_universe.sampled_instructions contains a non-object row"
+            )
+        offset = item.get("offset")
+        samples = item.get("samples")
+        category = item.get("category")
+        if (
+            isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or offset < 0
+        ):
+            raise ProvenanceError(
+                f"{name} sampled_instructions contains an invalid offset: {offset!r}"
+            )
+        if offset in seen_offsets:
+            raise ProvenanceError(
+                f"{name} sampled_instructions contains duplicate offset {offset}"
+            )
+        seen_offsets.add(offset)
+        if (
+            isinstance(samples, bool)
+            or not isinstance(samples, int)
+            or samples <= 0
+        ):
+            raise ProvenanceError(
+                f"{name} sampled_instructions[{offset}] must have positive integer samples"
+            )
+        if category in PROVEN_CATEGORIES:
+            observed_proven_samples += samples
+            continue
+        cluster = _primary_unknown_reason_cluster(item)
+        cluster_samples[cluster] += samples
+        cluster_rows[cluster].append(dict(item))
+
+    if observed_proven_samples != expected_proven_samples:
+        raise ProvenanceError(
+            f"{name} sampled_instructions proven samples ({observed_proven_samples}) "
+            f"do not match common_gating_universe proven category sum ({expected_proven_samples})"
+        )
+    observed_uncertain_samples = sum(cluster_samples.values())
+    if observed_uncertain_samples != expected_uncertain_samples:
+        raise ProvenanceError(
+            f"{name} sampled_instructions uncertain samples ({observed_uncertain_samples}) "
+            f"do not match common_gating_universe unknown+mixed samples ({expected_uncertain_samples})"
+        )
+
+    clusters: dict[str, Any] = {}
+    for cluster in UNKNOWN_REASON_CLUSTERS:
+        rows = sorted(
+            cluster_rows[cluster],
+            key=lambda row: (-int(row["samples"]), int(row["offset"])),
+        )
+        samples = cluster_samples[cluster]
+        clusters[cluster] = {
+            "samples": samples,
+            "percent_of_run": 100.0 * samples / total,
+            "percent_of_uncertain": (
+                100.0 * samples / expected_uncertain_samples
+                if expected_uncertain_samples
+                else 0.0
+            ),
+            "sampled_instruction_count": len(rows),
+            "sampled_instructions": rows,
+        }
+
+    return {
+        "uncertain_samples": expected_uncertain_samples,
+        "uncertain_percent_of_run": 100.0 * expected_uncertain_samples / total,
+        "clusters": clusters,
+    }
+
+
+def _trace_terminal_sinks_unblocked(
+    index: int,
+    instructions: Sequence[Instruction],
+    effects: Sequence[InstructionEffect],
+    consumers: Mapping[Definition, Sequence[ConsumerUse]],
+    reachable: set[int],
+    structural_guard_branches: set[int],
+    structural_guard_definitions: set[Definition],
+) -> tuple[str, list[str]]:
+    instruction = instructions[index]
+    effect = effects[index]
+    if index not in reachable:
+        return "dead_or_unconsumed", [
+            f"unreachable:{instruction.text}@{instruction.offset}"
+        ]
+    if not effect.recognized:
+        return "opaque_or_call_boundary", [
+            f"unrecognized:{instruction.text}@{instruction.offset}"
+        ]
+    if effect.memory:
+        return "combined_memory_writeback", [
+            f"memory:{instruction.text}@{instruction.offset}"
+        ]
+
+    definitions = {
+        register
+        for register in (
+            effect.primary_definitions | effect.secondary_definitions
+        )
+        if consumers.get(Definition(index, register))
+    }
+    if not definitions:
+        definitions = set(effect.primary_definitions)
+    if not definitions:
+        return "dead_or_unconsumed", [
+            f"no_defs:{instruction.text}@{instruction.offset}"
+        ]
+
+    worklist: list[Definition] = [
+        Definition(index, register) for register in sorted(definitions)
+    ]
+    visited: set[Definition] = set()
+    terminals: set[str] = set()
+    evidence: list[str] = []
+
+    def record(kind: str, detail: str) -> None:
+        terminals.add(kind)
+        if detail not in evidence:
+            evidence.append(detail)
+
+    while worklist:
+        definition = worklist.pop()
+        if definition in visited:
+            continue
+        visited.add(definition)
+        uses = consumers.get(definition, ())
+        if not uses:
+            if definition.instruction == index:
+                record(
+                    "dead",
+                    f"dead:{instruction.text}@{instruction.offset}",
+                )
+            continue
+        for consumer in uses:
+            use_inst = instructions[consumer.instruction]
+            role = consumer.use.role
+            if role == "address":
+                record("address", f"address:{use_inst.text}@{use_inst.offset}")
+            elif role == "escape":
+                record("escape", f"escape:{use_inst.text}@{use_inst.offset}")
+            elif role == "control":
+                if consumer.instruction in structural_guard_branches:
+                    record(
+                        "structural_guard",
+                        f"structural_guard:{use_inst.text}@{use_inst.offset}",
+                    )
+                else:
+                    record(
+                        "non_trap_control",
+                        f"control:{use_inst.text}@{use_inst.offset}",
+                    )
+            elif role == "compare":
+                nzcv_def = Definition(consumer.instruction, "nzcv")
+                if nzcv_def in structural_guard_definitions:
+                    record(
+                        "structural_guard",
+                        f"structural_guard:{use_inst.text}@{use_inst.offset}",
+                    )
+                else:
+                    nzcv_uses = consumers.get(nzcv_def, ())
+                    if not nzcv_uses:
+                        record(
+                            "non_trap_control",
+                            f"compare:{use_inst.text}@{use_inst.offset}",
+                        )
+                    else:
+                        worklist.append(nzcv_def)
+            elif role == "data":
+                record(
+                    "algorithmic",
+                    f"data:{use_inst.text}@{use_inst.offset}",
+                )
+            elif role == "unknown":
+                record("opaque", f"opaque:{use_inst.text}@{use_inst.offset}")
+            elif role != "value":
+                record(
+                    "opaque",
+                    f"unrecognized_role:{role}@{use_inst.offset}",
+                )
+
+            propagation_targets = [
+                target_register
+                for target_register in consumer.use.propagate_to
+                if target_register in effects[consumer.instruction].definitions
+            ]
+            if len(propagation_targets) != len(consumer.use.propagate_to):
+                record(
+                    "opaque",
+                    f"missing_target:{use_inst.text}@{use_inst.offset}",
+                )
+            active_targets = [
+                target_register
+                for target_register in propagation_targets
+                if consumers.get(
+                    Definition(consumer.instruction, target_register)
+                )
+            ]
+            if propagation_targets and not active_targets:
+                record(
+                    "dead",
+                    f"dead_transform:{use_inst.text}@{use_inst.offset}",
+                )
+            for target_register in active_targets:
+                worklist.append(
+                    Definition(consumer.instruction, target_register)
+                )
+
+    if not terminals or terminals == {"dead"}:
+        return "dead_or_unconsumed", evidence
+    live_terminals = terminals - {"dead"}
+    if live_terminals == {"address"}:
+        return "pure_address", evidence
+    if live_terminals == {"structural_guard"}:
+        return "pure_structural_guard", evidence
+    if live_terminals == {"algorithmic"}:
+        return "pure_algorithmic", evidence
+    if live_terminals == {"non_trap_control"}:
+        return "non_trap_control", evidence
+    if live_terminals == {"escape"}:
+        return "untyped_escape", evidence
+    if "address" in live_terminals:
+        return "mixed_address_and_control_or_escape", evidence
+    if "opaque" in live_terminals:
+        return "opaque_or_call_boundary", evidence
+    if "non_trap_control" in live_terminals:
+        return "non_trap_control", evidence
+    if "escape" in live_terminals:
+        return "untyped_escape", evidence
+    return "opaque_or_call_boundary", evidence
+
+
+def analyze_terminal_sink_exhaustion(
+    instructions: Sequence[Any],
+    *,
+    broad_classes: Sequence[str],
+    samples_by_offset: Mapping[int, int],
+    total_run_samples: int,
+    address_base: int = 0,
+    global_attributed_samples: int | None = None,
+) -> dict[str, Any]:
+    """Trace all common-universe candidates through CFG joins/cycles to terminal sinks."""
+    primary = analyze_instruction_stream(
+        instructions,
+        broad_classes=broad_classes,
+        samples_by_offset=samples_by_offset,
+        total_run_samples=total_run_samples,
+        address_base=address_base,
+        global_attributed_samples=global_attributed_samples,
+    )
+    normalized = normalize_instructions(
+        instructions, address_base=address_base
+    )
+    effects = [instruction_effect(instruction) for instruction in normalized]
+    successors, predecessors, _ = build_cfg(normalized, effects)
+    reachable = _reachable(successors)
+    incoming, _ = _reaching_definitions(effects, predecessors, reachable)
+    dominators = _dominators(predecessors, reachable)
+    structural_guard_branches, structural_guard_definitions, _ = (
+        _structural_address_guard_branches(
+            effects,
+            successors,
+            incoming,
+            dominators,
+            reachable,
+        )
+    )
+    consumers = _build_consumers(effects, incoming, reachable)
+    memo: dict[Definition, Trace] = {}
+
+    def strict_classify(index: int) -> tuple[str, str]:
+        effect = effects[index]
+        if index not in reachable:
+            return "unknown", "instruction is unreachable in the recovered CFG"
+        if not effect.recognized:
+            return (
+                "unknown",
+                "instruction semantics are not recognized conservatively",
+            )
+        if effect.memory:
+            return (
+                "unknown",
+                "combined memory and value-update costs cannot be isolated as pure ALU",
+            )
+        definitions = {
+            register
+            for register in (
+                effect.primary_definitions | effect.secondary_definitions
+            )
+            if consumers.get(Definition(index, register))
+        }
+        if not definitions:
+            definitions = set(effect.primary_definitions)
+        combined = Trace()
+        for register in definitions:
+            combined.merge(
+                _trace_definition(
+                    Definition(index, register),
+                    instructions=normalized,
+                    effects=effects,
+                    consumers=consumers,
+                    structural_guard_branches=structural_guard_branches,
+                    structural_guard_definitions=structural_guard_definitions,
+                    stack=set(),
+                    memo=memo,
+                )
+            )
+        return _category(combined)
+
+    common_indices = [
+        index
+        for index, (broad_class, effect) in enumerate(
+            zip(broad_classes, effects)
+        )
+        if broad_class == "alu"
+        or effect.gating_candidate
+        or not effect.recognized
+    ]
+
+    primary_by_offset = {
+        int(row["offset"]): row
+        for row in primary["common_gating_universe"]["sampled_instructions"]
+    }
+
+    sink_samples = {sink: 0 for sink in TERMINAL_SINK_CLASSES}
+    sink_static = {sink: 0 for sink in TERMINAL_SINK_CLASSES}
+    sink_rows: dict[str, list[dict[str, Any]]] = {
+        sink: [] for sink in TERMINAL_SINK_CLASSES
+    }
+    reclassified_rows: dict[str, list[dict[str, Any]]] = {
+        "pure_address": [],
+        "pure_structural_guard": [],
+        "pure_algorithmic": [],
+    }
+    reclassified_samples = {
+        "pure_address": 0,
+        "pure_structural_guard": 0,
+        "pure_algorithmic": 0,
+    }
+    reclassified_static = {
+        "pure_address": 0,
+        "pure_structural_guard": 0,
+        "pure_algorithmic": 0,
+    }
+
+    strict_category_for_sink = {
+        "pure_address": "address_generation",
+        "pure_structural_guard": "structural_address_guard",
+        "pure_algorithmic": "algorithmic_alu",
+    }
+
+    for idx in common_indices:
+        inst = normalized[idx]
+        offset = int(inst.offset)
+        samples = int(samples_by_offset.get(offset, 0))
+        sink_class, sink_evidence = _trace_terminal_sinks_unblocked(
+            idx,
+            normalized,
+            effects,
+            consumers,
+            reachable,
+            structural_guard_branches,
+            structural_guard_definitions,
+        )
+        strict_cat, strict_reason = strict_classify(idx)
+        sink_samples[sink_class] += samples
+        sink_static[sink_class] += 1
+        row = {
+            "offset": offset,
+            "address": inst.address,
+            "instruction": inst.text,
+            "samples": samples,
+            "percent_of_run": 100.0 * samples / total_run_samples,
+            "broad_class": broad_classes[idx],
+            "strict_category": strict_cat,
+            "strict_reason": strict_reason,
+            "terminal_sink_class": sink_class,
+            "terminal_evidence": sink_evidence[:12],
+        }
+        if samples > 0:
+            sink_rows[sink_class].append(row)
+        if sink_class in strict_category_for_sink:
+            expected_strict = strict_category_for_sink[sink_class]
+            if strict_cat != expected_strict:
+                reclassified_static[sink_class] += 1
+                reclassified_samples[sink_class] += samples
+                if samples > 0:
+                    reclassified_rows[sink_class].append(
+                        primary_by_offset.get(offset, row)
+                    )
+
+    common = primary["common_gating_universe"]
+    common_samples = int(common["samples"])
+    if sum(sink_samples.values()) != common_samples:
+        raise ProvenanceError(
+            "terminal sink exhaustion sample sum does not match common_gating_universe.samples"
+        )
+    for sink_key, strict_key in strict_category_for_sink.items():
+        strict_val = int(common["categories"][strict_key]["samples"])
+        if sink_samples[sink_key] < strict_val:
+            raise ProvenanceError(
+                f"unblocked {sink_key} samples ({sink_samples[sink_key]}) cannot be "
+                f"less than strict {strict_key} samples ({strict_val})"
+            )
+
+    sink_classes_out: dict[str, Any] = {}
+    for sink in TERMINAL_SINK_CLASSES:
+        rows = sorted(
+            sink_rows[sink],
+            key=lambda item: (-int(item["samples"]), int(item["offset"])),
+        )
+        sink_classes_out[sink] = {
+            "samples": sink_samples[sink],
+            "percent_of_run": 100.0 * sink_samples[sink] / total_run_samples,
+            "percent_of_common_universe": (
+                100.0 * sink_samples[sink] / common_samples
+                if common_samples
+                else 0.0
+            ),
+            "static_instructions": sink_static[sink],
+            "sampled_instructions": rows,
+        }
+
+    reclassified_out: dict[str, Any] = {}
+    for sink_key in (
+        "pure_address",
+        "pure_structural_guard",
+        "pure_algorithmic",
+    ):
+        rows = sorted(
+            reclassified_rows[sink_key],
+            key=lambda item: (-int(item["samples"]), int(item["offset"])),
+        )
+        reclassified_out[sink_key] = {
+            "samples": reclassified_samples[sink_key],
+            "percent_of_run": (
+                100.0 * reclassified_samples[sink_key] / total_run_samples
+            ),
+            "static_instructions": reclassified_static[sink_key],
+            "sampled_instructions": rows,
+        }
+
+    return {
+        "total_run_samples": total_run_samples,
+        "common_samples": common_samples,
+        "common_static_instructions": len(common_indices),
+        "sink_classes": sink_classes_out,
+        "reclassified_from_unknown": reclassified_out,
+        "primary_analysis": primary,
+    }
+
+
+def validate_terminal_sink_exhaustion(
+    analysis: Mapping[str, Any],
+    exhaustion: Mapping[str, Any],
+    *,
+    name: str = "exhaustion",
+) -> None:
+    validate_analysis_samples(analysis, name=f"{name}.analysis")
+    if not isinstance(exhaustion, Mapping):
+        raise ProvenanceError(f"{name} must be a mapping")
+    total = int(analysis["total_run_samples"])
+    common = analysis["common_gating_universe"]
+    common_samples = int(common["samples"])
+    if exhaustion.get("total_run_samples") != total:
+        raise ProvenanceError(
+            f"{name} total_run_samples does not match primary analysis"
+        )
+    if exhaustion.get("common_samples") != common_samples:
+        raise ProvenanceError(
+            f"{name} common_samples does not match common_gating_universe.samples"
+        )
+    sink_classes = exhaustion.get("sink_classes")
+    if not isinstance(sink_classes, Mapping):
+        raise ProvenanceError(f"{name} is missing sink_classes")
+    total_sink_samples = 0
+    for sink in TERMINAL_SINK_CLASSES:
+        if sink not in sink_classes or not isinstance(sink_classes[sink], Mapping):
+            raise ProvenanceError(f"{name}.sink_classes is missing {sink}")
+        samples = sink_classes[sink].get("samples")
+        if isinstance(samples, bool) or not isinstance(samples, int) or samples < 0:
+            raise ProvenanceError(
+                f"{name}.sink_classes.{sink}.samples must be a non-negative integer"
+            )
+        total_sink_samples += samples
+    if total_sink_samples != common_samples:
+        raise ProvenanceError(
+            f"{name}.sink_classes sample sum ({total_sink_samples}) does not equal "
+            f"common_samples ({common_samples})"
+        )
+
+    strict_map = {
+        "pure_address": int(common["categories"]["address_generation"]["samples"]),
+        "pure_structural_guard": int(
+            common["categories"]["structural_address_guard"]["samples"]
+        ),
+        "pure_algorithmic": int(
+            common["categories"]["algorithmic_alu"]["samples"]
+        ),
+    }
+    reclassified = exhaustion.get("reclassified_from_unknown")
+    if not isinstance(reclassified, Mapping):
+        raise ProvenanceError(f"{name} is missing reclassified_from_unknown")
+    for sink_key, strict_samples in strict_map.items():
+        unblocked_samples = int(sink_classes[sink_key]["samples"])
+        if unblocked_samples < strict_samples:
+            raise ProvenanceError(
+                f"{name} {sink_key} samples ({unblocked_samples}) are less than "
+                f"strict proven samples ({strict_samples})"
+            )
+        entry = reclassified.get(sink_key)
+        if not isinstance(entry, Mapping):
+            raise ProvenanceError(
+                f"{name}.reclassified_from_unknown is missing {sink_key}"
+            )
+        reclass_samples = entry.get("samples")
+        if (
+            isinstance(reclass_samples, bool)
+            or not isinstance(reclass_samples, int)
+            or reclass_samples != unblocked_samples - strict_samples
+        ):
+            raise ProvenanceError(
+                f"{name}.reclassified_from_unknown.{sink_key}.samples ({reclass_samples}) "
+                f"does not equal unblocked - strict delta ({unblocked_samples - strict_samples})"
+            )
+
+
+def compare_terminal_sink_exhaustion(
+    wamr: Mapping[str, Any],
+    wasmtime: Mapping[str, Any],
+    *,
+    wasmtime_exhaustion: Mapping[str, Any],
+    wamr_exhaustion: Mapping[str, Any] | None = None,
+    threshold_pct: float = DEFAULT_GATE_THRESHOLD_PCT,
+) -> dict[str, Any]:
+    """Compare WAMR vs Wasmtime after unblocking CFG joins and loop cycles."""
+    strict_gate = compare_engine_analyses(
+        wamr, wasmtime, threshold_pct=threshold_pct
+    )
+    validate_terminal_sink_exhaustion(
+        wasmtime, wasmtime_exhaustion, name="wasmtime_exhaustion"
+    )
+    if wamr_exhaustion is not None:
+        validate_terminal_sink_exhaustion(
+            wamr, wamr_exhaustion, name="wamr_exhaustion"
+        )
+
+    wasmtime_total = int(wasmtime["total_run_samples"])
+    wamr_total = int(wamr["total_run_samples"])
+    wasmtime_common = int(wasmtime["common_gating_universe"]["samples"])
+    wasmtime_instruction_unresolved = int(
+        wasmtime.get("sample_mapping", {}).get(
+            "unresolved_function_samples", 0
+        )
+    )
+    wasmtime_global_unattributed = int(
+        wasmtime["global_sample_mapping"]["unattributed_samples"]
+    )
+
+    sink_for_category = {
+        "address_generation": "pure_address",
+        "algorithmic_alu": "pure_algorithmic",
+    }
+    wt_sinks = wasmtime_exhaustion["sink_classes"]
+    wt_proven_sinks = {
+        "pure_address": int(wt_sinks["pure_address"]["samples"]),
+        "pure_structural_guard": int(
+            wt_sinks["pure_structural_guard"]["samples"]
+        ),
+        "pure_algorithmic": int(wt_sinks["pure_algorithmic"]["samples"]),
+    }
+    wt_non_proven_common_samples = wasmtime_common - sum(
+        wt_proven_sinks.values()
+    )
+
+    categories_out: dict[str, Any] = {}
+    for category in GATE_CATEGORIES:
+        sink_key = sink_for_category[category]
+        strict_wamr_samples = int(
+            wamr["common_gating_universe"]["categories"][category]["samples"]
+        )
+        strict_wt_samples = int(
+            wasmtime["common_gating_universe"]["categories"][category][
+                "samples"
+            ]
+        )
+        unblocked_wamr_samples = (
+            int(wamr_exhaustion["sink_classes"][sink_key]["samples"])
+            if wamr_exhaustion is not None
+            else strict_wamr_samples
+        )
+        unblocked_wt_samples = wt_proven_sinks[sink_key]
+        wt_reclassified_target = unblocked_wt_samples - strict_wt_samples
+        wt_reclassified_disjoint = sum(
+            wt_proven_sinks[other_sink]
+            - int(
+                wasmtime["common_gating_universe"]["categories"][other_cat][
+                    "samples"
+                ]
+            )
+            for other_sink, other_cat in (
+                ("pure_address", "address_generation"),
+                ("pure_structural_guard", "structural_address_guard"),
+                ("pure_algorithmic", "algorithmic_alu"),
+            )
+            if other_sink != sink_key
+        )
+
+        unblocked_wamr_share = 100.0 * unblocked_wamr_samples / wamr_total
+        unblocked_wt_share = 100.0 * unblocked_wt_samples / wasmtime_total
+        unblocked_wt_unknown_upper_samples = (
+            wt_non_proven_common_samples
+            + wasmtime_instruction_unresolved
+            + wasmtime_global_unattributed
+        )
+        unblocked_wt_unknown_upper_pct = (
+            100.0 * unblocked_wt_unknown_upper_samples / wasmtime_total
+        )
+        unblocked_conservative_headroom = unblocked_wamr_share - (
+            unblocked_wt_share + unblocked_wt_unknown_upper_pct
+        )
+
+        if category == "address_generation":
+            wamr_mixed_samples = (
+                int(
+                    wamr_exhaustion["sink_classes"][
+                        "mixed_address_and_control_or_escape"
+                    ]["samples"]
+                )
+                if wamr_exhaustion is not None
+                else int(
+                    wamr["common_gating_universe"]["categories"]["mixed"][
+                        "samples"
+                    ]
+                )
+            )
+        else:
+            wamr_mixed_samples = 0
+        wamr_mixed_upper_share = (
+            100.0 * (unblocked_wamr_samples + wamr_mixed_samples) / wamr_total
+        )
+        wamr_mixed_credit_headroom = wamr_mixed_upper_share - (
+            unblocked_wt_share + unblocked_wt_unknown_upper_pct
+        )
+        clears = unblocked_conservative_headroom >= threshold_pct
+        categories_out[category] = {
+            "strict_wamr_samples": strict_wamr_samples,
+            "strict_wasmtime_samples": strict_wt_samples,
+            "unblocked_wamr_samples": unblocked_wamr_samples,
+            "unblocked_wasmtime_samples": unblocked_wt_samples,
+            "wasmtime_reclassified_from_unknown_samples": wt_reclassified_target,
+            "wasmtime_reclassified_to_disjoint_proven_samples": (
+                wt_reclassified_disjoint
+            ),
+            "wasmtime_remaining_uncertain_common_samples": (
+                wt_non_proven_common_samples
+            ),
+            "wasmtime_remaining_upper_bound_samples": (
+                unblocked_wt_unknown_upper_samples
+            ),
+            "unblocked_wamr_percent_of_run": unblocked_wamr_share,
+            "unblocked_wasmtime_percent_of_run": unblocked_wt_share,
+            "unblocked_wasmtime_unknown_upper_percentage_points": (
+                unblocked_wt_unknown_upper_pct
+            ),
+            "strict_conservative_headroom_percentage_points": strict_gate[
+                "categories"
+            ][category]["conservative_headroom_percentage_points"],
+            "unblocked_conservative_headroom_percentage_points": (
+                unblocked_conservative_headroom
+            ),
+            "wamr_mixed_credit_upper_bound_headroom_percentage_points": (
+                wamr_mixed_credit_headroom
+            ),
+            "clears_threshold": clears,
+            "proven_exhausted": (
+                not clears and wamr_mixed_credit_headroom < threshold_pct
+            ),
+        }
+
+    cleared = [
+        category
+        for category, values in categories_out.items()
+        if values["clears_threshold"]
+    ]
+    all_exhausted = all(
+        values["proven_exhausted"] for values in categories_out.values()
+    )
+    return {
+        "threshold_percentage_points": threshold_pct,
+        "status": (
+            "cleared"
+            if cleared
+            else ("exhausted" if all_exhausted else "not-cleared")
+        ),
+        "optimization_authorized": bool(cleared),
+        "proven_exhausted": all_exhausted,
+        "cleared_categories": cleared,
+        "categories": categories_out,
     }

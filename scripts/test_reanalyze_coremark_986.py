@@ -89,6 +89,89 @@ class RetainedEvidenceTests(unittest.TestCase):
         self.assertEqual(
             (284, 1495), tuple(result["top_uncertain_paths"]["wasmtime"][0][k] for k in ("offset", "samples"))
         )
+        wamr_clusters = result["unknown_reason_clusters"]["wamr"]
+        self.assertEqual(13027, wamr_clusters["uncertain_samples"])
+        self.assertEqual(
+            8769, wamr_clusters["clusters"]["non_trap_control"]["samples"]
+        )
+        self.assertEqual(
+            2879, wamr_clusters["clusters"]["ambiguous_cfg_join"]["samples"]
+        )
+        self.assertEqual(
+            1303, wamr_clusters["clusters"]["mixed_categories"]["samples"]
+        )
+        wt_clusters = result["unknown_reason_clusters"]["wasmtime"]
+        self.assertEqual(5740, wt_clusters["uncertain_samples"])
+        self.assertEqual(
+            3411, wt_clusters["clusters"]["non_trap_control"]["samples"]
+        )
+        self.assertEqual(
+            2025, wt_clusters["clusters"]["ambiguous_cfg_join"]["samples"]
+        )
+        self.assertEqual(
+            216, wt_clusters["clusters"]["untyped_escape"]["samples"]
+        )
+        self.assertEqual(
+            76, wt_clusters["clusters"]["opaque_or_call_boundary"]["samples"]
+        )
+        self.assertEqual(
+            12, wt_clusters["clusters"]["combined_memory_writeback"]["samples"]
+        )
+
+        objdump_text = (root / "wasmtime-objdump.txt").read_text()
+        with_exhaustion = reanalysis.reanalyze(
+            report, cwasm, benchmark, wasmtime_objdump_text=objdump_text
+        )
+        native_ex = with_exhaustion["wasmtime_native_exhaustion"]
+        self.assertTrue(native_ex["verified_retained_provenance"])
+        self.assertEqual(0x600, native_ex["address_base"])
+        self.assertEqual(410, native_ex["static_instructions"])
+        self.assertEqual(208, native_ex["common_static_instructions"])
+        sinks = native_ex["sink_classes"]
+        self.assertEqual(256, sinks["pure_address"]["samples"])
+        self.assertEqual(0, sinks["pure_structural_guard"]["samples"])
+        self.assertEqual(0, sinks["pure_algorithmic"]["samples"])
+        self.assertEqual(3555, sinks["non_trap_control"]["samples"])
+        self.assertEqual(1735, sinks["untyped_escape"]["samples"])
+        self.assertEqual(
+            336, sinks["mixed_address_and_control_or_escape"]["samples"]
+        )
+        self.assertEqual(100, sinks["opaque_or_call_boundary"]["samples"])
+        self.assertEqual(12, sinks["combined_memory_writeback"]["samples"])
+        self.assertEqual(0, sinks["dead_or_unconsumed"]["samples"])
+        reclass_addr = native_ex["reclassified_from_unknown"]["pure_address"]
+        self.assertEqual(2, reclass_addr["samples"])
+        self.assertEqual(
+            [540, 1224],
+            [row["offset"] for row in reclass_addr["sampled_instructions"]],
+        )
+        ex_gate = native_ex["exhaustion_gate"]
+        self.assertEqual("exhausted", ex_gate["status"])
+        self.assertTrue(ex_gate["proven_exhausted"])
+        self.assertFalse(ex_gate["optimization_authorized"])
+        ex_addr = ex_gate["categories"]["address_generation"]
+        self.assertEqual((254, 256), (ex_addr["strict_wasmtime_samples"], ex_addr["unblocked_wasmtime_samples"]))
+        self.assertEqual(5738, ex_addr["wasmtime_remaining_uncertain_common_samples"])
+        self.assertEqual(5776, ex_addr["wasmtime_remaining_upper_bound_samples"])
+        self.assertAlmostEqual(
+            -7.431388244843346,
+            ex_addr["unblocked_conservative_headroom_percentage_points"],
+        )
+        self.assertAlmostEqual(
+            -5.538813297132446,
+            ex_addr["wamr_mixed_credit_upper_bound_headroom_percentage_points"],
+        )
+        with self.subTest("objdump tampering"), self.assertRaisesRegex(
+            ValueError, "differs from native disassembly"
+        ):
+            reanalysis.reanalyze(
+                report,
+                cwasm,
+                benchmark,
+                wasmtime_objdump_text=objdump_text.replace(
+                    "x3, x19", "x3, x20"
+                ),
+            )
 
         with self.subTest("benchmark hash"), self.assertRaisesRegex(
             ValueError, "benchmark report hash"
