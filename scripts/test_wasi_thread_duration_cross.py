@@ -777,6 +777,175 @@ def replace_retained_report(
 
 
 class DurationCrossReportTests(unittest.TestCase):
+    def test_execute_arm_full_report_uses_platform_thread_counts_for_atomic_preflight(self) -> None:
+        base_report = synthetic_report(
+            platform="ubuntu-24.04-aarch64", sequence=1
+        )
+        preflight_threads: list[int] = []
+        preflight_enforce_timing: list[bool] = []
+        pilot_queue = list(base_report["plan"]["pilots"])
+        record_queue = list(base_report["records"])
+
+        def fake_measured_with_telemetry(**kwargs: object) -> dict:
+            fields = kwargs["fields"]
+            assert isinstance(fields, dict)
+            cell = kwargs["cell"]
+            assert isinstance(cell, dict)
+            cpu_placement = kwargs["cpu_placement"]
+            assert isinstance(cpu_placement, dict)
+            duration.cpu_affinity_for(
+                cpu_placement, cell["workload"], cell["threads"]
+            )
+            if fields.get("phase") == "pilot":
+                return copy.deepcopy(pilot_queue.pop(0))
+            if fields.get("phase") == "preflight":
+                preflight_threads.append(int(cell["threads"]))
+                preflight_enforce_timing.append(
+                    bool(kwargs.get("enforce_timing_quality", True))
+                )
+                return {}
+            return copy.deepcopy(record_queue.pop(0))
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "out"
+            args = duration.parse_args(
+                [
+                    "--repo",
+                    str(REPO_ROOT),
+                    "--output-dir",
+                    str(output),
+                    "--source-sha",
+                    SHA,
+                    "--platform-id",
+                    "ubuntu-24.04-aarch64",
+                    "--report-sequence",
+                    "1",
+                    "--cohort-id",
+                    COHORT_ID,
+                    "--runner-environment",
+                    "github-hosted",
+                    "--host-pair-id",
+                    "github:1001:1:ubuntu-24.04-aarch64",
+                ]
+            )
+            def fake_build_variant(**kw: object) -> mock.MagicMock:
+                b = mock.MagicMock()
+                b.name = f"enabled-{kw['mode']}"
+                return b
+
+            with (
+                mock.patch.object(
+                    duration,
+                    "source_identity",
+                    return_value=copy.deepcopy(
+                        base_report["metadata"]["source_revision"]
+                    ),
+                ),
+                mock.patch.object(
+                    duration,
+                    "resolve_measurement_fixtures",
+                    return_value=(
+                        REPO_ROOT,
+                        copy.deepcopy(base_report["metadata"]["fixtures"]),
+                        base_report["metadata"]["fixture_set_sha256"],
+                    ),
+                ),
+                mock.patch.object(
+                    duration,
+                    "discover_cpu_placement",
+                    return_value=copy.deepcopy(
+                        base_report["metadata"]["cpu_placement"]
+                    ),
+                ),
+                mock.patch.object(
+                    duration,
+                    "host_metadata",
+                    return_value=copy.deepcopy(base_report["metadata"]["host"]),
+                ),
+                mock.patch.object(
+                    duration,
+                    "host_quiescence_diagnostics",
+                    return_value=copy.deepcopy(
+                        base_report["metadata"]["host_quiescence_at_start"]
+                    ),
+                ),
+                mock.patch.object(
+                    duration,
+                    "host_pair_identity",
+                    return_value=copy.deepcopy(
+                        base_report["metadata"]["host_pair"]
+                    ),
+                ),
+                mock.patch.object(
+                    duration,
+                    "build_variant",
+                    side_effect=fake_build_variant,
+                ),
+                mock.patch.object(
+                    duration,
+                    "compile_aot_fixtures",
+                    return_value={
+                        "single": Path("single.cwasm"),
+                        "threaded-polls-on": Path("threaded-polls-on.cwasm"),
+                        "threaded-polls-off": Path("threaded-polls-off.cwasm"),
+                    },
+                ),
+                mock.patch.object(
+                    duration,
+                    "aot_artifact_report",
+                    return_value={
+                        **copy.deepcopy(
+                            base_report["metadata"]["aot_artifacts"]
+                        ),
+                        "cancel_poll_static": {"sites_enabled": 12},
+                    },
+                ),
+                mock.patch.object(
+                    duration,
+                    "artifact_identity",
+                    return_value=copy.deepcopy(
+                        base_report["metadata"]["artifact_identity"]["baseline"]
+                    ),
+                ),
+                mock.patch.object(
+                    duration,
+                    "checked_trusted_barrier_preflight",
+                    return_value=copy.deepcopy(
+                        base_report["quality_preflight"]
+                    ),
+                ),
+                mock.patch.object(
+                    duration,
+                    "measured_with_telemetry",
+                    side_effect=fake_measured_with_telemetry,
+                ),
+                mock.patch.object(
+                    duration,
+                    "build_tool_report",
+                    return_value=copy.deepcopy(base_report["metadata"]["tools"]),
+                ),
+                mock.patch.object(duration.TelemetrySidecar, "start"),
+                mock.patch.object(
+                    duration.TelemetrySidecar,
+                    "stop",
+                    return_value=copy.deepcopy(
+                        base_report["telemetry_sidecar"]
+                    ),
+                ),
+            ):
+                document = duration.execute(args)
+            self.assertEqual(
+                preflight_threads,
+                [2] * duration.ATOMIC_WAIT_PREFLIGHT_RUNS["authoritative"],
+            )
+            self.assertEqual(
+                preflight_enforce_timing,
+                [False] * duration.ATOMIC_WAIT_PREFLIGHT_RUNS["authoritative"],
+            )
+            self.assertTrue((output / "report.json").is_file())
+            self.assertTrue((output / "report.md").is_file())
+            duration.validate_report(document)
+
     def test_arm_readiness_result_has_no_cohort_or_report(self) -> None:
         source = {"commit": SHA}
         plan = duration.build_plan("ubuntu-24.04-aarch64", 1, source)
