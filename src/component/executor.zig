@@ -165,6 +165,7 @@ pub const ExecutionError = error{
     PostReturnFailed,
     LiftError,
     LowerError,
+    Trap,
     ThreadCancellationUnavailable,
     /// AOT-backed core hit a canon-ABI shape this PR doesn't yet
     /// support — only scalar primitive params and a single scalar
@@ -1410,6 +1411,10 @@ fn callComponentFuncByLocalWithHostTaskContext(
         const realloc_idx = resolved_realloc_idx orelse return error.ReallocNotAvailable;
         const tuple_size = computeTupleSize(registry, param_types);
         const tuple_align = computeTupleAlign(registry, param_types);
+        const mut_owner: *ComponentInstance = @constCast(owner_inst);
+        const saved_may_leave = mut_owner.may_leave;
+        mut_owner.may_leave = false;
+        defer mut_owner.may_leave = saved_may_leave;
         const ptr = try callRealloc(&frame, realloc_idx, 0, 0, tuple_align, tuple_size);
         // Re-fetch memory: realloc may have grown it (relocating the slice).
         memory = frame.memory(default_mem_idx);
@@ -1521,8 +1526,21 @@ fn callComponentFuncByLocalWithHostTaskContext(
         }
     }
 
+    // Drain any queued `.ready` explicit component threads before post-return.
+    const mut_owner: *ComponentInstance = @constCast(owner_inst);
+    const active_thread_ctx = execution_context.current();
+    try runReadyComponentThreads(
+        mut_owner,
+        active_thread_ctx,
+        taskManagerFor(active_thread_ctx),
+        allocator,
+    );
+
     // 7. Post-return callback
     if (resolved_post_return_idx) |pr_idx| {
+        const saved_may_leave = mut_owner.may_leave;
+        mut_owner.may_leave = false;
+        defer mut_owner.may_leave = saved_may_leave;
         // Per spec: post_return receives the flat result value(s).
         // For inline results (≤ MAX_FLAT_RESULTS): re-push the flat values.
         // For spilled results: re-push the result pointer as i32.
@@ -1722,6 +1740,10 @@ fn callComponentFuncByLocalAsyncLiftedWithHostTaskContext(
             return error.ReallocNotAvailable;
         const tuple_size = computeTupleSize(registry, param_types);
         const tuple_align = computeTupleAlign(registry, param_types);
+        const mut_owner_realloc: *ComponentInstance = @constCast(owner_inst);
+        const saved_may_leave = mut_owner_realloc.may_leave;
+        mut_owner_realloc.may_leave = false;
+        defer mut_owner_realloc.may_leave = saved_may_leave;
         const ptr = try callRealloc(&frame, realloc_idx, 0, 0, tuple_align, tuple_size);
         memory = frame.memory(memory_idx);
         const refreshed_mem = memory orelse return error.MemoryNotAvailable;
@@ -1776,6 +1798,15 @@ fn callComponentFuncByLocalAsyncLiftedWithHostTaskContext(
         const status = frame.popSlot(.i32) catch return error.StackUnderflow;
         out_status.* = @bitCast(status.i32);
     }
+
+    const mut_owner_exit: *ComponentInstance = @constCast(owner_inst);
+    const active_thread_ctx = execution_context.current();
+    try runReadyComponentThreads(
+        mut_owner_exit,
+        active_thread_ctx,
+        taskManagerFor(active_thread_ctx),
+        allocator,
+    );
 }
 
 // ── Helper: extract ValType arrays from FuncType ────────────────────────────
@@ -2777,10 +2808,9 @@ pub fn dispatchCanonBuiltinWithCtx(
             // `canon thread.yield cancel?` — Binary.md tag 0x0c. Pushes
             // an i32 discriminant: 0 on normal resume, 1 if the task was
             // cancelled while parked (cancellable-only).
-            const outcome: u32 = if (task_manager) |tm| blk: {
-                const handle = tm.currentTask() orelse break :blk 0;
-                break :blk @backingInt(async_canon.taskYield(tm, handle, info.cancellable, allocator));
-            } else 0;
+            if (!comp_inst.may_leave) return error.Trap;
+            try runReadyComponentThreads(comp_inst, thread_context, task_manager, allocator);
+            const outcome = threadCancellationOutcome(info.cancellable, task_manager, allocator);
             env.pushI32(@bitCast(outcome)) catch return error.StackOverflow;
         },
         .context_get => |info| {
@@ -4035,12 +4065,13 @@ fn dispatchAsyncCanon(
             const ws_handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
 
             const is_wait = op == .waitable_set_wait;
-            // Bounded drive loop. Each iteration first asks the host
+            //Bounded drive loop. Each iteration first asks the host
             // async-event driver to advance time / drain host I/O,
             // then re-checks `popReadyEvent`. Caps total iterations
             // to keep the runtime responsive when the guest has
             // non-host work (e.g. `futures::join!` peer rendezvous
             // — the cli-stdio-roundtrip path).
+            try runReadyComponentThreads(comp_inst, thread_context, task_manager, allocator);
             const max_iters: usize = if (is_wait) 256 else 1;
             var iter: usize = 0;
             while (iter < max_iters) : (iter += 1) {
@@ -4250,7 +4281,576 @@ fn dispatchAsyncCanon(
             // just-dropped handle on the cancellation path; matching
             // wasmtime's tolerant behaviour avoids spurious traps.
         },
+
+        // ── Backpressure & explicit thread canonical built-ins (#972) ───
+        .backpressure_set => {
+            const v = env.popI32() catch return error.StackUnderflow;
+            if (!comp_inst.may_leave) return error.Trap;
+            comp_inst.backpressure = if (v != 0) 1 else 0;
+        },
+        .backpressure_inc => {
+            if (!comp_inst.may_leave) return error.Trap;
+            if (comp_inst.backpressure == std.math.maxInt(u16)) return error.Trap;
+            comp_inst.backpressure += 1;
+        },
+        .backpressure_dec => {
+            if (!comp_inst.may_leave) return error.Trap;
+            if (comp_inst.backpressure == 0) return error.Trap;
+            comp_inst.backpressure -= 1;
+        },
+        .thread_index => {
+            if (!comp_inst.may_leave) return error.Trap;
+            const idx = comp_inst.threads.current_thread_idx;
+            if (idx == 0 or comp_inst.threads.get(idx) == null) return error.Trap;
+            env.pushI32(@bitCast(idx)) catch return error.StackOverflow;
+        },
+        .thread_new_indirect => |info| {
+            const context_arg = env.popI32() catch return error.StackUnderflow;
+            const func_table_idx = env.popI32() catch return error.StackUnderflow;
+            if (!comp_inst.may_leave) return error.Trap;
+            const target = try resolveIndirectThreadTarget(
+                comp_inst,
+                env,
+                info.func_type_idx,
+                info.table_idx,
+                func_table_idx,
+                context_arg,
+            );
+            const new_idx = comp_inst.threads.allocThread(allocator, target, false) catch
+                return error.OutOfMemory;
+            env.pushI32(@bitCast(new_idx)) catch return error.StackOverflow;
+        },
+        .thread_resume_later => {
+            const raw_idx = env.popI32() catch return error.StackUnderflow;
+            if (!comp_inst.may_leave) return error.Trap;
+            if (raw_idx <= 0) return error.Trap;
+            const target_idx: u32 = @bitCast(raw_idx);
+            if (target_idx == comp_inst.threads.current_thread_idx) return error.Trap;
+            const entry = comp_inst.threads.get(target_idx) orelse return error.Trap;
+            if (entry.state != .suspended) return error.Trap;
+            comp_inst.threads.enqueueReady(allocator, target_idx) catch return error.OutOfMemory;
+        },
+        .thread_suspend => |info| {
+            if (!comp_inst.may_leave) return error.Trap;
+            const current_idx = comp_inst.threads.current_thread_idx;
+            if (current_idx == 0) return error.Trap;
+            const current_entry = comp_inst.threads.get(current_idx) orelse return error.Trap;
+            current_entry.state = .suspended;
+            try runReadyComponentThreads(comp_inst, thread_context, task_manager, allocator);
+            comp_inst.threads.current_thread_idx = current_idx;
+            if (comp_inst.threads.get(current_idx)) |ce| {
+                ce.state = .running;
+                comp_inst.threads.removeFromReadyQueue(current_idx);
+            }
+            const outcome = threadCancellationOutcome(info.cancellable, task_manager, allocator);
+            env.pushI32(@bitCast(outcome)) catch return error.StackOverflow;
+        },
+        .thread_suspend_then_resume => |info| {
+            const raw_idx = env.popI32() catch return error.StackUnderflow;
+            const outcome = try switchComponentThread(
+                comp_inst,
+                raw_idx,
+                false,
+                false,
+                info.cancellable,
+                thread_context,
+                task_manager,
+                allocator,
+            );
+            env.pushI32(@bitCast(outcome)) catch return error.StackOverflow;
+        },
+        .thread_yield_then_resume => |info| {
+            const raw_idx = env.popI32() catch return error.StackUnderflow;
+            const outcome = try switchComponentThread(
+                comp_inst,
+                raw_idx,
+                true,
+                false,
+                info.cancellable,
+                thread_context,
+                task_manager,
+                allocator,
+            );
+            env.pushI32(@bitCast(outcome)) catch return error.StackOverflow;
+        },
+        .thread_suspend_then_promote => |info| {
+            const raw_idx = env.popI32() catch return error.StackUnderflow;
+            const outcome = try switchComponentThread(
+                comp_inst,
+                raw_idx,
+                false,
+                true,
+                info.cancellable,
+                thread_context,
+                task_manager,
+                allocator,
+            );
+            env.pushI32(@bitCast(outcome)) catch return error.StackOverflow;
+        },
+        .thread_yield_then_promote => |info| {
+            const raw_idx = env.popI32() catch return error.StackUnderflow;
+            const outcome = try switchComponentThread(
+                comp_inst,
+                raw_idx,
+                true,
+                true,
+                info.cancellable,
+                thread_context,
+                task_manager,
+                allocator,
+            );
+            env.pushI32(@bitCast(outcome)) catch return error.StackOverflow;
+        },
+        .thread_spawn_ref => |info| {
+            const context_arg = env.popI32() catch return error.StackUnderflow;
+            const func_idx = try popFuncrefFuncIdx(env);
+            if (!comp_inst.may_leave) return error.Trap;
+            const target = try resolveRefThreadTarget(
+                comp_inst,
+                env,
+                info.func_type_idx,
+                func_idx,
+                context_arg,
+            );
+            const new_idx = comp_inst.threads.allocThread(allocator, target, info.is_shared) catch
+                return error.OutOfMemory;
+            comp_inst.threads.enqueueReady(allocator, new_idx) catch return error.OutOfMemory;
+            env.pushI32(@bitCast(new_idx)) catch return error.StackOverflow;
+        },
+        .thread_spawn_indirect => |info| {
+            const context_arg = env.popI32() catch return error.StackUnderflow;
+            const func_table_idx = env.popI32() catch return error.StackUnderflow;
+            if (!comp_inst.may_leave) return error.Trap;
+            const target = try resolveIndirectThreadTarget(
+                comp_inst,
+                env,
+                info.func_type_idx,
+                info.table_idx,
+                func_table_idx,
+                context_arg,
+            );
+            const new_idx = comp_inst.threads.allocThread(allocator, target, info.is_shared) catch
+                return error.OutOfMemory;
+            comp_inst.threads.enqueueReady(allocator, new_idx) catch return error.OutOfMemory;
+            env.pushI32(@bitCast(new_idx)) catch return error.StackOverflow;
+        },
+        .thread_available_parallelism => |info| {
+            if (!comp_inst.may_leave) return error.Trap;
+            const count: u32 = if (!info.is_shared or !@import("config").lib_wasi_threads)
+                1
+            else
+                @intCast(@max(@as(usize, 1), std.Thread.getCpuCount() catch 1));
+            env.pushI32(@bitCast(count)) catch return error.StackOverflow;
+        },
     }
+}
+
+// ── Explicit thread cooperative execution helpers (#972) ────────────────────
+
+fn threadCancellationOutcome(
+    cancellable: bool,
+    task_manager: ?*async_mod.TaskManager,
+    allocator: Allocator,
+) u32 {
+    if (task_manager) |tm| {
+        if (tm.currentTask()) |handle| {
+            return @backingInt(async_canon.taskYield(tm, handle, cancellable, allocator));
+        }
+    }
+    return 0;
+}
+
+fn isThreadStartCoreSig(ft: core_types.FuncType) bool {
+    return ft.params.len == 1 and ft.params[0] == .i32 and ft.results.len == 0;
+}
+
+fn isThreadStartAotSig(params: []const core_types.ValType, results: []const core_types.ValType) bool {
+    return params.len == 1 and params[0] == .i32 and results.len == 0;
+}
+
+fn isAotFuncThreadStart(ai: *const aot_runtime.AotInstance, func_idx: u32) bool {
+    if (func_idx < ai.module.import_function_count) {
+        var imported_func_idx: u32 = 0;
+        for (ai.module.imports) |imp| {
+            if (imp.kind != .function) continue;
+            if (imported_func_idx == func_idx) {
+                if (imp.func_type_idx >= ai.module.func_types.len) return false;
+                const ft = ai.module.func_types[imp.func_type_idx];
+                return isThreadStartAotSig(ft.params, ft.results);
+            }
+            imported_func_idx += 1;
+        }
+        return false;
+    }
+    const local_idx = func_idx - ai.module.import_function_count;
+    if (local_idx >= ai.module.local_func_type_indices.len) return false;
+    const type_idx = ai.module.local_func_type_indices[local_idx];
+    if (type_idx >= ai.module.func_types.len) return false;
+    const ft = ai.module.func_types[type_idx];
+    return isThreadStartAotSig(ft.params, ft.results);
+}
+
+fn validateComponentCoreThreadFuncType(
+    comp_inst: *const ComponentInstance,
+    func_type_idx: u32,
+) ExecutionError!void {
+    if (func_type_idx < comp_inst.component.core_types.len) {
+        switch (comp_inst.component.core_types[func_type_idx]) {
+            .func => |ft| {
+                if (ft.params.len != 1 or ft.params[0] != .i32 or ft.results.len != 0) {
+                    return error.Trap;
+                }
+            },
+            else => return error.Trap,
+        }
+    }
+}
+
+fn popFuncrefFuncIdx(env: anytype) ExecutionError!u32 {
+    const val = env.pop() catch return error.StackUnderflow;
+    return switch (val) {
+        .funcref => |opt_idx| opt_idx orelse return error.Trap,
+        .nonfuncref => |opt_idx| opt_idx orelse return error.Trap,
+        .i32 => |v| blk: {
+            if (v < 0) return error.Trap;
+            break :blk @bitCast(v);
+        },
+        else => error.Trap,
+    };
+}
+
+fn callerModuleInst(comp_inst: *ComponentInstance, env: anytype) ?*core_types.ModuleInstance {
+    const EnvPtr = @TypeOf(env);
+    if (EnvPtr == *ExecEnv) {
+        return env.module_inst;
+    }
+    return comp_inst.firstModuleInst();
+}
+
+fn callerAotInst(comp_inst: *ComponentInstance, env: anytype) ?*aot_runtime.AotInstance {
+    const EnvPtr = @TypeOf(env);
+    if (EnvPtr == *AotCanonBuiltinFrame) {
+        if (env.caller_aot_inst) |ai| return ai;
+    }
+    for (comp_inst.core_instances) |entry| {
+        if (entry.aot_inst) |ai| return ai;
+    }
+    return null;
+}
+
+fn resolveIndirectThreadTarget(
+    comp_inst: *ComponentInstance,
+    env: anytype,
+    func_type_idx: u32,
+    table_idx: u32,
+    func_table_elem_idx_i32: i32,
+    context_arg: i32,
+) ExecutionError!async_mod.ComponentThreadTarget {
+    try validateComponentCoreThreadFuncType(comp_inst, func_type_idx);
+    if (func_table_elem_idx_i32 < 0) return error.Trap;
+    const elem_idx: u32 = @bitCast(func_table_elem_idx_i32);
+
+    // 1. Check component-level aliased core table first, else caller module's local table.
+    const resolved_top = if (indexspace.resolveCoreTable(comp_inst.component, table_idx) != null)
+        comp_inst.resolveTopLevelTable(table_idx)
+    else
+        null;
+
+    if (resolved_top) |top| {
+        if (top.mi) |mi| {
+            const tbl = top.table orelse return error.Trap;
+            return validateAndBuildInterpTableTarget(
+                comp_inst,
+                mi,
+                tbl,
+                func_type_idx,
+                elem_idx,
+                context_arg,
+            );
+        }
+        if (top.ai) |ai| {
+            return validateAndBuildAotTableTarget(
+                comp_inst,
+                ai,
+                top.aot_table_idx,
+                func_type_idx,
+                elem_idx,
+                context_arg,
+            );
+        }
+    }
+
+    if (callerModuleInst(comp_inst, env)) |mi| {
+        if (table_idx < mi.tables.len) {
+            return validateAndBuildInterpTableTarget(
+                comp_inst,
+                mi,
+                mi.tables[table_idx],
+                func_type_idx,
+                elem_idx,
+                context_arg,
+            );
+        }
+    }
+    if (callerAotInst(comp_inst, env)) |ai| {
+        if (table_idx < ai.tables.len) {
+            return validateAndBuildAotTableTarget(
+                comp_inst,
+                ai,
+                table_idx,
+                func_type_idx,
+                elem_idx,
+                context_arg,
+            );
+        }
+    }
+    if (comp_inst.resolveTopLevelTable(table_idx)) |fallback| {
+        if (fallback.mi) |mi| {
+            if (fallback.table) |tbl| {
+                return validateAndBuildInterpTableTarget(
+                    comp_inst,
+                    mi,
+                    tbl,
+                    func_type_idx,
+                    elem_idx,
+                    context_arg,
+                );
+            }
+        }
+        if (fallback.ai) |ai| {
+            return validateAndBuildAotTableTarget(
+                comp_inst,
+                ai,
+                fallback.aot_table_idx,
+                func_type_idx,
+                elem_idx,
+                context_arg,
+            );
+        }
+    }
+    return error.Trap;
+}
+
+fn validateAndBuildInterpTableTarget(
+    comp_inst: *const ComponentInstance,
+    mi: *core_types.ModuleInstance,
+    table: *core_types.TableInstance,
+    func_type_idx: u32,
+    elem_idx: u32,
+    context_arg: i32,
+) ExecutionError!async_mod.ComponentThreadTarget {
+    if (comp_inst.component.core_types.len == 0 and func_type_idx < mi.module.types.len) {
+        if (!isThreadStartCoreSig(mi.module.types[func_type_idx])) return error.Trap;
+    }
+    if (elem_idx >= table.elements.len) return error.Trap;
+    const elem = table.elements[elem_idx];
+    const target_func_idx: u32 = switch (elem.value) {
+        .funcref => |opt| opt orelse return error.Trap,
+        .nonfuncref => |opt| opt orelse return error.Trap,
+        else => return error.Trap,
+    };
+    const target_mi: *core_types.ModuleInstance = if (elem.module_inst) |ptr|
+        @ptrCast(@alignCast(ptr))
+    else
+        mi;
+    const ft = target_mi.module.getFuncType(target_func_idx) orelse return error.Trap;
+    if (!isThreadStartCoreSig(ft)) return error.Trap;
+    return .{
+        .interp = .{
+            .module_inst_ptr = @ptrCast(target_mi),
+            .func_idx = target_func_idx,
+            .context_arg = context_arg,
+        },
+    };
+}
+
+fn validateAndBuildAotTableTarget(
+    comp_inst: *const ComponentInstance,
+    ai: *aot_runtime.AotInstance,
+    table_idx: u32,
+    func_type_idx: u32,
+    elem_idx: u32,
+    context_arg: i32,
+) ExecutionError!async_mod.ComponentThreadTarget {
+    if (comp_inst.component.core_types.len == 0 and func_type_idx < ai.module.func_types.len) {
+        const ft = ai.module.func_types[func_type_idx];
+        if (!isThreadStartAotSig(ft.params, ft.results)) return error.Trap;
+    }
+    if (table_idx >= ai.tables.len) return error.Trap;
+    const tbl = ai.tables[table_idx];
+    if (elem_idx >= tbl.elements.len) return error.Trap;
+    const elem = tbl.elements[elem_idx];
+    const target_func_idx: u32 = switch (elem.value) {
+        .funcref => |opt| opt orelse return error.Trap,
+        .nonfuncref => |opt| opt orelse return error.Trap,
+        else => return error.Trap,
+    };
+    if (!isAotFuncThreadStart(ai, target_func_idx)) return error.Trap;
+    return .{
+        .aot = .{
+            .aot_inst_ptr = @ptrCast(ai),
+            .func_idx = target_func_idx,
+            .context_arg = context_arg,
+        },
+    };
+}
+
+fn resolveRefThreadTarget(
+    comp_inst: *ComponentInstance,
+    env: anytype,
+    func_type_idx: u32,
+    func_idx: u32,
+    context_arg: i32,
+) ExecutionError!async_mod.ComponentThreadTarget {
+    try validateComponentCoreThreadFuncType(comp_inst, func_type_idx);
+    if (callerModuleInst(comp_inst, env)) |mi| {
+        if (comp_inst.component.core_types.len == 0 and func_type_idx < mi.module.types.len) {
+            if (!isThreadStartCoreSig(mi.module.types[func_type_idx])) return error.Trap;
+        }
+        const ft = mi.module.getFuncType(func_idx) orelse return error.Trap;
+        if (!isThreadStartCoreSig(ft)) return error.Trap;
+        return .{
+            .interp = .{
+                .module_inst_ptr = @ptrCast(mi),
+                .func_idx = func_idx,
+                .context_arg = context_arg,
+            },
+        };
+    }
+    if (callerAotInst(comp_inst, env)) |ai| {
+        if (comp_inst.component.core_types.len == 0 and func_type_idx < ai.module.func_types.len) {
+            const ft = ai.module.func_types[func_type_idx];
+            if (!isThreadStartAotSig(ft.params, ft.results)) return error.Trap;
+        }
+        if (!isAotFuncThreadStart(ai, func_idx)) return error.Trap;
+        return .{
+            .aot = .{
+                .aot_inst_ptr = @ptrCast(ai),
+                .func_idx = func_idx,
+                .context_arg = context_arg,
+            },
+        };
+    }
+    return error.Trap;
+}
+
+fn executeComponentThread(
+    comp_inst: *ComponentInstance,
+    thread_idx: u32,
+    thread_context: ?*execution_context.ThreadExecutionContext,
+    task_manager: ?*async_mod.TaskManager,
+    allocator: Allocator,
+) ExecutionError!void {
+    const entry = comp_inst.threads.get(thread_idx) orelse return error.Trap;
+    if (entry.in_flight or entry.target == .implicit_main) {
+        entry.state = .running;
+        comp_inst.threads.removeFromReadyQueue(thread_idx);
+        return;
+    }
+
+    const prev_thread_idx = comp_inst.threads.current_thread_idx;
+    const target = entry.target;
+    comp_inst.threads.removeFromReadyQueue(thread_idx);
+    entry.state = .running;
+    entry.in_flight = true;
+    comp_inst.threads.current_thread_idx = thread_idx;
+    defer {
+        comp_inst.threads.current_thread_idx = prev_thread_idx;
+        comp_inst.threads.remove(thread_idx);
+    }
+
+    switch (target) {
+        .implicit_main => return error.Trap,
+        .interp => |t| {
+            const mi: *core_types.ModuleInstance = @ptrCast(@alignCast(t.module_inst_ptr));
+            const child_env = ExecEnv.create(mi, 4096, allocator) catch return error.OutOfMemory;
+            defer child_env.destroy();
+            if (thread_context) |parent_ctx| {
+                child_env.thread_context.implicit_task_context = parent_ctx.implicit_task_context;
+            }
+            var ctx_scope = child_env.thread_context.enter();
+            defer ctx_scope.deinit();
+            var tm_scope = if (task_manager) |tm|
+                child_env.thread_context.bindTaskManager(@ptrCast(tm))
+            else
+                null;
+            defer if (tm_scope) |*s| s.deinit();
+            child_env.pushI32(t.context_arg) catch return error.StackOverflow;
+            interp.executeFunction(child_env, t.func_idx) catch return error.Trap;
+            if (thread_context) |parent_ctx| {
+                parent_ctx.implicit_task_context = child_env.thread_context.implicit_task_context;
+            }
+        },
+        .aot => |t| {
+            const ai: *aot_runtime.AotInstance = @ptrCast(@alignCast(t.aot_inst_ptr));
+            const param_types = [_]core_types.ValType{.i32};
+            const args = [_]core_types.Value{.{ .i32 = t.context_arg }};
+            var results_buf: [1]aot_runtime.ScalarResult = undefined;
+            _ = aot_runtime.callFuncScalar(
+                ai,
+                t.func_idx,
+                &param_types,
+                &.{},
+                &args,
+                &results_buf,
+            ) catch return error.Trap;
+        },
+    }
+}
+
+fn runReadyComponentThreads(
+    comp_inst: *ComponentInstance,
+    thread_context: ?*execution_context.ThreadExecutionContext,
+    task_manager: ?*async_mod.TaskManager,
+    allocator: Allocator,
+) ExecutionError!void {
+    while (comp_inst.threads.popReady()) |ready_idx| {
+        try executeComponentThread(comp_inst, ready_idx, thread_context, task_manager, allocator);
+    }
+}
+
+fn switchComponentThread(
+    comp_inst: *ComponentInstance,
+    raw_target_idx: i32,
+    is_yield: bool,
+    is_promote: bool,
+    cancellable: bool,
+    thread_context: ?*execution_context.ThreadExecutionContext,
+    task_manager: ?*async_mod.TaskManager,
+    allocator: Allocator,
+) ExecutionError!u32 {
+    if (!comp_inst.may_leave) return error.Trap;
+    if (raw_target_idx <= 0) return error.Trap;
+    const target_idx: u32 = @bitCast(raw_target_idx);
+    const current_idx = comp_inst.threads.current_thread_idx;
+    if (current_idx == 0 or target_idx == current_idx) return error.Trap;
+
+    const current_entry = comp_inst.threads.get(current_idx) orelse return error.Trap;
+    const target_entry = comp_inst.threads.get(target_idx) orelse return error.Trap;
+
+    if (!is_promote and target_entry.state != .suspended) {
+        return error.Trap;
+    }
+    const should_run_target = if (is_promote) target_entry.state == .ready else true;
+
+    if (is_yield) {
+        comp_inst.threads.enqueueReady(allocator, current_idx) catch return error.OutOfMemory;
+    } else {
+        current_entry.state = .suspended;
+    }
+
+    if (should_run_target) {
+        try executeComponentThread(comp_inst, target_idx, thread_context, task_manager, allocator);
+    }
+    try runReadyComponentThreads(comp_inst, thread_context, task_manager, allocator);
+
+    comp_inst.threads.current_thread_idx = current_idx;
+    if (comp_inst.threads.get(current_idx)) |ce| {
+        ce.state = .running;
+        comp_inst.threads.removeFromReadyQueue(current_idx);
+    }
+
+    return threadCancellationOutcome(cancellable, task_manager, allocator);
 }
 
 /// On the canon-lower-of-async-func path (#551) `componentTrampoline` packs
@@ -9321,10 +9921,12 @@ const AotCanonBuiltinFrame = struct {
 
     values: [max_slots]core_types.Value = undefined,
     sp: usize = 0,
+    caller_aot_inst: ?*aot_runtime.AotInstance = null,
 
     fn init(
         lowered_sig: host_trampolines.LoweredSig,
         regs: [10]u64,
+        caller_aot_inst: ?*aot_runtime.AotInstance,
     ) !AotCanonBuiltinFrame {
         const has_multi_result = lowered_sig.result_types.len > 1;
         if (lowered_sig.has_retptr != has_multi_result) return error.UnsupportedSignature;
@@ -9333,13 +9935,15 @@ const AotCanonBuiltinFrame = struct {
         if (lowered_sig.param_types.len > max_slots or lowered_sig.result_types.len > max_slots)
             return error.UnsupportedSignature;
 
-        var frame = AotCanonBuiltinFrame{};
+        var frame = AotCanonBuiltinFrame{ .caller_aot_inst = caller_aot_inst };
         for (lowered_sig.param_types, 0..) |ty, i| {
             frame.values[i] = switch (ty) {
                 .i32 => .{ .i32 = @bitCast(@as(u32, @truncate(regs[i]))) },
                 .i64 => .{ .i64 = @bitCast(regs[i]) },
                 .f32 => .{ .f32 = @bitCast(@as(u32, @truncate(regs[i]))) },
                 .f64 => .{ .f64 = @bitCast(regs[i]) },
+                .funcref => .{ .funcref = decodeAotFuncrefArg(caller_aot_inst, regs[i]) },
+                .nonfuncref => .{ .nonfuncref = decodeAotFuncrefArg(caller_aot_inst, regs[i]) },
                 else => return error.UnsupportedSignature,
             };
         }
@@ -9347,10 +9951,25 @@ const AotCanonBuiltinFrame = struct {
         return frame;
     }
 
+    fn decodeAotFuncrefArg(caller_aot_inst: ?*aot_runtime.AotInstance, raw: u64) ?u32 {
+        if (raw == 0 or raw == std.math.maxInt(u32)) return null;
+        if (caller_aot_inst) |ai| {
+            for (ai.funcptrs, 0..) |fp, idx| {
+                if (@as(u64, fp) == raw) return @intCast(idx);
+            }
+        }
+        if (raw <= std.math.maxInt(u32)) return @truncate(raw);
+        return null;
+    }
+
     fn pop(self: *AotCanonBuiltinFrame) !core_types.Value {
         if (self.sp == 0) return error.StackUnderflow;
         self.sp -= 1;
         return self.values[self.sp];
+    }
+
+    pub fn popValue(self: *AotCanonBuiltinFrame) !core_types.Value {
+        return self.pop();
     }
 
     pub fn popI32(self: *AotCanonBuiltinFrame) !i32 {
@@ -9530,7 +10149,11 @@ fn dispatchAotCanonBuiltin(
     defer if (context_scope) |scope| scope.deinit();
     const dispatch_thread_ctx = caller_thread_ctx orelse execution_context.current();
 
-    var frame = try AotCanonBuiltinFrame.init(lowered_sig, regs);
+    var frame = try AotCanonBuiltinFrame.init(
+        lowered_sig,
+        regs,
+        aotCallerInstance(caller_vmctx),
+    );
     var lower_binding: ComponentInstance.CanonLowerCallBinding = undefined;
     const lower_scope = bindLowerCallContext(
         ctx.comp_inst,
@@ -9643,13 +10266,17 @@ fn traceCanonLowerCall(ctx: *const ComponentTrampolineCtx, lowered_sig: host_tra
     std.debug.print("\n", .{});
 }
 
-fn aotCallerMemory(caller_vmctx: ?u64) ?*core_types.MemoryInstance {
+fn aotCallerInstance(caller_vmctx: ?u64) ?*aot_runtime.AotInstance {
     const raw_vmctx = caller_vmctx orelse return null;
     if (raw_vmctx == 0 or raw_vmctx % @alignOf(aot_runtime.VmCtx) != 0) return null;
     const vmctx: *const aot_runtime.VmCtx = @ptrFromInt(@as(usize, @intCast(raw_vmctx)));
     if (vmctx.instance_ptr == 0 or vmctx.instance_ptr % @alignOf(aot_runtime.AotInstance) != 0)
         return null;
-    const caller: *const aot_runtime.AotInstance = @ptrFromInt(vmctx.instance_ptr);
+    return @ptrFromInt(vmctx.instance_ptr);
+}
+
+fn aotCallerMemory(caller_vmctx: ?u64) ?*core_types.MemoryInstance {
+    const caller = aotCallerInstance(caller_vmctx) orelse return null;
     if (caller.memories.len == 0) return null;
     return caller.memories[0];
 }
@@ -12137,3 +12764,438 @@ test "callComponentFuncByLocalAsyncLifted enters the AOT frame context" {
         taskManagerFor(execution_context.current()).?,
     );
 }
+
+test "dispatchCanonBuiltin: backpressure.{inc,dec,set} normal operation and overflow/underflow traps (#972)" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+
+    try testing.expectEqual(@as(u16, 0), inst.backpressure);
+
+    // Underflow trap at 0.
+    try testing.expectError(
+        error.Trap,
+        dispatchCanonBuiltin(inst, .{ .async_canon = .backpressure_dec }, env, null, testing.allocator),
+    );
+
+    // Normal inc / dec.
+    try dispatchCanonBuiltin(inst, .{ .async_canon = .backpressure_inc }, env, null, testing.allocator);
+    try testing.expectEqual(@as(u16, 1), inst.backpressure);
+    try dispatchCanonBuiltin(inst, .{ .async_canon = .backpressure_inc }, env, null, testing.allocator);
+    try testing.expectEqual(@as(u16, 2), inst.backpressure);
+    try dispatchCanonBuiltin(inst, .{ .async_canon = .backpressure_dec }, env, null, testing.allocator);
+    try testing.expectEqual(@as(u16, 1), inst.backpressure);
+
+    // backpressure.set non-zero -> 1, zero -> 0.
+    try env.pushI32(42);
+    try dispatchCanonBuiltin(inst, .{ .async_canon = .backpressure_set }, env, null, testing.allocator);
+    try testing.expectEqual(@as(u16, 1), inst.backpressure);
+    try env.pushI32(0);
+    try dispatchCanonBuiltin(inst, .{ .async_canon = .backpressure_set }, env, null, testing.allocator);
+    try testing.expectEqual(@as(u16, 0), inst.backpressure);
+
+    // Overflow trap at 65535 -> 65536.
+    inst.backpressure = std.math.maxInt(u16);
+    try testing.expectError(
+        error.Trap,
+        dispatchCanonBuiltin(inst, .{ .async_canon = .backpressure_inc }, env, null, testing.allocator),
+    );
+    try testing.expectEqual(std.math.maxInt(u16), inst.backpressure);
+
+    // Trap when !may_leave.
+    inst.backpressure = 1;
+    inst.may_leave = false;
+    try testing.expectError(
+        error.Trap,
+        dispatchCanonBuiltin(inst, .{ .async_canon = .backpressure_inc }, env, null, testing.allocator),
+    );
+    try testing.expectError(
+        error.Trap,
+        dispatchCanonBuiltin(inst, .{ .async_canon = .backpressure_dec }, env, null, testing.allocator),
+    );
+    try env.pushI32(0);
+    try testing.expectError(
+        error.Trap,
+        dispatchCanonBuiltin(inst, .{ .async_canon = .backpressure_set }, env, null, testing.allocator),
+    );
+    inst.may_leave = true;
+}
+
+test "dispatchCanonBuiltin: thread.index, thread.new-indirect, resume/yield/suspend/promote/spawn & traps (#972)" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    // Import 0: thread.index () -> i32
+    // Local func 1: worker(ctx: i32) -> () {
+    //   mem[0..4] = ctx;
+    //   mem[4..8] = thread.index();
+    // }
+    // Local func 2: bad_sig() -> () {}
+    const imports = [_]core_types_mod.ImportDesc{
+        .{ .module_name = "$root", .field_name = "[thread-index]", .kind = .function, .func_type_idx = 0 },
+    };
+    const func_types = [_]core_types_mod.FuncType{
+        .{ .params = &.{}, .results = &.{.i32} },
+        .{ .params = &.{.i32}, .results = &.{} },
+        .{ .params = &.{}, .results = &.{} },
+    };
+    const worker_code = [_]u8{
+        0x41, 0x00, // i32.const 0
+        0x20, 0x00, // local.get 0 (context_arg)
+        0x36, 0x02, 0x00, // i32.store align=2 offset=0
+        0x41, 0x04, // i32.const 4
+        0x10, 0x00, // call 0 (thread.index)
+        0x36, 0x02, 0x00, // i32.store align=2 offset=0
+        0x0B, // end
+    };
+    const noop_code = [_]u8{0x0B};
+    const functions = [_]core_types_mod.WasmFunction{
+        .{
+            .type_idx = 1,
+            .func_type = func_types[1],
+            .local_count = 0,
+            .locals = &.{},
+            .code = &worker_code,
+        },
+        .{
+            .type_idx = 2,
+            .func_type = func_types[2],
+            .local_count = 0,
+            .locals = &.{},
+            .code = &noop_code,
+        },
+    };
+    const tables = [_]core_types_mod.TableType{
+        .{ .elem_type = .funcref, .limits = .{ .min = 4, .max = 4 } },
+    };
+    const memories = [_]core_types_mod.MemoryType{
+        .{ .limits = .{ .min = 1, .max = 1 } },
+    };
+    var module = core_types_mod.WasmModule{
+        .types = &func_types,
+        .imports = &imports,
+        .import_function_count = 1,
+        .functions = &functions,
+        .tables = &tables,
+        .memories = &memories,
+    };
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+
+    // Populate table[0]:
+    // slot 0 = null funcref
+    // slot 1 = func 1 (worker: (i32) -> ())
+    // slot 2 = func 2 (bad_sig: () -> ())
+    core_inst.tables[0].elements[0] = .{ .value = .{ .funcref = null } };
+    core_inst.tables[0].elements[1] = .{ .value = .{ .funcref = 1 }, .module_inst = @ptrCast(core_inst) };
+    core_inst.tables[0].elements[2] = .{ .value = .{ .funcref = 2 }, .module_inst = @ptrCast(core_inst) };
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+    const cis = try testing.allocator.alloc(ComponentInstance.CoreInstanceEntry, 1);
+    cis[0] = .{ .module_inst = core_inst };
+    inst.core_instances = cis;
+
+    var tidx_ctx = CanonBuiltinTrampolineCtx{
+        .comp_inst = inst,
+        .canon = .{ .async_canon = .thread_index },
+    };
+    const host_entries = try testing.allocator.alloc(?core_types_mod.HostFnEntry, 1);
+    host_entries[0] = .{ .func = &canonBuiltinTrampoline, .ctx = @ptrCast(&tidx_ctx) };
+    inst_mod_core.attachHostFuncEntries(core_inst, host_entries);
+
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    // 1. thread.index on implicit main thread returns 1.
+    try dispatchCanonBuiltin(inst, .{ .async_canon = .thread_index }, env, null, testing.allocator);
+    try testing.expectEqual(@as(i32, 1), try env.popI32());
+
+    // 2. thread.new-indirect + thread.yield-then-resume executes worker with context=0x12345678.
+    try env.pushI32(1); // table slot 1 (worker)
+    try env.pushI32(0x1234_5678); // context_arg
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .thread_new_indirect = .{ .func_type_idx = 1, .table_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const tid1 = try env.popI32();
+    try testing.expectEqual(@as(i32, 2), tid1);
+
+    try env.pushI32(tid1);
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .thread_yield_then_resume = .{ .cancellable = false } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(i32, 0), try env.popI32());
+    try testing.expectEqual(@as(u32, 0x1234_5678), std.mem.readInt(u32, core_inst.memories[0].data[0..4], .little));
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, core_inst.memories[0].data[4..8], .little));
+    // Active thread restored to 1, and finished thread 2 removed from table.
+    try testing.expectEqual(@as(u32, 1), inst.threads.current_thread_idx);
+    try testing.expect(inst.threads.get(2) == null);
+
+    // 3. thread.new-indirect + thread.suspend-then-resume.
+    try env.pushI32(1);
+    try env.pushI32(@bitCast(@as(u32, 0xCAFE_BABE)));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .thread_new_indirect = .{ .func_type_idx = 1, .table_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const tid2 = try env.popI32();
+    try env.pushI32(tid2);
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .thread_suspend_then_resume = .{ .cancellable = false } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(i32, 0), try env.popI32());
+    try testing.expectEqual(@as(u32, 0xCAFE_BABE), std.mem.readInt(u32, core_inst.memories[0].data[0..4], .little));
+
+    // 4. thread.new-indirect + thread.resume-later + thread.yield (Canon.task_yield).
+    try env.pushI32(1);
+    try env.pushI32(777);
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .thread_new_indirect = .{ .func_type_idx = 1, .table_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const tid3 = try env.popI32();
+    try env.pushI32(tid3);
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .thread_resume_later },
+        env,
+        null,
+        testing.allocator,
+    );
+    // Calling resume-later again on an already-.ready thread traps.
+    try env.pushI32(tid3);
+    try testing.expectError(
+        error.Trap,
+        dispatchCanonBuiltin(inst, .{ .async_canon = .thread_resume_later }, env, null, testing.allocator),
+    );
+    // Calling suspend-then-resume on a .ready (non-suspended) thread traps.
+    try env.pushI32(tid3);
+    try testing.expectError(
+        error.Trap,
+        dispatchCanonBuiltin(
+            inst,
+            .{ .async_canon = .{ .thread_suspend_then_resume = .{ .cancellable = false } } },
+            env,
+            null,
+            testing.allocator,
+        ),
+    );
+    // Yield runs the ready thread.
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .task_yield = .{ .cancellable = false } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(i32, 0), try env.popI32());
+    try testing.expectEqual(@as(u32, 777), std.mem.readInt(u32, core_inst.memories[0].data[0..4], .little));
+
+    // 5. thread.spawn-indirect + thread.suspend and thread.spawn-ref + thread.yield-then-promote.
+    try env.pushI32(1);
+    try env.pushI32(888);
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .thread_spawn_indirect = .{
+            .is_shared = false,
+            .func_type_idx = 1,
+            .table_idx = 0,
+        } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    _ = try env.popI32();
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .thread_suspend = .{ .cancellable = false } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(i32, 0), try env.popI32());
+    try testing.expectEqual(@as(u32, 888), std.mem.readInt(u32, core_inst.memories[0].data[0..4], .little));
+
+    try env.push(.{ .funcref = 1 });
+    try env.pushI32(999);
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .thread_spawn_ref = .{
+            .is_shared = false,
+            .func_type_idx = 1,
+        } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const tid_spawn_ref = try env.popI32();
+    try env.pushI32(tid_spawn_ref);
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .thread_yield_then_promote = .{ .cancellable = false } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(i32, 0), try env.popI32());
+    try testing.expectEqual(@as(u32, 999), std.mem.readInt(u32, core_inst.memories[0].data[0..4], .little));
+
+    // 6. Trap cases for thread.new-indirect:
+    // 6a. Out-of-bounds table index.
+    try env.pushI32(1);
+    try env.pushI32(0);
+    try testing.expectError(
+        error.Trap,
+        dispatchCanonBuiltin(
+            inst,
+            .{ .async_canon = .{ .thread_new_indirect = .{ .func_type_idx = 1, .table_idx = 99 } } },
+            env,
+            null,
+            testing.allocator,
+        ),
+    );
+    // 6b. Out-of-bounds table element index.
+    try env.pushI32(99);
+    try env.pushI32(0);
+    try testing.expectError(
+        error.Trap,
+        dispatchCanonBuiltin(
+            inst,
+            .{ .async_canon = .{ .thread_new_indirect = .{ .func_type_idx = 1, .table_idx = 0 } } },
+            env,
+            null,
+            testing.allocator,
+        ),
+    );
+    // 6c. Null funcref at table[0][0].
+    try env.pushI32(0);
+    try env.pushI32(0);
+    try testing.expectError(
+        error.Trap,
+        dispatchCanonBuiltin(
+            inst,
+            .{ .async_canon = .{ .thread_new_indirect = .{ .func_type_idx = 1, .table_idx = 0 } } },
+            env,
+            null,
+            testing.allocator,
+        ),
+    );
+    // 6d. Wrong function signature at table[0][2] (() -> () instead of (i32) -> ()).
+    try env.pushI32(2);
+    try env.pushI32(0);
+    try testing.expectError(
+        error.Trap,
+        dispatchCanonBuiltin(
+            inst,
+            .{ .async_canon = .{ .thread_new_indirect = .{ .func_type_idx = 1, .table_idx = 0 } } },
+            env,
+            null,
+            testing.allocator,
+        ),
+    );
+
+    // 7. Trap cases for resume-later / suspend-then-resume on invalid or self thread index:
+    try env.pushI32(0);
+    try testing.expectError(
+        error.Trap,
+        dispatchCanonBuiltin(inst, .{ .async_canon = .thread_resume_later }, env, null, testing.allocator),
+    );
+    try env.pushI32(1); // self (current_thread_idx == 1)
+    try testing.expectError(
+        error.Trap,
+        dispatchCanonBuiltin(inst, .{ .async_canon = .thread_resume_later }, env, null, testing.allocator),
+    );
+    try env.pushI32(1); // self
+    try testing.expectError(
+        error.Trap,
+        dispatchCanonBuiltin(
+            inst,
+            .{ .async_canon = .{ .thread_suspend_then_resume = .{ .cancellable = false } } },
+            env,
+            null,
+            testing.allocator,
+        ),
+    );
+    try env.pushI32(999); // non-existent thread index
+    try testing.expectError(
+        error.Trap,
+        dispatchCanonBuiltin(
+            inst,
+            .{ .async_canon = .{ .thread_suspend_then_resume = .{ .cancellable = false } } },
+            env,
+            null,
+            testing.allocator,
+        ),
+    );
+
+    // 8. thread.available-parallelism:
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .thread_available_parallelism = .{ .is_shared = false } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(i32, 1), try env.popI32());
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .thread_available_parallelism = .{ .is_shared = true } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expect((try env.popI32()) >= 1);
+}
+

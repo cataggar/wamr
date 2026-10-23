@@ -1053,6 +1053,10 @@ fn parseCoreType(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!
 
 fn readCoreValType(reader: *BinaryReader) LoadError!ctypes.CoreValType {
     const b = try reader.readByte();
+    if (b == 0x63 or b == 0x64) {
+        _ = try reader.readS33();
+        return .funcref;
+    }
     return std.enums.fromInt(ctypes.CoreValType, b) orelse return error.InvalidEncoding;
 }
 
@@ -1451,6 +1455,7 @@ fn parseCanon(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!cty
             const async_byte = try parseAsyncByte(reader);
             break :blk .{ .async_canon = .{ .subtask_cancel = .{ .is_async = async_byte } } };
         },
+        0x08 => .{ .async_canon = .backpressure_set },
         0x0d => .{ .async_canon = .subtask_drop },
         0x0e => .{ .async_canon = .{ .stream_new = .{ .type_idx = try reader.readU32() } } },
         0x0f => blk: {
@@ -1514,6 +1519,37 @@ fn parseCanon(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!cty
         },
         0x22 => .{ .async_canon = .waitable_set_drop },
         0x23 => .{ .async_canon = .waitable_join },
+        // ── Backpressure & explicit thread canonical built-ins (#972) ───────
+        0x24 => .{ .async_canon = .backpressure_inc },
+        0x25 => .{ .async_canon = .backpressure_dec },
+        0x26 => .{ .async_canon = .thread_index },
+        0x27 => blk: {
+            const ft = try reader.readU32();
+            const tbl = try reader.readU32();
+            break :blk .{ .async_canon = .{ .thread_new_indirect = .{ .func_type_idx = ft, .table_idx = tbl } } };
+        },
+        0x28 => .{ .async_canon = .thread_resume_later },
+        0x29 => .{ .async_canon = .{ .thread_suspend = .{ .cancellable = try parseCancelByte(reader) } } },
+        0x2a => .{ .async_canon = .{ .thread_suspend_then_resume = .{ .cancellable = try parseCancelByte(reader) } } },
+        0x2b => .{ .async_canon = .{ .thread_yield_then_resume = .{ .cancellable = try parseCancelByte(reader) } } },
+        0x2c => .{ .async_canon = .{ .thread_suspend_then_promote = .{ .cancellable = try parseCancelByte(reader) } } },
+        0x2d => .{ .async_canon = .{ .thread_yield_then_promote = .{ .cancellable = try parseCancelByte(reader) } } },
+        0x40 => blk: {
+            const is_shared = try parseSharedByte(reader);
+            const ft = try reader.readU32();
+            break :blk .{ .async_canon = .{ .thread_spawn_ref = .{ .is_shared = is_shared, .func_type_idx = ft } } };
+        },
+        0x41 => blk: {
+            const is_shared = try parseSharedByte(reader);
+            const ft = try reader.readU32();
+            const tbl = try reader.readU32();
+            break :blk .{ .async_canon = .{ .thread_spawn_indirect = .{
+                .is_shared = is_shared,
+                .func_type_idx = ft,
+                .table_idx = tbl,
+            } } };
+        },
+        0x42 => .{ .async_canon = .{ .thread_available_parallelism = .{ .is_shared = try parseSharedByte(reader) } } },
         else => error.InvalidEncoding,
     };
 }
@@ -1547,6 +1583,13 @@ fn parseAsyncByte(reader: *BinaryReader) LoadError!bool {
 /// different semantic name — kept distinct so the IR matches Binary.md
 /// vocabulary at the leaf. (#478 sub-PR 3.)
 fn parseCancelByte(reader: *BinaryReader) LoadError!bool {
+    return parseAsyncByte(reader);
+}
+
+/// Parse the `sh?` immediate byte (`0x00` = unshared, `0x01` = shared)
+/// used by `thread.spawn-ref`, `thread.spawn-indirect`, and
+/// `thread.available-parallelism` (#972).
+fn parseSharedByte(reader: *BinaryReader) LoadError!bool {
     return parseAsyncByte(reader);
 }
 
@@ -1977,6 +2020,101 @@ test "parseCanon: waitable-set.{new,wait,poll,drop} + waitable.join" {
     // join
     var r5 = BinaryReader{ .data = &[_]u8{0x23} };
     try std.testing.expect((try parseCanon(&r5, std.testing.allocator)).async_canon == .waitable_join);
+}
+
+test "parseCanon: backpressure.{set,inc,dec} (0x08, 0x24, 0x25)" {
+    var r_set = BinaryReader{ .data = &[_]u8{0x08} };
+    const c_set = try parseCanon(&r_set, std.testing.allocator);
+    try std.testing.expect(c_set == .async_canon);
+    try std.testing.expect(c_set.async_canon == .backpressure_set);
+
+    var r_inc = BinaryReader{ .data = &[_]u8{0x24} };
+    const c_inc = try parseCanon(&r_inc, std.testing.allocator);
+    try std.testing.expect(c_inc == .async_canon);
+    try std.testing.expect(c_inc.async_canon == .backpressure_inc);
+
+    var r_dec = BinaryReader{ .data = &[_]u8{0x25} };
+    const c_dec = try parseCanon(&r_dec, std.testing.allocator);
+    try std.testing.expect(c_dec == .async_canon);
+    try std.testing.expect(c_dec.async_canon == .backpressure_dec);
+}
+
+test "parseCanon: explicit thread canon builtins (0x26..0x2d)" {
+    // 0x26 thread.index
+    var r_idx = BinaryReader{ .data = &[_]u8{0x26} };
+    try std.testing.expect((try parseCanon(&r_idx, std.testing.allocator)).async_canon == .thread_index);
+
+    // 0x27 thread.new-indirect ft=3, tbl=1
+    var r_new = BinaryReader{ .data = &[_]u8{ 0x27, 0x03, 0x01 } };
+    const c_new = try parseCanon(&r_new, std.testing.allocator);
+    try std.testing.expect(c_new.async_canon == .thread_new_indirect);
+    try std.testing.expectEqual(@as(u32, 3), c_new.async_canon.thread_new_indirect.func_type_idx);
+    try std.testing.expectEqual(@as(u32, 1), c_new.async_canon.thread_new_indirect.table_idx);
+
+    // 0x28 thread.resume-later
+    var r_rl = BinaryReader{ .data = &[_]u8{0x28} };
+    try std.testing.expect((try parseCanon(&r_rl, std.testing.allocator)).async_canon == .thread_resume_later);
+
+    // 0x29 thread.suspend cancel?=1
+    var r_sus = BinaryReader{ .data = &[_]u8{ 0x29, 0x01 } };
+    const c_sus = try parseCanon(&r_sus, std.testing.allocator);
+    try std.testing.expect(c_sus.async_canon == .thread_suspend);
+    try std.testing.expectEqual(true, c_sus.async_canon.thread_suspend.cancellable);
+
+    // 0x2a thread.suspend-then-resume cancel?=0
+    var r_str = BinaryReader{ .data = &[_]u8{ 0x2a, 0x00 } };
+    const c_str = try parseCanon(&r_str, std.testing.allocator);
+    try std.testing.expect(c_str.async_canon == .thread_suspend_then_resume);
+    try std.testing.expectEqual(false, c_str.async_canon.thread_suspend_then_resume.cancellable);
+
+    // 0x2b thread.yield-then-resume cancel?=1
+    var r_ytr = BinaryReader{ .data = &[_]u8{ 0x2b, 0x01 } };
+    const c_ytr = try parseCanon(&r_ytr, std.testing.allocator);
+    try std.testing.expect(c_ytr.async_canon == .thread_yield_then_resume);
+    try std.testing.expectEqual(true, c_ytr.async_canon.thread_yield_then_resume.cancellable);
+
+    // 0x2c thread.suspend-then-promote cancel?=0
+    var r_stp = BinaryReader{ .data = &[_]u8{ 0x2c, 0x00 } };
+    const c_stp = try parseCanon(&r_stp, std.testing.allocator);
+    try std.testing.expect(c_stp.async_canon == .thread_suspend_then_promote);
+    try std.testing.expectEqual(false, c_stp.async_canon.thread_suspend_then_promote.cancellable);
+
+    // 0x2d thread.yield-then-promote cancel?=1
+    var r_ytp = BinaryReader{ .data = &[_]u8{ 0x2d, 0x01 } };
+    const c_ytp = try parseCanon(&r_ytp, std.testing.allocator);
+    try std.testing.expect(c_ytp.async_canon == .thread_yield_then_promote);
+    try std.testing.expectEqual(true, c_ytp.async_canon.thread_yield_then_promote.cancellable);
+
+    // Invalid cancel? byte rejected
+    var r_bad = BinaryReader{ .data = &[_]u8{ 0x29, 0x02 } };
+    try std.testing.expectError(error.InvalidEncoding, parseCanon(&r_bad, std.testing.allocator));
+}
+
+test "parseCanon: thread.spawn-{ref,indirect} and thread.available-parallelism (0x40..0x42)" {
+    // 0x40 thread.spawn-ref sh?=1, ft=5
+    var r_sr = BinaryReader{ .data = &[_]u8{ 0x40, 0x01, 0x05 } };
+    const c_sr = try parseCanon(&r_sr, std.testing.allocator);
+    try std.testing.expect(c_sr.async_canon == .thread_spawn_ref);
+    try std.testing.expectEqual(true, c_sr.async_canon.thread_spawn_ref.is_shared);
+    try std.testing.expectEqual(@as(u32, 5), c_sr.async_canon.thread_spawn_ref.func_type_idx);
+
+    // 0x41 thread.spawn-indirect sh?=0, ft=2, tbl=4
+    var r_si = BinaryReader{ .data = &[_]u8{ 0x41, 0x00, 0x02, 0x04 } };
+    const c_si = try parseCanon(&r_si, std.testing.allocator);
+    try std.testing.expect(c_si.async_canon == .thread_spawn_indirect);
+    try std.testing.expectEqual(false, c_si.async_canon.thread_spawn_indirect.is_shared);
+    try std.testing.expectEqual(@as(u32, 2), c_si.async_canon.thread_spawn_indirect.func_type_idx);
+    try std.testing.expectEqual(@as(u32, 4), c_si.async_canon.thread_spawn_indirect.table_idx);
+
+    // 0x42 thread.available-parallelism sh?=1
+    var r_ap = BinaryReader{ .data = &[_]u8{ 0x42, 0x01 } };
+    const c_ap = try parseCanon(&r_ap, std.testing.allocator);
+    try std.testing.expect(c_ap.async_canon == .thread_available_parallelism);
+    try std.testing.expectEqual(true, c_ap.async_canon.thread_available_parallelism.is_shared);
+
+    // Invalid sh? byte rejected
+    var r_bad = BinaryReader{ .data = &[_]u8{ 0x42, 0x02 } };
+    try std.testing.expectError(error.InvalidEncoding, parseCanon(&r_bad, std.testing.allocator));
 }
 
 test "parseTypeDef: instance type with `sub resource` type decl" {
