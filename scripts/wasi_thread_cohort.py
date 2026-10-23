@@ -433,6 +433,27 @@ def validate_dispatch_options(
     )
     if training_runs <= 0 or training_runs >= args.runs:
         raise HarnessError("--training-runs must be between one and runs minus one")
+    start_sequence = (
+        1
+        if getattr(args, "start_sequence", None) is None
+        else getattr(args, "start_sequence")
+    )
+    end_sequence = (
+        args.runs
+        if getattr(args, "end_sequence", None) is None
+        else getattr(args, "end_sequence")
+    )
+    if (
+        not isinstance(start_sequence, int)
+        or isinstance(start_sequence, bool)
+        or not isinstance(end_sequence, int)
+        or isinstance(end_sequence, bool)
+        or not (1 <= start_sequence <= end_sequence <= args.runs)
+    ):
+        raise HarnessError(
+            "--start-sequence and --end-sequence must satisfy "
+            "1 <= start-sequence <= end-sequence <= runs"
+        )
     accepted_cpu_classes = parse_cpu_class_assignments(
         getattr(args, "accepted_cpu_class", None)
     )
@@ -507,6 +528,16 @@ def dispatch(args: argparse.Namespace) -> int:
         training_runs,
         accepted_cpu_classes,
     ) = validate_dispatch_options(args)
+    start_sequence = (
+        1
+        if getattr(args, "start_sequence", None) is None
+        else getattr(args, "start_sequence")
+    )
+    end_sequence = (
+        args.runs
+        if getattr(args, "end_sequence", None) is None
+        else getattr(args, "end_sequence")
+    )
     deadline = time.monotonic() + args.timeout_seconds
     if args.runner_target == "trusted-calibration":
         preflight_runner_inventory(
@@ -530,52 +561,159 @@ def dispatch(args: argparse.Namespace) -> int:
             "trusted calibration baseline and candidate SHAs must equal the "
             "immutable workflow tag commit"
         )
-    cohort_id = uuid.uuid4().hex
-    state = {
-        "schema_version": REPORT_SCHEMA_VERSION,
-        "kind": "wasi-thread-cohort-dispatch",
-        "created_at": collected_at(),
-        "repository": args.repository,
-        "workflow": args.workflow,
-        "workflow_ref": args.workflow_ref,
-        "workflow_head_sha": workflow_head_sha,
-        "cohort_id": cohort_id,
-        "baseline_sha": baseline_sha,
-        "candidate_sha": candidate_sha,
-        "comparison_purpose": args.purpose,
-        "profile": args.profile,
-        "warmups": args.warmups,
-        "samples": args.samples,
-        "runner_target": args.runner_target,
-        "required_platforms": list(DEFAULT_PLATFORMS),
-        "accepted_cpu_classes": accepted_cpu_classes,
-        "requested_runs": args.runs,
-        "requested_reports": args.runs * len(DEFAULT_PLATFORMS),
-        "max_in_flight": args.max_in_flight,
-        "timeout_seconds": args.timeout_seconds,
-        "split": {
-            "method": "predeclared-sequence",
-            "training_runs": training_runs,
-            "holdout_runs": args.runs - training_runs,
-            "assignments": [
-                {
-                    "sequence": sequence,
-                    "partition": (
-                        "training" if sequence <= training_runs else "holdout"
-                    ),
-                }
-                for sequence in range(1, args.runs + 1)
-            ],
-        },
-        "runs": [],
+    expected_split = {
+        "method": "predeclared-sequence",
+        "training_runs": training_runs,
+        "holdout_runs": args.runs - training_runs,
+        "assignments": [
+            {
+                "sequence": sequence,
+                "partition": (
+                    "training" if sequence <= training_runs else "holdout"
+                ),
+            }
+            for sequence in range(1, args.runs + 1)
+        ],
     }
+    if start_sequence > 1:
+        if not args.output.exists():
+            raise HarnessError(
+                "resuming dispatch with --start-sequence > 1 requires an "
+                "existing --output state file"
+            )
+        state = json.loads(args.output.read_text(encoding="UTF-8"))
+        if (
+            not isinstance(state, dict)
+            or state.get("schema_version") != REPORT_SCHEMA_VERSION
+            or state.get("kind") != "wasi-thread-cohort-dispatch"
+        ):
+            raise HarnessError(
+                "existing dispatch state must be a schema-v4 dispatch manifest"
+            )
+        cohort_id = state.get("cohort_id")
+        if (
+            not isinstance(cohort_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", cohort_id) is None
+        ):
+            raise HarnessError("existing dispatch state has invalid cohort_id")
+        if (
+            state.get("repository") != args.repository
+            or state.get("workflow") != args.workflow
+            or state.get("workflow_ref") != args.workflow_ref
+            or state.get("workflow_head_sha") != workflow_head_sha
+            or state.get("baseline_sha") != baseline_sha
+            or state.get("candidate_sha") != candidate_sha
+            or state.get("comparison_purpose") != args.purpose
+            or state.get("profile") != args.profile
+            or state.get("warmups") != args.warmups
+            or state.get("samples") != args.samples
+            or state.get("runner_target") != args.runner_target
+            or state.get("required_platforms") != list(DEFAULT_PLATFORMS)
+            or validate_cpu_class_mapping(
+                state.get("accepted_cpu_classes"),
+                "existing dispatch state accepted_cpu_classes",
+            )
+            != accepted_cpu_classes
+            or state.get("requested_runs") != args.runs
+            or state.get("requested_reports")
+            != args.runs * len(DEFAULT_PLATFORMS)
+            or state.get("split") != expected_split
+        ):
+            raise HarnessError(
+                "existing dispatch state does not match dispatch arguments"
+            )
+        existing_runs = state.get("runs")
+        if not isinstance(existing_runs, list):
+            raise HarnessError("existing dispatch state runs must be a list")
+        completed_sequences: set[int] = set()
+        seen_run_ids: set[int] = set()
+        for run in existing_runs:
+            if not isinstance(run, dict):
+                raise HarnessError("existing dispatch state run record invalid")
+            seq = run.get("sequence")
+            run_id = run.get("run_id")
+            expected_partition = (
+                "training"
+                if isinstance(seq, int) and seq <= training_runs
+                else "holdout"
+            )
+            if (
+                not isinstance(seq, int)
+                or isinstance(seq, bool)
+                or not (1 <= seq <= args.runs)
+                or seq in completed_sequences
+                or not isinstance(run_id, int)
+                or isinstance(run_id, bool)
+                or run_id <= 0
+                or run_id in seen_run_ids
+                or run.get("partition") != expected_partition
+                or run.get("run_name")
+                != f"WASI thread cohort-{cohort_id}-{seq}-{expected_partition}"
+                or run.get("status") != "completed"
+                or run.get("conclusion") != "success"
+                or run.get("attempt", 1) != 1
+                or str(run.get("workflow_head_sha", "")).lower()
+                != workflow_head_sha
+            ):
+                raise HarnessError(
+                    "existing dispatch state contains incomplete or invalid runs"
+                )
+            completed_sequences.add(seq)
+            seen_run_ids.add(run_id)
+        required_prior = set(range(1, start_sequence))
+        if not required_prior.issubset(completed_sequences):
+            missing = sorted(required_prior - completed_sequences)
+            raise HarnessError(
+                "existing dispatch state is missing completed sequences "
+                f"before {start_sequence}: {missing}"
+            )
+        state["max_in_flight"] = args.max_in_flight
+        state["timeout_seconds"] = args.timeout_seconds
+        state["runs"].sort(key=lambda item: item["sequence"])
+        pending_sequences = [
+            sequence
+            for sequence in range(start_sequence, end_sequence + 1)
+            if sequence not in completed_sequences
+        ]
+    else:
+        cohort_id = uuid.uuid4().hex
+        state = {
+            "schema_version": REPORT_SCHEMA_VERSION,
+            "kind": "wasi-thread-cohort-dispatch",
+            "created_at": collected_at(),
+            "repository": args.repository,
+            "workflow": args.workflow,
+            "workflow_ref": args.workflow_ref,
+            "workflow_head_sha": workflow_head_sha,
+            "cohort_id": cohort_id,
+            "baseline_sha": baseline_sha,
+            "candidate_sha": candidate_sha,
+            "comparison_purpose": args.purpose,
+            "profile": args.profile,
+            "warmups": args.warmups,
+            "samples": args.samples,
+            "runner_target": args.runner_target,
+            "required_platforms": list(DEFAULT_PLATFORMS),
+            "accepted_cpu_classes": accepted_cpu_classes,
+            "requested_runs": args.runs,
+            "requested_reports": args.runs * len(DEFAULT_PLATFORMS),
+            "max_in_flight": args.max_in_flight,
+            "timeout_seconds": args.timeout_seconds,
+            "split": expected_split,
+            "runs": [],
+        }
+        pending_sequences = list(range(start_sequence, end_sequence + 1))
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
     active: dict[int, dict[str, Any]] = {}
-    launched = 0
-    while launched < args.runs or active:
-        while launched < args.runs and len(active) < args.max_in_flight:
+    pending_index = 0
+    while pending_index < len(pending_sequences) or active:
+        while (
+            pending_index < len(pending_sequences)
+            and len(active) < args.max_in_flight
+        ):
             remaining_timeout(deadline, "launching workflow runs")
-            sequence = launched + 1
+            sequence = pending_sequences[pending_index]
             partition = "training" if sequence <= training_runs else "holdout"
             run_name = (
                 f"WASI thread cohort-{cohort_id}-{sequence}-{partition}"
@@ -619,6 +757,7 @@ def dispatch(args: argparse.Namespace) -> int:
                     ),
                 ).strip()
             except subprocess.TimeoutExpired as exc:
+                state["runs"].sort(key=lambda item: item["sequence"])
                 atomic_write_json(args.output, state)
                 raise HarnessError(
                     f"cohort dispatch timed out while launching sequence {sequence}"
@@ -642,8 +781,9 @@ def dispatch(args: argparse.Namespace) -> int:
                 "artifacts": [],
             }
             state["runs"].append(record)
+            state["runs"].sort(key=lambda item: item["sequence"])
             active[run_id] = record
-            launched += 1
+            pending_index += 1
             atomic_write_json(args.output, state)
 
         try:
@@ -652,6 +792,7 @@ def dispatch(args: argparse.Namespace) -> int:
                 remaining_timeout(deadline, "waiting for workflow runs"),
             )
         except HarnessError:
+            state["runs"].sort(key=lambda item: item["sequence"])
             atomic_write_json(args.output, state)
             raise
         time.sleep(sleep_seconds)
@@ -681,6 +822,7 @@ def dispatch(args: argparse.Namespace) -> int:
                 }
             )
             if str(run["headSha"]).lower() != workflow_head_sha:
+                state["runs"].sort(key=lambda item: item["sequence"])
                 atomic_write_json(args.output, state)
                 raise HarnessError(
                     f"workflow run {run_id} head SHA {run['headSha']!r} "
@@ -701,15 +843,154 @@ def dispatch(args: argparse.Namespace) -> int:
                     run_id,
                 )
                 if run["conclusion"] != "success":
+                    state["runs"].sort(key=lambda item: item["sequence"])
                     atomic_write_json(args.output, state)
                     raise HarnessError(
                         f"workflow run {run_id} concluded {run['conclusion']}; "
                         "the failed observation is retained and is not retried"
                     )
                 del active[run_id]
+        state["runs"].sort(key=lambda item: item["sequence"])
         atomic_write_json(args.output, state)
-    print(f"Recorded {args.runs} successful immutable dispatches in {args.output}")
+    print(
+        f"Recorded {len(state['runs'])} successful immutable dispatches in {args.output}"
+    )
     return 0
+
+
+def download_cohort_artifacts(args: argparse.Namespace) -> dict[str, Any]:
+    dispatch_state = json.loads(args.dispatch_state.read_text(encoding="UTF-8"))
+    if not isinstance(dispatch_state, dict):
+        raise HarnessError("dispatch state must be a JSON object")
+    repository = require_api_string(
+        dispatch_state, "repository", "dispatch state"
+    )
+    runs_requested = dispatch_state.get(
+        "requested_runs", dispatch_state.get("runs_requested")
+    )
+    if (
+        not isinstance(runs_requested, int)
+        or isinstance(runs_requested, bool)
+        or runs_requested < 1
+    ):
+        raise HarnessError("dispatch state is missing valid requested_runs")
+    runs = dispatch_state.get("runs")
+    if not isinstance(runs, list) or not runs:
+        raise HarnessError("dispatch state has no runs to download")
+    allow_partial = bool(getattr(args, "allow_partial", False))
+    if not allow_partial and len(runs) != int(runs_requested):
+        raise HarnessError(
+            f"dispatch state has {len(runs)} runs, expected {runs_requested}"
+        )
+    if len(runs) > int(runs_requested):
+        raise HarnessError(
+            f"dispatch state has {len(runs)} runs, exceeding {runs_requested}"
+        )
+    timeout_seconds = getattr(args, "timeout_seconds", 300)
+    if (
+        not isinstance(timeout_seconds, (int, float))
+        or isinstance(timeout_seconds, bool)
+        or timeout_seconds <= 0
+    ):
+        raise HarnessError("--timeout-seconds must be positive")
+    seen_sequences: set[int] = set()
+    validated_runs: list[dict[str, Any]] = []
+    for run in runs:
+        if not isinstance(run, dict):
+            raise HarnessError("dispatch state run record must be an object")
+        sequence = run.get("sequence")
+        run_id = run.get("run_id")
+        run_id_str = str(run_id or "")
+        if (
+            not isinstance(sequence, int)
+            or isinstance(sequence, bool)
+            or sequence < 1
+            or sequence in seen_sequences
+            or not run_id_str.isdigit()
+        ):
+            raise HarnessError("dispatch state run has invalid sequence or run_id")
+        if (
+            run.get("status") != "completed"
+            or run.get("conclusion") != "success"
+            or run.get("attempt", 1) != 1
+        ):
+            raise HarnessError(
+                f"workflow run {run_id_str} is not a completed first-attempt success"
+            )
+        seen_sequences.add(sequence)
+        validated_runs.append(run)
+    validated_runs.sort(key=lambda item: int(item["sequence"]))
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    downloaded_artifacts: list[dict[str, Any]] = []
+    for run in validated_runs:
+        sequence = int(run["sequence"])
+        run_id_str = str(run["run_id"])
+        for platform in DEFAULT_PLATFORMS:
+            artifact_name = f"wasi-thread-bench-{platform}-{run_id_str}-1"
+            target_dir = (
+                args.output_dir
+                / f"seq-{sequence:02d}-run-{run_id_str}-{platform}"
+            )
+            report_json = target_dir / "report.json"
+            report_md = target_dir / "report.md"
+            if report_json.is_file() and report_md.is_file():
+                reused = True
+            else:
+                reused = False
+                target_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    subprocess.check_output(
+                        [
+                            "gh",
+                            "run",
+                            "download",
+                            run_id_str,
+                            "--repo",
+                            repository,
+                            "--name",
+                            artifact_name,
+                            "--dir",
+                            str(target_dir),
+                        ],
+                        text=True,
+                        stderr=subprocess.STDOUT,
+                        timeout=timeout_seconds,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise HarnessError(
+                        f"timed out downloading artifact {artifact_name}"
+                    ) from exc
+                if not (report_json.is_file() and report_md.is_file()):
+                    raise HarnessError(
+                        f"downloaded artifact {artifact_name} is missing "
+                        "report.json or report.md"
+                    )
+            downloaded_artifacts.append(
+                {
+                    "sequence": sequence,
+                    "partition": run.get("partition"),
+                    "run_id": int(run_id_str),
+                    "platform": platform,
+                    "artifact_name": artifact_name,
+                    "directory": str(target_dir),
+                    "report_json": str(report_json),
+                    "report_md": str(report_md),
+                    "reused": reused,
+                }
+            )
+    manifest = {
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "kind": "wasi-thread-cohort-download-manifest",
+        "downloaded_at": collected_at(),
+        "repository": repository,
+        "cohort_id": dispatch_state.get("cohort_id"),
+        "requested_runs": int(runs_requested),
+        "completed_runs": len(validated_runs),
+        "partial": len(validated_runs) < int(runs_requested),
+        "artifacts": downloaded_artifacts,
+    }
+    atomic_write_json(args.output_dir / "manifest.json", manifest)
+    return manifest
 
 
 def validate_platforms(required_platforms: tuple[str, ...]) -> None:
@@ -722,7 +1003,10 @@ def validate_platforms(required_platforms: tuple[str, ...]) -> None:
 
 
 def validate_dispatch_state(
-    state: dict[str, Any], required_platforms: tuple[str, ...]
+    state: dict[str, Any],
+    required_platforms: tuple[str, ...],
+    *,
+    allow_partial: bool = False,
 ) -> dict[str, Any]:
     if (
         not isinstance(state, dict)
@@ -821,7 +1105,11 @@ def validate_dispatch_state(
     ):
         raise HarnessError("dispatch manifest split counts")
     runs = state.get("runs")
-    if not isinstance(runs, list) or len(runs) != requested_runs:
+    if not isinstance(runs, list) or (
+        not (1 <= len(runs) <= requested_runs)
+        if allow_partial
+        else len(runs) != requested_runs
+    ):
         raise HarnessError("dispatch manifest run count")
     run_by_id: dict[str, dict[str, Any]] = {}
     seen_sequences: set[int] = set()
@@ -852,7 +1140,7 @@ def validate_dispatch_state(
             raise HarnessError(f"workflow run {run_id} used a mixed workflow head")
         seen_sequences.add(sequence)
         run_by_id[run_id] = run
-    if seen_sequences != set(range(1, requested_runs + 1)):
+    if not allow_partial and seen_sequences != set(range(1, requested_runs + 1)):
         raise HarnessError("dispatch manifest run sequence coverage")
     return {
         "baseline_sha": baseline_sha,
@@ -1032,12 +1320,21 @@ def validate_paired_documents(
     documents: list[tuple[Path, dict[str, Any]]],
     required_platforms: tuple[str, ...],
     dispatch_state: dict[str, Any],
+    *,
+    allow_partial: bool = False,
 ) -> dict[str, Any]:
-    expected = validate_dispatch_state(dispatch_state, required_platforms)
-    if len(documents) != expected["requested_reports"]:
+    expected = validate_dispatch_state(
+        dispatch_state, required_platforms, allow_partial=allow_partial
+    )
+    expected_reports = (
+        len(expected["run_by_id"]) * len(required_platforms)
+        if allow_partial
+        else expected["requested_reports"]
+    )
+    if len(documents) != expected_reports:
         raise HarnessError(
             f"cohort has {len(documents)} reports, expected exactly "
-            f"{expected['requested_reports']}"
+            f"{expected_reports}"
         )
     grouped: dict[str, dict[str, tuple[Path, dict[str, Any]]]] = {
         platform: {} for platform in required_platforms
@@ -1225,15 +1522,18 @@ def validate_paired_documents(
                 f"trusted x86 reports have mixed "
                 f"{TRUSTED_X86_RUNNER_NAME} host fingerprints"
             )
+    all_classes_observed = True
     for platform_id in required_platforms:
         observed_classes = set(host_cpus[platform_id])
         accepted_classes = set(expected["accepted_cpu_classes"][platform_id])
         if observed_classes != accepted_classes:
-            raise HarnessError(
-                f"{platform_id}: accepted CPU classes were not all observed; "
-                f"accepted={sorted(accepted_classes)!r}, "
-                f"observed={sorted(observed_classes)!r}"
-            )
+            all_classes_observed = False
+            if not allow_partial:
+                raise HarnessError(
+                    f"{platform_id}: accepted CPU classes were not all observed; "
+                    f"accepted={sorted(accepted_classes)!r}, "
+                    f"observed={sorted(observed_classes)!r}"
+                )
     observations.sort(key=lambda item: (item["sequence"], item["platform"]))
     if len(observations) != len(documents):
         raise HarnessError("cohort observation exclusion is forbidden")
@@ -1243,7 +1543,10 @@ def validate_paired_documents(
     return {
         "schema_version": REPORT_SCHEMA_VERSION,
         "kind": "wasi-thread-paired-cohort",
-        "authoritative": True,
+        "authoritative": (
+            len(expected["run_by_id"]) == expected["requested_runs"]
+            and all_classes_observed
+        ),
         "validated_at": collected_at(),
         "dispatch": {
             "repository": dispatch_state["repository"],
@@ -1342,6 +1645,8 @@ def validate_documents(
     required_platforms: tuple[str, ...],
     minimum_reports: int,
     dispatch_state: dict[str, Any] | None = None,
+    *,
+    allow_partial: bool = False,
 ) -> dict[str, Any]:
     if not documents:
         raise HarnessError("cohort has no reports")
@@ -1358,7 +1663,10 @@ def validate_documents(
                 "dispatch manifest"
             )
         return validate_paired_documents(
-            documents, required_platforms, dispatch_state
+            documents,
+            required_platforms,
+            dispatch_state,
+            allow_partial=allow_partial,
         )
     if dispatch_state is not None:
         raise HarnessError("dispatch-backed authoritative cohort rejects legacy reports")
@@ -1384,6 +1692,7 @@ def validate_cohort(args: argparse.Namespace) -> int:
         DEFAULT_PLATFORMS,
         args.minimum_reports,
         dispatch_state,
+        allow_partial=bool(getattr(args, "allow_partial", False)),
     )
     atomic_write_json(args.output, result)
     print(
@@ -2698,6 +3007,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     dispatch_parser.add_argument("--runs", type=int, default=20)
     dispatch_parser.add_argument("--training-runs", type=int)
+    dispatch_parser.add_argument("--start-sequence", type=int, default=1)
+    dispatch_parser.add_argument("--end-sequence", type=int, default=None)
     dispatch_parser.add_argument("--max-in-flight", type=int, default=2)
     dispatch_parser.add_argument(
         "--timeout-seconds",
@@ -2712,6 +3023,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--output", type=Path, default=Path("wasi-thread-cohort-dispatch.json")
     )
 
+    download_parser = sub.add_parser("download")
+    download_parser.add_argument("--dispatch-state", type=Path, required=True)
+    download_parser.add_argument("--output-dir", type=Path, required=True)
+    download_parser.add_argument("--timeout-seconds", type=int, default=300)
+    download_parser.add_argument("--allow-partial", action="store_true")
+
     validate_parser = sub.add_parser("validate")
     validate_parser.add_argument("--input-dir", type=Path, required=True)
     validate_parser.add_argument(
@@ -2724,6 +3041,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=20,
         help="legacy single-revision compatibility only",
+    )
+    validate_parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="validate a partial subset of completed dispatch runs",
     )
     validate_parser.add_argument(
         "--output", type=Path, default=Path("wasi-thread-cohort.json")
@@ -2757,6 +3079,9 @@ def main(argv: list[str] | None = None) -> int:
         args = parse_args(argv)
         if args.command == "dispatch":
             return dispatch(args)
+        if args.command == "download":
+            download_cohort_artifacts(args)
+            return 0
         if args.command == "validate":
             return validate_cohort(args)
         return derive_budget(args)
