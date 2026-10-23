@@ -85,14 +85,14 @@ for match in re.finditer(r"^\s*pub fn (populateWasi\w+)\s*\(", src, re.M):
 print(f"populators={populators} registered-member-rows={total}")
 ```
 
-At this audit: `populators=48 registered-member-rows=356`. The stable
-host-import denominator is 352. Four registered rows do not enter it:
-the reserved unpublished `wasi:logging@0.2.x` duplicate, the unstable
-P2 `cli.exit-with-code` and `sockets.network-error-code` methods, and
+At this audit: `populators=51 registered-member-rows=386`. The stable
+host-import denominator is 381. Five registered rows do not enter it:
+the two reserved unpublished `wasi:logging@0.2.x` duplicates (`log` and `kv-log`),
+the unstable P2 `cli.exit-with-code` and `sockets.network-error-code` methods, and
 the synthetic P2 `http/incoming-handler.handle` provider for an
-interface the pinned world exports. The source registers 30 P2 named
-instances, of which 29 contain stable host imports, and 26 P3
-instances (135 stable host methods plus four zero-method/type-only
+interface the pinned world exports. The source registers 33 P2/cross-version named
+instances (including `wasi:blobstore/{blobstore,container,types}@0.2.0-draft`),
+and 26 P3 instances (135 stable host methods plus four zero-method/type-only
 instances).
 
 ### Cross-reference against the pinned WIT/build inputs
@@ -128,10 +128,29 @@ branch are not inputs:
   methods, and two guest exports.
 * **Other registered packages:** `wasi:keyvalue@0.2.0-draft2` uses the
   in-tree [`docs/wasi-keyvalue-wit-vendored`](wasi-keyvalue-wit-vendored)
-  copy. Logging and config have no vendored WIT or fixture corpus in
-  this tree; their one- and two-method denominators are therefore
-  checked against their published package shapes and called out as a
-  provenance limitation.
+  copy (plus the `#972 A6/E4` crash-safe write-ahead redo journal and
+  metadata/inode-preserving in-place file persistence in
+  `src/component/keyvalue_persistence.zig`, and transactional
+  `batch.set-many` / `batch.delete-many`), and
+  `wasi:blobstore@0.2.0-draft` uses the in-tree
+  [`docs/wasi-blobstore-wit-vendored`](wasi-blobstore-wit-vendored)
+  copy (`blobstore`, `container`, `types` — 28 functions/methods
+  including 4 resource drops, bridged to `wasi:io/streams`; `#972 E2`).
+  Logging (`log` + `kv-log`, structured `key=value` / JSON context
+  parsing, and `--log-format=<text|json>` / `WAMR_LOG_FORMAT`;
+  `#972 E5`) and config have no vendored WIT or fixture corpus in
+  this tree; their two-method denominators are therefore checked against
+  their published package shapes and called out as a provenance
+  limitation.
+* **Component Model canonical built-ins & HTTP/2 incoming-handler (`#972 B1.7/E3/E1`):**
+  Component Model thread and backpressure canonical built-ins
+  (`0x08`, `0x24`–`0x2d`, `0x40`–`0x42`) are wired across
+  `types.zig`/`loader.zig`/`async.zig`/`instance.zig`/`executor.zig`,
+  including OS-thread-backed shared-everything threads (`is_shared = true`)
+  integrated with `ThreadManager`. HTTP/2 (`h2c` prior-knowledge and TLS
+  `h2` ALPN) framing, HPACK header compression, flow control, and stream
+  multiplexing for `wasi:http/incoming-handler` are implemented in
+  `src/component/http2.zig` and `src/component/wasi_cli_adapter.zig`.
 
 The comparison counts every WIT `func`, `static func`,
 `constructor`, resource method, and canonical resource drop.
@@ -171,9 +190,10 @@ Resource-drop entries are required by the canonical ABI for every
 | Preview 2 (0.2.6) — `wasi:cli` + `wasi:io` + `wasi:clocks` + `wasi:random` + `wasi:filesystem` + `wasi:sockets` + `wasi:http` | 199 | 198 | 1 | 0 | 99.5 % |
 | Preview 3 (0.3.0) | 135 | 135 | — | 0 | 100.0 % |
 | `wasi:keyvalue@0.2.0-draft2` | 15 | 15 | — | 0 | 100.0 % |
-| `wasi:logging@0.1.0-draft` | 1 | 1 | — | — | 100.0 % |
+| `wasi:blobstore@0.2.0-draft` | 28 | 28 | — | 0 | 100.0 % |
+| `wasi:logging@0.1.0-draft` | 2 | 2 | — | — | 100.0 % |
 | `wasi:config/store@0.2.0-rc.1` | 2 | 2 | — | — | 100.0 % |
-| **Total** | **352** | **351** | **1** | **0** | **99.7 %** |
+| **Total** | **381** | **380** | **1** | **0** | **99.7 %** |
 
 Stubbed: 0.3 %. Missing: 0.0 %. Type-only P3 instances
 (`wasi:cli/types`, `wasi:clocks/types`, plus the adapter's synthetic
@@ -704,7 +724,13 @@ Pinned WIT: [`types.wit`](https://github.com/WebAssembly/wasi-http/blob/d97efe47
 exports `incoming-handler`; its WIT documentation likewise says
 components should export it. The adapter's no-op provider is a
 synthetic compatibility registration and is not method implementation
-coverage.
+coverage. For components that export `wasi:http/incoming-handler@0.2.*`
+(or `wasi:http/handler@0.3.*`), the host server loop
+(`serveOneHttpConnection` / `serveHttp2Connection` in
+`src/component/wasi_cli_adapter.zig` + `src/component/http2.zig`)
+supports both HTTP/1.1 and HTTP/2 (`h2c` prior-knowledge and TLS `h2`
+ALPN, RFC 9113 framing, RFC 7541 HPACK header compression, flow
+control, and multiplexed streams; `#972 E1`).
 
 ## Preview 3 (0.3.0) interfaces
 
@@ -1056,8 +1082,11 @@ Vendored WIT:
 | `[method]bucket.list-keys` | ✅ | :22168 |
 | `[resource-drop]bucket` | ✅ | :22169 |
 
-7/7 (100 %). `std.StringHashMapUnmanaged`-backed, with optional
-JSON-file persistence via `--keyvalue-store`; no replication.
+7/7 (100 %). `std.StringHashMapUnmanaged`-backed, with crash-safe
+write-ahead redo journal (`WAMRKVJ1`/`WAMRKVJC` + SHA-256) and
+metadata/inode-preserving in-place JSON-file persistence via
+`--keyvalue-store` (`src/component/keyvalue_persistence.zig`, `#972 A6/E4`);
+no cross-process replication.
 
 ### `wasi:keyvalue/atomics@0.2.0-draft2`
 
@@ -1086,7 +1115,67 @@ Vendored WIT:
 | `set-many` (free fn) | ✅ | :22233 |
 | `delete-many` (free fn) | ✅ | :22234 |
 
-3/3 (100 %).
+3/3 (100 %). `set-many` and `delete-many` execute transactionally with
+a single write-ahead journal commit + in-place target flush per batch
+and full in-memory rollback on failure (`#972 A6/E4`).
+
+### `wasi:blobstore/blobstore@0.2.0-draft`
+
+Vendored WIT:
+[`blobstore.wit`](../docs/wasi-blobstore-wit-vendored/blobstore.wit) (vendored, `#972 E2`).
+
+| WIT method | Status | Adapter location |
+| --- | :-: | --- |
+| `create-container` (free fn) | ✅ | wasi_cli_adapter.zig:32361 |
+| `get-container` (free fn) | ✅ | :32362 |
+| `delete-container` (free fn) | ✅ | :32363 |
+| `container-exists` (free fn) | ✅ | :32364 |
+| `copy-object` (free fn) | ✅ | :32365 |
+| `move-object` (free fn) | ✅ | :32366 |
+
+6/6 (100 %).
+
+### `wasi:blobstore/container@0.2.0-draft`
+
+Vendored WIT:
+[`container.wit`](../docs/wasi-blobstore-wit-vendored/container.wit) (vendored, `#972 E2`).
+
+| WIT method | Status | Adapter location |
+| --- | :-: | --- |
+| `[method]container.name` | ✅ | wasi_cli_adapter.zig:32385 |
+| `[method]container.info` | ✅ | :32386 |
+| `[method]container.get-data` | ✅ | :32387 |
+| `[method]container.write-data` | ✅ | :32388 |
+| `[method]container.list-objects` | ✅ | :32389 |
+| `[method]container.delete-object` | ✅ | :32390 |
+| `[method]container.delete-objects` | ✅ | :32391 |
+| `[method]container.has-object` | ✅ | :32392 |
+| `[method]container.object-info` | ✅ | :32393 |
+| `[method]container.clear` | ✅ | :32394 |
+| `[method]stream-object-names.read-stream-object-names` | ✅ | :32395 |
+| `[method]stream-object-names.skip-stream-object-names` | ✅ | :32396 |
+| `[resource-drop]container` | ✅ | :32397 |
+| `[resource-drop]stream-object-names` | ✅ | :32398 |
+
+14/14 (100 %).
+
+### `wasi:blobstore/types@0.2.0-draft`
+
+Vendored WIT:
+[`types.wit`](../docs/wasi-blobstore-wit-vendored/types.wit) (vendored, `#972 E2`).
+
+| WIT method | Status | Adapter location |
+| --- | :-: | --- |
+| `[static]outgoing-value.new-outgoing-value` | ✅ | wasi_cli_adapter.zig:32417 |
+| `[method]outgoing-value.outgoing-value-write-body` | ✅ | :32418 |
+| `[static]outgoing-value.finish` | ✅ | :32419 |
+| `[method]incoming-value.incoming-value-consume-sync` | ✅ | :32420 |
+| `[method]incoming-value.incoming-value-consume-async` | ✅ | :32421 |
+| `[method]incoming-value.size` | ✅ | :32422 |
+| `[resource-drop]outgoing-value` | ✅ | :32423 |
+| `[resource-drop]incoming-value` | ✅ | :32424 |
+
+8/8 (100 %), bridged to `wasi:io/streams`.
 
 ### `wasi:logging/logging@0.1.0-draft`
 
@@ -1094,12 +1183,13 @@ Pinned reference: [`logging.wit`](https://github.com/WebAssembly/wasi-logging/bl
 
 | WIT method | Status | Adapter location | Notes |
 | --- | :-: | --- | --- |
-| `log` (free fn) | ✅ | wasi_cli_adapter.zig:6727 | Routes to host stderr + `std.log.scoped(.wasi_guest)`; level filter via `--log-level` / `WAMR_LOG_LEVEL`. |
+| `log` (free fn) | ✅ | wasi_cli_adapter.zig:11029 | Routes to host stderr + `std.log.scoped(.wasi_guest)`; level filter via `--log-level` / `WAMR_LOG_LEVEL`; structured context parsing (`key=value` and JSON object) and `--log-format=<text\|json>` / `WAMR_LOG_FORMAT` (`#972 E5`). |
+| `kv-log` (free fn) | ✅ | :11032 | Structured key-value logging (`list<tuple<string, string>>`) merged with parsed context fields in text or JSON-lines output (`#972 E5`). |
 
-1/1 (100 %). The `_p2` slot (`populateWasiLoggingP2`, line 6740)
+2/2 (100 %). The `_p2` slot (`populateWasiLoggingP2`, line 11045)
 is reserved for a future `@0.2.x` revision and currently mirrors
-the same `wasiLog` callback. It is a registration compatibility slot,
-not a second published method in the denominator.
+the same `wasiLog` and `wasiKvLog` callbacks. It is a registration compatibility slot,
+not a second published interface in the denominator.
 
 ### `wasi:config/store@0.2.0-rc.1`
 
