@@ -7,6 +7,7 @@ import json
 import math
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1768,8 +1769,13 @@ class DurationCrossCohortTests(unittest.TestCase):
         self.assertIn("permissions:\n  contents: read", workflow)
         self.assertIn("group: wasi-thread-duration-cross-diagnostic", workflow)
         self.assertIn("cancel-in-progress: false", workflow)
-        self.assertIn("needs: x86", workflow)
+        self.assertNotIn("needs: x86", workflow)
         self.assertIn("runs-on: ubuntu-22.04", workflow)
+        self.assertIn("Acquire target x86 CPU class", workflow)
+        self.assertIn(
+            'TARGET_CPU_CLASS: "AMD EPYC 7763 64-Core Processor"',
+            workflow,
+        )
         self.assertNotIn("wamr-temp-20260906", workflow)
         self.assertNotIn("vm31e-wamr-temp-20260906", workflow)
         self.assertNotIn("--runner-environment self-hosted", workflow)
@@ -1796,7 +1802,10 @@ class DurationCrossCohortTests(unittest.TestCase):
         self.assertIn("if: ${{ success() && inputs.preflight_only }}", workflow)
         self.assertIn("--preflight-only", workflow)
         self.assertIn("preflight_platform:", workflow)
-        self.assertIn("needs.x86.result == 'skipped'", workflow)
+        self.assertIn(
+            "if: ${{ !inputs.preflight_only || inputs.preflight_platform == 'arm' }}",
+            workflow,
+        )
         self.assertIn("name: Run Arm gate-readiness probe", workflow)
         self.assertIn("name: Retain Arm gate-readiness result", workflow)
         self.assertIn("wasi-thread-duration-cross-readiness-arm-", workflow)
@@ -1817,6 +1826,222 @@ class DurationCrossCohortTests(unittest.TestCase):
         self.assertNotIn("~/.cache", workflow)
         self.assertNotIn("TMPDIR: /tmp", workflow)
         self.assertNotIn("/var/tmp", workflow)
+
+    def test_bounded_sequence_and_concurrent_dispatch_waves(self) -> None:
+        plan = cohort.make_dispatch_plan(
+            cohort_id=COHORT_ID,
+            source_sha=SHA,
+            workflow_ref="wasi-thread-duration-cross-v21",
+            max_workflows_in_flight=4,
+            trusted_x86_runner_name=duration.HOSTED_X86_RUNNER_NAME,
+            x86_cpu_class=duration.HOSTED_X86_CPU_CLASS,
+        )
+        cohort.validate_dispatch_plan(plan, completed=False)
+        plan_path = self.scratch / "plan.json"
+        state_path = self.scratch / "state.json"
+        plan_path.write_text(json.dumps(plan), encoding="UTF-8")
+
+        full = completed_dispatch()
+        dispatched_sequences: list[int] = []
+
+        def fake_check_output(cmd: list[str], **kwargs: object) -> str:
+            if cmd[:3] == ["gh", "workflow", "run"]:
+                for arg in cmd:
+                    if arg.startswith("report_sequence="):
+                        dispatched_sequences.append(int(arg.split("=", 1)[1]))
+                return ""
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        def fake_gh_json(args: list[str], timeout: float) -> object:
+            if args[:1] == ["api"] and args[1].endswith(
+                f"/commits/{plan['workflow_ref']}"
+            ):
+                return {"sha": SHA}
+            if args[:2] == ["run", "list"]:
+                rows = []
+                for seq in dispatched_sequences:
+                    run = full["runs"][seq - 1]
+                    rows.append(
+                        {
+                            "databaseId": run["run_id"],
+                            "displayTitle": (
+                                f"WASI thread duration-cross {COHORT_ID}-"
+                                f"{seq}-{duration.PARTITIONS[seq]}"
+                            ),
+                            "headSha": SHA,
+                            "headBranch": "wasi-thread-duration-cross-v21",
+                            "url": run["url"],
+                            "status": "completed",
+                            "conclusion": "success",
+                            "attempt": 1,
+                        }
+                    )
+                return rows
+            if args[:2] == ["run", "view"]:
+                run_id = int(args[2])
+                return {
+                    "attempt": 1,
+                    "status": "completed",
+                    "conclusion": "success",
+                    "headSha": SHA,
+                    "url": f"https://example.invalid/{run_id - 10_000}",
+                }
+            if args[:1] == ["api"] and args[1].endswith("/artifacts"):
+                run_id = int(args[1].split("/")[-2])
+                run = full["runs"][run_id - 10_001]
+                return remote_artifact_response(run)
+            raise AssertionError(f"unexpected gh_json args: {args}")
+
+        with (
+            mock.patch.object(
+                cohort.subprocess, "check_output", side_effect=fake_check_output
+            ),
+            mock.patch.object(cohort, "gh_json", side_effect=fake_gh_json),
+        ):
+            wave1 = cohort.dispatch_cohort(
+                plan_path,
+                state_path,
+                start_sequence=1,
+                end_sequence=2,
+                concurrency=2,
+            )
+            self.assertEqual([r["sequence"] for r in wave1["runs"]], [1, 2])
+            self.assertEqual(dispatched_sequences, [1, 2])
+
+            wave2 = cohort.dispatch_cohort(
+                plan_path,
+                state_path,
+                start_sequence=3,
+                end_sequence=4,
+                concurrency=2,
+            )
+            self.assertEqual(
+                [r["sequence"] for r in wave2["runs"]], [1, 2, 3, 4]
+            )
+            self.assertEqual(dispatched_sequences, [1, 2, 3, 4])
+
+    def test_partial_download_and_validation_reuse_verified_artifacts(
+        self,
+    ) -> None:
+        partial_dispatch = completed_dispatch()
+        partial_dispatch["runs"] = partial_dispatch["runs"][:2]
+        download_dir = self.scratch / "partial-download"
+        download_dir.mkdir(parents=True)
+
+        zip_bytes_by_id: dict[int, bytes] = {}
+        for run in partial_dispatch["runs"]:
+            for artifact in run["artifacts"]:
+                platform = artifact["platform"]
+                report = synthetic_report(
+                    sequence=run["sequence"],
+                    platform=platform,
+                )
+                staging = self.scratch / f"stage-{artifact['id']}"
+                staging.mkdir(parents=True)
+                report_path = staging / "report.json"
+                md_path = staging / "report.md"
+                zip_path = staging / "artifact.zip"
+                report_path.write_text(
+                    json.dumps(report, indent=2, sort_keys=True) + "\n",
+                    encoding="UTF-8",
+                )
+                md_path.write_text(
+                    duration.render_markdown(report) + "\n",
+                    encoding="UTF-8",
+                )
+                with zipfile.ZipFile(
+                    zip_path, "w", zipfile.ZIP_DEFLATED
+                ) as archive:
+                    archive.write(report_path, "report.json")
+                    archive.write(md_path, "report.md")
+                artifact["size_in_bytes"] = zip_path.stat().st_size
+                artifact["digest_sha256"] = sha256_file(zip_path)
+                zip_bytes_by_id[artifact["id"]] = zip_path.read_bytes()
+
+        dispatch_path = self.scratch / "partial-dispatch.json"
+        manifest_path = self.scratch / "partial-manifest.json"
+        cohort_path = self.scratch / "partial-cohort.json"
+        dispatch_path.write_text(
+            json.dumps(partial_dispatch, indent=2, sort_keys=True) + "\n",
+            encoding="UTF-8",
+        )
+
+        download_calls: list[int] = []
+
+        def fake_gh_json(args: list[str], timeout: float) -> object:
+            if args[:2] == ["run", "view"]:
+                return {
+                    "attempt": 1,
+                    "status": "completed",
+                    "conclusion": "success",
+                    "headSha": SHA,
+                }
+            if args[:1] == ["api"] and args[1].endswith("/artifacts"):
+                run_id = int(args[1].split("/")[-2])
+                run = next(
+                    r for r in partial_dispatch["runs"] if r["run_id"] == run_id
+                )
+                return remote_artifact_response(run)
+            raise AssertionError(f"unexpected gh_json args: {args}")
+
+        def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            artifact_id = int(cmd[2].split("/")[-2])
+            download_calls.append(artifact_id)
+            stdout = kwargs["stdout"]
+            assert hasattr(stdout, "write")
+            stdout.write(zip_bytes_by_id[artifact_id])
+            return subprocess.CompletedProcess(cmd, 0)
+
+        with (
+            mock.patch.object(
+                cohort, "require_live_dispatch_membership", return_value=None
+            ),
+            mock.patch.object(cohort, "gh_json", side_effect=fake_gh_json),
+            mock.patch.object(cohort.subprocess, "run", side_effect=fake_run),
+        ):
+            self.assertEqual(
+                cohort.download_artifacts(
+                    dispatch_path,
+                    download_dir,
+                    manifest_path,
+                    30,
+                    allow_partial=True,
+                ),
+                0,
+            )
+            self.assertEqual(len(download_calls), 4)
+
+            download_calls.clear()
+            self.assertEqual(
+                cohort.download_artifacts(
+                    dispatch_path,
+                    download_dir,
+                    manifest_path,
+                    30,
+                    allow_partial=True,
+                ),
+                0,
+            )
+            self.assertEqual(download_calls, [])
+
+        self.assertEqual(
+            cohort.validate_cohort(
+                download_dir,
+                dispatch_path,
+                manifest_path,
+                cohort_path,
+                allow_partial=True,
+            ),
+            0,
+        )
+        validated = json.loads(cohort_path.read_text(encoding="UTF-8"))
+        self.assertEqual(len(validated["observations"]), 4)
+        self.assertEqual(
+            validated["platform_counts"],
+            {platform: 2 for platform in duration.PLATFORM_CELLS},
+        )
+        with self.assertRaises(HarnessError):
+            cohort.validate_cohort_document(validated, allow_partial=False)
 
 
 if __name__ == "__main__":
