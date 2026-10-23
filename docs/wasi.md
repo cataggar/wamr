@@ -34,7 +34,7 @@ seam where each interface name is version-multiplexed onto the matching
 - [Known limitations](#known-limitations)
 - [Build & test](#build--test)
 - [Roadmap](#roadmap)
-- [wasi:blobstore — deferred (#583 B7)](#wasiblobstore--deferred-583-b7)
+- [wasi:blobstore@0.2.0-draft (#972 E2)](#wasiblobstore020-draft-972-e2)
 - [See also](#see-also)
 
 ## Status overview
@@ -44,15 +44,15 @@ seam where each interface name is version-multiplexed onto the matching
 | `wasi:cli`         | ✅ | ✅ | Real stdio capture, env / args / exit / terminal stubs. |
 | `wasi:clocks`      | ✅ | ✅ | Monotonic + wall / system clock; `wait-for` / `wait-until` host-driven. |
 | `wasi:filesystem`  | ✅ | ✅ | Full descriptor + preopens surface; sandboxed by `--preopen`. |
-| `wasi:http`        | ✅ | ✅ | Real outbound HTTP/HTTPS via `std.http.Client`; incoming-handler HTTP/1.1 (keep-alive / chunked / trailers / limits). HTTPS termination live (`--tls-cert` / `--tls-key` / `--tls-pem`): TLS 1.3 server handshake (RSA + ECDSA certs) via the `cataggar/tls.zig` dependency ([#799](https://github.com/cataggar/wamr/pull/799)). |
+| `wasi:http`        | ✅ | ✅ | Real outbound HTTP/HTTPS via `std.http.Client`; incoming-handler HTTP/1.1 (keep-alive / chunked / trailers / limits) + HTTP/2 (`h2c` prior-knowledge and TLS `h2` ALPN, RFC 9113 framing, RFC 7541 HPACK, flow control, stream multiplexing; `#972 E1`, `src/component/http2.zig`). HTTPS termination live (`--tls-cert` / `--tls-key` / `--tls-pem`): TLS 1.3 server handshake (RSA + ECDSA certs) via the `cataggar/tls.zig` dependency ([#799](https://github.com/cataggar/wamr/pull/799)). |
 | `wasi:io`          | ✅ | ✅ | `poll` / `error` / `streams`; P3 stream/future plumbing lives in the canonical ABI. |
 | `wasi:random`      | ✅ | ✅ | OS CSPRNG (`std.crypto.random`) + insecure variants + 128-bit seed. |
 | `wasi:sockets`     | ✅ | ✅ | TCP + UDP + DNS; allow-list gated; SO_REUSEADDR; Windows + POSIX parity. |
-| `wasi:keyvalue`    | ✅ | — | Memory-store host adapter — `store` + `atomics` (real CAS) + `batch`; optional file-backed persistence via `--keyvalue-store=<path>` (#583 B4). |
-| `wasi:logging`     | ✅ | — | `wasi:logging@0.1.0-draft`: routes guest log calls to host stderr + `std.log.scoped(.wasi_guest)`. Level filter via `--log-level` / `WAMR_LOG_LEVEL`. |
+| `wasi:keyvalue`    | ✅ | — | Memory-store host adapter — `store` + `atomics` (real CAS) + transactional `batch`; crash-safe write-ahead redo journal (`WAMRKVJ1`/`WAMRKVJC` + SHA-256) and metadata/inode-preserving in-place file persistence via `--keyvalue-store=<path>` (#583 B4, #972 A6/E4, `src/component/keyvalue_persistence.zig`). |
+| `wasi:logging`     | ✅ | — | `wasi:logging@0.1.0-draft`: `log` + `kv-log`, structured context parsing (`key=value` and JSON object), text and JSON lines output via `--log-format=<text\|json>` / `WAMR_LOG_FORMAT`, level filter via `--log-level` / `WAMR_LOG_LEVEL` (#583 B5, #972 E5). |
 | `wasi:config`      | ✅ (rc.1) | — | Layered env (`WAMR_CONFIG_*`) + `--config-store=PATH.json` host adapter (#583 B6). |
-| `wasi:blobstore`   | — | — | Not implemented (#583 B7). |
-| `wasi:threads`     | ✅ (Preview 1) | — | Legacy Preview-1 `wasi.thread-spawn` is production-wired for interpreter and AOT builds on x86_64/AArch64 behind `-Dlib_wasi_threads=true`; shared-everything Component Model threads remain out of scope ([#616 B1](https://github.com/cataggar/wamr/issues/616)). |
+| `wasi:blobstore`   | ✅ (0.2.0-draft) | — | In-memory host adapter — `blobstore`, `container`, and `types` (28 functions/methods including 4 resource drops, bridged to `wasi:io/streams`; `#972 E2`, vendored WIT under `docs/wasi-blobstore-wit-vendored/`). |
+| `wasi:threads`     | ✅ (Preview 1 + CM) | ✅ (CM built-ins) | Preview-1 `wasi.thread-spawn` is production-wired for interpreter and AOT builds on x86_64/AArch64 behind `-Dlib_wasi_threads=true`; Component Model thread and backpressure canonical built-ins (`0x08`, `0x24`–`0x2d`, `0x40`–`0x42`) and OS-thread-backed shared-everything threads (`is_shared = true`) integrated with `ThreadManager` are implemented (`#972 B1.7/E3`). |
 
 ✅ = shipped + gated by the conformance suite. — = not in scope today.
 
@@ -92,12 +92,15 @@ correspond 1:1 with the WIT functions / methods / `[constructor]` /
 | `wasi:sockets/udp-create-socket`   |  1 | `wasi-p2-testsuite` | — |
 | `wasi:http/types`                  | 56 | `wasi-p2-testsuite` (`zig-http`) | Fields + outgoing/incoming request/response + bodies + futures. |
 | `wasi:http/outgoing-handler`       |  1 | `wasi-p2-testsuite` (`zig-http`) | Real `std.http.Client.fetch` for `http://` + `https://`. |
-| `wasi:http/incoming-handler`       |  1 | `wasi-p2-testsuite` (`zig-http`) | Real TCP-listener-backed dispatch (#580). |
-| `wasi:keyvalue/store@0.2.0-draft2`     |  7 | unit tests (`#583 B4`) | Memory-store `bucket`: `open`, `get`, `set`, `delete`, `exists`, `list-keys`, `[resource-drop]`. Hydrated from `--keyvalue-store=PATH.json` on startup when set. |
+| `wasi:http/incoming-handler`       |  1 | `wasi-p2-testsuite` (`zig-http`), unit tests (`#972 E1`) | Real TCP-listener-backed dispatch (#580) supporting HTTP/1.1 and HTTP/2 (`h2c` prior-knowledge + TLS `h2` ALPN, RFC 9113 frame codec, RFC 7541 HPACK, flow control, and multiplexed streams in `src/component/http2.zig`, `#972 E1`). |
+| `wasi:keyvalue/store@0.2.0-draft2`     |  7 | unit tests (`#583 B4`, `#972 A6/E4`) | Memory-store `bucket`: `open`, `get`, `set`, `delete`, `exists`, `list-keys`, `[resource-drop]`. Crash-safe write-ahead redo journal (`WAMRKVJ1`/`WAMRKVJC` + SHA-256) and metadata/inode-preserving in-place file persistence via `--keyvalue-store=PATH.json` (`src/component/keyvalue_persistence.zig`). |
 | `wasi:keyvalue/atomics@0.2.0-draft2`   |  5 | unit tests (`#583 B4`) | `increment` + real CAS: `[static]cas.new` snapshots `(bucket, key)`, `[method]cas.current` lifts the snapshot, `swap` is the atomic test-and-set (`cas-error::cas-failed(cas)` on mismatch, re-snapshotted handle for retry). |
-| `wasi:keyvalue/batch@0.2.0-draft2`     |  3 | unit tests (`#583 B4`) | `get-many`, `set-many`, `delete-many` over the same bucket table; mutations flush through to `--keyvalue-store` when set. |
-| `wasi:logging/logging@0.1.0-draft` |  1 | unit tests | Host stderr + `std.log.scoped(.wasi_guest)`; level filter via `--log-level` / `WAMR_LOG_LEVEL`. No structured-logging backends yet (#583 B5). |
+| `wasi:keyvalue/batch@0.2.0-draft2`     |  3 | unit tests (`#583 B4`, `#972 A6/E4`) | `get-many`, transactional `set-many` and `delete-many` (single journal + in-place flush per batch with full rollback on error) over the same bucket table. |
+| `wasi:logging/logging@0.1.0-draft` |  2 | unit tests (`#583 B5`, `#972 E5`) | `log` + `kv-log`: routes to host stderr + `std.log.scoped(.wasi_guest)`; level filter via `--log-level` / `WAMR_LOG_LEVEL`; structured context parsing (`key=value` and JSON object) and `--log-format=<text\|json>` / `WAMR_LOG_FORMAT` (#972 E5). |
 | `wasi:config/store@0.2.0-rc.1`     |  2 | Adapter unit tests (#583 B6) | `get` / `get-all`. Layered backing: env vars matching `WAMR_CONFIG_<KEY>=<value>` (prefix stripped, key lower-cased ASCII) plus an optional `--config-store=PATH.json` flat object. **File overrides env** on duplicate keys. In-memory store never surfaces the `error` arms (`upstream` / `io`) — reserved for future Vault / Kubernetes / etc. backends. Pinned to upstream `wasi:config@0.2.0-rc.1` ([WebAssembly/wasi-config](https://github.com/WebAssembly/wasi-config)); the version-multiplex in `populateWasiProviders` accepts any `wasi:config/store@…` import so future revisions that keep the method shape work without code changes. |
+| `wasi:blobstore/blobstore@0.2.0-draft` |  6 | unit tests (`#972 E2`) | `create-container`, `get-container`, `delete-container`, `container-exists`, `copy-object`, `move-object`. |
+| `wasi:blobstore/container@0.2.0-draft` | 14 | unit tests (`#972 E2`) | `container` (`name`, `info`, `get-data`, `write-data`, `list-objects`, `delete-object`, `delete-objects`, `has-object`, `object-info`, `clear`, `[resource-drop]container`) + `stream-object-names` (`read-stream-object-names`, `skip-stream-object-names`, `[resource-drop]stream-object-names`). |
+| `wasi:blobstore/types@0.2.0-draft`     |  8 | unit tests (`#972 E2`) | `outgoing-value` (`new-outgoing-value`, `outgoing-value-write-body`, `finish`, `[resource-drop]outgoing-value`) + `incoming-value` (`incoming-value-consume-sync`, `incoming-value-consume-async`, `size`, `[resource-drop]incoming-value`) bridged to `wasi:io/streams`. |
 
 ### WASI Preview 3 (0.3.0)
 
@@ -120,7 +123,7 @@ correspond 1:1 with the WIT functions / methods / `[constructor]` /
 | `wasi:sockets/types@0.3.0`               | 43 | `wasi-p3-testsuite` (`sockets-*`) | Unified TCP + UDP resource surface (#486 / #544 / #565); callback-driven async `run` resumption (#905). |
 | `wasi:sockets/ip-name-lookup@0.3.0`      |  1 | `wasi-p3-testsuite` | — |
 | `wasi:http/types@0.3.0`                  | 40 | `wasi-p3-testsuite` (`http-*`) | Unified `request` / `response` resource (#487 / #568). |
-| `wasi:http/handler@0.3.0`                |  1 | `wasi-p3-testsuite` (`http-service`) | Incoming-handler trampoline (#549 / #580); HTTP/1.1 keep-alive + chunked + trailers + 431/413 limits (#595); HTTPS termination live — TLS 1.3 server handshake (RSA + ECDSA certs) via the `cataggar/tls.zig` dependency (#799). |
+| `wasi:http/handler@0.3.0`                |  1 | `wasi-p3-testsuite` (`http-service`), unit tests (`#972 E1`) | Incoming-handler trampoline (#549 / #580); HTTP/1.1 keep-alive + chunked + trailers + 431/413 limits (#595); HTTP/2 (`h2c` prior-knowledge and TLS `h2` ALPN, RFC 9113 framing, RFC 7541 HPACK, flow control, stream multiplexing; `#972 E1`); HTTPS termination live — TLS 1.3 server handshake (RSA + ECDSA certs) via the `cataggar/tls.zig` dependency (#799). |
 | `wasi:http/client@0.3.0`                 |  1 | `wasi-p3-testsuite` (`http-request`, `http-fields`) | Outbound; async state machine (#583 A2 / #590). |
 
 `wasi-testsuite-expectations.toml` carries the narrow Preview-1 exceptions.
@@ -458,42 +461,57 @@ session while an unlocked stream callback is running.
   x86_64/AArch64. Group termination is first-wins: the first `proc_exit` or
   trap fixes the process result, siblings blocked on guest futexes or blocking
   WASI I/O are woken, AOT loop headers poll a group-cancel word so compiled
-  guest loops are interruptible too, and teardown is bounded.
-  ([#616 B1](https://github.com/cataggar/wamr/issues/616))
+  guest loops are interruptible too, and teardown is bounded. Component Model
+  thread and backpressure canonical built-ins (`backpressure.set` `0x08`,
+  `backpressure.inc`/`dec` `0x24`–`0x25`, `thread.index` `0x26`,
+  `thread.new-indirect` `0x27`, `thread.switch-to` `0x28`, `thread.suspend`
+  `0x29`, `thread.resume-later` `0x2a`, `thread.yield-to` `0x2b`,
+  `thread.suspend-to` `0x2c`, `thread.suspend-to-able` `0x2d`,
+  `thread.spawn-ref` `0x40`, `thread.spawn-indirect` `0x41`,
+  `thread.available-parallelism` `0x42`) are wired across
+  `types.zig`/`loader.zig`/`async.zig`/`instance.zig`/`executor.zig`, including
+  OS-thread-backed shared-everything threads (`is_shared = true`) integrated
+  with `ThreadManager`.
+  ([#616 B1](https://github.com/cataggar/wamr/issues/616), `#972 B1.7/E3`)
 * **`wasi:keyvalue@0.2.x`** — memory-store host adapter shipped, with
-  optional file-backed persistence and real compare-and-swap.
-  Limitations: in-process `std.StringHashMapUnmanaged` only; no
-  cross-process / replicated consistency beyond the file-backed
-  snapshot. Persistence is opt-in via `--keyvalue-store=<path>` —
-  the file holds a JSON object whose top-level keys are bucket
-  identifiers and whose inner objects map keys to base64-encoded
+  crash-safe write-ahead redo journal (`WAMRKVJ1`/`WAMRKVJC` + SHA-256),
+  metadata/inode-preserving in-place file persistence
+  (`src/component/keyvalue_persistence.zig`), transactional
+  `batch.set-many` / `batch.delete-many`, and real compare-and-swap
+  (`#972 A6/E4`).
+  Persistence is opt-in via `--keyvalue-store=<path>` —
+  the file holds a deterministic sorted JSON object whose top-level keys are
+  bucket identifiers and whose inner objects map keys to base64-encoded
   value bytes (e.g. `{"primary":{"alpha":"dmFsdWU="}}`). Reads on
-  startup, rewrites synchronously on every mutation (`set` /
-  `delete` / successful `swap` / `increment` / batch.{set,delete}-many).
-  The flush is a plain `writeFile`; the metadata-preserving,
-  crash-safe replacement protocol is specified in
-  [`docs/design/metadata-safe-json-persistence.md`](design/metadata-safe-json-persistence.md)
-  for follow-up implementation. The `cas`
-  resource is now a real atomic test-and-set (`[static]cas.new` /
+  startup (replaying any committed `<path>.journal` frame or discarding
+  an uncommitted/truncated journal), and commits every mutation (`set` /
+  `delete` / successful `swap` / `increment` / transactional
+  `batch.{set,delete}-many`) through the write-ahead redo journal + in-place
+  target rewrite without replacing the file's inode or permissions
+  ([`docs/design/metadata-safe-json-persistence.md`](design/metadata-safe-json-persistence.md)).
+  The `cas` resource is a real atomic test-and-set (`[static]cas.new` /
   `[method]cas.current` / `swap` / `[resource-drop]cas`); mismatches
   surface `cas-error::cas-failed(cas)` with a re-snapshotted handle
   so guests can retry without re-issuing `cas.new`. Upstream WIT
   pinned at `wasi:keyvalue@0.2.0-draft2`
   ([commit `fb6e23d`](https://github.com/WebAssembly/wasi-keyvalue/tree/fb6e23d11d41d0704b41cdd6362536c5750e0329)
   — vendored under [`docs/wasi-keyvalue-wit-vendored/`](wasi-keyvalue-wit-vendored/)).
-* **`wasi:logging@0.1.x`** — host adapter shipped. Routes guest
-  `log(level, context, message)` calls to host stderr + Zig's
-  `std.log.scoped(.wasi_guest)`. Level filter: `--log-level=<name>` CLI
-  flag or `WAMR_LOG_LEVEL` env var. No structured-logging backend
-  integration yet — future work.
-* **`wasi:config@0.2.x`** — not implemented; would read from env / CLI /
-  config-store file. ([#583 B6](https://github.com/cataggar/wamr/issues/583))
-* **`wasi:blobstore`, `wasi:cli/run-with-server`** — deferred. The
-  upstream WIT is still WASI Phase 1 (Feasibility) with active rename
-  proposals and no wasmtime baseline; `run-with-server` has no upstream
-  WIT at all. See [`wasi:blobstore — deferred`](#wasiblobstore--deferred-583-b7)
-  below for the full status check, concrete blockers, and acceptance
-  criteria. ([#583 B7](https://github.com/cataggar/wamr/issues/583))
+* **`wasi:logging@0.1.x`** — host adapter shipped (`#583 B5`, `#972 E5`).
+  Routes guest `log(level, context, message)` and
+  `kv-log(level, context, message, fields)` calls to host stderr + Zig's
+  `std.log.scoped(.wasi_guest)`. Supports structured context parsing
+  (`key=value` pairs and JSON object contexts) and text or JSON-lines
+  formatting via `--log-format=<text|json>` / `WAMR_LOG_FORMAT`, plus
+  level filtering via `--log-level=<name>` or `WAMR_LOG_LEVEL`.
+* **`wasi:config@0.2.x`** — layered `WAMR_CONFIG_*` env + `--config-store=PATH.json`
+  host adapter shipped ([#583 B6](https://github.com/cataggar/wamr/issues/583)).
+* **`wasi:blobstore@0.2.0-draft`** — in-memory host adapter shipped
+  (`#972 E2`, vendored WIT under [`docs/wasi-blobstore-wit-vendored/`](wasi-blobstore-wit-vendored/)).
+  Implements `wasi:blobstore/blobstore`, `wasi:blobstore/container`, and
+  `wasi:blobstore/types` (28 functions/methods including 4 resource drops,
+  bridged to `wasi:io/streams`). See
+  [`wasi:blobstore@0.2.0-draft (#972 E2)`](#wasiblobstore020-draft-972-e2)
+  below.
 
 ### Conformance & CI (section C)
 
@@ -502,8 +520,7 @@ session while an unlocked stream callback is running.
   41-fixture Preview 3 corpus through manifest AOT, no-sidecar JIT, and
   Wasmtime 46.0.1. All three modes pass 41 / 41 with zero parity deltas.
   ([#583 C1](https://github.com/cataggar/wamr/issues/583))
-* **Stable host-import audit.** Refreshed by
-  [PR #909](https://github.com/cataggar/wamr/pull/909): 351 / 352
+* **Stable host-import audit.** Refreshed for `#972`: 380 / 381
   methods are implemented (99.7 %), with no missing stable imports.
   The only stub is P2
   `wasi:filesystem/types.filesystem-error-code`, which ignores its
@@ -697,151 +714,54 @@ The post-Preview-3 hardening tracker is
 additions (one PR per interface, gated behind the existing
 `populateWasiProviders` version-multiplex):
 
-* **Guest threads** — [#616 B1](https://github.com/cataggar/wamr/issues/616).
-  Design doc: [`docs/design/wasi-threads.md`](design/wasi-threads.md)
-  (instance-per-thread isolation across interpreter and AOT,
-  and production-gating plan).
-* **`wasi:keyvalue@0.2.x`** — [#583 B4](https://github.com/cataggar/wamr/issues/583).
-* ~~**`wasi:logging@0.1.x`**~~ — host adapter shipped (#583 B5); see the
-  Preview-2 detail table for the registered methods.
-* **`wasi:config@0.2.x`** — [#583 B6](https://github.com/cataggar/wamr/issues/583).
-* **`wasi:blobstore`, `wasi:cli/run-with-server`** — deferred. See
-  [`wasi:blobstore — deferred (#583 B7)`](#wasiblobstore--deferred-583-b7)
-  for the upstream status check and acceptance criteria
-  ([#583 B7](https://github.com/cataggar/wamr/issues/583)).
+* ~~**Guest threads**~~ — shipped ([#616 B1](https://github.com/cataggar/wamr/issues/616), `#972 B1.7/E3`):
+  Preview-1 `wasi.thread-spawn` plus Component Model thread and backpressure
+  canonical built-ins (`0x08`, `0x24`–`0x2d`, `0x40`–`0x42`), including
+  OS-thread-backed shared-everything threads (`is_shared = true`) integrated
+  with `ThreadManager`.
+* ~~**`wasi:keyvalue@0.2.x`**~~ — shipped ([#583 B4](https://github.com/cataggar/wamr/issues/583), `#972 A6/E4`)
+  with crash-safe write-ahead redo journal (`WAMRKVJ1`/`WAMRKVJC` + SHA-256),
+  metadata/inode-preserving in-place file persistence
+  (`src/component/keyvalue_persistence.zig`), and transactional batch updates.
+* ~~**`wasi:logging@0.1.x`**~~ — shipped (#583 B5, `#972 E5`) with `log`,
+  `kv-log`, structured context parsing (`key=value` and JSON object), and
+  `--log-format=<text|json>` / `WAMR_LOG_FORMAT`.
+* ~~**`wasi:config@0.2.x`**~~ — shipped ([#583 B6](https://github.com/cataggar/wamr/issues/583)).
+* ~~**`wasi:blobstore@0.2.0-draft`**~~ — shipped (`#972 E2`); see
+  [`wasi:blobstore@0.2.0-draft (#972 E2)`](#wasiblobstore020-draft-972-e2)
+  below (`wasi:cli/run-with-server` remains a non-existent upstream world).
 
 Performance work is tracked separately under
 [#393](https://github.com/cataggar/wamr/issues/393); TLS in Zig std and
 Linux/macOS-specific async I/O (`io_uring`, `kqueue`) are explicitly out
 of scope.
 
-## wasi:blobstore — deferred (#583 B7)
+## wasi:blobstore@0.2.0-draft (#972 E2)
 
-[`#583 B7`](https://github.com/cataggar/wamr/issues/583) groups two
-interfaces whose host adapters are explicitly _not_ being landed in this
-wave: `wasi:blobstore` and the speculative `wasi:cli/run-with-server`
-world. Status as of wave 10 (Nov 2025):
+`wasi:blobstore@0.2.0-draft` is implemented in
+[`src/component/wasi_cli_adapter.zig`](../src/component/wasi_cli_adapter.zig)
+against the upstream `v0.2.0-draft` WIT vendored under
+[`docs/wasi-blobstore-wit-vendored/`](wasi-blobstore-wit-vendored/):
 
-### Upstream snapshot
-
-| Repo / interface | Latest pin | Wasmtime crate | Fixtures | Phase |
-| ---------------- | ---------- | -------------- | -------- | ----- |
-| [`WebAssembly/wasi-blobstore`](https://github.com/WebAssembly/wasi-blobstore) | `v0.2.0-draft` ([commit `005c425`](https://github.com/WebAssembly/wasi-blobstore/tree/v0.2.0-draft), Feb 2024 — re-tagged of the same commit Feb 2024; only chore commits since) | _none_ | _none_ | Phase 1 (Feasibility) |
-| `wasi:cli/run-with-server` (per [#583](https://github.com/cataggar/wamr/issues/583)) | _does not exist upstream_ — no interface in [`WebAssembly/wasi-cli`](https://github.com/WebAssembly/wasi-cli) (`wit/` or `wit-0.3.0-draft/`), no tracking issue, no draft PR | n/a | n/a | n/a |
-
-The `wasi-blobstore` interface surface (summarised here rather than
-vendored under `docs/wasi-blobstore-wit-vendored/`, because we are
-intentionally not shipping host code yet) covers:
-
-* `wasi:blobstore/blobstore` — `create-container`, `get-container`,
-  `delete-container`, `container-exists`, `copy-object`, `move-object`.
-* `wasi:blobstore/container` — `container` and `stream-object-names`
-  resources (`name`, `info`, `get-data`, `write-data`, `list-objects`,
-  `delete-object`, `delete-objects`, `has-object`, `object-info`,
-  `clear`; plus `read-stream-object-names` / `skip-stream-object-names`).
-* `wasi:blobstore/types` — `container-metadata`, `object-metadata`,
-  `object-id`, plus `outgoing-value` / `incoming-value` resources
-  bridging to `wasi:io/streams@0.2.1`.
-
-### Concrete blockers
-
-1. **No wasmtime baseline.** `bytecodealliance/wasmtime` has zero
-   references to `blobstore` in its source tree — there is no
-   `crates/wasi-blobstore`, no host trait, and no commit history
-   suggesting one is imminent. Without a reference host we cannot align
-   `populateWasiProviders` registration, behavioural semantics
-   (`copy-object` cross-container, `delete-objects` partial-failure,
-   `get-data` start/end inclusivity past end-of-blob), or canonicalised
-   `error` strings.
-2. **No conformance fixtures.** The proposal repo ships an empty
-   `test/` directory, and `WebAssembly/wasi-testsuite` contains zero
-   blobstore fixtures. We would have to author the entire conformance
-   suite ourselves, which both burns engineering budget and risks
-   shipping semantics that diverge from whatever the upstream test
-   suite eventually mandates.
-3. **Active design churn — likely breaking changes pending.** Open PRs
-   and issues on the proposal repo (as of Nov 2025):
-   * [PR #26](https://github.com/WebAssembly/wasi-blobstore/pull/26) —
-     rename `wasi:blobstore/blobstore` → `wasi:blob/store` (package
-     rename; would force a re-vendor + every adapter import path
-     change).
-   * [PR #23](https://github.com/WebAssembly/wasi-blobstore/pull/23) —
-     "Reorganizes the blobstore interface" (still open since 2024).
-   * [Issue #32](https://github.com/WebAssembly/wasi-blobstore/issues/32) —
-     rename `container` → `bucket` (resource name).
-   * [Issue #33](https://github.com/WebAssembly/wasi-blobstore/issues/33) —
-     consistency-guarantee semantics still undefined.
-   * [Issue #30](https://github.com/WebAssembly/wasi-blobstore/issues/30) —
-     `container.delete-objects` semantics undefined.
-   * [Issue #29](https://github.com/WebAssembly/wasi-blobstore/issues/29) —
-     `stream-object-names.skip` required-behaviour gap.
-   * [Issue #27](https://github.com/WebAssembly/wasi-blobstore/issues/27) —
-     intended multi-store usage pattern (no concept of store handle).
-   * [Issue #7](https://github.com/WebAssembly/wasi-blobstore/issues/7) —
-     `timestamp` should be a richer type than `u64`.
-   Any one of these landing would invalidate a shipped wamr adapter.
-4. **No Preview-3 async story.** The current WIT targets
-   `wasi:io/streams@0.2.1` synchronous streams. The proposal repo has
-   no `wit-0.3.0-draft/` tree and PR #38 ("Make selected methods
-   async") was closed unmerged. Anything we ship today would have to be
-   re-plumbed onto the P3 `stream<u8>` / `future<...>` lifted forms
-   when the proposal eventually adopts them, mirroring the
-   `wasi:io@0.2 → @0.3` rework that just landed across our other
-   adapters.
-5. **Phase 4 advancement criteria explicitly unmet.** The proposal's
-   own README lists, as preconditions for Phase 4: "At least two
-   independent production implementations", "At least two cloud
-   provider implementations", a cross-platform test suite. None of
-   these exist yet.
-6. **`wasi:cli/run-with-server` does not exist upstream.** The name
-   appears in our [#583](https://github.com/cataggar/wamr/issues/583)
-   tracker as a placeholder for a hypothetical world that fuses
-   `wasi:cli/run` with `wasi:http/incoming-handler` for long-lived
-   server components, but no such world is drafted in
-   [`WebAssembly/wasi-cli`](https://github.com/WebAssembly/wasi-cli),
-   including its `wit-0.3.0-draft/` tree at the
-   [`v0.3.0-rc-2025-09-16`](https://github.com/WebAssembly/wasi-cli/tree/v0.3.0-rc-2025-09-16)
-   tag, and there is no tracking issue. There is nothing to implement
-   against until the upstream world is drafted.
-
-### Acceptance criteria for wamr to implement
-
-We will re-evaluate B7 once **all** of the following are true:
-
-1. **Tagged, non-draft WIT** at `wasi:blobstore@0.2.x` (or successor
-   package name) with rename churn settled — i.e. PRs #26 and #23 on
-   the proposal repo are either merged or formally closed/withdrawn,
-   and the proposal has advanced to WASI Phase 2 (Proposed Spec Text)
-   or higher.
-2. **Upstream host baseline.** Either a `wasi-blobstore` crate landed
-   in `bytecodealliance/wasmtime` (with a tagged release we can target,
-   mirroring our `wasi:keyvalue` / `wasi:config` cadence), _or_ another
-   recognised runtime (jco / wasm-tools) ships a maintained host
-   adapter we can spec-align against.
-3. **Conformance fixtures.** Blobstore fixtures present in
-   `WebAssembly/wasi-testsuite` (or the proposal repo's own
-   `test/` directory), so the wamr adapter can be gated under
-   `zig build wasi-testsuite` / `wasi-p3-testsuite` like every other
-   shipped interface.
-4. **P3 async story decided.** Either a `wit-0.3.0-draft/` tree exists
-   in the proposal repo binding to `wasi:io@0.3` `stream` / `future`
-   primitives, or the WASI subgroup explicitly resolves that
-   `wasi:blobstore` stays on `wasi:io@0.2.1` semantics for the
-   foreseeable future.
-5. **`wasi:cli/run-with-server`**: a draft world (or issue with
-   accepted API sketch) exists in `WebAssembly/wasi-cli`. Until then
-   we treat the `run-with-server` half of B7 as a documentation entry
-   only.
-
-When all five hold, the implementation plan mirrors
-[PR #601](https://github.com/cataggar/wamr/pull/601) (wasi:keyvalue
-memory-store host adapter): vendor the pinned WIT under
-`docs/wasi-blobstore-wit-vendored/`, ship a memory-backed
-`StringHashMapUnmanaged(StringHashMapUnmanaged([]const u8))` adapter in
-`src/component/wasi_cli_adapter.zig`, register through
-`populateWasiProviders`, add unit tests for container/object lifecycle
-+ `list-objects`, and bump the Detail-table / Status-overview rows
-above.
+* `wasi:blobstore/blobstore` (6 functions) — `create-container`,
+  `get-container`, `delete-container`, `container-exists`, `copy-object`,
+  `move-object`.
+* `wasi:blobstore/container` (12 methods + 2 resource drops) — `container`
+  (`name`, `info`, `get-data`, `write-data`, `list-objects`, `delete-object`,
+  `delete-objects`, `has-object`, `object-info`, `clear`,
+  `[resource-drop]container`) and `stream-object-names`
+  (`read-stream-object-names`, `skip-stream-object-names`,
+  `[resource-drop]stream-object-names`).
+* `wasi:blobstore/types` (6 functions/methods + 2 resource drops) —
+  `outgoing-value` (`new-outgoing-value`, `outgoing-value-write-body`,
+  `finish`, `[resource-drop]outgoing-value`) and `incoming-value`
+  (`incoming-value-consume-sync`, `incoming-value-consume-async`, `size`,
+  `[resource-drop]incoming-value`) bridged to `wasi:io/streams`.
+* Resource handle safety: `blobstore_resources` enforces resource-tag checks
+  across `container`, `outgoing-value`, `incoming-value`, and
+  `stream-object-names`, rejects handle `0` and cross-type handles with
+  `error.InvalidHandle`, and traps with `error.InvalidState` if a resource is
+  dropped while an active borrow is in flight.
 
 ## See also
 

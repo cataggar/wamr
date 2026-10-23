@@ -52,6 +52,7 @@ const task_cancellation = @import("../runtime/common/task_cancellation.zig");
 const platform = @import("../platform/platform.zig");
 const parking_lot = @import("../platform/parking_lot.zig");
 pub const keyvalue_persistence = @import("keyvalue_persistence.zig");
+pub const http2 = @import("http2.zig");
 
 const tls = @import("tls");
 
@@ -4444,6 +4445,7 @@ pub const IncomingRequest = struct {
     scheme_other: ?[]u8 = null,
     authority: ?[]u8 = null,
     headers_handle: u32 = 0,
+    trailers_handle: ?u32 = null,
     body_consumed: bool = false,
     /// Request body bytes owned by this request until `consume` transfers
     /// them to an `IncomingBody`.
@@ -4480,6 +4482,7 @@ pub const OutgoingResponse = struct {
     operation_claim: stable_resource.ConditionalOperationClaim = .init,
     status: u16 = 200,
     headers_handle: u32,
+    trailers_handle: ?u32 = null,
     body_consumed: bool = false,
     body_handle: ?u32 = null,
     body_owner: ?*OutputStreamOwner = null,
@@ -4498,6 +4501,7 @@ pub const IncomingBody = struct {
     operation_claim: stable_resource.ConditionalOperationClaim = .init,
     /// Owned body bytes. Freed on drop.
     data: ?[]u8 = null,
+    trailers_handle: ?u32 = null,
     stream_taken: bool = false,
 
     pub fn deinit(self: *IncomingBody, allocator: Allocator) void {
@@ -4559,6 +4563,7 @@ pub const FutureIncomingResponse = struct {
 /// `some(ok(ok(none)))` (no trailers).
 pub const FutureTrailers = struct {
     operation_claim: stable_resource.ConditionalOperationClaim = .init,
+    trailers_handle: ?u32 = null,
     polled: bool = false,
 };
 
@@ -24028,8 +24033,12 @@ pub const WasiCliAdapter = struct {
         r.body_consumed = true;
 
         const body = try self.allocator.create(IncomingBody);
-        body.* = .{ .data = r.body_data };
+        body.* = .{
+            .data = r.body_data,
+            .trailers_handle = r.trailers_handle,
+        };
         r.body_data = null;
+        r.trailers_handle = null;
 
         const bh = try self.pushIncomingBody(body);
         results[0] = try httpResultOk(allocator, .{ .handle = bh });
@@ -24214,14 +24223,26 @@ pub const WasiCliAdapter = struct {
     fn httpIncomingBodyFinish(
         ctx_opaque: ?*anyopaque,
         _: *ComponentInstance,
-        _: []const InterfaceValue,
+        args: []const InterfaceValue,
         results: []InterfaceValue,
         _: Allocator,
     ) anyerror!void {
         const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
         if (results.len == 0) return error.InvalidArgs;
+        var trailers_handle: ?u32 = null;
+        if (args.len > 0) {
+            if (args[0] == .handle) {
+                const body_h = args[0].handle;
+                if (self.lookupIncomingBody(body_h)) |initial_lease| {
+                    var body_lease = initial_lease;
+                    trailers_handle = body_lease.value().*.trailers_handle;
+                    body_lease.release();
+                }
+                _ = self.http_incoming_bodies.remove(body_h);
+            }
+        }
         const ft = try self.allocator.create(FutureTrailers);
-        ft.* = .{};
+        ft.* = .{ .trailers_handle = trailers_handle };
         const h = try self.pushFutureTrailers(ft);
         results[0] = .{ .handle = h };
     }
@@ -24463,12 +24484,19 @@ pub const WasiCliAdapter = struct {
         final_body.finished = true;
         body_lease.unlock();
         body_lease.release();
+        var guest_trailers_handle: ?u32 = null;
+        if (args.len >= 2 and args[1] == .option_val and args[1].option_val.is_some) {
+            if (args[1].option_val.payload) |pl| {
+                if (pl.* == .handle) guest_trailers_handle = pl.handle;
+            }
+        }
         if (parent_response_handle) |response_handle| {
             if (self.lookupOutgoingResponse(response_handle)) |initial_response_lease| {
                 var response_lease = initial_response_lease;
                 const response = response_lease.lock().*;
                 response.body_finished = content_length_matches;
                 response.body_incomplete = !content_length_matches;
+                if (guest_trailers_handle) |th| response.trailers_handle = th;
                 response_lease.unlock();
                 response_lease.release();
             }
@@ -24715,12 +24743,19 @@ pub const WasiCliAdapter = struct {
             results[0] = .{ .option_val = .{ .is_some = true, .payload = inner } };
             return;
         }
+        const trailers_handle = ft.trailers_handle;
         ft.polled = true;
         ft_lease.unlock();
-        // inner: option<own<trailers>> = none
+        // inner: option<own<trailers>>
         const inner_opt = try allocator.create(InterfaceValue);
-        inner_opt.* = .{ .option_val = .{ .is_some = false, .payload = null } };
-        // middle: result<option<own<trailers>>, error-code> = ok(none)
+        if (trailers_handle) |th| {
+            const th_payload = try allocator.create(InterfaceValue);
+            th_payload.* = .{ .handle = th };
+            inner_opt.* = .{ .option_val = .{ .is_some = true, .payload = th_payload } };
+        } else {
+            inner_opt.* = .{ .option_val = .{ .is_some = false, .payload = null } };
+        }
+        // middle: result<option<own<trailers>>, error-code> = ok(inner_opt)
         const middle = try allocator.create(InterfaceValue);
         middle.* = .{ .result_val = .{ .is_ok = true, .payload = inner_opt } };
         // outer: result<middle, _> = ok(middle)
@@ -25537,6 +25572,90 @@ pub const WasiCliAdapter = struct {
             self.pos = 0;
             self.any_bytes_consumed = false;
         }
+
+        /// Peek initial connection bytes to detect the 24-byte HTTP/2 client
+        /// connection preface (`"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"`, RFC 9113 §3.4).
+        /// If detected, consumes the 24-byte preface and returns `true`.
+        /// If the stream does not begin with the HTTP/2 preface, leaves `pos`
+        /// unchanged so the HTTP/1.1 reader observes every byte intact and returns `false`.
+        pub fn detectHttp2Preface(self: *BufferedLineReader) !bool {
+            while (self.buf.items.len - self.pos < http2.client_preface.len) {
+                const avail = self.buf.items[self.pos..];
+                if (avail.len > 0 and !http2.isPrefacePrefix(avail)) {
+                    if (std.mem.startsWith(u8, avail, "PRI *")) {
+                        return error.Http2PrefaceError;
+                    }
+                    return false;
+                }
+                const got = try self.refill();
+                if (!got) {
+                    const tail = self.buf.items[self.pos..];
+                    if (std.mem.startsWith(u8, tail, "PRI *")) {
+                        return error.Http2PrefaceError;
+                    }
+                    return false;
+                }
+            }
+            const avail = self.buf.items[self.pos..];
+            if (std.mem.startsWith(u8, avail, http2.client_preface)) {
+                self.pos += http2.client_preface.len;
+                self.any_bytes_consumed = true;
+                self.compact();
+                return true;
+            }
+            if (std.mem.startsWith(u8, avail, "PRI *")) {
+                return error.Http2PrefaceError;
+            }
+            return false;
+        }
+
+        pub const RawHttp2Frame = struct {
+            header: http2.FrameHeader,
+            payload: []u8,
+        };
+
+        /// Read one complete HTTP/2 frame from the buffered stream.
+        /// Returns `null` on a clean EOF before any byte of the frame header is read.
+        pub fn readHttp2Frame(
+            self: *BufferedLineReader,
+            allocator: Allocator,
+            max_frame_size: u24,
+        ) !?RawHttp2Frame {
+            while (self.buf.items.len - self.pos < http2.frame_header_len) {
+                const got = try self.refill();
+                if (!got) {
+                    if (self.buf.items.len == self.pos) return null;
+                    return error.ProtocolError;
+                }
+            }
+            const hdr = http2.FrameHeader.decode(
+                self.buf.items[self.pos..][0..http2.frame_header_len].*,
+            );
+            self.pos += http2.frame_header_len;
+            self.any_bytes_consumed = true;
+            if (hdr.length > max_frame_size) return error.FrameSizeError;
+
+            const payload = try allocator.alloc(u8, hdr.length);
+            errdefer allocator.free(payload);
+
+            var copied: usize = 0;
+            while (copied < hdr.length) {
+                const avail = self.buf.items.len - self.pos;
+                if (avail > 0) {
+                    const take = @min(avail, hdr.length - copied);
+                    @memcpy(payload[copied .. copied + take], self.buf.items[self.pos..][0..take]);
+                    self.pos += take;
+                    copied += take;
+                    continue;
+                }
+                const got = try self.refill();
+                if (!got) return error.ProtocolError;
+            }
+            if (self.pos >= 4096 or self.pos == self.buf.items.len) {
+                self.compact();
+            }
+            return .{ .header = hdr, .payload = payload };
+        }
     };
 
     /// Read one complete HTTP/1.1 request from `stream` and create an
@@ -25558,13 +25677,42 @@ pub const WasiCliAdapter = struct {
         stream: *streams.InputStream,
         request_method: *?HttpRequestMethod,
     ) !u32 {
+        var reader: BufferedLineReader = .{ .allocator = self.allocator, .stream = stream };
+        defer reader.deinit();
+        return self.readIncomingRequestFromBufferedReaderWithMethod(&reader, request_method);
+    }
+
+    fn readIncomingRequestFromBufferedReaderWithMethod(
+        self: *WasiCliAdapter,
+        reader: *BufferedLineReader,
+        request_method: *?HttpRequestMethod,
+    ) !u32 {
         var bytes: std.ArrayListUnmanaged(u8) = .empty;
         defer bytes.deinit(self.allocator);
 
-        var header_end: ?usize = null;
+        if (reader.buf.items.len > reader.pos) {
+            try bytes.appendSlice(self.allocator, reader.buf.items[reader.pos..]);
+            reader.pos = reader.buf.items.len;
+        }
+
+        var header_end: ?usize = httpHeaderEnd(bytes.items);
+        if (request_method.* == null) {
+            if (std.mem.indexOf(u8, bytes.items, "\r\n")) |line_end| {
+                if (parseHttpRequestLineSyntax(
+                    bytes.items[0..line_end],
+                    false,
+                )) |parsed| {
+                    request_method.* = HttpRequestMethod.fromDiscriminant(
+                        parsed.method_disc,
+                    );
+                } else |_| {}
+            }
+        }
+        if (bytes.items.len > max_http_header_bytes) return error.HttpRequestHeaderTooLarge;
+
         var tmp: [4096]u8 = undefined;
         while (header_end == null) {
-            const n = switch (stream.read(&tmp)) {
+            const n = switch (reader.stream.read(&tmp)) {
                 .ok => |count| count,
                 .closed => return error.HttpBadRequest,
                 .err => return error.IoError,
@@ -25591,7 +25739,7 @@ pub const WasiCliAdapter = struct {
         if (body_len > max_http_body_bytes) return error.HttpRequestBodyTooLarge;
         const total_len = std.math.add(usize, end, body_len) catch return error.HttpRequestBodyTooLarge;
         while (bytes.items.len < total_len) {
-            const n = switch (stream.read(&tmp)) {
+            const n = switch (reader.stream.read(&tmp)) {
                 .ok => |count| count,
                 .closed => return error.HttpBadRequest,
                 .err => return error.IoError,
@@ -28519,6 +28667,24 @@ pub const WasiCliAdapter = struct {
         var reader: BufferedLineReader = .{ .allocator = self.allocator, .stream = input };
         defer reader.deinit();
 
+        const is_h2 = reader.detectHttp2Preface() catch |err| {
+            if (err == error.Http2PrefaceError) {
+                self.sendHttp2Goaway(output, 0, .protocol_error, "invalid connection preface");
+                return;
+            }
+            self.writeHttpSimpleResponseForMethod(
+                output,
+                statusForRequestReadError(err),
+                "bad request\n",
+                .other,
+            ) catch {};
+            return;
+        };
+        if (is_h2) {
+            self.serveHttp2Connection(ci, handler_name, &reader, output, true, interrupt);
+            return;
+        }
+
         while (true) {
             var request_method: ?HttpRequestMethod = null;
             const parsed = self.readIncomingRequestP3FromBufferedReaderWithMethod(
@@ -28691,6 +28857,1628 @@ pub const WasiCliAdapter = struct {
             if (!connection_reusable) return;
             reader.compact();
         }
+    }
+
+    pub const Http2ServerStream = struct {
+        stream_id: u31,
+        header_block: std.ArrayListUnmanaged(u8) = .empty,
+        trailer_block: std.ArrayListUnmanaged(u8) = .empty,
+        awaiting_continuation: bool = false,
+        in_trailers: bool = false,
+        headers_complete: bool = false,
+        end_stream_received: bool = false,
+        decoded_headers: ?http2.DecodedRequestHeaders = null,
+        decoded_trailers: std.ArrayListUnmanaged(http2.OwnedHeaderField) = .empty,
+        body: std.ArrayListUnmanaged(u8) = .empty,
+        recv_window: i64 = http2.default_initial_window_size,
+        send_window: i64 = http2.default_initial_window_size,
+
+        pub fn deinit(self: *Http2ServerStream, allocator: Allocator) void {
+            self.header_block.deinit(allocator);
+            self.trailer_block.deinit(allocator);
+            if (self.decoded_headers) |*dh| dh.deinit(allocator);
+            for (self.decoded_trailers.items) |*t| t.deinit(allocator);
+            self.decoded_trailers.deinit(allocator);
+            self.body.deinit(allocator);
+        }
+    };
+
+    fn sendHttp2Goaway(
+        self: *WasiCliAdapter,
+        output: *streams.OutputStream,
+        last_stream_id: u31,
+        error_code: http2.ErrorCode,
+        debug_data: []const u8,
+    ) void {
+        const frame = http2.encodeGoaway(
+            self.allocator,
+            last_stream_id,
+            error_code,
+            debug_data,
+        ) catch return;
+        defer self.allocator.free(frame);
+        self.writeAllOutputStream(output, frame) catch {};
+    }
+
+    fn sendHttp2RstStream(
+        self: *WasiCliAdapter,
+        output: *streams.OutputStream,
+        stream_id: u31,
+        error_code: http2.ErrorCode,
+    ) void {
+        const frame = http2.encodeRstStream(stream_id, error_code);
+        self.writeAllOutputStream(output, &frame) catch {};
+    }
+
+    fn createIncomingRequestFromHttp2Stream(
+        self: *WasiCliAdapter,
+        decoded: *const http2.DecodedRequestHeaders,
+        body_bytes: []const u8,
+        trailers: []const http2.OwnedHeaderField,
+    ) !struct { request_handle: u32, request_method: HttpRequestMethod } {
+        const method_disc = httpMethodDiscriminant(decoded.method);
+        var method_other: ?[]u8 = null;
+        errdefer if (method_other) |s| self.allocator.free(s);
+        if (method_disc == 9) {
+            method_other = try self.allocator.dupe(u8, decoded.method);
+        }
+
+        var path_copy: ?[]u8 = try self.allocator.dupe(u8, decoded.path);
+        errdefer if (path_copy) |s| self.allocator.free(s);
+
+        var scheme_disc: ?u32 = 0;
+        var scheme_other: ?[]u8 = null;
+        errdefer if (scheme_other) |s| self.allocator.free(s);
+        if (decoded.scheme) |sch| {
+            if (std.ascii.eqlIgnoreCase(sch, "http")) {
+                scheme_disc = 0;
+            } else if (std.ascii.eqlIgnoreCase(sch, "https")) {
+                scheme_disc = 1;
+            } else {
+                scheme_disc = 2;
+                scheme_other = try self.allocator.dupe(u8, sch);
+            }
+        }
+
+        const fields = try self.allocator.create(HttpFields);
+        fields.* = .{ .immutable = true };
+        var fields_owned = true;
+        errdefer if (fields_owned) {
+            fields.deinit(self.allocator);
+            self.allocator.destroy(fields);
+        };
+
+        var host_header: ?[]const u8 = null;
+        for (decoded.headers.items) |h| {
+            const name_copy = try self.allocator.dupe(u8, h.name);
+            const value_copy = self.allocator.dupe(u8, h.value) catch |err| {
+                self.allocator.free(name_copy);
+                return err;
+            };
+            fields.entries.append(self.allocator, .{ .name = name_copy, .value = value_copy }) catch |err| {
+                self.allocator.free(name_copy);
+                self.allocator.free(value_copy);
+                return err;
+            };
+            if (std.ascii.eqlIgnoreCase(h.name, "host") and host_header == null) {
+                host_header = value_copy;
+            }
+        }
+
+        var authority_copy: ?[]u8 = null;
+        errdefer if (authority_copy) |s| self.allocator.free(s);
+        const auth_src = if (decoded.authority) |a| (if (a.len > 0) a else host_header) else host_header;
+        if (auth_src) |a| {
+            authority_copy = try self.allocator.dupe(u8, a);
+        }
+
+        var body_copy: ?[]u8 = null;
+        errdefer if (body_copy) |s| self.allocator.free(s);
+        if (body_bytes.len > 0) {
+            body_copy = try self.allocator.dupe(u8, body_bytes);
+        }
+
+        const fields_handle = try self.pushHttpFields(fields);
+        fields_owned = false;
+        errdefer {
+            if (self.http_fields_table.withdraw(fields_handle)) |withdrawn| {
+                withdrawn.deinit(self.allocator);
+                self.allocator.destroy(withdrawn);
+            }
+        }
+
+        var trailers_handle: ?u32 = null;
+        if (trailers.len > 0) {
+            const tf = try self.allocator.create(HttpFields);
+            tf.* = .{ .immutable = true };
+            errdefer {
+                tf.deinit(self.allocator);
+                self.allocator.destroy(tf);
+            }
+            for (trailers) |t| {
+                const n_copy = try self.allocator.dupe(u8, t.name);
+                const v_copy = self.allocator.dupe(u8, t.value) catch |err| {
+                    self.allocator.free(n_copy);
+                    return err;
+                };
+                tf.entries.append(self.allocator, .{ .name = n_copy, .value = v_copy }) catch |err| {
+                    self.allocator.free(n_copy);
+                    self.allocator.free(v_copy);
+                    return err;
+                };
+            }
+            trailers_handle = try self.pushHttpFields(tf);
+        }
+
+        const req = try self.allocator.create(IncomingRequest);
+        errdefer {
+            req.deinit(self.allocator);
+            self.allocator.destroy(req);
+        }
+        req.* = .{
+            .method_disc = method_disc,
+            .method_other = method_other,
+            .path_with_query = path_copy,
+            .scheme_disc = scheme_disc,
+            .scheme_other = scheme_other,
+            .authority = authority_copy,
+            .headers_handle = fields_handle,
+            .trailers_handle = trailers_handle,
+            .body_data = body_copy,
+        };
+        method_other = null;
+        path_copy = null;
+        scheme_other = null;
+        authority_copy = null;
+        body_copy = null;
+
+        const req_handle = try self.pushIncomingRequest(req);
+        return .{
+            .request_handle = req_handle,
+            .request_method = HttpRequestMethod.fromDiscriminant(method_disc),
+        };
+    }
+
+    fn createIncomingRequestP3FromHttp2Stream(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        decoded: *const http2.DecodedRequestHeaders,
+        body_bytes: []const u8,
+        trailers: []const http2.OwnedHeaderField,
+    ) !HttpRequestP3Read {
+        const method_disc = httpMethodDiscriminant(decoded.method);
+        var method_other: ?[]u8 = null;
+        errdefer if (method_other) |s| self.allocator.free(s);
+        if (method_disc == 9) {
+            method_other = try self.allocator.dupe(u8, decoded.method);
+        }
+
+        var path_owned: ?[]u8 = try self.allocator.dupe(u8, decoded.path);
+        errdefer if (path_owned) |s| self.allocator.free(s);
+
+        var scheme_disc: u32 = 0;
+        var scheme_other: ?[]u8 = null;
+        errdefer if (scheme_other) |s| self.allocator.free(s);
+        if (decoded.scheme) |sch| {
+            if (std.ascii.eqlIgnoreCase(sch, "http")) {
+                scheme_disc = 0;
+            } else if (std.ascii.eqlIgnoreCase(sch, "https")) {
+                scheme_disc = 1;
+            } else {
+                scheme_disc = 2;
+                scheme_other = try self.allocator.dupe(u8, sch);
+            }
+        }
+
+        const fields = try self.allocator.create(HttpFields);
+        fields.* = .{ .immutable = true };
+        var fields_owned = true;
+        errdefer if (fields_owned) {
+            fields.deinit(self.allocator);
+            self.allocator.destroy(fields);
+        };
+
+        var host_header: ?[]const u8 = null;
+        for (decoded.headers.items) |h| {
+            const name_copy = try self.allocator.dupe(u8, h.name);
+            const value_copy = self.allocator.dupe(u8, h.value) catch |err| {
+                self.allocator.free(name_copy);
+                return err;
+            };
+            fields.entries.append(self.allocator, .{ .name = name_copy, .value = value_copy }) catch |err| {
+                self.allocator.free(name_copy);
+                self.allocator.free(value_copy);
+                return err;
+            };
+            if (std.ascii.eqlIgnoreCase(h.name, "host") and host_header == null) {
+                host_header = value_copy;
+            }
+        }
+
+        var authority_copy: ?[]u8 = null;
+        errdefer if (authority_copy) |s| self.allocator.free(s);
+        const auth_src = if (decoded.authority) |a| (if (a.len > 0) a else host_header) else host_header;
+        if (auth_src) |a| {
+            authority_copy = try self.allocator.dupe(u8, a);
+        }
+
+        const fields_handle = try self.pushHttpFields(fields);
+        fields_owned = false;
+        errdefer {
+            if (self.http_fields_table.withdraw(fields_handle)) |withdrawn| {
+                withdrawn.deinit(self.allocator);
+                self.allocator.destroy(withdrawn);
+            }
+        }
+
+        const body_handle = ci.allocAsyncHandle();
+        var body_stream: async_mod.AsyncStream = .{ .elem_type_idx = 0 };
+        if (body_bytes.len > 0) {
+            body_stream.buffer.appendSlice(ci.allocator, body_bytes) catch |e| {
+                body_stream.deinit(ci.allocator);
+                return e;
+            };
+        }
+        body_stream.write_closed = true;
+        ci.streams.put(ci.allocator, body_handle, body_stream) catch |e| {
+            body_stream.deinit(ci.allocator);
+            return e;
+        };
+        errdefer _ = ci.streams.remove(body_handle);
+
+        const trailers_handle = if (trailers.len > 0) blk: {
+            const tf = try self.allocator.create(HttpFields);
+            tf.* = .{ .immutable = true };
+            errdefer {
+                tf.deinit(self.allocator);
+                self.allocator.destroy(tf);
+            }
+            for (trailers) |t| {
+                const n_copy = try self.allocator.dupe(u8, t.name);
+                const v_copy = self.allocator.dupe(u8, t.value) catch |err| {
+                    self.allocator.free(n_copy);
+                    return err;
+                };
+                tf.entries.append(self.allocator, .{ .name = n_copy, .value = v_copy }) catch |err| {
+                    self.allocator.free(n_copy);
+                    self.allocator.free(v_copy);
+                    return err;
+                };
+            }
+            const tf_handle = try self.pushHttpFields(tf);
+            const reg = httpP3TypeRegistry();
+            const vt: ctypes.ValType = .{ .result = HTTP_P3_RESULT_OPTION_TRAILERS_IDX };
+            const size = abi.sizeOfType(reg, vt);
+            const payload_buf = try ci.allocator.alloc(u8, size);
+            errdefer ci.allocator.free(payload_buf);
+            @memset(payload_buf, 0);
+            var h_iv = InterfaceValue{ .handle = tf_handle };
+            var opt_iv = InterfaceValue{ .option_val = .{ .is_some = true, .payload = &h_iv } };
+            const res_iv = InterfaceValue{ .result_val = .{ .is_ok = true, .payload = &opt_iv } };
+            try abi.storeValReg(payload_buf, 0, vt, res_iv, reg);
+            const fh = ci.allocAsyncHandle();
+            try ci.futures.put(ci.allocator, fh, .{
+                .elem_type_idx = 0,
+                .state = .ready,
+                .write_closed = true,
+                .payload = payload_buf,
+            });
+            break :blk fh;
+        } else try allocReadyUnitFuture(ci);
+        errdefer _ = ci.futures.remove(trailers_handle);
+
+        const tx_handle = try allocReadyUnitFuture(ci);
+        errdefer _ = ci.futures.remove(tx_handle);
+
+        const r = try self.allocator.create(HttpRequestP3);
+        r.* = .{
+            .method_disc = method_disc,
+            .method_other = method_other,
+            .path_with_query = path_owned,
+            .scheme_disc = scheme_disc,
+            .scheme_other = scheme_other,
+            .authority = authority_copy,
+            .headers_handle = fields_handle,
+            .body_stream_handle = body_handle,
+            .trailers_future_handle = trailers_handle,
+            .transmission_future_handle = tx_handle,
+        };
+        method_other = null;
+        path_owned = null;
+        scheme_other = null;
+        authority_copy = null;
+
+        const handle = self.pushHttpRequestP3(r) catch |err| {
+            r.deinit(self.allocator);
+            self.allocator.destroy(r);
+            return err;
+        };
+        return .{
+            .request_handle = handle,
+            .keep_alive = true,
+            .request_method = HttpRequestMethod.fromDiscriminant(method_disc),
+        };
+    }
+
+    fn emitHttp2HeaderBlockFrames(
+        self: *WasiCliAdapter,
+        out: *streams.OutputStream,
+        stream_id: u31,
+        max_frame_size: u24,
+        header_block: []const u8,
+        end_stream: bool,
+    ) !void {
+        const frame_limit: usize = @max(@as(usize, 1), @as(usize, max_frame_size));
+        if (header_block.len <= frame_limit) {
+            const frame = try http2.encodeHeadersFrame(
+                self.allocator,
+                stream_id,
+                header_block,
+                end_stream,
+                true,
+            );
+            defer self.allocator.free(frame);
+            try self.writeAllOutputStream(out, frame);
+            return;
+        }
+
+        const first_chunk = header_block[0..frame_limit];
+        const first_frame = try http2.encodeHeadersFrame(
+            self.allocator,
+            stream_id,
+            first_chunk,
+            end_stream,
+            false,
+        );
+        defer self.allocator.free(first_frame);
+        try self.writeAllOutputStream(out, first_frame);
+
+        var offset: usize = frame_limit;
+        while (offset < header_block.len) {
+            const end = @min(offset + frame_limit, header_block.len);
+            const is_last = end == header_block.len;
+            const cont_frame = try http2.encodeContinuationFrame(
+                self.allocator,
+                stream_id,
+                header_block[offset..end],
+                is_last,
+            );
+            defer self.allocator.free(cont_frame);
+            try self.writeAllOutputStream(out, cont_frame);
+            offset = end;
+        }
+    }
+
+    fn emitHttp2ResponseFrames(
+        self: *WasiCliAdapter,
+        out: *streams.OutputStream,
+        hpack_encoder: *http2.Encoder,
+        stream_id: u31,
+        max_frame_size: u24,
+        status: u16,
+        headers: []const http2.HeaderField,
+        body: []const u8,
+        trailers: []const http2.HeaderField,
+        wire_body_allowed: bool,
+    ) !void {
+        const has_body = wire_body_allowed and body.len > 0;
+        const has_trailers = wire_body_allowed and trailers.len > 0;
+        const end_stream_on_headers = !has_body and !has_trailers;
+
+        const header_block = try hpack_encoder.encodeResponseHeaders(status, headers);
+        defer self.allocator.free(header_block);
+        try self.emitHttp2HeaderBlockFrames(
+            out,
+            stream_id,
+            max_frame_size,
+            header_block,
+            end_stream_on_headers,
+        );
+
+        if (has_body) {
+            const frame_limit: usize = @max(@as(usize, 1), @as(usize, max_frame_size));
+            var offset: usize = 0;
+            while (offset < body.len) {
+                const end = @min(offset + frame_limit, body.len);
+                const is_last_data = end == body.len;
+                const end_stream_on_data = is_last_data and !has_trailers;
+                const data_frame = try http2.encodeDataFrame(
+                    self.allocator,
+                    stream_id,
+                    body[offset..end],
+                    end_stream_on_data,
+                );
+                defer self.allocator.free(data_frame);
+                try self.writeAllOutputStream(out, data_frame);
+                offset = end;
+            }
+        }
+
+        if (has_trailers) {
+            const trailer_block = try hpack_encoder.encodeTrailerHeaders(trailers);
+            defer self.allocator.free(trailer_block);
+            try self.emitHttp2HeaderBlockFrames(
+                out,
+                stream_id,
+                max_frame_size,
+                trailer_block,
+                true,
+            );
+        }
+    }
+
+    fn writeHttp2SimpleResponseForMethod(
+        self: *WasiCliAdapter,
+        out: *streams.OutputStream,
+        hpack_encoder: *http2.Encoder,
+        stream_id: u31,
+        max_frame_size: u24,
+        status: u16,
+        body: []const u8,
+        request_method: HttpRequestMethod,
+    ) !void {
+        const semantics = HttpResponseBodySemantics.classify(request_method, status);
+        var cl_buf: [32]u8 = undefined;
+        var hdrs: [1]http2.HeaderField = undefined;
+        var hdr_count: usize = 0;
+        const content_length: ?usize = switch (semantics.content_length) {
+            .framing => body.len,
+            .representation => if (request_method == .head and status != 304) body.len else null,
+            .zero => 0,
+            .forbidden => null,
+        };
+        if (content_length) |len| {
+            const cl_str = try std.fmt.bufPrint(&cl_buf, "{d}", .{len});
+            hdrs[0] = .{ .name = "content-length", .value = cl_str };
+            hdr_count = 1;
+        }
+        try self.emitHttp2ResponseFrames(
+            out,
+            hpack_encoder,
+            stream_id,
+            max_frame_size,
+            status,
+            hdrs[0..hdr_count],
+            body,
+            &.{},
+            semantics.wire_body_allowed,
+        );
+    }
+
+    fn writeHttp2ResponseFromOutparamForMethod(
+        self: *WasiCliAdapter,
+        out: *streams.OutputStream,
+        hpack_encoder: *http2.Encoder,
+        stream_id: u31,
+        max_frame_size: u24,
+        outparam_handle: u32,
+        request_method: HttpRequestMethod,
+    ) !void {
+        var outparam_lease = self.lookupResponseOutparam(outparam_handle) orelse {
+            return self.writeHttp2SimpleResponseForMethod(
+                out,
+                hpack_encoder,
+                stream_id,
+                max_frame_size,
+                500,
+                "missing response outparam\n",
+                request_method,
+            );
+        };
+        defer outparam_lease.release();
+        const outparam = outparam_lease.value().*;
+        switch (outparam.state) {
+            .unset => return self.writeHttp2SimpleResponseForMethod(
+                out,
+                hpack_encoder,
+                stream_id,
+                max_frame_size,
+                500,
+                "handler did not set response\n",
+                request_method,
+            ),
+            .err => |code| return self.writeHttp2SimpleResponseForMethod(
+                out,
+                hpack_encoder,
+                stream_id,
+                max_frame_size,
+                httpStatusFromError(code),
+                "handler returned error\n",
+                request_method,
+            ),
+            .response => |response_handle| {
+                var response_lease = self.lookupOutgoingResponse(response_handle) orelse {
+                    return self.writeHttp2SimpleResponseForMethod(
+                        out,
+                        hpack_encoder,
+                        stream_id,
+                        max_frame_size,
+                        500,
+                        "invalid response handle\n",
+                        request_method,
+                    );
+                };
+                const response = response_lease.value().*;
+                const status: u16 = if (response.status >= 100 and response.status <= 999) response.status else 500;
+                const headers_handle = response.headers_handle;
+                const trailers_handle = response.trailers_handle;
+                const body_handle = response.body_handle;
+                const body_incomplete = response.body_incomplete;
+                const body_finished = response.body_finished;
+                const body_owner = response.body_owner;
+                if (body_owner) |owner| owner.retain();
+                response_lease.release();
+                defer if (body_owner) |owner| owner.release();
+                if (body_incomplete) {
+                    return self.writeHttp2SimpleResponseForMethod(
+                        out,
+                        hpack_encoder,
+                        stream_id,
+                        max_frame_size,
+                        500,
+                        "incomplete response body\n",
+                        request_method,
+                    );
+                }
+
+                var body_owned: ?[]u8 = null;
+                defer if (body_owned) |bytes| self.allocator.free(bytes);
+                if (body_owner) |owner| {
+                    owner.operation_claim.acquire();
+                    body_owned = self.allocator.dupe(
+                        u8,
+                        owner.stream.getBufferContents(),
+                    ) catch |err| {
+                        owner.operation_claim.release();
+                        return err;
+                    };
+                    owner.operation_claim.release();
+                } else if (body_finished) {
+                    body_owned = try self.allocator.alloc(u8, 0);
+                } else if (body_handle) |handle| {
+                    body_owned = try self.copyOutgoingBodyBytes(handle) orelse {
+                        return self.writeHttp2SimpleResponseForMethod(
+                            out,
+                            hpack_encoder,
+                            stream_id,
+                            max_frame_size,
+                            500,
+                            "invalid body handle\n",
+                            request_method,
+                        );
+                    };
+                }
+                const body: []const u8 = if (body_owned) |bytes| bytes else "";
+                const semantics = HttpResponseBodySemantics.classify(request_method, status);
+
+                var response_fields_lease = self.lookupHttpFields(headers_handle);
+                defer if (response_fields_lease) |*lease| lease.release();
+                var content_length: ?usize = null;
+                var h2_headers: std.ArrayListUnmanaged(http2.HeaderField) = .empty;
+                defer h2_headers.deinit(self.allocator);
+
+                if (response_fields_lease) |*lease| {
+                    const fields = lease.value().*;
+                    content_length = try httpFieldsContentLength(fields);
+                    for (fields.entries.items) |entry| {
+                        if (isHopByHopOrFramingHeader(entry.name)) continue;
+                        if (!httpHeaderNameValid(entry.name) or !httpHeaderValueValid(entry.value)) {
+                            return self.writeHttp2SimpleResponseForMethod(
+                                out,
+                                hpack_encoder,
+                                stream_id,
+                                max_frame_size,
+                                500,
+                                "invalid response header\n",
+                                request_method,
+                            );
+                        }
+                        try h2_headers.append(self.allocator, .{
+                            .name = entry.name,
+                            .value = entry.value,
+                        });
+                    }
+                }
+                const has_body_producer = body_owner != null or body_handle != null;
+                if (semantics.wire_body_allowed and has_body_producer) {
+                    if (content_length) |expected| {
+                        if (body.len != expected) return error.ResponseBodySize;
+                    }
+                }
+
+                var h2_trailers: std.ArrayListUnmanaged(http2.HeaderField) = .empty;
+                defer h2_trailers.deinit(self.allocator);
+                var trailer_fields_lease = if (trailers_handle) |th| self.lookupHttpFields(th) else null;
+                defer if (trailer_fields_lease) |*lease| lease.release();
+                if (trailer_fields_lease) |*lease| {
+                    const tf = lease.value().*;
+                    for (tf.entries.items) |entry| {
+                        if (isHopByHopOrFramingHeader(entry.name)) continue;
+                        if (!httpHeaderNameValid(entry.name) or !httpHeaderValueValid(entry.value)) continue;
+                        try h2_trailers.append(self.allocator, .{
+                            .name = entry.name,
+                            .value = entry.value,
+                        });
+                    }
+                }
+
+                var cl_buf: [32]u8 = undefined;
+                if (h2_trailers.items.len == 0) {
+                    const wire_cl: ?usize = switch (semantics.content_length) {
+                        .framing => body.len,
+                        .representation => if (status == 304)
+                            content_length
+                        else
+                            content_length orelse if (has_body_producer) body.len else null,
+                        .zero => 0,
+                        .forbidden => null,
+                    };
+                    if (wire_cl) |len| {
+                        const cl_str = try std.fmt.bufPrint(&cl_buf, "{d}", .{len});
+                        try h2_headers.append(self.allocator, .{
+                            .name = "content-length",
+                            .value = cl_str,
+                        });
+                    }
+                }
+
+                try self.emitHttp2ResponseFrames(
+                    out,
+                    hpack_encoder,
+                    stream_id,
+                    max_frame_size,
+                    status,
+                    h2_headers.items,
+                    body,
+                    h2_trailers.items,
+                    semantics.wire_body_allowed,
+                );
+            },
+        }
+    }
+
+    fn writeHttp2ResponseP3FromHandleForMethodWithTicket(
+        self: *WasiCliAdapter,
+        out: *streams.OutputStream,
+        ci: *ComponentInstance,
+        hpack_encoder: *http2.Encoder,
+        stream_id: u31,
+        max_frame_size: u24,
+        response_handle: u32,
+        request_method: HttpRequestMethod,
+        body_timeout_ns: u64,
+        cancellation_ticket: *const P3FallbackCancellationTicket,
+    ) !void {
+        var response_lease = self.lookupHttpResponseP3(response_handle) orelse {
+            return self.writeHttp2SimpleResponseForMethod(
+                out,
+                hpack_encoder,
+                stream_id,
+                max_frame_size,
+                500,
+                "invalid response handle\n",
+                request_method,
+            );
+        };
+        defer response_lease.release();
+        const response = response_lease.value().*;
+
+        const status: u16 = if (response.status >= 100 and response.status <= 999) response.status else 500;
+        const semantics = HttpResponseBodySemantics.classify(request_method, status);
+
+        var response_fields_lease = self.lookupHttpFields(response.headers_handle);
+        defer if (response_fields_lease) |*lease| lease.release();
+        const response_fields: ?*HttpFields = if (response_fields_lease) |*lease|
+            lease.value().*
+        else
+            null;
+        const content_length = if (response_fields) |fields|
+            try httpFieldsContentLength(fields)
+        else
+            null;
+
+        var h2_headers: std.ArrayListUnmanaged(http2.HeaderField) = .empty;
+        defer h2_headers.deinit(self.allocator);
+        if (response_fields) |fields| {
+            for (fields.entries.items) |entry| {
+                if (isHopByHopOrFramingHeader(entry.name)) continue;
+                if (!httpHeaderNameValid(entry.name) or !httpHeaderValueValid(entry.value)) {
+                    return self.writeHttp2SimpleResponseForMethod(
+                        out,
+                        hpack_encoder,
+                        stream_id,
+                        max_frame_size,
+                        500,
+                        "invalid response header\n",
+                        request_method,
+                    );
+                }
+                try h2_headers.append(self.allocator, .{
+                    .name = entry.name,
+                    .value = entry.value,
+                });
+            }
+        }
+
+        var body_owned: ?[]u8 = null;
+        defer if (body_owned) |b| self.allocator.free(b);
+        if (response.body_stream_handle) |sh| {
+            body_owned = try self.settleP3FallbackBodyStream(
+                ci,
+                sh,
+                semantics.wire_body_allowed,
+                body_timeout_ns,
+                cancellation_ticket,
+            );
+        }
+        const body: []const u8 = if (body_owned) |b| b else "";
+        if (semantics.content_length == .framing) {
+            if (content_length) |expected| {
+                if (body.len != expected) return error.ResponseBodySize;
+            }
+        }
+
+        var trailer_fields_lease = try self.lookupTrailerFieldsFromFuture(
+            ci,
+            response.trailers_future_handle,
+            cancellation_ticket,
+        );
+        defer if (trailer_fields_lease) |*lease| lease.release();
+        var h2_trailers: std.ArrayListUnmanaged(http2.HeaderField) = .empty;
+        defer h2_trailers.deinit(self.allocator);
+        if (trailer_fields_lease) |*lease| {
+            const tf = lease.value().*;
+            for (tf.entries.items) |entry| {
+                if (isHopByHopOrFramingHeader(entry.name)) continue;
+                if (!httpHeaderNameValid(entry.name) or !httpHeaderValueValid(entry.value)) continue;
+                try h2_trailers.append(self.allocator, .{
+                    .name = entry.name,
+                    .value = entry.value,
+                });
+            }
+        }
+
+        var cl_buf: [32]u8 = undefined;
+        if (h2_trailers.items.len == 0) {
+            const wire_cl: ?usize = switch (semantics.content_length) {
+                .framing => content_length orelse body.len,
+                .representation => content_length,
+                .zero => 0,
+                .forbidden => null,
+            };
+            if (wire_cl) |len| {
+                const cl_str = try std.fmt.bufPrint(&cl_buf, "{d}", .{len});
+                try h2_headers.append(self.allocator, .{
+                    .name = "content-length",
+                    .value = cl_str,
+                });
+            }
+        }
+
+        try self.emitHttp2ResponseFrames(
+            out,
+            hpack_encoder,
+            stream_id,
+            max_frame_size,
+            status,
+            h2_headers.items,
+            body,
+            h2_trailers.items,
+            semantics.wire_body_allowed,
+        );
+    }
+
+    fn dispatchHttp2CompletedStream(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        handler_name: []const u8,
+        output: *streams.OutputStream,
+        hpack_encoder: *http2.Encoder,
+        peer_max_frame_size: u24,
+        stream: *Http2ServerStream,
+        dispatch_p3: bool,
+        _: ?HttpConnectionInterrupt,
+    ) void {
+        const decoded = &(stream.decoded_headers orelse {
+            self.sendHttp2RstStream(output, stream.stream_id, .protocol_error);
+            return;
+        });
+
+        if (dispatch_p3) {
+            defer self.cleanupHttpResourcesAllVersions();
+            const parsed = self.createIncomingRequestP3FromHttp2Stream(
+                ci,
+                decoded,
+                stream.body.items,
+                stream.decoded_trailers.items,
+            ) catch {
+                self.writeHttp2SimpleResponseForMethod(
+                    output,
+                    hpack_encoder,
+                    stream.stream_id,
+                    peer_max_frame_size,
+                    400,
+                    "bad request\n",
+                    .other,
+                ) catch {};
+                return;
+            };
+
+            var fallback_ticket = P3FallbackCancellationTicket.inert(
+                ci.allocAsyncHandle(),
+            );
+            defer fallback_ticket.release(ci);
+
+            const outcome = self.dispatchHttpHandlerP3WithLiveResponse(
+                ci,
+                handler_name,
+                parsed.request_handle,
+                null,
+                &fallback_ticket,
+                self.allocator,
+            ) catch {
+                self.writeHttp2SimpleResponseForMethod(
+                    output,
+                    hpack_encoder,
+                    stream.stream_id,
+                    peer_max_frame_size,
+                    503,
+                    "service unavailable\n",
+                    parsed.request_method,
+                ) catch {};
+                cancelAllPendingAsyncOps(self, ci, null, self.allocator);
+                return;
+            };
+
+            if (!outcome.is_ok) {
+                const code: u16 = httpStatusFromError(outcome.payload);
+                self.writeHttp2SimpleResponseForMethod(
+                    output,
+                    hpack_encoder,
+                    stream.stream_id,
+                    peer_max_frame_size,
+                    code,
+                    "handler returned error\n",
+                    parsed.request_method,
+                ) catch {};
+                cancelAllPendingAsyncOps(self, ci, null, self.allocator);
+                return;
+            }
+
+            self.writeHttp2ResponseP3FromHandleForMethodWithTicket(
+                output,
+                ci,
+                hpack_encoder,
+                stream.stream_id,
+                peer_max_frame_size,
+                outcome.payload,
+                parsed.request_method,
+                http_live_response_completion_timeout_ns,
+                &fallback_ticket,
+            ) catch {
+                self.failHttpResponseTransmission(ci, outcome.payload);
+                cancelAllPendingAsyncOps(self, ci, null, self.allocator);
+                return;
+            };
+            self.succeedHttpResponseTransmission(ci, outcome.payload);
+        } else {
+            defer self.cleanupHttpResources();
+            const created = self.createIncomingRequestFromHttp2Stream(
+                decoded,
+                stream.body.items,
+                stream.decoded_trailers.items,
+            ) catch {
+                self.writeHttp2SimpleResponseForMethod(
+                    output,
+                    hpack_encoder,
+                    stream.stream_id,
+                    peer_max_frame_size,
+                    400,
+                    "bad request\n",
+                    .other,
+                ) catch {};
+                return;
+            };
+            var request_method_scope = InboundHttpRequestMethodScope.bind(
+                created.request_method,
+            );
+            defer request_method_scope.deinit();
+
+            const outparam = self.allocator.create(ResponseOutparam) catch {
+                self.writeHttp2SimpleResponseForMethod(
+                    output,
+                    hpack_encoder,
+                    stream.stream_id,
+                    peer_max_frame_size,
+                    500,
+                    "out of memory\n",
+                    created.request_method,
+                ) catch {};
+                return;
+            };
+            outparam.* = .{};
+            const outparam_handle = self.pushResponseOutparam(outparam) catch {
+                self.allocator.destroy(outparam);
+                self.writeHttp2SimpleResponseForMethod(
+                    output,
+                    hpack_encoder,
+                    stream.stream_id,
+                    peer_max_frame_size,
+                    500,
+                    "out of memory\n",
+                    created.request_method,
+                ) catch {};
+                return;
+            };
+
+            const args = [_]abi_root.InterfaceValue{
+                .{ .handle = created.request_handle },
+                .{ .handle = outparam_handle },
+            };
+            var results: [0]abi_root.InterfaceValue = .{};
+            executor_root.callComponentFuncWithHostTaskContext(
+                ci,
+                handler_name,
+                &args,
+                &results,
+                null,
+                self.allocator,
+            ) catch {
+                self.writeHttp2SimpleResponseForMethod(
+                    output,
+                    hpack_encoder,
+                    stream.stream_id,
+                    peer_max_frame_size,
+                    500,
+                    "handler trapped\n",
+                    created.request_method,
+                ) catch {};
+                cancelAllPendingAsyncOps(self, ci, null, self.allocator);
+                return;
+            };
+
+            self.writeHttp2ResponseFromOutparamForMethod(
+                output,
+                hpack_encoder,
+                stream.stream_id,
+                peer_max_frame_size,
+                outparam_handle,
+                created.request_method,
+            ) catch {
+                self.writeHttp2SimpleResponseForMethod(
+                    output,
+                    hpack_encoder,
+                    stream.stream_id,
+                    peer_max_frame_size,
+                    500,
+                    "invalid response\n",
+                    created.request_method,
+                ) catch {};
+                cancelAllPendingAsyncOps(self, ci, null, self.allocator);
+            };
+        }
+    }
+
+    /// Drive an RFC 9113 HTTP/2 connection (`h2c` prior-knowledge or TLS `h2` ALPN)
+    /// over `reader` and `output`, multiplexing client-initiated odd streams through
+    /// the component's `wasi:http/incoming-handler` export (#972 E1).
+    pub fn serveHttp2Connection(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        handler_name: []const u8,
+        reader: *BufferedLineReader,
+        output: *streams.OutputStream,
+        dispatch_p3: bool,
+        interrupt: ?HttpConnectionInterrupt,
+    ) void {
+        var hpack_decoder = http2.Decoder.init(self.allocator);
+        defer hpack_decoder.deinit();
+        var hpack_encoder = http2.Encoder.init(self.allocator);
+        defer hpack_encoder.deinit();
+
+        var streams_map: std.AutoArrayHashMapUnmanaged(u31, Http2ServerStream) = .empty;
+        defer {
+            for (streams_map.values()) |*s| s.deinit(self.allocator);
+            streams_map.deinit(self.allocator);
+        }
+
+        // Send initial server SETTINGS frame.
+        const server_settings = [_]http2.Setting{
+            .{ .id = .max_concurrent_streams, .value = 100 },
+            .{ .id = .initial_window_size, .value = http2.default_initial_window_size },
+        };
+        if (http2.encodeSettings(self.allocator, &server_settings)) |settings_frame| {
+            defer self.allocator.free(settings_frame);
+            self.writeAllOutputStream(output, settings_frame) catch return;
+        } else |_| return;
+
+        var conn_send_window: i64 = http2.default_initial_window_size;
+        var peer_initial_window_size: i64 = http2.default_initial_window_size;
+        var peer_max_frame_size: u24 = http2.default_max_frame_size;
+        var last_client_stream_id: u31 = 0;
+        var continuation_stream_id: ?u31 = null;
+
+        while (true) {
+            const raw_frame = (reader.readHttp2Frame(
+                self.allocator,
+                http2.default_max_frame_size,
+            ) catch |err| {
+                const code: http2.ErrorCode = switch (err) {
+                    error.FrameSizeError => .frame_size_error,
+                    else => .protocol_error,
+                };
+                self.sendHttp2Goaway(output, last_client_stream_id, code, "frame read error");
+                return;
+            }) orelse return;
+            defer self.allocator.free(raw_frame.payload);
+
+            const hdr = raw_frame.header;
+            const payload = raw_frame.payload;
+
+            if (continuation_stream_id) |expected_sid| {
+                if (hdr.frame_type != .continuation or hdr.stream_id != expected_sid) {
+                    self.sendHttp2Goaway(
+                        output,
+                        last_client_stream_id,
+                        .protocol_error,
+                        "expected CONTINUATION frame",
+                    );
+                    return;
+                }
+            }
+
+            switch (hdr.frame_type) {
+                .settings => {
+                    const decoded_settings = http2.decodeSettings(
+                        self.allocator,
+                        payload,
+                        hdr.flags,
+                        hdr.stream_id,
+                    ) catch |err| {
+                        const code: http2.ErrorCode = switch (err) {
+                            error.FrameSizeError => .frame_size_error,
+                            error.FlowControlError => .flow_control_error,
+                            else => .protocol_error,
+                        };
+                        self.sendHttp2Goaway(output, last_client_stream_id, code, "invalid SETTINGS");
+                        return;
+                    };
+                    defer self.allocator.free(decoded_settings);
+
+                    if ((hdr.flags & http2.Flags.ACK) == 0) {
+                        for (decoded_settings) |s| {
+                            switch (s.id) {
+                                .header_table_size => {
+                                    hpack_encoder.dynamic_table.setAllowedMaxSize(s.value);
+                                },
+                                .initial_window_size => {
+                                    const new_init: i64 = @intCast(s.value);
+                                    const delta = new_init - peer_initial_window_size;
+                                    peer_initial_window_size = new_init;
+                                    for (streams_map.values()) |*st| {
+                                        st.send_window += delta;
+                                        if (st.send_window > http2.max_flow_control_window) {
+                                            self.sendHttp2Goaway(
+                                                output,
+                                                last_client_stream_id,
+                                                .flow_control_error,
+                                                "stream window overflow",
+                                            );
+                                            return;
+                                        }
+                                    }
+                                },
+                                .max_frame_size => {
+                                    peer_max_frame_size = @intCast(s.value);
+                                },
+                                else => {},
+                            }
+                        }
+                        const ack = http2.encodeSettingsAck();
+                        self.writeAllOutputStream(output, &ack) catch return;
+                    }
+                },
+                .ping => {
+                    const opaque_data = http2.decodePing(payload, hdr.stream_id) catch |err| {
+                        const code: http2.ErrorCode = if (err == error.FrameSizeError)
+                            .frame_size_error
+                        else
+                            .protocol_error;
+                        self.sendHttp2Goaway(output, last_client_stream_id, code, "invalid PING");
+                        return;
+                    };
+                    if ((hdr.flags & http2.Flags.ACK) == 0) {
+                        const ping_ack = http2.encodePing(opaque_data, true);
+                        self.writeAllOutputStream(output, &ping_ack) catch return;
+                    }
+                },
+                .window_update => {
+                    const inc = http2.decodeWindowUpdate(payload) catch |err| {
+                        const code: http2.ErrorCode = if (err == error.FrameSizeError)
+                            .frame_size_error
+                        else
+                            .protocol_error;
+                        if (hdr.stream_id == 0 or err == error.FrameSizeError) {
+                            self.sendHttp2Goaway(output, last_client_stream_id, code, "invalid WINDOW_UPDATE");
+                            return;
+                        }
+                        self.sendHttp2RstStream(output, hdr.stream_id, code);
+                        return;
+                    };
+                    if (hdr.stream_id == 0) {
+                        if (conn_send_window + @as(i64, inc) > http2.max_flow_control_window) {
+                            self.sendHttp2Goaway(
+                                output,
+                                last_client_stream_id,
+                                .flow_control_error,
+                                "connection window overflow",
+                            );
+                            return;
+                        }
+                        conn_send_window += @as(i64, inc);
+                    } else if (streams_map.getPtr(hdr.stream_id)) |st| {
+                        if (st.send_window + @as(i64, inc) > http2.max_flow_control_window) {
+                            self.sendHttp2RstStream(output, hdr.stream_id, .flow_control_error);
+                            if (streams_map.fetchOrderedRemove(hdr.stream_id)) |kv| {
+                                var removed = kv.value;
+                                removed.deinit(self.allocator);
+                            }
+                        } else {
+                            st.send_window += @as(i64, inc);
+                        }
+                    }
+                },
+                .rst_stream => {
+                    _ = http2.decodeRstStream(payload, hdr.stream_id) catch |err| {
+                        const code: http2.ErrorCode = if (err == error.FrameSizeError)
+                            .frame_size_error
+                        else
+                            .protocol_error;
+                        self.sendHttp2Goaway(output, last_client_stream_id, code, "invalid RST_STREAM");
+                        return;
+                    };
+                    if (streams_map.fetchOrderedRemove(hdr.stream_id)) |kv| {
+                        var removed = kv.value;
+                        removed.deinit(self.allocator);
+                    }
+                },
+                .goaway => {
+                    _ = http2.decodeGoaway(payload, hdr.stream_id) catch |err| {
+                        const code: http2.ErrorCode = if (err == error.FrameSizeError)
+                            .frame_size_error
+                        else
+                            .protocol_error;
+                        self.sendHttp2Goaway(output, last_client_stream_id, code, "invalid GOAWAY");
+                        return;
+                    };
+                    return;
+                },
+                .priority => {
+                    if (hdr.stream_id == 0) {
+                        self.sendHttp2Goaway(output, last_client_stream_id, .protocol_error, "PRIORITY on stream 0");
+                        return;
+                    }
+                    if (payload.len != 5) {
+                        self.sendHttp2RstStream(output, hdr.stream_id, .frame_size_error);
+                    }
+                },
+                .headers => {
+                    if (hdr.stream_id == 0 or (hdr.stream_id & 1) == 0) {
+                        self.sendHttp2Goaway(
+                            output,
+                            last_client_stream_id,
+                            .protocol_error,
+                            "invalid HEADERS stream id",
+                        );
+                        return;
+                    }
+                    const fragment = http2.extractHeadersFragment(payload, hdr.flags) catch |err| {
+                        const code: http2.ErrorCode = if (err == error.FrameSizeError)
+                            .frame_size_error
+                        else
+                            .protocol_error;
+                        self.sendHttp2Goaway(output, last_client_stream_id, code, "invalid HEADERS payload");
+                        return;
+                    };
+
+                    const gop = streams_map.getOrPut(self.allocator, hdr.stream_id) catch return;
+                    if (!gop.found_existing) {
+                        if (hdr.stream_id <= last_client_stream_id) {
+                            _ = streams_map.orderedRemove(hdr.stream_id);
+                            self.sendHttp2Goaway(
+                                output,
+                                last_client_stream_id,
+                                .protocol_error,
+                                "non-monotonic stream id",
+                            );
+                            return;
+                        }
+                        last_client_stream_id = hdr.stream_id;
+                        gop.value_ptr.* = .{
+                            .stream_id = hdr.stream_id,
+                            .send_window = peer_initial_window_size,
+                        };
+                    }
+                    const st = gop.value_ptr;
+                    if (st.end_stream_received) {
+                        self.sendHttp2Goaway(output, last_client_stream_id, .stream_closed, "HEADERS on closed stream");
+                        return;
+                    }
+                    if (st.headers_complete) {
+                        // Trailing HEADERS frame: RFC 9113 §8.1 requires END_STREAM.
+                        if ((hdr.flags & http2.Flags.END_STREAM) == 0) {
+                            self.sendHttp2Goaway(
+                                output,
+                                last_client_stream_id,
+                                .protocol_error,
+                                "trailing HEADERS without END_STREAM",
+                            );
+                            return;
+                        }
+                        st.in_trailers = true;
+                        st.trailer_block.appendSlice(self.allocator, fragment) catch return;
+                    } else {
+                        st.header_block.appendSlice(self.allocator, fragment) catch return;
+                    }
+
+                    if ((hdr.flags & http2.Flags.END_STREAM) != 0) {
+                        st.end_stream_received = true;
+                    }
+                    if ((hdr.flags & http2.Flags.END_HEADERS) != 0) {
+                        continuation_stream_id = null;
+                        st.awaiting_continuation = false;
+                        if (!st.in_trailers) {
+                            st.decoded_headers = hpack_decoder.decodeRequestHeaders(
+                                st.header_block.items,
+                            ) catch |err| {
+                                const code: http2.ErrorCode = if (err == error.CompressionError)
+                                    .compression_error
+                                else
+                                    .protocol_error;
+                                self.sendHttp2Goaway(output, last_client_stream_id, code, "invalid request headers");
+                                return;
+                            };
+                            st.headers_complete = true;
+                        } else {
+                            st.decoded_trailers = hpack_decoder.decodeTrailers(
+                                st.trailer_block.items,
+                            ) catch |err| {
+                                const code: http2.ErrorCode = if (err == error.CompressionError)
+                                    .compression_error
+                                else
+                                    .protocol_error;
+                                self.sendHttp2Goaway(output, last_client_stream_id, code, "invalid trailer headers");
+                                return;
+                            };
+                        }
+                        if (st.end_stream_received) {
+                            var completed = streams_map.fetchOrderedRemove(hdr.stream_id).?.value;
+                            defer completed.deinit(self.allocator);
+                            self.dispatchHttp2CompletedStream(
+                                ci,
+                                handler_name,
+                                output,
+                                &hpack_encoder,
+                                peer_max_frame_size,
+                                &completed,
+                                dispatch_p3,
+                                interrupt,
+                            );
+                        }
+                    } else {
+                        continuation_stream_id = hdr.stream_id;
+                        st.awaiting_continuation = true;
+                    }
+                },
+                .continuation => {
+                    const st = streams_map.getPtr(hdr.stream_id) orelse {
+                        self.sendHttp2Goaway(output, last_client_stream_id, .protocol_error, "unknown CONTINUATION stream");
+                        return;
+                    };
+                    if (!st.awaiting_continuation) {
+                        self.sendHttp2Goaway(output, last_client_stream_id, .protocol_error, "unexpected CONTINUATION");
+                        return;
+                    }
+                    if (st.in_trailers) {
+                        st.trailer_block.appendSlice(self.allocator, payload) catch return;
+                    } else {
+                        st.header_block.appendSlice(self.allocator, payload) catch return;
+                    }
+                    if ((hdr.flags & http2.Flags.END_HEADERS) != 0) {
+                        continuation_stream_id = null;
+                        st.awaiting_continuation = false;
+                        if (!st.in_trailers) {
+                            st.decoded_headers = hpack_decoder.decodeRequestHeaders(
+                                st.header_block.items,
+                            ) catch |err| {
+                                const code: http2.ErrorCode = if (err == error.CompressionError)
+                                    .compression_error
+                                else
+                                    .protocol_error;
+                                self.sendHttp2Goaway(output, last_client_stream_id, code, "invalid request headers");
+                                return;
+                            };
+                            st.headers_complete = true;
+                        } else {
+                            st.decoded_trailers = hpack_decoder.decodeTrailers(
+                                st.trailer_block.items,
+                            ) catch |err| {
+                                const code: http2.ErrorCode = if (err == error.CompressionError)
+                                    .compression_error
+                                else
+                                    .protocol_error;
+                                self.sendHttp2Goaway(output, last_client_stream_id, code, "invalid trailer headers");
+                                return;
+                            };
+                        }
+                        if (st.end_stream_received) {
+                            var completed = streams_map.fetchOrderedRemove(hdr.stream_id).?.value;
+                            defer completed.deinit(self.allocator);
+                            self.dispatchHttp2CompletedStream(
+                                ci,
+                                handler_name,
+                                output,
+                                &hpack_encoder,
+                                peer_max_frame_size,
+                                &completed,
+                                dispatch_p3,
+                                interrupt,
+                            );
+                        }
+                    }
+                },
+                .data => {
+                    if (hdr.stream_id == 0) {
+                        self.sendHttp2Goaway(output, last_client_stream_id, .protocol_error, "DATA on stream 0");
+                        return;
+                    }
+                    const st = streams_map.getPtr(hdr.stream_id) orelse {
+                        self.sendHttp2Goaway(output, last_client_stream_id, .stream_closed, "DATA on unknown stream");
+                        return;
+                    };
+                    if (!st.headers_complete or st.end_stream_received) {
+                        self.sendHttp2Goaway(output, last_client_stream_id, .stream_closed, "DATA in invalid stream state");
+                        return;
+                    }
+                    const data_slice = http2.extractDataPayload(payload, hdr.flags) catch {
+                        self.sendHttp2Goaway(output, last_client_stream_id, .protocol_error, "invalid DATA padding");
+                        return;
+                    };
+                    if (st.body.items.len + data_slice.len > max_http_p3_body_bytes) {
+                        self.sendHttp2RstStream(output, hdr.stream_id, .enhance_your_calm);
+                        var removed = streams_map.fetchOrderedRemove(hdr.stream_id).?.value;
+                        removed.deinit(self.allocator);
+                        continue;
+                    }
+                    st.body.appendSlice(self.allocator, data_slice) catch return;
+
+                    if (hdr.length > 0) {
+                        const inc: u31 = @intCast(hdr.length);
+                        const conn_wu = http2.encodeWindowUpdate(0, inc);
+                        self.writeAllOutputStream(output, &conn_wu) catch return;
+                        if ((hdr.flags & http2.Flags.END_STREAM) == 0) {
+                            const stream_wu = http2.encodeWindowUpdate(hdr.stream_id, inc);
+                            self.writeAllOutputStream(output, &stream_wu) catch return;
+                        }
+                    }
+
+                    if ((hdr.flags & http2.Flags.END_STREAM) != 0) {
+                        st.end_stream_received = true;
+                        var completed = streams_map.fetchOrderedRemove(hdr.stream_id).?.value;
+                        defer completed.deinit(self.allocator);
+                        self.dispatchHttp2CompletedStream(
+                            ci,
+                            handler_name,
+                            output,
+                            &hpack_encoder,
+                            peer_max_frame_size,
+                            &completed,
+                            dispatch_p3,
+                            interrupt,
+                        );
+                    }
+                },
+                .push_promise => {
+                    self.sendHttp2Goaway(output, last_client_stream_id, .protocol_error, "client PUSH_PROMISE forbidden");
+                    return;
+                },
+                _ => {
+                    // RFC 9113 §5.5: Implementations MUST ignore and discard frames of unknown types.
+                },
+            }
+        }
+    }
+
+    /// Drive a single accepted P2 (`@0.2.x`) HTTP/1.1 or HTTP/2 connection over
+    /// `input` and `output` streams.
+    pub fn serveOneHttpConnectionStream(
+        self: *WasiCliAdapter,
+        inst: *ComponentInstance,
+        handler_name: []const u8,
+        input: *streams.InputStream,
+        output: *streams.OutputStream,
+    ) void {
+        self.serveOneHttpConnectionStreamInterruptible(
+            inst,
+            handler_name,
+            input,
+            output,
+            null,
+        );
+    }
+
+    pub fn serveOneHttpConnectionStreamInterruptible(
+        self: *WasiCliAdapter,
+        inst: *ComponentInstance,
+        handler_name: []const u8,
+        input: *streams.InputStream,
+        output: *streams.OutputStream,
+        interrupt: ?HttpConnectionInterrupt,
+    ) void {
+        defer self.cleanupHttpResources();
+
+        var reader: BufferedLineReader = .{ .allocator = self.allocator, .stream = input };
+        defer reader.deinit();
+
+        const is_h2 = reader.detectHttp2Preface() catch |err| {
+            if (err == error.Http2PrefaceError) {
+                self.sendHttp2Goaway(output, 0, .protocol_error, "invalid connection preface");
+                return;
+            }
+            self.writeHttpSimpleResponseForMethod(
+                output,
+                statusForRequestReadError(err),
+                "bad request\n",
+                .other,
+            ) catch {};
+            return;
+        };
+        if (is_h2) {
+            self.serveHttp2Connection(inst, handler_name, &reader, output, false, interrupt);
+            return;
+        }
+
+        var parsed_method: ?HttpRequestMethod = null;
+        const request_handle = self.readIncomingRequestFromBufferedReaderWithMethod(
+            &reader,
+            &parsed_method,
+        ) catch |err| {
+            self.writeHttpSimpleResponseForMethod(
+                output,
+                statusForRequestReadError(err),
+                "bad request\n",
+                parsed_method orelse .other,
+            ) catch {};
+            return;
+        };
+        const request_method = parsed_method orelse .other;
+        var request_method_scope = InboundHttpRequestMethodScope.bind(
+            request_method,
+        );
+        defer request_method_scope.deinit();
+
+        const outparam = self.allocator.create(ResponseOutparam) catch {
+            self.writeHttpSimpleResponseForMethod(
+                output,
+                500,
+                "out of memory\n",
+                request_method,
+            ) catch {};
+            return;
+        };
+        outparam.* = .{};
+        const outparam_handle = self.pushResponseOutparam(outparam) catch {
+            self.allocator.destroy(outparam);
+            self.writeHttpSimpleResponseForMethod(
+                output,
+                500,
+                "out of memory\n",
+                request_method,
+            ) catch {};
+            return;
+        };
+
+        const args = [_]abi_root.InterfaceValue{
+            .{ .handle = request_handle },
+            .{ .handle = outparam_handle },
+        };
+        var results: [0]abi_root.InterfaceValue = .{};
+        const live_response: ?*InboundHttpResponseSession = live: {
+            const session = InboundHttpResponseSession.create(
+                self.allocator,
+                self,
+                inst,
+                output,
+                false,
+                request_method,
+                interrupt,
+                null,
+            ) catch break :live null;
+            session.p2_mode = true;
+            session.start() catch {
+                session.destroy();
+                break :live null;
+            };
+            break :live session;
+        };
+
+        executor_root.callComponentFuncWithHostTaskContext(
+            inst,
+            handler_name,
+            &args,
+            &results,
+            if (live_response) |session| @ptrCast(session) else null,
+            self.allocator,
+        ) catch {
+            var output_started = false;
+            var terminal: HttpLiveTerminal = .handler_error;
+            if (live_response) |session| {
+                session.handlerFailed();
+                session.waitAndJoin();
+                session.propagateTerminalToGuest();
+                output_started = session.hasOutputStarted();
+                terminal = session.currentTerminal();
+                session.destroy();
+            }
+            if (!output_started and terminal != .client_disconnected and
+                terminal != .shutdown)
+            {
+                self.writeHttpSimpleResponseForMethod(
+                    output,
+                    500,
+                    "handler trapped\n",
+                    request_method,
+                ) catch {};
+            }
+            cancelAllPendingAsyncOps(
+                self,
+                inst,
+                null,
+                self.allocator,
+            );
+            return;
+        };
+
+        var live_terminal: HttpLiveTerminal = .fallback;
+        var live_output_started = false;
+        var live_error_status: u16 = 500;
+        if (live_response) |session| {
+            _ = session.handlerReturnedP2(outparam_handle);
+            session.waitAndJoin();
+            session.propagateTerminalToGuest();
+            live_terminal = session.currentTerminal();
+            live_output_started = session.hasOutputStarted();
+            live_error_status = session.responseErrorStatus();
+            session.destroy();
+        }
+        if (live_terminal == .succeeded) return;
+        if (live_terminal != .fallback) {
+            if (live_terminal == .response_error and !live_output_started) {
+                self.writeHttpSimpleResponseForMethod(
+                    output,
+                    live_error_status,
+                    "invalid response\n",
+                    request_method,
+                ) catch {};
+            }
+            cancelAllPendingAsyncOps(
+                self,
+                inst,
+                null,
+                self.allocator,
+            );
+            return;
+        }
+
+        self.writeHttpResponseFromOutparamForMethod(
+            output,
+            outparam_handle,
+            request_method,
+        ) catch |err| {
+            if (err == error.HttpClientDisconnected) {
+                cancelAllPendingAsyncOps(self, inst, null, self.allocator);
+            }
+        };
     }
 
     /// Register `wasi:http/types@0.3.0-*` (#487).
@@ -33503,6 +35291,15 @@ pub const TlsServerConn = struct {
             .now = std.Io.Clock.real.now(io),
         });
     }
+
+    pub fn negotiatedHttp2Alpn(self: *const TlsServerConn) bool {
+        if (@hasField(@TypeOf(self.conn), "alpn")) {
+            if (self.conn.alpn) |proto| {
+                return std.mem.eql(u8, proto, "h2");
+            }
+        }
+        return false;
+    }
 };
 
 /// Sniff a PEM private-key BEGIN marker and classify the key type.
@@ -33727,7 +35524,7 @@ pub fn serveLoadedHttpComponent(
             if (dispatch_p3) {
                 serveOneHttpConnectionP3(adapter, inst, handler_name, accepted, options.tls_config);
             } else {
-                serveOneHttpConnection(adapter, inst, handler_name, accepted);
+                serveOneHttpConnectionWithTls(adapter, inst, handler_name, accepted, options.tls_config);
             }
         }
         served += 1;
@@ -33815,16 +35612,24 @@ fn statusForRequestReadError(err: anyerror) u16 {
     };
 }
 
-fn serveOneHttpConnection(
+pub fn serveOneHttpConnection(
     adapter: *WasiCliAdapter,
     inst: *ComponentInstance,
     handler_name: []const u8,
     accepted: std.Io.net.Stream,
 ) void {
+    serveOneHttpConnectionWithTls(adapter, inst, handler_name, accepted, null);
+}
+
+pub fn serveOneHttpConnectionWithTls(
+    adapter: *WasiCliAdapter,
+    inst: *ComponentInstance,
+    handler_name: []const u8,
+    accepted: std.Io.net.Stream,
+    tls_config: ?*HttpsTlsConfig,
+) void {
     defer adapter.cleanupHttpResources();
 
-    var input = streams.InputStream.fromTcpStream(accepted.socket.handle);
-    var output = streams.OutputStream.toTcpStream(accepted.socket.handle);
     const io = std.Io.Threaded.global_single_threaded.io();
     var interrupt_ctx = HttpAcceptedInterruptContext{
         .stream = accepted,
@@ -33835,150 +35640,31 @@ fn serveOneHttpConnection(
         .callback = &interruptAcceptedHttpConnection,
     };
 
-    var parsed_method: ?HttpRequestMethod = null;
-    const request_handle = adapter.readIncomingRequestFromStreamWithMethod(
-        &input,
-        &parsed_method,
-    ) catch |err| {
-        adapter.writeHttpSimpleResponseForMethod(
-            &output,
-            statusForRequestReadError(err),
-            "bad request\n",
-            parsed_method orelse .other,
-        ) catch {};
-        return;
-    };
-    const request_method = parsed_method orelse .other;
-    var request_method_scope = InboundHttpRequestMethodScope.bind(
-        request_method,
-    );
-    defer request_method_scope.deinit();
-
-    const outparam = adapter.allocator.create(ResponseOutparam) catch {
-        adapter.writeHttpSimpleResponseForMethod(
-            &output,
-            500,
-            "out of memory\n",
-            request_method,
-        ) catch {};
-        return;
-    };
-    outparam.* = .{};
-    const outparam_handle = adapter.pushResponseOutparam(outparam) catch {
-        adapter.allocator.destroy(outparam);
-        adapter.writeHttpSimpleResponseForMethod(
-            &output,
-            500,
-            "out of memory\n",
-            request_method,
-        ) catch {};
-        return;
-    };
-
-    const args = [_]abi_root.InterfaceValue{
-        .{ .handle = request_handle },
-        .{ .handle = outparam_handle },
-    };
-    var results: [0]abi_root.InterfaceValue = .{};
-    const live_response: ?*InboundHttpResponseSession = live: {
-        const session = InboundHttpResponseSession.create(
-            adapter.allocator,
-            adapter,
+    if (tls_config) |cfg| {
+        var tconn: TlsServerConn = .{};
+        tconn.handshake(accepted, cfg) catch return;
+        defer tconn.conn.close() catch {};
+        var input = streams.InputStream.fromTlsConn(&tconn.conn);
+        var output = streams.OutputStream.toTlsConn(&tconn.conn);
+        adapter.serveOneHttpConnectionStreamInterruptible(
             inst,
+            handler_name,
+            &input,
             &output,
-            false,
-            request_method,
             interrupt,
-            null,
-        ) catch break :live null;
-        session.p2_mode = true;
-        session.start() catch {
-            session.destroy();
-            break :live null;
-        };
-        break :live session;
-    };
+        );
+        return;
+    }
 
-    executor_root.callComponentFuncWithHostTaskContext(
+    var input = streams.InputStream.fromTcpStream(accepted.socket.handle);
+    var output = streams.OutputStream.toTcpStream(accepted.socket.handle);
+    adapter.serveOneHttpConnectionStreamInterruptible(
         inst,
         handler_name,
-        &args,
-        &results,
-        if (live_response) |session| @ptrCast(session) else null,
-        adapter.allocator,
-    ) catch {
-        var output_started = false;
-        var terminal: HttpLiveTerminal = .handler_error;
-        if (live_response) |session| {
-            session.handlerFailed();
-            session.waitAndJoin();
-            session.propagateTerminalToGuest();
-            output_started = session.hasOutputStarted();
-            terminal = session.currentTerminal();
-            session.destroy();
-        }
-        if (!output_started and terminal != .client_disconnected and
-            terminal != .shutdown)
-        {
-            adapter.writeHttpSimpleResponseForMethod(
-                &output,
-                500,
-                "handler trapped\n",
-                request_method,
-            ) catch {};
-        }
-        WasiCliAdapter.cancelAllPendingAsyncOps(
-            adapter,
-            inst,
-            null,
-            adapter.allocator,
-        );
-        return;
-    };
-
-    var live_terminal: HttpLiveTerminal = .fallback;
-    var live_output_started = false;
-    var live_error_status: u16 = 500;
-    if (live_response) |session| {
-        _ = session.handlerReturnedP2(outparam_handle);
-        session.waitAndJoin();
-        session.propagateTerminalToGuest();
-        live_terminal = session.currentTerminal();
-        live_output_started = session.hasOutputStarted();
-        live_error_status = session.responseErrorStatus();
-        session.destroy();
-    }
-    if (live_terminal == .succeeded) return;
-    if (live_terminal != .fallback) {
-        if (live_terminal == .response_error and !live_output_started) {
-            adapter.writeHttpSimpleResponseForMethod(
-                &output,
-                live_error_status,
-                "invalid response\n",
-                request_method,
-            ) catch {};
-        }
-        WasiCliAdapter.cancelAllPendingAsyncOps(
-            adapter,
-            inst,
-            null,
-            adapter.allocator,
-        );
-        return;
-    }
-
-    // P2 serves one request per connection, so a disconnect has no
-    // keep-alive to suppress — but the guest may still own host
-    // operations whose results can no longer be observed (#616 A8).
-    adapter.writeHttpResponseFromOutparamForMethod(
+        &input,
         &output,
-        outparam_handle,
-        request_method,
-    ) catch |err| {
-        if (err == error.HttpClientDisconnected) {
-            WasiCliAdapter.cancelAllPendingAsyncOps(adapter, inst, null, adapter.allocator);
-        }
-    };
+        interrupt,
+    );
 }
 
 const HttpAcceptedInterruptContext = struct {
@@ -58771,6 +60457,7 @@ test "wasi:keyvalue persistence: set flushes through; second adapter reads it ba
 
 test {
     std.testing.refAllDecls(keyvalue_persistence);
+    std.testing.refAllDecls(http2);
 }
 
 test "wasi:keyvalue persistence #972: inode preservation and sorted JSON across set/delete/batch flushes" {
@@ -61537,4 +63224,607 @@ test "adapter resource safety: wasi:blobstore resource handle safety, cross-type
     const drop_ov = [_]InterfaceValue{.{ .handle = ov_handle }};
     try WasiCliAdapter.blobstoreOutgoingValueDrop(&adapter, &ci, &drop_ov, &.{}, testing.allocator);
 }
+
+test "adapter resource safety: wasi:http/incoming-handler HTTP/2 h2c prior-knowledge multiplexed streams with interleaved HEADERS/DATA and trailers (#972 E1)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    // Core wasm module that imports `host.handle : (i32, i32) -> ()` and
+    // exports `handle : (i32, i32) -> ()` forwarding both handles.
+    const core_wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // Type section: 1 type `(param i32 i32) (result)`
+        0x01, 0x06, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x00,
+        // Import section: 1 import `"host" "handle" (func 0)`
+        0x02, 0x0f, 0x01, 0x04, 'h',  'o',  's',  't',
+        0x06, 'h',  'a',  'n',  'd',  'l',  'e',  0x00,
+        0x00,
+        // Function section: 1 func of type 0
+        0x03, 0x02, 0x01, 0x00,
+        // Export section: `"handle"` -> func 1
+        0x07, 0x0a, 0x01, 0x06, 'h',  'a',  'n',  'd',
+        'l',  'e',  0x00, 0x01,
+        // Code section: `local.get 0; local.get 1; call 0; end`
+        0x0a, 0x0a, 0x01, 0x08, 0x00, 0x20, 0x00, 0x20,
+        0x01, 0x10, 0x00, 0x0b,
+    };
+    const core_modules = [_]ctypes.CoreModule{.{ .data = &core_wasm }};
+    const RES_TYPE_IDX: u32 = 100;
+    const t0_params = [_]ctypes.NamedValType{
+        .{ .name = "request", .type = .{ .own = RES_TYPE_IDX } },
+        .{ .name = "response-out", .type = .{ .own = RES_TYPE_IDX } },
+    };
+    const inst_handler_decls = [_]ctypes.Decl{
+        .{ .@"export" = .{ .name = "handle", .desc = .{ .func = 0 } } },
+    };
+    const type_defs = [_]ctypes.TypeDef{
+        .{ .func = .{ .params = &t0_params, .results = .none } },
+        .{ .instance = .{ .decls = &inst_handler_decls } },
+    };
+    const imports_decl = [_]ctypes.ImportDecl{
+        .{ .name = "test:http2/handler", .desc = .{ .instance = 1 } },
+    };
+    const aliases_decl = [_]ctypes.Alias{
+        .{ .instance_export = .{ .sort = .func, .instance_idx = 0, .name = "handle" } },
+        .{ .instance_export = .{ .sort = .{ .core = .func }, .instance_idx = 1, .name = "handle" } },
+    };
+    const canons = [_]ctypes.Canon{
+        .{ .lower = .{ .func_idx = 0, .opts = &.{} } },
+        .{ .lift = .{ .core_func_idx = 1, .type_idx = 0, .opts = &.{} } },
+    };
+    const inline_exports = [_]ctypes.CoreInlineExport{
+        .{ .name = "handle", .sort_idx = .{ .sort = .func, .idx = 0 } },
+    };
+    const inst_args = [_]ctypes.CoreInstantiateArg{
+        .{ .name = "host", .instance_idx = 0 },
+    };
+    const core_insts = [_]ctypes.CoreInstanceExpr{
+        .{ .exports = &inline_exports },
+        .{ .instantiate = .{ .module_idx = 0, .args = &inst_args } },
+    };
+    const comp_inline_exp = [_]ctypes.InlineExport{
+        .{ .name = "handle", .sort_idx = .{ .sort = .func, .idx = 1 } },
+    };
+    const instances = [_]ctypes.InstanceExpr{
+        .{ .exports = &comp_inline_exp },
+    };
+    const exports_decl = [_]ctypes.ExportDecl{
+        .{
+            .name = "wasi:http/incoming-handler@0.2.6",
+            .desc = .{ .instance = 1 },
+            .sort_idx = .{ .sort = .instance, .idx = 1 },
+        },
+    };
+    const component = ctypes.Component{
+        .core_modules = &core_modules,
+        .core_instances = &core_insts,
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &instances,
+        .aliases = &aliases_decl,
+        .types = &type_defs,
+        .canons = &canons,
+        .imports = &imports_decl,
+        .exports = &exports_decl,
+    };
+
+    const inst = try instance_mod.instantiate(&component, testing.allocator);
+    defer inst.deinit();
+
+    const HandlerCtx = struct {
+        adapter: *WasiCliAdapter,
+        call_count: usize = 0,
+
+        fn handle(
+            ctx_opaque: ?*anyopaque,
+            ci: *ComponentInstance,
+            args: []const InterfaceValue,
+            _: []InterfaceValue,
+            call_alloc: Allocator,
+        ) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_opaque.?));
+            self.call_count += 1;
+            const req_handle = args[0].handle;
+            const outparam_handle = args[1].handle;
+
+            // Read request fields & body + trailers through the P2 adapter tables/methods.
+            var req_lease = self.adapter.lookupIncomingRequest(req_handle) orelse return error.InvalidHandle;
+            const req_ptr = req_lease.value().*;
+            const path = try call_alloc.dupe(u8, req_ptr.path_with_query orelse "/");
+            defer call_alloc.free(path);
+            var stream_tag: []const u8 = "unknown";
+            if (self.adapter.lookupHttpFields(req_ptr.headers_handle)) |initial_hdr_lease| {
+                var hdr_lease = initial_hdr_lease;
+                defer hdr_lease.release();
+                for (hdr_lease.value().*.entries.items) |e| {
+                    if (std.ascii.eqlIgnoreCase(e.name, "x-stream-tag")) {
+                        stream_tag = e.value;
+                        break;
+                    }
+                }
+            }
+            const tag_copy = try call_alloc.dupe(u8, stream_tag);
+            defer call_alloc.free(tag_copy);
+            req_lease.release();
+
+            // Consume incoming body -> stream -> finish -> future-trailers.get
+            var consume_res: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.httpIncomingRequestConsume(
+                self.adapter,
+                ci,
+                &.{.{ .handle = req_handle }},
+                &consume_res,
+                call_alloc,
+            );
+            defer consume_res[0].deinit(call_alloc);
+            const in_body_handle = consume_res[0].result_val.payload.?.handle;
+
+            var stream_res: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.httpIncomingBodyStream(
+                self.adapter,
+                ci,
+                &.{.{ .handle = in_body_handle }},
+                &stream_res,
+                call_alloc,
+            );
+            defer stream_res[0].deinit(call_alloc);
+            const in_stream_handle = stream_res[0].result_val.payload.?.handle;
+
+            var body_bytes: std.ArrayListUnmanaged(u8) = .empty;
+            defer body_bytes.deinit(call_alloc);
+            if (self.adapter.lookupInputStream(in_stream_handle)) |initial_s_lease| {
+                var s_lease = initial_s_lease;
+                defer s_lease.release();
+                var buf: [256]u8 = undefined;
+                while (true) {
+                    switch (s_lease.value().stream.read(&buf)) {
+                        .ok => |n| {
+                            if (n == 0) break;
+                            try body_bytes.appendSlice(call_alloc, buf[0..n]);
+                        },
+                        .closed => break,
+                        else => return error.IoError,
+                    }
+                }
+            }
+            try WasiCliAdapter.dropInputStream(
+                self.adapter,
+                ci,
+                &.{.{ .handle = in_stream_handle }},
+                &.{},
+                call_alloc,
+            );
+
+            var finish_in_res: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.httpIncomingBodyFinish(
+                self.adapter,
+                ci,
+                &.{.{ .handle = in_body_handle }},
+                &finish_in_res,
+                call_alloc,
+            );
+            const ft_handle = finish_in_res[0].handle;
+
+            var ft_get_res: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.httpFutureTrailersGet(
+                self.adapter,
+                ci,
+                &.{.{ .handle = ft_handle }},
+                &ft_get_res,
+                call_alloc,
+            );
+            defer ft_get_res[0].deinit(call_alloc);
+            var trailer_val: []const u8 = "none";
+            if (ft_get_res[0].option_val.is_some) {
+                const outer_res = ft_get_res[0].option_val.payload.?.result_val;
+                if (outer_res.is_ok) {
+                    const inner_res = outer_res.payload.?.result_val;
+                    if (inner_res.is_ok and inner_res.payload.?.option_val.is_some) {
+                        const tr_handle = inner_res.payload.?.option_val.payload.?.handle;
+                        if (self.adapter.lookupHttpFields(tr_handle)) |initial_tr_lease| {
+                            var tr_lease = initial_tr_lease;
+                            defer tr_lease.release();
+                            for (tr_lease.value().*.entries.items) |e| {
+                                if (std.ascii.eqlIgnoreCase(e.name, "x-req-trailer")) {
+                                    trailer_val = e.value;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            const trailer_copy = try call_alloc.dupe(u8, trailer_val);
+            defer call_alloc.free(trailer_copy);
+
+            // Construct OutgoingResponse with status 200, custom header, body, and trailers.
+            const resp_fields = try self.adapter.allocator.create(HttpFields);
+            resp_fields.* = .{};
+            try resp_fields.entries.append(self.adapter.allocator, .{
+                .name = try self.adapter.allocator.dupe(u8, "x-handled-stream"),
+                .value = try self.adapter.allocator.dupe(u8, tag_copy),
+            });
+            const resp_fields_h = try self.adapter.pushHttpFields(resp_fields);
+
+            var new_resp_res: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.httpOutgoingResponseConstructor(
+                self.adapter,
+                ci,
+                &.{.{ .handle = resp_fields_h }},
+                &new_resp_res,
+                call_alloc,
+            );
+            const resp_h = new_resp_res[0].handle;
+
+            var body_res: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.httpOutgoingResponseBody(
+                self.adapter,
+                ci,
+                &.{.{ .handle = resp_h }},
+                &body_res,
+                call_alloc,
+            );
+            defer body_res[0].deinit(call_alloc);
+            const out_body_h = body_res[0].result_val.payload.?.handle;
+
+            var write_res: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.httpOutgoingBodyWrite(
+                self.adapter,
+                ci,
+                &.{.{ .handle = out_body_h }},
+                &write_res,
+                call_alloc,
+            );
+            defer write_res[0].deinit(call_alloc);
+            const out_stream_h = write_res[0].result_val.payload.?.handle;
+
+            const formatted_body = try std.fmt.allocPrint(
+                call_alloc,
+                "resp:{s}:{s}:{s}",
+                .{ path, body_bytes.items, trailer_copy },
+            );
+            defer call_alloc.free(formatted_body);
+
+            if (self.adapter.lookupStream(out_stream_h)) |initial_os_lease| {
+                var os_lease = initial_os_lease;
+                defer os_lease.release();
+                try testing.expect(os_lease.value().stream.write(formatted_body, self.adapter.allocator) == .ok);
+            }
+            try WasiCliAdapter.dropOutputStream(
+                self.adapter,
+                ci,
+                &.{.{ .handle = out_stream_h }},
+                &.{},
+                call_alloc,
+            );
+
+            // Attach response trailers via `outgoing-body.finish`
+            const resp_trailers = try self.adapter.allocator.create(HttpFields);
+            resp_trailers.* = .{};
+            try resp_trailers.entries.append(self.adapter.allocator, .{
+                .name = try self.adapter.allocator.dupe(u8, "x-resp-trailer"),
+                .value = try std.fmt.allocPrint(self.adapter.allocator, "done-{s}", .{tag_copy}),
+            });
+            const resp_trailers_h = try self.adapter.pushHttpFields(resp_trailers);
+
+            var some_tr_payload = InterfaceValue{ .handle = resp_trailers_h };
+            var finish_out_res: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.httpOutgoingBodyFinish(
+                self.adapter,
+                ci,
+                &.{
+                    .{ .handle = out_body_h },
+                    .{ .option_val = .{ .is_some = true, .payload = &some_tr_payload } },
+                },
+                &finish_out_res,
+                call_alloc,
+            );
+            defer finish_out_res[0].deinit(call_alloc);
+
+            var ok_resp_payload = InterfaceValue{ .handle = resp_h };
+            try WasiCliAdapter.httpResponseOutparamSet(
+                self.adapter,
+                ci,
+                &.{
+                    .{ .handle = outparam_handle },
+                    .{ .result_val = .{ .is_ok = true, .payload = &ok_resp_payload } },
+                },
+                &.{},
+                call_alloc,
+            );
+        }
+    };
+
+    var handler_ctx = HandlerCtx{ .adapter = &adapter };
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+    var host_inst: instance_mod.HostInstance = .{};
+    defer host_inst.deinit(testing.allocator);
+    try host_inst.members.put(testing.allocator, "handle", .{
+        .func = .{
+            .call = &HandlerCtx.handle,
+            .context = &handler_ctx,
+        },
+    });
+    try providers.put(testing.allocator, "test:http2/handler", .{ .host_instance = &host_inst });
+    try inst.linkImports(providers);
+
+    // Build client HTTP/2 byte sequence with interleaved streams 1 and 3.
+    var client_wire: std.ArrayListUnmanaged(u8) = .empty;
+    defer client_wire.deinit(testing.allocator);
+    try client_wire.appendSlice(testing.allocator, http2.client_preface);
+
+    const client_settings = try http2.encodeSettings(testing.allocator, &.{
+        .{ .id = .max_concurrent_streams, .value = 100 },
+        .{ .id = .initial_window_size, .value = 65535 },
+    });
+    defer testing.allocator.free(client_settings);
+    try client_wire.appendSlice(testing.allocator, client_settings);
+
+    const ping_frame = http2.encodePing("ping1234".*, false);
+    try client_wire.appendSlice(testing.allocator, &ping_frame);
+
+    var hpack_enc = http2.Encoder.init(testing.allocator);
+    defer hpack_enc.deinit();
+
+    // Stream 1 request headers split across HEADERS (no END_HEADERS) + CONTINUATION (END_HEADERS).
+    const s1_hblock = try hpack_enc.encodeRequestHeaders(
+        "POST",
+        "http",
+        "h2.example.com",
+        "/stream-one",
+        &.{.{ .name = "x-stream-tag", .value = "s1" }},
+    );
+    defer testing.allocator.free(s1_hblock);
+    const split = s1_hblock.len / 2;
+    const s1_hdr_frame = try http2.encodeHeadersFrame(testing.allocator, 1, s1_hblock[0..split], false, false);
+    defer testing.allocator.free(s1_hdr_frame);
+    const s1_cont_frame = try http2.encodeContinuationFrame(testing.allocator, 1, s1_hblock[split..], true);
+    defer testing.allocator.free(s1_cont_frame);
+    try client_wire.appendSlice(testing.allocator, s1_hdr_frame);
+    try client_wire.appendSlice(testing.allocator, s1_cont_frame);
+
+    // Stream 3 request headers (interleaved while stream 1 body has not been sent yet).
+    const s3_hblock = try hpack_enc.encodeRequestHeaders(
+        "POST",
+        "http",
+        "h2.example.com",
+        "/stream-three",
+        &.{.{ .name = "x-stream-tag", .value = "s3" }},
+    );
+    defer testing.allocator.free(s3_hblock);
+    const s3_hdr_frame = try http2.encodeHeadersFrame(testing.allocator, 3, s3_hblock, false, true);
+    defer testing.allocator.free(s3_hdr_frame);
+    try client_wire.appendSlice(testing.allocator, s3_hdr_frame);
+
+    // Interleaved DATA frames: stream 1 chunk 1, then stream 3 completes with END_STREAM,
+    // then stream 1 chunk 2, then stream 1 trailing HEADERS with END_STREAM.
+    const s1_data1 = try http2.encodeDataFrame(testing.allocator, 1, "part1-", false);
+    defer testing.allocator.free(s1_data1);
+    const s3_data = try http2.encodeDataFrame(testing.allocator, 3, "body3", true);
+    defer testing.allocator.free(s3_data);
+    const s1_data2 = try http2.encodeDataFrame(testing.allocator, 1, "part2", false);
+    defer testing.allocator.free(s1_data2);
+    const s1_tr_block = try hpack_enc.encodeTrailerHeaders(&.{
+        .{ .name = "x-req-trailer", .value = "trail-s1" },
+    });
+    defer testing.allocator.free(s1_tr_block);
+    const s1_tr_frame = try http2.encodeHeadersFrame(testing.allocator, 1, s1_tr_block, true, true);
+    defer testing.allocator.free(s1_tr_frame);
+
+    try client_wire.appendSlice(testing.allocator, s1_data1);
+    try client_wire.appendSlice(testing.allocator, s3_data);
+    try client_wire.appendSlice(testing.allocator, s1_data2);
+    try client_wire.appendSlice(testing.allocator, s1_tr_frame);
+
+    const goaway = try http2.encodeGoaway(testing.allocator, 3, .no_error, "");
+    defer testing.allocator.free(goaway);
+    try client_wire.appendSlice(testing.allocator, goaway);
+
+    // Exercise `serveOneHttpConnection` over a real loopback TCP socket pair.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const listen_addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    var server = try listen_addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    const client_stream = try server.socket.address.connect(io, .{ .mode = .stream });
+    defer client_stream.close(io);
+    const accepted = try server.accept(io);
+    defer accepted.close(io);
+
+    var client_out = streams.OutputStream.toTcpStream(client_stream.socket.handle);
+    try testing.expect(client_out.write(client_wire.items, testing.allocator) == .ok);
+    client_stream.shutdown(io, .send) catch {};
+
+    serveOneHttpConnection(
+        &adapter,
+        inst,
+        "wasi:http/incoming-handler@0.2.6/handle",
+        accepted,
+    );
+    accepted.shutdown(io, .send) catch {};
+
+    try testing.expectEqual(@as(usize, 2), handler_ctx.call_count);
+
+    // Read all server HTTP/2 frames and verify SETTINGS, SETTINGS ACK, PING ACK,
+    // WINDOW_UPDATE, and per-stream HEADERS + DATA + trailer HEADERS.
+    var client_in = streams.InputStream.fromTcpStream(client_stream.socket.handle);
+    var reader: WasiCliAdapter.BufferedLineReader = .{
+        .allocator = testing.allocator,
+        .stream = &client_in,
+    };
+    defer reader.deinit();
+
+    var saw_server_settings = false;
+    var saw_settings_ack = false;
+    var saw_ping_ack = false;
+    var saw_conn_window_update = false;
+
+    var hpack_dec = http2.Decoder.init(testing.allocator);
+    defer hpack_dec.deinit();
+
+    var s1_status: ?u16 = null;
+    var s1_header_tag: std.ArrayListUnmanaged(u8) = .empty;
+    defer s1_header_tag.deinit(testing.allocator);
+    var s1_body: std.ArrayListUnmanaged(u8) = .empty;
+    defer s1_body.deinit(testing.allocator);
+    var s1_trailer: std.ArrayListUnmanaged(u8) = .empty;
+    defer s1_trailer.deinit(testing.allocator);
+    var s1_end_stream = false;
+
+    var s3_status: ?u16 = null;
+    var s3_header_tag: std.ArrayListUnmanaged(u8) = .empty;
+    defer s3_header_tag.deinit(testing.allocator);
+    var s3_body: std.ArrayListUnmanaged(u8) = .empty;
+    defer s3_body.deinit(testing.allocator);
+    var s3_trailer: std.ArrayListUnmanaged(u8) = .empty;
+    defer s3_trailer.deinit(testing.allocator);
+    var s3_end_stream = false;
+
+    while (try reader.readHttp2Frame(testing.allocator, http2.default_max_frame_size)) |frame| {
+        defer testing.allocator.free(frame.payload);
+        switch (frame.header.frame_type) {
+            .settings => {
+                if ((frame.header.flags & http2.Flags.ACK) != 0) {
+                    saw_settings_ack = true;
+                } else {
+                    saw_server_settings = true;
+                }
+            },
+            .ping => {
+                if ((frame.header.flags & http2.Flags.ACK) != 0 and
+                    std.mem.eql(u8, frame.payload, "ping1234"))
+                {
+                    saw_ping_ack = true;
+                }
+            },
+            .window_update => {
+                if (frame.header.stream_id == 0) saw_conn_window_update = true;
+            },
+            .headers => {
+                const sub = try http2.extractHeadersFragment(frame.payload, frame.header.flags);
+                var fields = try hpack_dec.decodeHeaderList(sub);
+                defer {
+                    for (fields.items) |*item| item.deinit(testing.allocator);
+                    fields.deinit(testing.allocator);
+                }
+                if (frame.header.stream_id == 1) {
+                    if (s1_status == null) {
+                        for (fields.items) |f| {
+                            if (std.mem.eql(u8, f.name, ":status")) {
+                                s1_status = try std.fmt.parseInt(u16, f.value, 10);
+                            } else if (std.ascii.eqlIgnoreCase(f.name, "x-handled-stream")) {
+                                try s1_header_tag.appendSlice(testing.allocator, f.value);
+                            }
+                        }
+                    } else {
+                        for (fields.items) |f| {
+                            if (std.ascii.eqlIgnoreCase(f.name, "x-resp-trailer")) {
+                                try s1_trailer.appendSlice(testing.allocator, f.value);
+                            }
+                        }
+                    }
+                    if ((frame.header.flags & http2.Flags.END_STREAM) != 0) s1_end_stream = true;
+                } else if (frame.header.stream_id == 3) {
+                    if (s3_status == null) {
+                        for (fields.items) |f| {
+                            if (std.mem.eql(u8, f.name, ":status")) {
+                                s3_status = try std.fmt.parseInt(u16, f.value, 10);
+                            } else if (std.ascii.eqlIgnoreCase(f.name, "x-handled-stream")) {
+                                try s3_header_tag.appendSlice(testing.allocator, f.value);
+                            }
+                        }
+                    } else {
+                        for (fields.items) |f| {
+                            if (std.ascii.eqlIgnoreCase(f.name, "x-resp-trailer")) {
+                                try s3_trailer.appendSlice(testing.allocator, f.value);
+                            }
+                        }
+                    }
+                    if ((frame.header.flags & http2.Flags.END_STREAM) != 0) s3_end_stream = true;
+                }
+            },
+            .data => {
+                const sub = try http2.extractDataPayload(frame.payload, frame.header.flags);
+                if (frame.header.stream_id == 1) {
+                    try s1_body.appendSlice(testing.allocator, sub);
+                    if ((frame.header.flags & http2.Flags.END_STREAM) != 0) s1_end_stream = true;
+                } else if (frame.header.stream_id == 3) {
+                    try s3_body.appendSlice(testing.allocator, sub);
+                    if ((frame.header.flags & http2.Flags.END_STREAM) != 0) s3_end_stream = true;
+                }
+            },
+            else => {},
+        }
+    }
+
+    try testing.expect(saw_server_settings);
+    try testing.expect(saw_settings_ack);
+    try testing.expect(saw_ping_ack);
+    try testing.expect(saw_conn_window_update);
+
+    try testing.expectEqual(@as(?u16, 200), s3_status);
+    try testing.expectEqualStrings("s3", s3_header_tag.items);
+    try testing.expectEqualStrings("resp:/stream-three:body3:none", s3_body.items);
+    try testing.expectEqualStrings("done-s3", s3_trailer.items);
+    try testing.expect(s3_end_stream);
+
+    try testing.expectEqual(@as(?u16, 200), s1_status);
+    try testing.expectEqualStrings("s1", s1_header_tag.items);
+    try testing.expectEqualStrings("resp:/stream-one:part1-part2:trail-s1", s1_body.items);
+    try testing.expectEqualStrings("done-s1", s1_trailer.items);
+    try testing.expect(s1_end_stream);
+}
+
+test "adapter resource safety: wasi:http/incoming-handler HTTP/2 protocol error emits GOAWAY (#972 E1)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    var client_wire: std.ArrayListUnmanaged(u8) = .empty;
+    defer client_wire.deinit(testing.allocator);
+    try client_wire.appendSlice(testing.allocator, http2.client_preface);
+
+    // Client sends a PING with non-zero stream_id = 1 (RFC 9113 §6.7 protocol error).
+    var bad_ping: [http2.frame_header_len + 8]u8 = undefined;
+    const hdr = (http2.FrameHeader{
+        .length = 8,
+        .frame_type = .ping,
+        .flags = 0,
+        .stream_id = 1,
+    }).encode();
+    @memcpy(bad_ping[0..http2.frame_header_len], &hdr);
+    @memset(bad_ping[http2.frame_header_len..], 0);
+    try client_wire.appendSlice(testing.allocator, &bad_ping);
+
+    var input = streams.InputStream.fromBuffer(client_wire.items);
+    var output = streams.OutputStream.toBuffer();
+    defer output.deinit(testing.allocator);
+
+    adapter.serveOneHttpConnectionStream(&ci, "unused", &input, &output);
+
+    var out_in = streams.InputStream.fromBuffer(output.getBufferContents());
+    var reader: WasiCliAdapter.BufferedLineReader = .{
+        .allocator = testing.allocator,
+        .stream = &out_in,
+    };
+    defer reader.deinit();
+
+    var saw_goaway_protocol_err = false;
+    while (try reader.readHttp2Frame(testing.allocator, http2.default_max_frame_size)) |frame| {
+        defer testing.allocator.free(frame.payload);
+        if (frame.header.frame_type == .goaway) {
+            const parsed = try http2.decodeGoaway(frame.payload, frame.header.stream_id);
+            if (parsed.error_code == .protocol_error) {
+                saw_goaway_protocol_err = true;
+            }
+        }
+    }
+    try testing.expect(saw_goaway_protocol_err);
+}
+
 
