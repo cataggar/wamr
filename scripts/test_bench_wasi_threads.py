@@ -5665,6 +5665,15 @@ class ThreadBenchmarkTests(unittest.TestCase):
         )
         self.assertIn("runs-on: ubuntu-22.04", trusted_x86)
         self.assertIn("--runner-environment github-hosted", trusted_x86)
+        self.assertIn("slot: [1, 2, 3, 4, 5, 6, 7, 8]", trusted_x86)
+        self.assertIn("Acquire target x86 CPU class", trusted_x86)
+        self.assertIn(
+            'TARGET_CPU_CLASS: "AMD EPYC 7763 64-Core Processor"', trusted_x86
+        )
+        self.assertIn(
+            "format('wasi-thread-temp-runner-{0}-{1}', inputs.cohort_id || github.run_id, inputs.cohort_sequence || github.run_attempt)",
+            workflow,
+        )
         self.assertNotIn("runs-on: [", trusted_x86)
         self.assertNotIn("runs-on: self-hosted", trusted_x86)
         self.assertNotIn("pull_request", trusted_x86)
@@ -6065,6 +6074,215 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertFalse(uncalibrated["enforcement"])
         self.assertIsNone(uncalibrated["calibration_provenance"])
         self.assertEqual(uncalibrated["platforms"], {})
+
+    def test_cohort_dispatch_resumes_bounded_sequence_waves(self) -> None:
+        baseline = "b" * 40
+        candidate = "a" * 40
+        workflow_head = "f" * 40
+        workflow_ref = "calibration/966-immutable"
+        output = self.scratch / "dispatch-wave.json"
+        common = {
+            "baseline_sha": baseline,
+            "candidate_sha": candidate,
+            "purpose": "candidate-evaluation",
+            "profile": "authoritative",
+            "warmups": 2,
+            "samples": 12,
+            "runner_target": "github-hosted",
+            "accepted_cpu_class": TEST_ACCEPTED_CPU_CLASS_ARGS,
+            "runs": 2,
+            "training_runs": 1,
+            "max_in_flight": 1,
+            "timeout_seconds": 3600,
+            "output": output,
+            "repository": "cataggar/wamr",
+            "workflow": "wasi-thread-bench.yml",
+            "workflow_ref": workflow_ref,
+            "poll_seconds": 0,
+            "lookup_attempts": 1,
+            "lookup_seconds": 0,
+        }
+        wave1_responses = [
+            json.dumps({"sha": workflow_head}),
+            "https://github.com/cataggar/wamr/actions/runs/201\n",
+            json.dumps(
+                {
+                    "status": "completed",
+                    "conclusion": "success",
+                    "headSha": workflow_head,
+                    "url": "https://github.com/cataggar/wamr/actions/runs/201",
+                }
+            ),
+            json.dumps({"artifacts": []}),
+        ]
+        with (
+            mock.patch.object(
+                cohort.subprocess,
+                "check_output",
+                side_effect=wave1_responses,
+            ) as run_wave1,
+            mock.patch.object(cohort.time, "sleep"),
+            mock.patch.object(
+                cohort.uuid,
+                "uuid4",
+                return_value=Namespace(hex="c" * 32),
+            ),
+        ):
+            cohort.dispatch(
+                Namespace(**common, start_sequence=1, end_sequence=1)
+            )
+        self.assertEqual(run_wave1.call_count, 4)
+        wave1_state = json.loads(output.read_text(encoding="UTF-8"))
+        self.assertEqual(wave1_state["cohort_id"], "c" * 32)
+        self.assertEqual(
+            [item["sequence"] for item in wave1_state["runs"]], [1]
+        )
+
+        wave2_responses = [
+            json.dumps({"sha": workflow_head}),
+            "https://github.com/cataggar/wamr/actions/runs/202\n",
+            json.dumps(
+                {
+                    "status": "completed",
+                    "conclusion": "success",
+                    "headSha": workflow_head,
+                    "url": "https://github.com/cataggar/wamr/actions/runs/202",
+                }
+            ),
+            json.dumps({"artifacts": []}),
+        ]
+        with (
+            mock.patch.object(
+                cohort.subprocess,
+                "check_output",
+                side_effect=wave2_responses,
+            ) as run_wave2,
+            mock.patch.object(cohort.time, "sleep"),
+            mock.patch.object(
+                cohort.uuid,
+                "uuid4",
+                return_value=Namespace(hex="e" * 32),
+            ),
+        ):
+            cohort.dispatch(
+                Namespace(**common, start_sequence=2, end_sequence=2)
+            )
+        self.assertEqual(run_wave2.call_count, 4)
+        wave2_state = json.loads(output.read_text(encoding="UTF-8"))
+        self.assertEqual(wave2_state["cohort_id"], "c" * 32)
+        self.assertEqual(wave2_state["split"], wave1_state["split"])
+        self.assertEqual(
+            [(item["sequence"], item["run_id"]) for item in wave2_state["runs"]],
+            [(1, 201), (2, 202)],
+        )
+
+        for start_seq, end_seq in ((0, 1), (2, 1), (1, 3)):
+            with self.subTest(start_seq=start_seq, end_seq=end_seq):
+                with self.assertRaisesRegex(
+                    bench.HarnessError, "1 <= start-sequence <= end-sequence <= runs"
+                ):
+                    cohort.validate_dispatch_options(
+                        Namespace(
+                            **common,
+                            start_sequence=start_seq,
+                            end_sequence=end_seq,
+                        )
+                    )
+
+    def test_cohort_download_and_partial_validation(self) -> None:
+        dispatch_state = make_dispatch_state(run_ids=("100", "101"))
+        partial_state = copy.deepcopy(dispatch_state)
+        partial_state["runs"] = [partial_state["runs"][0]]
+        dispatch_path = self.scratch / "partial-dispatch.json"
+        dispatch_path.write_text(
+            json.dumps(partial_state), encoding="UTF-8"
+        )
+        download_dir = self.scratch / "downloaded"
+
+        with self.assertRaisesRegex(
+            bench.HarnessError, "dispatch state has 1 runs, expected 2"
+        ):
+            cohort.download_cohort_artifacts(
+                Namespace(
+                    dispatch_state=dispatch_path,
+                    output_dir=download_dir,
+                    timeout_seconds=60,
+                    allow_partial=False,
+                )
+            )
+
+        existing_x86 = (
+            download_dir / "seq-01-run-100-ubuntu-22.04-x86_64"
+        )
+        existing_x86.mkdir(parents=True, exist_ok=True)
+        (existing_x86 / "report.json").write_text(
+            json.dumps(make_report(run_id="100")), encoding="UTF-8"
+        )
+        (existing_x86 / "report.md").write_text(
+            "# x86 report\n", encoding="UTF-8"
+        )
+
+        def fake_download(cmd, **_kwargs):
+            target = Path(cmd[cmd.index("--dir") + 1])
+            (target / "report.json").write_text(
+                json.dumps(
+                    make_report(
+                        platform_id="ubuntu-24.04-aarch64",
+                        machine="aarch64",
+                        run_id="100",
+                    )
+                ),
+                encoding="UTF-8",
+            )
+            (target / "report.md").write_text(
+                "# arm report\n", encoding="UTF-8"
+            )
+            return ""
+
+        with mock.patch.object(
+            cohort.subprocess, "check_output", side_effect=fake_download
+        ) as check_output:
+            manifest = cohort.download_cohort_artifacts(
+                Namespace(
+                    dispatch_state=dispatch_path,
+                    output_dir=download_dir,
+                    timeout_seconds=60,
+                    allow_partial=True,
+                )
+            )
+        check_output.assert_called_once()
+        self.assertTrue(manifest["partial"])
+        self.assertEqual(manifest["completed_runs"], 1)
+        self.assertEqual(
+            [(item["platform"], item["reused"]) for item in manifest["artifacts"]],
+            [
+                ("ubuntu-22.04-x86_64", True),
+                ("ubuntu-24.04-aarch64", False),
+            ],
+        )
+        self.assertTrue((download_dir / "manifest.json").is_file())
+
+        partial_cohort_out = self.scratch / "partial-cohort.json"
+        self.assertEqual(
+            cohort.main(
+                [
+                    "validate",
+                    "--input-dir",
+                    str(download_dir),
+                    "--dispatch-state",
+                    str(dispatch_path),
+                    "--allow-partial",
+                    "--output",
+                    str(partial_cohort_out),
+                ]
+            ),
+            0,
+        )
+        validated_partial = json.loads(
+            partial_cohort_out.read_text(encoding="UTF-8")
+        )
+        self.assertFalse(validated_partial["authoritative"])
+        self.assertEqual(len(validated_partial["observations"]), 2)
 
 
 if __name__ == "__main__":
