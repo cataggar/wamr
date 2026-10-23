@@ -31,7 +31,7 @@ on:
         default: x86
 
 concurrency:
-  group: wasi-thread-duration-cross-diagnostic
+  group: wasi-thread-duration-cross-diagnostic-${{ inputs.cohort_id }}-${{ inputs.report_sequence }}-${{ inputs.preflight_only && inputs.preflight_platform || 'full' }}
   cancel-in-progress: false
 
 permissions:
@@ -44,8 +44,14 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 720
     permissions:
+      actions: read
       contents: read
       attestations: read
+    strategy:
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        slot: [1, 2, 3, 4, 5, 6, 7, 8]
     env:
       ROOT: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86
       HOME: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86/home
@@ -54,7 +60,41 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86/zig-global-cache
       ZIG_LOCAL_CACHE_DIR: /d/wamr-duration-cross/${{ github.run_id }}-${{ github.run_attempt }}-x86/zig-local-cache
     steps:
+      - name: Acquire target x86 CPU class
+        id: acquire
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREFLIGHT_ONLY: ${{ inputs.preflight_only }}
+          SLOT: ${{ matrix.slot }}
+          TARGET_CPU_CLASS: "AMD EPYC 7763 64-Core Processor"
+        run: |
+          set -euo pipefail
+          if [ "$PREFLIGHT_ONLY" = true ]; then
+            EXPECTED_ARTIFACT="wasi-thread-duration-cross-readiness-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          else
+            EXPECTED_ARTIFACT="wasi-thread-duration-cross-ubuntu-22.04-x86_64-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          fi
+          EXISTING="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" --jq ".artifacts[] | select(.name == \"${EXPECTED_ARTIFACT}\") | .name")"
+          if [ -n "$EXISTING" ]; then
+            echo "Artifact $EXPECTED_ARTIFACT already uploaded by an earlier slot; skipping slot $SLOT."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          ACTUAL_CPU="$(grep -m1 '^model name' /proc/cpuinfo | sed 's/^[^:]*:[[:space:]]*//')"
+          echo "Slot $SLOT assigned CPU: $ACTUAL_CPU"
+          if [ "$ACTUAL_CPU" = "$TARGET_CPU_CLASS" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$SLOT" -ge 8 ]; then
+            echo "Failed to acquire $TARGET_CPU_CLASS after $SLOT slots (last CPU: $ACTUAL_CPU)" >&2
+            exit 1
+          fi
+          echo "Skipping non-target CPU $ACTUAL_CPU on slot $SLOT; next slot will request a fresh runner."
+          echo "should_run=false" >> "$GITHUB_OUTPUT"
+
       - name: Validate runner and create run-scoped paths
+        if: ${{ steps.acquire.outputs.should_run == 'true' }}
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
           COHORT_ID: ${{ inputs.cohort_id }}
@@ -91,6 +131,7 @@ jobs:
           mkdir -p "$ROOT"/{home,tmp,xdg-cache,zig-global-cache,zig-local-cache,zig,output,source}
 
       - name: Fetch and validate immutable trusted source
+        if: ${{ steps.acquire.outputs.should_run == 'true' }}
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
@@ -105,6 +146,7 @@ jobs:
           test -z "$(git -C "$ROOT/source" status --porcelain)"
 
       - name: Install Zig 0.17.0
+        if: ${{ steps.acquire.outputs.should_run == 'true' }}
         uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
         env:
           GH_TOKEN: ${{ github.token }}
@@ -115,10 +157,11 @@ jobs:
             cataggar/zig@v0.16.0 ?id=wamr-benchmark-zig016&alias=zig:zig016 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Test diagnostic harness
+        if: ${{ steps.acquire.outputs.should_run == 'true' }}
         run: python3 "$ROOT/source/scripts/test_wasi_thread_duration_cross.py"
 
       - name: Run x86 duration-cross report
-        if: ${{ !inputs.preflight_only }}
+        if: ${{ steps.acquire.outputs.should_run == 'true' && !inputs.preflight_only }}
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
           COHORT_ID: ${{ inputs.cohort_id }}
@@ -138,7 +181,7 @@ jobs:
           cat "$ROOT/output/report.md" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run x86 gate-readiness probe
-        if: ${{ inputs.preflight_only }}
+        if: ${{ steps.acquire.outputs.should_run == 'true' && inputs.preflight_only }}
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
           COHORT_ID: ${{ inputs.cohort_id }}
@@ -158,7 +201,7 @@ jobs:
           cat "$ROOT/output/preflight-readiness.md" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload x86 diagnostic report
-        if: ${{ always() && !inputs.preflight_only }}
+        if: ${{ always() && steps.acquire.outputs.should_run == 'true' && !inputs.preflight_only }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: wasi-thread-duration-cross-ubuntu-22.04-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
@@ -169,7 +212,7 @@ jobs:
           retention-days: 90
 
       - name: Retain x86 gate-readiness result
-        if: ${{ success() && inputs.preflight_only }}
+        if: ${{ success() && steps.acquire.outputs.should_run == 'true' && inputs.preflight_only }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: wasi-thread-duration-cross-readiness-${{ github.run_id }}-${{ github.run_attempt }}
@@ -180,7 +223,7 @@ jobs:
           retention-days: 90
 
       - name: Retain x86 preflight failure evidence
-        if: always()
+        if: ${{ always() && steps.acquire.outputs.should_run == 'true' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: wasi-thread-duration-cross-failure-x86-${{ github.run_id }}-${{ github.run_attempt }}
@@ -191,7 +234,7 @@ jobs:
           retention-days: 90
 
       - name: Clean run-scoped files
-        if: always()
+        if: ${{ always() && steps.acquire.outputs.should_run == 'true' }}
         run: |
           set -euo pipefail
           case "$ROOT" in
@@ -202,8 +245,7 @@ jobs:
 
   arm:
     name: Neoverse-N2 duration-cross
-    needs: x86
-    if: ${{ always() && ((inputs.preflight_only && inputs.preflight_platform == 'arm' && needs.x86.result == 'skipped') || (!inputs.preflight_only && needs.x86.result == 'success')) }}
+    if: ${{ !inputs.preflight_only || inputs.preflight_platform == 'arm' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 720
     permissions:

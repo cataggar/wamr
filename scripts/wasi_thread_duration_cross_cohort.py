@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -29,6 +30,8 @@ from wasi_thread_duration_cross import (
     ARMS,
     ACCEPTANCE_SURFACE,
     DESIGN_PROVENANCE,
+    HOSTED_X86_CPU_CLASS,
+    HOSTED_X86_RUNNER_NAME,
     PARTITIONS,
     PLATFORM_CELLS,
     PLAN_KIND,
@@ -49,6 +52,9 @@ CONCLUSION_KIND = "wasi-thread-duration-cross-conclusion"
 DOWNLOAD_MANIFEST_KIND = "wasi-thread-duration-cross-download-manifest"
 COHORT_SCHEMA_VERSION = 1
 WORKFLOW = "wasi-thread-duration-cross.yml"
+DEFAULT_WORKFLOW = WORKFLOW
+DEFAULT_REPOSITORY = "cataggar/wamr"
+WORKFLOW_RUN_COUNT = 20
 TAG_RE = re.compile(
     r"^wasi-thread-duration-cross-[A-Za-z0-9][A-Za-z0-9._-]*$"
 )
@@ -152,10 +158,15 @@ def parse_artifacts(value: Any, run_id: int) -> list[dict[str, Any]]:
 
 def make_dispatch_plan(
     *,
+    cohort_id: str | None = None,
     source_sha: str,
     workflow_ref: str,
-    repository: str,
-    cohort_id: str | None = None,
+    repository: str = DEFAULT_REPOSITORY,
+    workflow: str = DEFAULT_WORKFLOW,
+    created_at: str | None = None,
+    max_workflows_in_flight: int = 1,
+    trusted_x86_runner_name: str = TRUSTED_X86_RUNNER_NAME,
+    x86_cpu_class: str = X86_CPU_CLASS,
 ) -> dict[str, Any]:
     require_sha(source_sha, "source SHA")
     require(
@@ -168,8 +179,22 @@ def make_dispatch_plan(
         re.fullmatch(r"[0-9a-f]{32}", resolved_cohort_id) is not None,
         "cohort ID must be 32 lowercase hexadecimal characters",
     )
+    require(
+        isinstance(max_workflows_in_flight, int)
+        and not isinstance(max_workflows_in_flight, bool)
+        and 1 <= max_workflows_in_flight <= WORKFLOW_RUN_COUNT,
+        "maximum_workflows_in_flight must be between 1 and 20",
+    )
+    require(
+        trusted_x86_runner_name in (TRUSTED_X86_RUNNER_NAME, HOSTED_X86_RUNNER_NAME),
+        "unsupported trusted_x86_runner_name",
+    )
+    require(
+        x86_cpu_class in (X86_CPU_CLASS, HOSTED_X86_CPU_CLASS),
+        "unsupported x86_cpu_class",
+    )
     assignments = []
-    for sequence in range(1, 21):
+    for sequence in range(1, WORKFLOW_RUN_COUNT + 1):
         assignments.append(
             {
                 "sequence": sequence,
@@ -186,9 +211,9 @@ def make_dispatch_plan(
     return {
         "schema_version": COHORT_SCHEMA_VERSION,
         "kind": DISPATCH_KIND,
-        "created_at": collected_at(),
+        "created_at": created_at or collected_at(),
         "repository": repository,
-        "workflow": WORKFLOW,
+        "workflow": workflow,
         "workflow_ref": workflow_ref,
         "workflow_head_sha": source_sha,
         "source_sha": source_sha,
@@ -196,14 +221,14 @@ def make_dispatch_plan(
         "diagnostic_only": True,
         "production_budget_eligible": False,
         "runner_contract": {
-            "maximum_workflows_in_flight": 1,
-            "trusted_x86_runner_name": TRUSTED_X86_RUNNER_NAME,
-            "x86_cpu_class": X86_CPU_CLASS,
+            "maximum_workflows_in_flight": max_workflows_in_flight,
+            "trusted_x86_runner_name": trusted_x86_runner_name,
+            "x86_cpu_class": x86_cpu_class,
             "arm_cpu_class": ARM_CPU_CLASS,
             "runner_worker_count_at_start": 1,
         },
-        "requested_workflows": 20,
-        "requested_reports": 40,
+        "requested_workflows": WORKFLOW_RUN_COUNT,
+        "requested_reports": WORKFLOW_RUN_COUNT * len(PLATFORM_CELLS),
         "required_platforms": list(PLATFORM_CELLS),
         "split": {
             "method": "predeclared-sequence",
@@ -219,6 +244,87 @@ def make_dispatch_plan(
         },
         "runs": [],
     }
+
+
+def _validate_completed_runs_prefix(
+    runs: list[Any], *, require_full: bool
+) -> None:
+    if require_full:
+        require(
+            len(runs) == WORKFLOW_RUN_COUNT,
+            "completed dispatch requires exactly 20 runs",
+        )
+    else:
+        require(
+            1 <= len(runs) <= WORKFLOW_RUN_COUNT,
+            "partial dispatch requires between 1 and 20 runs",
+        )
+    run_ids: set[int] = set()
+    artifact_ids: set[int] = set()
+    artifact_names: set[str] = set()
+    artifact_digests: set[str] = set()
+    for sequence, run in enumerate(runs, 1):
+        require(
+            isinstance(run, dict)
+            and run.get("sequence") == sequence
+            and run.get("partition") == PARTITIONS[sequence]
+            and isinstance(run.get("run_id"), int)
+            and not isinstance(run["run_id"], bool)
+            and run["run_id"] > 0
+            and run.get("status") == "completed"
+            and run.get("conclusion") == "success",
+            f"dispatch run {sequence} is missing, partial, or unsuccessful",
+        )
+        require(run.get("attempt") == 1, f"dispatch run {sequence} was rerun")
+        require(
+            isinstance(run.get("artifacts"), list)
+            and run["artifacts"]
+            == sorted(run["artifacts"], key=lambda artifact: artifact["name"])
+            and {artifact.get("name") for artifact in run["artifacts"]}
+            == expected_artifact_names(run["run_id"])
+            and len(run["artifacts"]) == len(PLATFORM_CELLS)
+            and all(
+                isinstance(artifact.get("id"), int)
+                and not isinstance(artifact["id"], bool)
+                and artifact["id"] > 0
+                and isinstance(artifact.get("size_in_bytes"), int)
+                and not isinstance(artifact["size_in_bytes"], bool)
+                and artifact["size_in_bytes"] > 0
+                and isinstance(artifact.get("digest_sha256"), str)
+                and re.fullmatch(
+                    r"[0-9a-f]{64}", artifact["digest_sha256"]
+                )
+                is not None
+                and artifact.get("run_id") == run["run_id"]
+                and artifact.get("platform") in PLATFORM_CELLS
+                and artifact.get("name")
+                == (
+                    "wasi-thread-duration-cross-"
+                    f"{artifact['platform']}-{run['run_id']}-1"
+                )
+                and artifact.get("expired") is False
+                for artifact in run["artifacts"]
+            ),
+            f"dispatch run {sequence} artifacts",
+        )
+        require(run["run_id"] not in run_ids, "dispatch duplicate run ID")
+        run_ids.add(run["run_id"])
+        for artifact in run["artifacts"]:
+            require(
+                artifact["id"] not in artifact_ids,
+                "dispatch duplicate artifact ID",
+            )
+            require(
+                artifact["name"] not in artifact_names,
+                "dispatch duplicate artifact name",
+            )
+            require(
+                artifact["digest_sha256"] not in artifact_digests,
+                "dispatch duplicate artifact ZIP identity",
+            )
+            artifact_ids.add(artifact["id"])
+            artifact_names.add(artifact["name"])
+            artifact_digests.add(artifact["digest_sha256"])
 
 
 def validate_dispatch_plan(document: dict[str, Any], *, completed: bool) -> None:
@@ -253,13 +359,19 @@ def validate_dispatch_plan(document: dict[str, Any], *, completed: bool) -> None
         "dispatch platform set",
     )
     contract = document.get("runner_contract")
+    require(isinstance(contract, dict), "dispatch runner contract")
+    max_in_flight = contract.get("maximum_workflows_in_flight")
     require(
-        isinstance(contract, dict)
-        and contract.get("maximum_workflows_in_flight") == 1
-        and isinstance(contract.get("trusted_x86_runner_name"), str)
-        and bool(contract["trusted_x86_runner_name"].strip())
-        and isinstance(contract.get("x86_cpu_class"), str)
-        and bool(contract["x86_cpu_class"].strip())
+        isinstance(max_in_flight, int)
+        and not isinstance(max_in_flight, bool)
+        and 1 <= max_in_flight <= WORKFLOW_RUN_COUNT,
+        "maximum_workflows_in_flight must be between 1 and 20",
+    )
+    require(
+        contract.get("trusted_x86_runner_name")
+        in (TRUSTED_X86_RUNNER_NAME, HOSTED_X86_RUNNER_NAME)
+        and contract.get("x86_cpu_class")
+        in (X86_CPU_CLASS, HOSTED_X86_CPU_CLASS)
         and contract.get("arm_cpu_class") == ARM_CPU_CLASS
         and contract.get("runner_worker_count_at_start") == 1,
         "dispatch runner contract",
@@ -302,70 +414,16 @@ def validate_dispatch_plan(document: dict[str, Any], *, completed: bool) -> None
     runs = document.get("runs")
     require(isinstance(runs, list), "dispatch runs")
     if completed:
-        require(len(runs) == 20, "completed dispatch requires exactly 20 runs")
-        run_ids: set[int] = set()
-        artifact_ids: set[int] = set()
-        artifact_names: set[str] = set()
-        artifact_digests: set[str] = set()
-        for sequence, run in enumerate(runs, 1):
-            require(
-                isinstance(run, dict)
-                and run.get("sequence") == sequence
-                and run.get("partition") == PARTITIONS[sequence]
-                and isinstance(run.get("run_id"), int)
-                and run["run_id"] > 0
-                and run.get("status") == "completed"
-                and run.get("conclusion") == "success",
-                f"dispatch run {sequence} is missing, partial, or unsuccessful",
-            )
-            require(run.get("attempt") == 1, f"dispatch run {sequence} was rerun")
-            require(
-                isinstance(run.get("artifacts"), list)
-                and run["artifacts"]
-                == sorted(run["artifacts"], key=lambda artifact: artifact["name"])
-                and {artifact.get("name") for artifact in run["artifacts"]}
-                == expected_artifact_names(run["run_id"])
-                and len(run["artifacts"]) == len(PLATFORM_CELLS)
-                and all(
-                    isinstance(artifact.get("id"), int)
-                    and artifact["id"] > 0
-                    and isinstance(artifact.get("size_in_bytes"), int)
-                    and artifact["size_in_bytes"] > 0
-                    and isinstance(artifact.get("digest_sha256"), str)
-                    and re.fullmatch(
-                        r"[0-9a-f]{64}", artifact["digest_sha256"]
-                    )
-                    is not None
-                    and artifact.get("run_id") == run["run_id"]
-                    and artifact.get("platform") in PLATFORM_CELLS
-                    and artifact.get("name")
-                    == (
-                        "wasi-thread-duration-cross-"
-                        f"{artifact['platform']}-{run['run_id']}-1"
-                    )
-                    and artifact.get("expired") is False
-                    for artifact in run["artifacts"]
-                ),
-                f"dispatch run {sequence} artifacts",
-            )
-            require(run["run_id"] not in run_ids, "dispatch duplicate run ID")
-            run_ids.add(run["run_id"])
-            for artifact in run["artifacts"]:
-                require(
-                    artifact["id"] not in artifact_ids,
-                    "dispatch duplicate artifact ID",
-                )
-                require(
-                    artifact["name"] not in artifact_names,
-                    "dispatch duplicate artifact name",
-                )
-                require(
-                    artifact["digest_sha256"] not in artifact_digests,
-                    "dispatch duplicate artifact ZIP identity",
-                )
-                artifact_ids.add(artifact["id"])
-                artifact_names.add(artifact["name"])
-                artifact_digests.add(artifact["digest_sha256"])
+        _validate_completed_runs_prefix(runs, require_full=True)
+    elif runs:
+        _validate_completed_runs_prefix(runs, require_full=False)
+
+
+def validate_partial_dispatch_state(document: dict[str, Any]) -> None:
+    validate_dispatch_plan(document, completed=False)
+    runs = document.get("runs")
+    require(isinstance(runs, list), "dispatch runs")
+    _validate_completed_runs_prefix(runs, require_full=False)
 
 
 def gh_json(arguments: list[str], timeout: float) -> Any:
@@ -427,14 +485,21 @@ def matching_runs(
     ]
 
 
-def find_run(plan: dict[str, Any], sequence: int, timeout: float) -> dict[str, Any]:
-    for _ in range(30):
+def find_run(
+    plan: dict[str, Any],
+    sequence: int,
+    timeout: float,
+    *,
+    attempts: int = 30,
+    interval_seconds: float = 2,
+) -> dict[str, Any]:
+    for _ in range(attempts):
         matches = matching_runs(plan, sequence, timeout)
         if len(matches) > 1:
             raise HarnessError(f"duplicate workflow runs found for sequence {sequence}")
         if matches:
             return matches[0]
-        time.sleep(2)
+        time.sleep(interval_seconds)
     raise HarnessError(f"could not locate workflow run for sequence {sequence}")
 
 
@@ -463,8 +528,13 @@ def require_recorded_run_unique(
 def require_live_dispatch_membership(
     document: dict[str, Any],
     timeout: float,
+    *,
+    allow_partial: bool = False,
 ) -> None:
-    validate_dispatch_plan(document, completed=True)
+    if allow_partial:
+        validate_partial_dispatch_state(document)
+    else:
+        validate_dispatch_plan(document, completed=True)
     require(timeout > 0, "workflow membership validation timed out")
     deadline = time.monotonic() + timeout
     for run in document["runs"]:
@@ -473,24 +543,27 @@ def require_live_dispatch_membership(
         require_recorded_run_unique(document, run, remaining)
 
 
+def fetch_run_artifacts(
+    document: dict[str, Any], run_id: int, timeout: float
+) -> list[dict[str, Any]]:
+    return parse_artifacts(
+        gh_json(
+            [
+                "api",
+                f"repos/{document['repository']}/actions/runs/{run_id}/artifacts",
+            ],
+            timeout,
+        ),
+        run_id,
+    )
+
+
 def require_remote_run_artifacts(
     document: dict[str, Any],
     run: dict[str, Any],
     timeout: float,
 ) -> None:
-    remote_artifacts = parse_artifacts(
-        gh_json(
-            [
-                "api",
-                (
-                    f"repos/{document['repository']}/actions/runs/"
-                    f"{run['run_id']}/artifacts"
-                ),
-            ],
-            timeout,
-        ),
-        run["run_id"],
-    )
+    remote_artifacts = fetch_run_artifacts(document, run["run_id"], timeout)
     require(
         remote_artifacts == run["artifacts"],
         f"run {run['run_id']} remote artifact inventory differs from "
@@ -516,10 +589,68 @@ def finalize_dispatch_state(document: dict[str, Any], timeout: float) -> None:
     validate_dispatch_plan(document, completed=True)
 
 
-def dispatch(plan_path: Path, output: Path, timeout_seconds: float) -> int:
+def dispatch_cohort(
+    plan_path: Path,
+    output_path: Path,
+    *,
+    poll_seconds: float = 60,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    lookup_attempts: int = 30,
+    lookup_seconds: float = 2,
+    start_sequence: int = 1,
+    end_sequence: int = WORKFLOW_RUN_COUNT,
+    concurrency: int | None = None,
+) -> dict[str, Any]:
+    require(
+        isinstance(start_sequence, int)
+        and not isinstance(start_sequence, bool)
+        and isinstance(end_sequence, int)
+        and not isinstance(end_sequence, bool)
+        and 1 <= start_sequence <= end_sequence <= WORKFLOW_RUN_COUNT,
+        "start_sequence and end_sequence must satisfy 1 <= start <= end <= 20",
+    )
     plan = json.loads(plan_path.read_text(encoding="UTF-8"))
     validate_dispatch_plan(plan, completed=False)
-    require(plan["runs"] == [], "dispatch plan already contains run observations")
+    if (
+        start_sequence == 1
+        and end_sequence == WORKFLOW_RUN_COUNT
+        and not output_path.exists()
+    ):
+        require(
+            plan["runs"] == [],
+            "dispatch plan already contains run observations",
+        )
+    state = copy.deepcopy(plan)
+    if output_path.exists() and (start_sequence > 1 or not state["runs"]):
+        existing = json.loads(output_path.read_text(encoding="UTF-8"))
+        if existing.get("runs"):
+            validate_dispatch_plan(existing, completed=False)
+            require(
+                existing.get("cohort_id") == plan["cohort_id"]
+                and existing.get("source_sha") == plan["source_sha"]
+                and existing.get("workflow_ref") == plan["workflow_ref"]
+                and existing.get("repository") == plan["repository"]
+                and existing.get("workflow") == plan["workflow"],
+                "existing output state does not match dispatch plan identity",
+            )
+            state = copy.deepcopy(existing)
+    if state["runs"]:
+        _validate_completed_runs_prefix(state["runs"], require_full=False)
+    require(
+        len(state["runs"]) >= start_sequence - 1,
+        f"cannot start at sequence {start_sequence} with {len(state['runs'])} completed runs",
+    )
+    effective_concurrency = (
+        concurrency
+        if concurrency is not None
+        else int(state["runner_contract"].get("maximum_workflows_in_flight", 1))
+    )
+    require(
+        isinstance(effective_concurrency, int)
+        and not isinstance(effective_concurrency, bool)
+        and 1 <= effective_concurrency <= WORKFLOW_RUN_COUNT,
+        "concurrency must be between 1 and 20",
+    )
     deadline = time.monotonic() + timeout_seconds
 
     def remaining(context: str) -> float:
@@ -528,13 +659,19 @@ def dispatch(plan_path: Path, output: Path, timeout_seconds: float) -> int:
             raise HarnessError(f"duration-cross dispatch timed out while {context}")
         return value
 
-    resolved = resolve_workflow_head(plan, remaining("resolving immutable tag"))
+    resolved = resolve_workflow_head(state, remaining("resolving immutable tag"))
     require(
-        resolved == plan["source_sha"],
-        f"immutable tag resolves to {resolved}, expected {plan['source_sha']}",
+        resolved == state["source_sha"],
+        f"immutable tag resolves to {resolved}, expected {state['source_sha']}",
     )
-    state = copy.deepcopy(plan)
-    for sequence in range(1, 21):
+    completed_sequences = {int(run["sequence"]) for run in state["runs"]}
+    pending_sequences = [
+        sequence
+        for sequence in range(start_sequence, end_sequence + 1)
+        if sequence not in completed_sequences
+    ]
+
+    def launch_sequence(sequence: int) -> dict[str, Any]:
         require(
             matching_runs(
                 state, sequence, remaining(f"checking sequence {sequence}")
@@ -565,10 +702,19 @@ def dispatch(plan_path: Path, output: Path, timeout_seconds: float) -> int:
             stderr=subprocess.STDOUT,
             timeout=remaining(f"dispatching sequence {sequence}"),
         )
-        run = find_run(state, sequence, remaining(f"finding sequence {sequence}"))
+        if lookup_attempts == 30 and lookup_seconds == 2:
+            run = find_run(state, sequence, remaining(f"finding sequence {sequence}"))
+        else:
+            run = find_run(
+                state,
+                sequence,
+                remaining(f"finding sequence {sequence}"),
+                attempts=lookup_attempts,
+                interval_seconds=lookup_seconds,
+            )
         run_id = run.get("databaseId")
         require(
-            isinstance(run_id, int) and run_id > 0,
+            isinstance(run_id, int) and not isinstance(run_id, bool) and run_id > 0,
             f"sequence {sequence} returned invalid run ID",
         )
         record = {
@@ -578,107 +724,145 @@ def dispatch(plan_path: Path, output: Path, timeout_seconds: float) -> int:
             "url": run.get("url"),
             "status": run.get("status"),
             "conclusion": run.get("conclusion") or "",
-            "attempt": None,
+            "attempt": run.get("attempt"),
             "artifacts": [],
         }
         state["runs"].append(record)
-        atomic_write_json(output, state)
-        while record["status"] != "completed":
-            time.sleep(min(60, remaining(f"waiting for sequence {sequence}")))
-            viewed = gh_json(
-                [
-                    "run",
-                    "view",
-                    str(run_id),
-                    "--repo",
-                    state["repository"],
-                    "--json",
-                    "attempt,status,conclusion,headSha,url",
-                ],
-                remaining(f"polling sequence {sequence}"),
-            )
-            require(
-                viewed.get("headSha") == state["workflow_head_sha"],
-                f"sequence {sequence} workflow head changed",
-            )
-            record.update(
-                {
-                    "status": viewed.get("status"),
-                    "conclusion": viewed.get("conclusion") or "",
-                    "url": viewed.get("url"),
-                    "attempt": viewed.get("attempt"),
-                }
-            )
-            atomic_write_json(output, state)
+        state["runs"].sort(key=lambda item: int(item["sequence"]))
+        atomic_write_json(output_path, state)
+        return record
+
+    def poll_record(record: dict[str, Any], context_prefix: str) -> None:
+        sequence = record["sequence"]
+        run_id = record["run_id"]
+        viewed = gh_json(
+            [
+                "run",
+                "view",
+                str(run_id),
+                "--repo",
+                state["repository"],
+                "--json",
+                "attempt,status,conclusion,headSha,url",
+            ],
+            remaining(f"{context_prefix} sequence {sequence}"),
+        )
+        require(
+            viewed.get("headSha") == state["workflow_head_sha"],
+            f"sequence {sequence} workflow head changed",
+        )
+        record.update(
+            {
+                "status": viewed.get("status"),
+                "conclusion": viewed.get("conclusion") or "",
+                "url": viewed.get("url"),
+                "attempt": viewed.get("attempt"),
+            }
+        )
+        atomic_write_json(output_path, state)
+
+    def finalize_record(record: dict[str, Any]) -> None:
+        sequence = record["sequence"]
+        run_id = record["run_id"]
         if record["attempt"] is None:
-            viewed = gh_json(
-                [
-                    "run",
-                    "view",
-                    str(run_id),
-                    "--repo",
-                    state["repository"],
-                    "--json",
-                    "attempt,status,conclusion,headSha,url",
-                ],
-                remaining(f"validating sequence {sequence}"),
-            )
-            require(
-                viewed.get("headSha") == state["workflow_head_sha"],
-                f"sequence {sequence} workflow head changed",
-            )
-            record.update(
-                {
-                    "status": viewed.get("status"),
-                    "conclusion": viewed.get("conclusion") or "",
-                    "url": viewed.get("url"),
-                    "attempt": viewed.get("attempt"),
-                }
-            )
-            atomic_write_json(output, state)
+            poll_record(record, "validating")
         if record["conclusion"] != "success":
             raise HarnessError(
                 f"sequence {sequence} concluded {record['conclusion']}; "
                 "the observation is retained and will not be retried or replaced"
             )
         require(record["attempt"] == 1, f"sequence {sequence} was rerun")
-        record["artifacts"] = parse_artifacts(
-            gh_json(
-                [
-                    "api",
-                    f"repos/{state['repository']}/actions/runs/{run_id}/artifacts",
-                ],
-                remaining(f"listing artifacts for sequence {sequence}"),
-            ),
+        record["artifacts"] = fetch_run_artifacts(
+            state,
             run_id,
+            remaining(f"listing artifacts for sequence {sequence}"),
         )
         require_recorded_run_unique(
             state,
             record,
             remaining(f"rechecking sequence {sequence}"),
         )
-        atomic_write_json(output, state)
-    finalize_dispatch_state(state, remaining("finalizing dispatch membership"))
-    atomic_write_json(output, state)
-    print(f"recorded 20 successful no-retry workflows in {output}")
+        atomic_write_json(output_path, state)
+
+    active_records: list[dict[str, Any]] = []
+    while pending_sequences or active_records:
+        while pending_sequences and len(active_records) < effective_concurrency:
+            active_records.append(launch_sequence(pending_sequences.pop(0)))
+        completed_now = [
+            record
+            for record in active_records
+            if record["status"] == "completed"
+        ]
+        if completed_now:
+            for record in completed_now:
+                finalize_record(record)
+                active_records.remove(record)
+            continue
+        time.sleep(
+            min(
+                poll_seconds,
+                remaining(
+                    f"waiting for sequence {active_records[0]['sequence']}"
+                ),
+            )
+        )
+        for record in active_records:
+            poll_record(record, "polling")
+
+    if len(state["runs"]) == WORKFLOW_RUN_COUNT:
+        finalize_dispatch_state(state, remaining("finalizing dispatch membership"))
+    else:
+        validate_partial_dispatch_state(state)
+    atomic_write_json(output_path, state)
+    return state
+
+
+def dispatch(
+    plan_path: Path,
+    output: Path,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    *,
+    start_sequence: int = 1,
+    end_sequence: int = WORKFLOW_RUN_COUNT,
+    concurrency: int | None = None,
+) -> int:
+    state = dispatch_cohort(
+        plan_path,
+        output,
+        timeout_seconds=timeout_seconds,
+        start_sequence=start_sequence,
+        end_sequence=end_sequence,
+        concurrency=concurrency,
+    )
+    print(
+        f"recorded {len(state['runs'])} successful no-retry workflows in {output}"
+    )
     return 0
 
 
 def download_artifacts(
     dispatch_path: Path,
     output_dir: Path,
-    manifest_path: Path,
-    timeout_seconds: float,
+    manifest_path: Path | None = None,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    *,
+    allow_partial: bool = False,
 ) -> int:
     dispatch_document = json.loads(dispatch_path.read_text(encoding="UTF-8"))
-    validate_dispatch_plan(dispatch_document, completed=True)
+    if allow_partial:
+        validate_partial_dispatch_state(dispatch_document)
+    else:
+        validate_dispatch_plan(dispatch_document, completed=True)
     require(timeout_seconds > 0, "download timeout must be positive")
     deadline = time.monotonic() + timeout_seconds
     require_live_dispatch_membership(
         dispatch_document,
         deadline - time.monotonic(),
+        allow_partial=allow_partial,
     )
     output_dir = output_dir.resolve()
+    if manifest_path is None:
+        manifest_path = output_dir.parent / f"{output_dir.name}-manifest.json"
     require(
         manifest_path.resolve() != output_dir
         and output_dir not in manifest_path.resolve().parents,
@@ -686,10 +870,11 @@ def download_artifacts(
     )
     if os.getenv("GITHUB_ACTIONS") == "true":
         require(str(output_dir).startswith("/d/"), "downloads must remain under /d")
-    require(
-        not output_dir.exists() or not any(output_dir.iterdir()),
-        "download directory must be absent or empty; partial downloads are not reusable",
-    )
+    if not allow_partial:
+        require(
+            not output_dir.exists() or not any(output_dir.iterdir()),
+            "download directory must be absent or empty; partial downloads are not reusable",
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     entries = []
     for run in dispatch_document["runs"]:
@@ -719,46 +904,60 @@ def download_artifacts(
         require_remote_run_artifacts(dispatch_document, run, remaining)
         for artifact in run["artifacts"]:
             artifact_dir = output_dir / artifact["name"]
-            artifact_dir.mkdir(parents=True, exist_ok=False)
             artifact_zip = artifact_dir / "artifact.zip"
-            remaining = deadline - time.monotonic()
-            require(remaining > 0, "artifact download timed out")
-            with artifact_zip.open("wb") as output_stream:
-                subprocess.run(
-                    [
-                        "gh",
-                        "api",
-                        (
-                            f"repos/{dispatch_document['repository']}/actions/"
-                            f"artifacts/{artifact['id']}/zip"
-                        ),
-                    ],
-                    check=True,
-                    stdout=output_stream,
-                    stderr=subprocess.PIPE,
-                    timeout=remaining,
-                )
-            require(
-                artifact_zip.stat().st_size == artifact["size_in_bytes"]
-                and sha256_file(artifact_zip) == artifact["digest_sha256"],
-                f"artifact {artifact['name']} ZIP differs from dispatch identity",
+            report_json_path = artifact_dir / "report.json"
+            report_md_path = artifact_dir / "report.md"
+            reused = (
+                allow_partial
+                and artifact_dir.is_dir()
+                and artifact_zip.is_file()
+                and report_json_path.is_file()
+                and report_md_path.is_file()
+                and artifact_zip.stat().st_size == artifact["size_in_bytes"]
+                and sha256_file(artifact_zip) == artifact["digest_sha256"]
             )
-            with zipfile.ZipFile(artifact_zip) as archive:
-                members = archive.infolist()
+            if not reused:
+                if allow_partial and artifact_dir.exists():
+                    shutil.rmtree(artifact_dir)
+                artifact_dir.mkdir(parents=True, exist_ok=False)
+                remaining = deadline - time.monotonic()
+                require(remaining > 0, "artifact download timed out")
+                with artifact_zip.open("wb") as output_stream:
+                    subprocess.run(
+                        [
+                            "gh",
+                            "api",
+                            (
+                                f"repos/{dispatch_document['repository']}/actions/"
+                                f"artifacts/{artifact['id']}/zip"
+                            ),
+                        ],
+                        check=True,
+                        stdout=output_stream,
+                        stderr=subprocess.PIPE,
+                        timeout=remaining,
+                    )
                 require(
-                    sorted(member.filename for member in members)
-                    == ["report.json", "report.md"]
-                    and all(not member.is_dir() for member in members),
-                    f"artifact {artifact['name']} is partial or contains unexpected files",
+                    artifact_zip.stat().st_size == artifact["size_in_bytes"]
+                    and sha256_file(artifact_zip) == artifact["digest_sha256"],
+                    f"artifact {artifact['name']} ZIP differs from dispatch identity",
                 )
-                for member in members:
+                with zipfile.ZipFile(artifact_zip) as archive:
+                    members = archive.infolist()
                     require(
-                        (member.external_attr >> 16) & 0o170000 != 0o120000,
-                        f"artifact {artifact['name']} contains a symbolic link",
+                        sorted(member.filename for member in members)
+                        == ["report.json", "report.md"]
+                        and all(not member.is_dir() for member in members),
+                        f"artifact {artifact['name']} is partial or contains unexpected files",
                     )
-                    (artifact_dir / member.filename).write_bytes(
-                        archive.read(member.filename)
-                    )
+                    for member in members:
+                        require(
+                            (member.external_attr >> 16) & 0o170000 != 0o120000,
+                            f"artifact {artifact['name']} contains a symbolic link",
+                        )
+                        (artifact_dir / member.filename).write_bytes(
+                            archive.read(member.filename)
+                        )
             files = sorted(
                 path.relative_to(artifact_dir).as_posix()
                 for path in artifact_dir.rglob("*")
@@ -815,7 +1014,7 @@ def download_artifacts(
         ),
     }
     atomic_write_json(manifest_path, manifest)
-    print(f"downloaded 40 exact diagnostic artifacts into {output_dir}")
+    print(f"downloaded {len(entries)} exact diagnostic artifacts into {output_dir}")
     return 0
 
 
@@ -866,7 +1065,16 @@ def validate_download_manifest(
     manifest: dict[str, Any],
     dispatch_document: dict[str, Any],
     input_dir: Path,
+    *,
+    allow_partial: bool = False,
 ) -> list[Path]:
+    if allow_partial:
+        validate_partial_dispatch_state(dispatch_document)
+        expected_sequences = [
+            int(run["sequence"]) for run in dispatch_document["runs"]
+        ]
+    else:
+        expected_sequences = list(range(1, WORKFLOW_RUN_COUNT + 1))
     require(
         manifest.get("schema_version") == COHORT_SCHEMA_VERSION
         and manifest.get("kind") == DOWNLOAD_MANIFEST_KIND
@@ -877,12 +1085,13 @@ def validate_download_manifest(
     )
     entries = manifest.get("entries")
     require(
-        isinstance(entries, list) and len(entries) == 40,
+        isinstance(entries, list)
+        and len(entries) == len(expected_sequences) * len(PLATFORM_CELLS),
         "download manifest membership",
     )
     expected = {
         (sequence, platform)
-        for sequence in range(1, 21)
+        for sequence in expected_sequences
         for platform in PLATFORM_CELLS
     }
     seen = set()
@@ -1038,10 +1247,21 @@ def build_validated_cohort(
     input_dir: Path,
     dispatch_document: dict[str, Any],
     manifest: dict[str, Any],
+    *,
+    allow_partial: bool = False,
 ) -> dict[str, Any]:
-    validate_dispatch_plan(dispatch_document, completed=True)
+    if allow_partial:
+        validate_partial_dispatch_state(dispatch_document)
+        expected_sequences = [
+            int(run["sequence"]) for run in dispatch_document["runs"]
+        ]
+    else:
+        validate_dispatch_plan(dispatch_document, completed=True)
+        expected_sequences = list(range(1, WORKFLOW_RUN_COUNT + 1))
     input_dir = input_dir.resolve()
-    paths = validate_download_manifest(manifest, dispatch_document, input_dir)
+    paths = validate_download_manifest(
+        manifest, dispatch_document, input_dir, allow_partial=allow_partial
+    )
     manifest_entries = {
         (entry["sequence"], entry["platform"]): entry
         for entry in manifest["entries"]
@@ -1212,24 +1432,31 @@ def build_validated_cohort(
         )
     expected_keys = {
         (sequence, platform)
-        for sequence in range(1, 21)
+        for sequence in expected_sequences
         for platform in PLATFORM_CELLS
     }
     require(seen == expected_keys, "cohort has missing, partial, or unexpected membership")
+    expected_platform_count = len(expected_sequences)
     require(
-        all(platform_counts[platform] == 20 for platform in PLATFORM_CELLS),
-        "cohort must contain exactly 20 reports per platform",
+        all(
+            platform_counts[platform] == expected_platform_count
+            for platform in PLATFORM_CELLS
+        ),
+        f"cohort must contain exactly {expected_platform_count} reports per platform",
+    )
+    expected_partition_counter = Counter(
+        PARTITIONS[sequence] for sequence in expected_sequences
     )
     require(
         all(
-            partition_counts[platform] == Counter({"training": 16, "holdout": 4})
+            partition_counts[platform] == expected_partition_counter
             for platform in PLATFORM_CELLS
         ),
-        "cohort partition counts must be 16 training and 4 holdout per platform",
+        "cohort partition counts do not match predeclared sequence membership",
     )
     require(
         all(platforms == set(PLATFORM_CELLS) for platforms in run_platforms.values())
-        and len(run_platforms) == 20,
+        and len(run_platforms) == expected_platform_count,
         "cohort contains a partial cross-platform workflow",
     )
     cohort = {
@@ -1254,7 +1481,7 @@ def build_validated_cohort(
             reports, key=lambda item: (item["sequence"], item["platform"])
         ),
     }
-    validate_cohort_document(cohort)
+    validate_cohort_document(cohort, allow_partial=allow_partial)
     return cohort
 
 
@@ -1263,21 +1490,27 @@ def validate_cohort(
     dispatch_path: Path,
     manifest_path: Path,
     output: Path,
+    *,
+    allow_partial: bool = False,
 ) -> int:
     dispatch_document = json.loads(dispatch_path.read_text(encoding="UTF-8"))
     manifest = json.loads(manifest_path.read_text(encoding="UTF-8"))
-    cohort = build_validated_cohort(input_dir, dispatch_document, manifest)
+    cohort = build_validated_cohort(
+        input_dir, dispatch_document, manifest, allow_partial=allow_partial
+    )
     atomic_write_json(output, cohort)
     markdown_output_path(output).write_text(
         render_cohort_markdown(cohort) + "\n",
         encoding="UTF-8",
         newline="\n",
     )
-    print(f"validated 40 duration-cross reports in {output}")
+    print(f"validated {len(cohort['observations'])} duration-cross reports in {output}")
     return 0
 
 
-def validate_cohort_document(cohort: dict[str, Any]) -> None:
+def validate_cohort_document(
+    cohort: dict[str, Any], *, allow_partial: bool = False
+) -> None:
     require(cohort.get("schema_version") == COHORT_SCHEMA_VERSION, "cohort schema")
     require(cohort.get("kind") == COHORT_KIND, "cohort kind")
     require(cohort.get("authoritative") is False, "cohort authoritative identity")
@@ -1293,18 +1526,33 @@ def validate_cohort_document(cohort: dict[str, Any]) -> None:
     )
     dispatch_document = cohort.get("dispatch")
     require(isinstance(dispatch_document, dict), "cohort dispatch")
-    validate_dispatch_plan(dispatch_document, completed=True)
+    if allow_partial:
+        validate_partial_dispatch_state(dispatch_document)
+        expected_sequences = [
+            int(run["sequence"]) for run in dispatch_document["runs"]
+        ]
+    else:
+        validate_dispatch_plan(dispatch_document, completed=True)
+        expected_sequences = list(range(1, WORKFLOW_RUN_COUNT + 1))
+    expected_platform_count = len(expected_sequences)
+    expected_partition_counts = dict(
+        Counter(PARTITIONS[sequence] for sequence in expected_sequences)
+    )
     observations = cohort.get("observations")
-    require(isinstance(observations, list) and len(observations) == 40, "cohort observations")
+    require(
+        isinstance(observations, list)
+        and len(observations) == expected_platform_count * len(PLATFORM_CELLS),
+        "cohort observations",
+    )
     require(
         cohort.get("platform_counts")
-        == {platform: 20 for platform in PLATFORM_CELLS},
+        == {platform: expected_platform_count for platform in PLATFORM_CELLS},
         "cohort platform counts",
     )
     require(
         cohort.get("partition_counts")
         == {
-            platform: {"training": 16, "holdout": 4}
+            platform: expected_partition_counts
             for platform in PLATFORM_CELLS
         },
         "cohort partition counts",
@@ -1463,7 +1711,7 @@ def validate_cohort_document(cohort: dict[str, Any]) -> None:
         seen
         == {
             (sequence, platform)
-            for sequence in range(1, 21)
+            for sequence in expected_sequences
             for platform in PLATFORM_CELLS
         },
         "cohort observation membership",
@@ -1835,8 +2083,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     plan_parser = sub.add_parser("plan")
     plan_parser.add_argument("--source-sha", required=True)
     plan_parser.add_argument("--workflow-ref", required=True)
-    plan_parser.add_argument("--repository", default="cataggar/wamr")
+    plan_parser.add_argument("--repository", default=DEFAULT_REPOSITORY)
     plan_parser.add_argument("--cohort-id")
+    plan_parser.add_argument(
+        "--max-workflows-in-flight", type=int, default=1
+    )
+    plan_parser.add_argument(
+        "--trusted-x86-runner-name", default=TRUSTED_X86_RUNNER_NAME
+    )
+    plan_parser.add_argument("--x86-cpu-class", default=X86_CPU_CLASS)
     plan_parser.add_argument(
         "--output", type=Path, default=Path("wasi-thread-duration-cross-dispatch.json")
     )
@@ -1848,6 +2103,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     dispatch_parser.add_argument(
         "--timeout-seconds", type=float, default=DEFAULT_TIMEOUT_SECONDS
     )
+    dispatch_parser.add_argument("--start-sequence", type=int, default=1)
+    dispatch_parser.add_argument(
+        "--end-sequence", type=int, default=WORKFLOW_RUN_COUNT
+    )
+    dispatch_parser.add_argument("--concurrency", type=int, default=None)
     download_parser = sub.add_parser("download")
     download_parser.add_argument("--dispatch", type=Path, required=True)
     download_parser.add_argument("--output-dir", type=Path, required=True)
@@ -1855,6 +2115,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     download_parser.add_argument(
         "--timeout-seconds", type=float, default=DEFAULT_TIMEOUT_SECONDS
     )
+    download_parser.add_argument("--allow-partial", action="store_true")
     validate_parser = sub.add_parser("validate")
     validate_parser.add_argument("--input-dir", type=Path, required=True)
     validate_parser.add_argument("--dispatch", type=Path, required=True)
@@ -1862,6 +2123,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     validate_parser.add_argument(
         "--output", type=Path, default=Path("wasi-thread-duration-cross-cohort.json")
     )
+    validate_parser.add_argument("--allow-partial", action="store_true")
     analyze_parser = sub.add_parser("analyze")
     analyze_parser.add_argument("--cohort", type=Path, required=True)
     analyze_parser.add_argument("--input-dir", type=Path, required=True)
@@ -1886,19 +2148,32 @@ def main(argv: list[str] | None = None) -> int:
                 workflow_ref=args.workflow_ref,
                 repository=args.repository,
                 cohort_id=args.cohort_id,
+                max_workflows_in_flight=getattr(args, "max_workflows_in_flight", 1),
+                trusted_x86_runner_name=getattr(
+                    args, "trusted_x86_runner_name", TRUSTED_X86_RUNNER_NAME
+                ),
+                x86_cpu_class=getattr(args, "x86_cpu_class", X86_CPU_CLASS),
             )
             validate_dispatch_plan(document, completed=False)
             atomic_write_json(args.output, document)
             print(f"wrote predeclared 20-workflow plan to {args.output}")
             return 0
         if args.command == "dispatch":
-            return dispatch(args.plan, args.output, args.timeout_seconds)
+            return dispatch(
+                args.plan,
+                args.output,
+                args.timeout_seconds,
+                start_sequence=getattr(args, "start_sequence", 1),
+                end_sequence=getattr(args, "end_sequence", WORKFLOW_RUN_COUNT),
+                concurrency=getattr(args, "concurrency", None),
+            )
         if args.command == "download":
             return download_artifacts(
                 args.dispatch,
                 args.output_dir,
                 args.manifest,
                 args.timeout_seconds,
+                allow_partial=getattr(args, "allow_partial", False),
             )
         if args.command == "validate":
             return validate_cohort(
@@ -1906,6 +2181,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.dispatch,
                 args.manifest,
                 args.output,
+                allow_partial=getattr(args, "allow_partial", False),
             )
         return analyze(
             args.cohort,

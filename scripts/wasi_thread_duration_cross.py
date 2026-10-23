@@ -73,6 +73,8 @@ ARMS = ("current", "doubled")
 PARTITIONS = {sequence: ("training" if sequence <= 16 else "holdout") for sequence in range(1, 21)}
 TRUSTED_X86_RUNNER_NAME = "vm31e-wamr-temp-20260906"
 X86_CPU_CLASS = "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz"
+HOSTED_X86_RUNNER_NAME = "github-hosted-ubuntu-22.04"
+HOSTED_X86_CPU_CLASS = "AMD EPYC 7763 64-Core Processor"
 ARM_CPU_CLASS = "Neoverse-N2"
 INVOCATION_TIMEOUT_SECONDS = 180.0
 MINIMUM_INTERVAL_NS = 1_250_000_000
