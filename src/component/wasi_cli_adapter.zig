@@ -7314,6 +7314,146 @@ pub const Cas = struct {
     }
 };
 
+/// Stored object inside a `wasi:blobstore` backing container (#972 E2).
+pub const BlobstoreObject = struct {
+    data: []u8,
+    created_at: u64,
+};
+
+/// Backing store for a named `wasi:blobstore` container (#972 E2).
+/// Persists across opening/dropping `container` resource handles until
+/// `delete-container` or adapter teardown.
+pub const BlobstoreBackingContainer = struct {
+    name: []u8,
+    created_at: u64,
+    objects: std.StringHashMapUnmanaged(BlobstoreObject) = .empty,
+
+    pub fn deinit(self: *BlobstoreBackingContainer, allocator: Allocator) void {
+        var it = self.objects.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.data);
+        }
+        self.objects.deinit(allocator);
+        allocator.free(self.name);
+    }
+
+    pub fn clearObjects(self: *BlobstoreBackingContainer, allocator: Allocator) void {
+        var it = self.objects.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.data);
+        }
+        self.objects.clearRetainingCapacity();
+    }
+
+    pub fn putObject(
+        self: *BlobstoreBackingContainer,
+        allocator: Allocator,
+        object_name: []const u8,
+        data: []const u8,
+        created_at: u64,
+    ) !void {
+        const data_copy = try allocator.dupe(u8, data);
+        errdefer allocator.free(data_copy);
+        if (self.objects.getPtr(object_name)) |existing| {
+            allocator.free(existing.data);
+            existing.data = data_copy;
+            existing.created_at = created_at;
+        } else {
+            const key_copy = try allocator.dupe(u8, object_name);
+            errdefer allocator.free(key_copy);
+            try self.objects.put(allocator, key_copy, .{
+                .data = data_copy,
+                .created_at = created_at,
+            });
+        }
+    }
+
+    pub fn removeObject(
+        self: *BlobstoreBackingContainer,
+        allocator: Allocator,
+        object_name: []const u8,
+    ) bool {
+        if (self.objects.fetchRemove(object_name)) |kv| {
+            allocator.free(kv.key);
+            allocator.free(kv.value.data);
+            return true;
+        }
+        return false;
+    }
+};
+
+pub const BlobstoreWriteTarget = struct {
+    container_name: []u8,
+    object_name: []u8,
+};
+
+pub const BlobstoreContainerRep = struct {
+    container_name: []u8,
+};
+
+pub const BlobstoreStreamObjectNamesRep = struct {
+    names: std.ArrayListUnmanaged([]u8) = .empty,
+    cursor: usize = 0,
+};
+
+pub const BlobstoreOutgoingValueRep = struct {
+    stream_owner: ?*OutputStreamOwner = null,
+    child_stream_handle: ?u32 = null,
+    stream_taken: bool = false,
+    finished: bool = false,
+    targets: std.ArrayListUnmanaged(BlobstoreWriteTarget) = .empty,
+};
+
+pub const BlobstoreIncomingValueRep = struct {
+    data: ?[]u8 = null,
+    byte_size: u64 = 0,
+    consumed: bool = false,
+};
+
+pub const BlobstoreResourceKind = union(enum) {
+    container: BlobstoreContainerRep,
+    stream_object_names: BlobstoreStreamObjectNamesRep,
+    outgoing_value: BlobstoreOutgoingValueRep,
+    incoming_value: BlobstoreIncomingValueRep,
+};
+
+pub const BlobstoreResource = struct {
+    active_borrows: std.atomic.Value(u32) = .init(0),
+    operation_claim: stable_resource.ConditionalOperationClaim = .init,
+    kind: BlobstoreResourceKind,
+
+    pub fn deinit(self: *BlobstoreResource, allocator: Allocator) void {
+        switch (self.kind) {
+            .container => |*c| {
+                allocator.free(c.container_name);
+            },
+            .stream_object_names => |*s| {
+                for (s.names.items) |n| allocator.free(n);
+                s.names.deinit(allocator);
+            },
+            .outgoing_value => |*ov| {
+                if (ov.stream_owner) |owner| {
+                    owner.release();
+                    ov.stream_owner = null;
+                }
+                for (ov.targets.items) |t| {
+                    allocator.free(t.container_name);
+                    allocator.free(t.object_name);
+                }
+                ov.targets.deinit(allocator);
+            },
+            .incoming_value => |*iv| {
+                if (iv.data) |d| {
+                    allocator.free(d);
+                    iv.data = null;
+                }
+            },
+        }
+    }
+};
+
 /// `wasi:keyvalue` persistence-layer snapshot (#583 B4 follow-up, #972).
 ///
 /// Mirrors the JSON file at `WasiCliAdapter.keyvalue_store_path` —
@@ -7543,6 +7683,7 @@ const OutputStreamResource = struct {
     owned: bool,
     owner: ?*OutputStreamOwner = null,
     http_outgoing_body_handle: ?u32 = null,
+    blobstore_outgoing_value_handle: ?u32 = null,
     descriptor_lease: ?FsDescriptorTable.Lease = null,
     socket_lease: ?SocketTable.Lease = null,
     operation_claim: stable_resource.ConditionalOperationClaim = .init,
@@ -7688,6 +7829,11 @@ fn destroyKeyvalueBucket(allocator: Allocator, bucket: **KeyvalueBucket) void {
 fn destroyCas(allocator: Allocator, cas: **Cas) void {
     cas.*.deinit(allocator);
     allocator.destroy(cas.*);
+}
+
+fn destroyBlobstoreResource(allocator: Allocator, res: **BlobstoreResource) void {
+    res.*.deinit(allocator);
+    allocator.destroy(res.*);
 }
 
 fn destroyPollable(_: void, _: *Pollable) void {}
@@ -7945,6 +8091,12 @@ const CasTable = adapter_resource.ResourceTable(
     destroyCas,
     false,
 );
+const BlobstoreResourceTable = adapter_resource.ResourceTable(
+    *BlobstoreResource,
+    Allocator,
+    destroyBlobstoreResource,
+    true,
+);
 const PollableTable = adapter_resource.ResourceTable(
     Pollable,
     void,
@@ -8147,6 +8299,11 @@ pub const WasiCliAdapter = struct {
     keyvalue_store_iface: HostInstance = .{},
     keyvalue_atomics_iface: HostInstance = .{},
     keyvalue_batch_iface: HostInstance = .{},
+
+    // ── wasi:blobstore@0.2.0-draft host instances (#972 E2) ──────────
+    blobstore_iface: HostInstance = .{},
+    blobstore_container_iface: HostInstance = .{},
+    blobstore_types_iface: HostInstance = .{},
 
     /// `wasi:config/store@0.2.0-rc.1` host instance (#583 B6). Members
     /// (`get`, `get-all`) registered by `populateWasiConfigStore`. Backed
@@ -8413,6 +8570,14 @@ pub const WasiCliAdapter = struct {
     keyvalue_store_path: ?[]const u8 = null,
     keyvalue_flush_count: usize = 0,
     keyvalue_state_claim: stable_resource.ConditionalOperationClaim = .init,
+
+    /// `wasi:blobstore` backing container store (#972 E2), keyed by
+    /// container name.
+    blobstore_containers_store: std.StringHashMapUnmanaged(*BlobstoreBackingContainer) = .empty,
+    blobstore_state_claim: stable_resource.ConditionalOperationClaim = .init,
+    /// Unified resource table for `wasi:blobstore` (`container`,
+    /// `stream-object-names`, `outgoing-value`, `incoming-value`) (#972 E2).
+    blobstore_resources: BlobstoreResourceTable,
     /// `wasi:io/poll.pollable` table. Pollables borrow their source
     /// resources and become ready if that source is dropped/closed, so the
     /// guest can observe the underlying closed/error condition without UAF.
@@ -8527,6 +8692,7 @@ pub const WasiCliAdapter = struct {
             .http_request_options_p3 = RequestOptionsTable.init(allocator, allocator),
             .keyvalue_buckets = KeyvalueBucketTable.init(allocator, allocator),
             .cas_table = CasTable.init(allocator, allocator),
+            .blobstore_resources = BlobstoreResourceTable.init(allocator, allocator),
             .pollable_table = PollableTable.init(allocator, {}),
             .pending_udp_receives = PendingUdpReceiveTable.init(allocator, {}),
             .pending_http_fetches = PendingHttpFetchTable.init(allocator, allocator),
@@ -8603,6 +8769,7 @@ pub const WasiCliAdapter = struct {
             .http_request_options_p3 = RequestOptionsTable.init(allocator, allocator),
             .keyvalue_buckets = KeyvalueBucketTable.init(allocator, allocator),
             .cas_table = CasTable.init(allocator, allocator),
+            .blobstore_resources = BlobstoreResourceTable.init(allocator, allocator),
             .pollable_table = PollableTable.init(allocator, {}),
             .pending_udp_receives = PendingUdpReceiveTable.init(allocator, {}),
             .pending_http_fetches = PendingHttpFetchTable.init(allocator, allocator),
@@ -8654,6 +8821,9 @@ pub const WasiCliAdapter = struct {
         self.keyvalue_store_iface.deinit(self.allocator);
         self.keyvalue_atomics_iface.deinit(self.allocator);
         self.keyvalue_batch_iface.deinit(self.allocator);
+        self.blobstore_iface.deinit(self.allocator);
+        self.blobstore_container_iface.deinit(self.allocator);
+        self.blobstore_types_iface.deinit(self.allocator);
 
         // wasi:config/store@0.2.0-rc.1 (#583 B6).
         self.config_store_iface.deinit(self.allocator);
@@ -8719,6 +8889,8 @@ pub const WasiCliAdapter = struct {
             @panic("WasiCliAdapter destroyed with outstanding incoming-body leases");
         self.http_outgoing_bodies.deinit() catch
             @panic("WasiCliAdapter destroyed with outstanding outgoing-body leases");
+        self.blobstore_resources.deinit() catch
+            @panic("WasiCliAdapter destroyed with outstanding blobstore resource leases");
         self.stream_table.deinit() catch
             @panic("WasiCliAdapter destroyed with outstanding output-stream leases");
         self.input_stream_table.deinit() catch
@@ -8794,6 +8966,13 @@ pub const WasiCliAdapter = struct {
         self.keyvalue_persisted.deinit(self.allocator);
         if (self.keyvalue_store_path) |p| self.allocator.free(p);
 
+        var bit = self.blobstore_containers_store.iterator();
+        while (bit.next()) |kv| {
+            kv.value_ptr.*.deinit(self.allocator);
+            self.allocator.destroy(kv.value_ptr.*);
+        }
+        self.blobstore_containers_store.deinit(self.allocator);
+
         self.pollable_table.deinit() catch
             @panic("WasiCliAdapter destroyed with outstanding pollable leases");
     }
@@ -8817,6 +8996,7 @@ pub const WasiCliAdapter = struct {
         // leases. Retire in dependency order.
         self.http_incoming_bodies.shutdown();
         self.http_outgoing_bodies.shutdown();
+        self.blobstore_resources.shutdown();
         self.stream_table.shutdown();
         self.input_stream_table.shutdown();
 
@@ -8857,6 +9037,7 @@ pub const WasiCliAdapter = struct {
             self.fs_read_stream_ctxs.isQuiescent() and
             self.http_incoming_bodies.isQuiescent() and
             self.http_outgoing_bodies.isQuiescent() and
+            self.blobstore_resources.isQuiescent() and
             self.stream_table.isQuiescent() and
             self.input_stream_table.isQuiescent() and
             self.pollable_table.isQuiescent() and
@@ -13248,38 +13429,45 @@ pub const WasiCliAdapter = struct {
             .list => |pl| pl,
             else => return error.InvalidArgs,
         };
-        var stream_lease = self.lookupStream(handle) orelse return error.InvalidHandle;
-        defer stream_lease.release();
-        const resource = stream_lease.value();
-        if (resource.http_outgoing_body_handle != null) {
-            const owner = resource.owner orelse return error.InvalidHandle;
-            owner.retain();
-            stream_lease.release();
-            defer owner.release();
+        var blobstore_ov_handle: ?u32 = null;
+        {
+            var stream_lease = self.lookupStream(handle) orelse return error.InvalidHandle;
+            defer stream_lease.release();
+            const resource = stream_lease.value();
+            if (resource.http_outgoing_body_handle != null) {
+                const owner = resource.owner orelse return error.InvalidHandle;
+                owner.retain();
+                stream_lease.release();
+                defer owner.release();
+                const bytes = ci.readGuestBytes(list.ptr, list.len) orelse
+                    return error.OutOfBoundsMemory;
+                try self.writeOwnedHttpBodyStream(owner, bytes, true);
+                results[0] = .{ .result_val = .{
+                    .is_ok = true,
+                    .payload = null,
+                } };
+                return;
+            }
+            blobstore_ov_handle = resource.blobstore_outgoing_value_handle;
+            const claim = resource.claim();
+            claim.acquire();
+            defer claim.release();
+            const stream = resource.stream;
             const bytes = ci.readGuestBytes(list.ptr, list.len) orelse
                 return error.OutOfBoundsMemory;
-            try self.writeOwnedHttpBodyStream(owner, bytes, true);
-            results[0] = .{ .result_val = .{
-                .is_ok = true,
-                .payload = null,
-            } };
-            return;
+            switch (stream.write(bytes, self.allocator)) {
+                .ok => {},
+                .err, .closed => return error.IoError,
+            }
+            // `blocking-write-and-flush` semantically includes a flush.
+            // Honor `descriptor-flags` sync bits for host-file sinks (#181).
+            switch (stream.flush()) {
+                .ok => {},
+                .err, .closed => return error.IoError,
+            }
         }
-        const claim = resource.claim();
-        claim.acquire();
-        defer claim.release();
-        const stream = resource.stream;
-        const bytes = ci.readGuestBytes(list.ptr, list.len) orelse
-            return error.OutOfBoundsMemory;
-        switch (stream.write(bytes, self.allocator)) {
-            .ok => {},
-            .err, .closed => return error.IoError,
-        }
-        // `blocking-write-and-flush` semantically includes a flush.
-        // Honor `descriptor-flags` sync bits for host-file sinks (#181).
-        switch (stream.flush()) {
-            .ok => {},
-            .err, .closed => return error.IoError,
+        if (blobstore_ov_handle) |ov_handle| {
+            try self.syncBlobstoreOutgoingValue(ov_handle);
         }
         results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
     }
@@ -13304,32 +13492,39 @@ pub const WasiCliAdapter = struct {
             .list => |pl| pl,
             else => return error.InvalidArgs,
         };
-        var stream_lease = self.lookupStream(handle) orelse return error.InvalidHandle;
-        defer stream_lease.release();
-        const resource = stream_lease.value();
-        if (resource.http_outgoing_body_handle != null) {
-            const owner = resource.owner orelse return error.InvalidHandle;
-            owner.retain();
-            stream_lease.release();
-            defer owner.release();
+        var blobstore_ov_handle: ?u32 = null;
+        {
+            var stream_lease = self.lookupStream(handle) orelse return error.InvalidHandle;
+            defer stream_lease.release();
+            const resource = stream_lease.value();
+            if (resource.http_outgoing_body_handle != null) {
+                const owner = resource.owner orelse return error.InvalidHandle;
+                owner.retain();
+                stream_lease.release();
+                defer owner.release();
+                const bytes = ci.readGuestBytes(list.ptr, list.len) orelse
+                    return error.OutOfBoundsMemory;
+                try self.writeOwnedHttpBodyStream(owner, bytes, false);
+                results[0] = .{ .result_val = .{
+                    .is_ok = true,
+                    .payload = null,
+                } };
+                return;
+            }
+            blobstore_ov_handle = resource.blobstore_outgoing_value_handle;
+            const claim = resource.claim();
+            claim.acquire();
+            defer claim.release();
+            const stream = resource.stream;
             const bytes = ci.readGuestBytes(list.ptr, list.len) orelse
                 return error.OutOfBoundsMemory;
-            try self.writeOwnedHttpBodyStream(owner, bytes, false);
-            results[0] = .{ .result_val = .{
-                .is_ok = true,
-                .payload = null,
-            } };
-            return;
+            switch (stream.write(bytes, self.allocator)) {
+                .ok => {},
+                .err, .closed => return error.IoError,
+            }
         }
-        const claim = resource.claim();
-        claim.acquire();
-        defer claim.release();
-        const stream = resource.stream;
-        const bytes = ci.readGuestBytes(list.ptr, list.len) orelse
-            return error.OutOfBoundsMemory;
-        switch (stream.write(bytes, self.allocator)) {
-            .ok => {},
-            .err, .closed => return error.IoError,
+        if (blobstore_ov_handle) |ov_handle| {
+            try self.syncBlobstoreOutgoingValue(ov_handle);
         }
         results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
     }
@@ -13481,9 +13676,11 @@ pub const WasiCliAdapter = struct {
             else => return error.InvalidArgs,
         };
         var body_handle: ?u32 = null;
+        var blobstore_ov_handle: ?u32 = null;
         if (self.stream_table.acquire(handle)) |initial_lease| {
             var lease = initial_lease;
             body_handle = lease.value().http_outgoing_body_handle;
+            blobstore_ov_handle = lease.value().blobstore_outgoing_value_handle;
             lease.release();
         }
         if (body_handle) |parent_handle| {
@@ -13495,6 +13692,19 @@ pub const WasiCliAdapter = struct {
                 }
                 body_lease.unlock();
                 body_lease.release();
+            }
+        }
+        if (blobstore_ov_handle) |ov_handle| {
+            self.syncBlobstoreOutgoingValue(ov_handle) catch {};
+            if (self.blobstore_resources.acquire(ov_handle)) |initial_ov_lease| {
+                var ov_lease = initial_ov_lease;
+                const res = ov_lease.value().*;
+                res.operation_claim.acquire();
+                if (res.kind == .outgoing_value and res.kind.outgoing_value.child_stream_handle == handle) {
+                    res.kind.outgoing_value.child_stream_handle = null;
+                }
+                res.operation_claim.release();
+                ov_lease.release();
             }
         }
         _ = self.stream_table.remove(handle);
@@ -13760,24 +13970,31 @@ pub const WasiCliAdapter = struct {
             .u64 => |v| v,
             else => return error.InvalidArgs,
         };
-        var stream_lease = self.lookupStream(handle) orelse return error.InvalidHandle;
-        defer stream_lease.release();
-        const resource = stream_lease.value();
-        const claim = resource.claim();
-        claim.acquire();
-        defer claim.release();
-        const stream = resource.stream;
+        var blobstore_ov_handle: ?u32 = null;
+        {
+            var stream_lease = self.lookupStream(handle) orelse return error.InvalidHandle;
+            defer stream_lease.release();
+            const resource = stream_lease.value();
+            blobstore_ov_handle = resource.blobstore_outgoing_value_handle;
+            const claim = resource.claim();
+            claim.acquire();
+            defer claim.release();
+            const stream = resource.stream;
 
-        const want: usize = @min(want_u64, std.math.maxInt(usize));
-        const capped: usize = @min(want, STREAM_SCRATCH_CAP);
+            const want: usize = @min(want_u64, std.math.maxInt(usize));
+            const capped: usize = @min(want, STREAM_SCRATCH_CAP);
 
-        const buf = try allocator.alloc(u8, capped);
-        defer allocator.free(buf);
-        @memset(buf, 0);
+            const buf = try allocator.alloc(u8, capped);
+            defer allocator.free(buf);
+            @memset(buf, 0);
 
-        switch (stream.write(buf, self.allocator)) {
-            .ok => {},
-            .err, .closed => return error.IoError,
+            switch (stream.write(buf, self.allocator)) {
+                .ok => {},
+                .err, .closed => return error.IoError,
+            }
+        }
+        if (blobstore_ov_handle) |ov_handle| {
+            try self.syncBlobstoreOutgoingValue(ov_handle);
         }
         results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
     }
@@ -13806,32 +14023,39 @@ pub const WasiCliAdapter = struct {
             .u64 => |v| v,
             else => return error.InvalidArgs,
         };
-        var stream_lease = self.lookupStream(handle) orelse return error.InvalidHandle;
-        defer stream_lease.release();
-        const resource = stream_lease.value();
-        const claim = resource.claim();
-        claim.acquire();
-        defer claim.release();
-        const stream = resource.stream;
+        var blobstore_ov_handle: ?u32 = null;
+        {
+            var stream_lease = self.lookupStream(handle) orelse return error.InvalidHandle;
+            defer stream_lease.release();
+            const resource = stream_lease.value();
+            blobstore_ov_handle = resource.blobstore_outgoing_value_handle;
+            const claim = resource.claim();
+            claim.acquire();
+            defer claim.release();
+            const stream = resource.stream;
 
-        var remaining: usize = @min(want_u64, std.math.maxInt(usize));
-        if (remaining > 0) {
-            const chunk_sz: usize = @min(remaining, STREAM_SCRATCH_CAP);
-            const buf = try allocator.alloc(u8, chunk_sz);
-            defer allocator.free(buf);
-            @memset(buf, 0);
-            while (remaining > 0) {
-                const n = @min(remaining, chunk_sz);
-                switch (stream.write(buf[0..n], self.allocator)) {
-                    .ok => {},
-                    .err, .closed => return error.IoError,
+            var remaining: usize = @min(want_u64, std.math.maxInt(usize));
+            if (remaining > 0) {
+                const chunk_sz: usize = @min(remaining, STREAM_SCRATCH_CAP);
+                const buf = try allocator.alloc(u8, chunk_sz);
+                defer allocator.free(buf);
+                @memset(buf, 0);
+                while (remaining > 0) {
+                    const n = @min(remaining, chunk_sz);
+                    switch (stream.write(buf[0..n], self.allocator)) {
+                        .ok => {},
+                        .err, .closed => return error.IoError,
+                    }
+                    remaining -= n;
                 }
-                remaining -= n;
+            }
+            switch (stream.flush()) {
+                .ok => {},
+                .err, .closed => return error.IoError,
             }
         }
-        switch (stream.flush()) {
-            .ok => {},
-            .err, .closed => return error.IoError,
+        if (blobstore_ov_handle) |ov_handle| {
+            try self.syncBlobstoreOutgoingValue(ov_handle);
         }
         results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
     }
@@ -13887,51 +14111,58 @@ pub const WasiCliAdapter = struct {
             .u64 => |v| v,
             else => return error.InvalidArgs,
         };
-        var dst_lease = self.lookupStream(out_handle) orelse return error.InvalidHandle;
-        defer dst_lease.release();
-        var src_lease = self.lookupInputStream(in_handle) orelse return error.InvalidHandle;
-        defer src_lease.release();
-        const src_resource = src_lease.value();
-        const dst_resource = dst_lease.value();
-        const src_claim = src_resource.claim();
-        const dst_claim = dst_resource.claim();
-        src_claim.acquire();
-        defer src_claim.release();
-        dst_claim.acquire();
-        defer dst_claim.release();
-        const src = src_resource.stream;
-        const dst = dst_resource.stream;
+        var blobstore_ov_handle: ?u32 = null;
+        const n_read: usize = blk: {
+            var dst_lease = self.lookupStream(out_handle) orelse return error.InvalidHandle;
+            defer dst_lease.release();
+            var src_lease = self.lookupInputStream(in_handle) orelse return error.InvalidHandle;
+            defer src_lease.release();
+            const src_resource = src_lease.value();
+            const dst_resource = dst_lease.value();
+            blobstore_ov_handle = dst_resource.blobstore_outgoing_value_handle;
+            const src_claim = src_resource.claim();
+            const dst_claim = dst_resource.claim();
+            src_claim.acquire();
+            defer src_claim.release();
+            dst_claim.acquire();
+            defer dst_claim.release();
+            const src = src_resource.stream;
+            const dst = dst_resource.stream;
 
-        const want: usize = @min(want_u64, std.math.maxInt(usize));
-        const capped: usize = @min(want, STREAM_SCRATCH_CAP);
+            const want: usize = @min(want_u64, std.math.maxInt(usize));
+            const capped: usize = @min(want, STREAM_SCRATCH_CAP);
 
-        const n_read: usize = switch (streams.splice(src, dst, capped, mode)) {
-            .ok => |n| n,
-            .closed => {
-                results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
-                return;
-            },
-            .err => return error.IoError,
-            .unsupported => buffered: {
-                const buf = try allocator.alloc(u8, capped);
-                defer allocator.free(buf);
+            break :blk switch (streams.splice(src, dst, capped, mode)) {
+                .ok => |n| n,
+                .closed => {
+                    results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
+                    return;
+                },
+                .err => return error.IoError,
+                .unsupported => buffered: {
+                    const buf = try allocator.alloc(u8, capped);
+                    defer allocator.free(buf);
 
-                const n = switch (src.read(buf)) {
-                    .ok => |read_n| read_n,
-                    .closed => {
-                        results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
-                        return;
-                    },
-                    .err => return error.IoError,
-                };
+                    const n = switch (src.read(buf)) {
+                        .ok => |read_n| read_n,
+                        .closed => {
+                            results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
+                            return;
+                        },
+                        .err => return error.IoError,
+                    };
 
-                switch (dst.write(buf[0..n], self.allocator)) {
-                    .ok => {},
-                    .err, .closed => return error.IoError,
-                }
-                break :buffered n;
-            },
+                    switch (dst.write(buf[0..n], self.allocator)) {
+                        .ok => {},
+                        .err, .closed => return error.IoError,
+                    }
+                    break :buffered n;
+                },
+            };
         };
+        if (blobstore_ov_handle) |ov_handle| {
+            try self.syncBlobstoreOutgoingValue(ov_handle);
+        }
 
         const payload = try allocator.create(InterfaceValue);
         payload.* = .{ .u64 = @intCast(n_read) };
@@ -30311,6 +30542,1472 @@ pub const WasiCliAdapter = struct {
         list_iv.* = .{ .list = .{ .ptr = list_ptr, .len = @intCast(n) } };
         results[0] = .{ .result_val = .{ .is_ok = true, .payload = list_iv } };
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // wasi:blobstore@0.2.0-draft host implementation (#972 E2)
+    //
+    // Implements:
+    //   • `wasi:blobstore/blobstore` — `create-container`, `get-container`,
+    //     `delete-container`, `container-exists`, `copy-object`, `move-object`
+    //   • `wasi:blobstore/container` — `container` resource methods
+    //     (`name`, `info`, `get-data`, `write-data`, `list-objects`,
+    //     `delete-object`, `delete-objects`, `has-object`, `object-info`,
+    //     `clear`), `stream-object-names` resource methods
+    //     (`read-stream-object-names`, `skip-stream-object-names`), and
+    //     resource drops
+    //   • `wasi:blobstore/types` — `outgoing-value` (`new-outgoing-value`,
+    //     `outgoing-value-write-body`, `finish`), `incoming-value`
+    //     (`incoming-value-consume-sync`, `incoming-value-consume-async`,
+    //     `size`), and resource drops
+    //
+    // WIT reference: `docs/wasi-blobstore-wit-vendored/{blobstore,container,types,world}.wit`.
+    // ════════════════════════════════════════════════════════════════════
+
+    pub fn populateWasiBlobstore(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        interface_name: []const u8,
+    ) !void {
+        const Member = struct { name: []const u8, func: *const fn (?*anyopaque, *ComponentInstance, []const InterfaceValue, []InterfaceValue, Allocator) anyerror!void };
+        const members = [_]Member{
+            .{ .name = "create-container", .func = &blobstoreCreateContainer },
+            .{ .name = "get-container", .func = &blobstoreGetContainer },
+            .{ .name = "delete-container", .func = &blobstoreDeleteContainer },
+            .{ .name = "container-exists", .func = &blobstoreContainerExists },
+            .{ .name = "copy-object", .func = &blobstoreCopyObject },
+            .{ .name = "move-object", .func = &blobstoreMoveObject },
+        };
+        for (members) |m| {
+            try self.blobstore_iface.members.put(self.allocator, m.name, .{
+                .func = .{ .context = self, .call = m.func },
+            });
+        }
+        try providers.put(self.allocator, interface_name, .{
+            .host_instance = &self.blobstore_iface,
+        });
+    }
+
+    pub fn populateWasiBlobstoreContainer(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        interface_name: []const u8,
+    ) !void {
+        const Member = struct { name: []const u8, func: *const fn (?*anyopaque, *ComponentInstance, []const InterfaceValue, []InterfaceValue, Allocator) anyerror!void };
+        const members = [_]Member{
+            .{ .name = "[method]container.name", .func = &blobstoreContainerName },
+            .{ .name = "[method]container.info", .func = &blobstoreContainerInfo },
+            .{ .name = "[method]container.get-data", .func = &blobstoreContainerGetData },
+            .{ .name = "[method]container.write-data", .func = &blobstoreContainerWriteData },
+            .{ .name = "[method]container.list-objects", .func = &blobstoreContainerListObjects },
+            .{ .name = "[method]container.delete-object", .func = &blobstoreContainerDeleteObject },
+            .{ .name = "[method]container.delete-objects", .func = &blobstoreContainerDeleteObjects },
+            .{ .name = "[method]container.has-object", .func = &blobstoreContainerHasObject },
+            .{ .name = "[method]container.object-info", .func = &blobstoreContainerObjectInfo },
+            .{ .name = "[method]container.clear", .func = &blobstoreContainerClear },
+            .{ .name = "[method]stream-object-names.read-stream-object-names", .func = &blobstoreStreamObjectNamesRead },
+            .{ .name = "[method]stream-object-names.skip-stream-object-names", .func = &blobstoreStreamObjectNamesSkip },
+            .{ .name = "[resource-drop]container", .func = &blobstoreContainerDrop },
+            .{ .name = "[resource-drop]stream-object-names", .func = &blobstoreStreamObjectNamesDrop },
+        };
+        for (members) |m| {
+            try self.blobstore_container_iface.members.put(self.allocator, m.name, .{
+                .func = .{ .context = self, .call = m.func },
+            });
+        }
+        try providers.put(self.allocator, interface_name, .{
+            .host_instance = &self.blobstore_container_iface,
+        });
+    }
+
+    pub fn populateWasiBlobstoreTypes(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        interface_name: []const u8,
+    ) !void {
+        const Member = struct { name: []const u8, func: *const fn (?*anyopaque, *ComponentInstance, []const InterfaceValue, []InterfaceValue, Allocator) anyerror!void };
+        const members = [_]Member{
+            .{ .name = "[static]outgoing-value.new-outgoing-value", .func = &blobstoreOutgoingValueNew },
+            .{ .name = "[method]outgoing-value.outgoing-value-write-body", .func = &blobstoreOutgoingValueWriteBody },
+            .{ .name = "[static]outgoing-value.finish", .func = &blobstoreOutgoingValueFinish },
+            .{ .name = "[method]incoming-value.incoming-value-consume-sync", .func = &blobstoreIncomingValueConsumeSync },
+            .{ .name = "[method]incoming-value.incoming-value-consume-async", .func = &blobstoreIncomingValueConsumeAsync },
+            .{ .name = "[method]incoming-value.size", .func = &blobstoreIncomingValueSize },
+            .{ .name = "[resource-drop]outgoing-value", .func = &blobstoreOutgoingValueDrop },
+            .{ .name = "[resource-drop]incoming-value", .func = &blobstoreIncomingValueDrop },
+        };
+        for (members) |m| {
+            try self.blobstore_types_iface.members.put(self.allocator, m.name, .{
+                .func = .{ .context = self, .call = m.func },
+            });
+        }
+        try providers.put(self.allocator, interface_name, .{
+            .host_instance = &self.blobstore_types_iface,
+        });
+    }
+
+    fn blobstoreNowSeconds(self: *const WasiCliAdapter) u64 {
+        const dt = self.wall_clock_override orelse readClockDatetime(.REALTIME);
+        return dt.seconds;
+    }
+
+    fn pushBlobstoreResource(
+        self: *WasiCliAdapter,
+        kind: BlobstoreResourceKind,
+    ) !u32 {
+        const res = try self.allocator.create(BlobstoreResource);
+        errdefer self.allocator.destroy(res);
+        res.* = .{ .kind = kind };
+        return self.blobstore_resources.publish(res);
+    }
+
+    fn blobstoreResultOkUnit() InterfaceValue {
+        return .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    fn blobstoreResultOk(
+        allocator: Allocator,
+        inner: InterfaceValue,
+    ) !InterfaceValue {
+        const payload = try allocator.create(InterfaceValue);
+        payload.* = inner;
+        return .{ .result_val = .{ .is_ok = true, .payload = payload } };
+    }
+
+    fn blobstoreResultErr(
+        ci: *ComponentInstance,
+        allocator: Allocator,
+        msg: []const u8,
+    ) !InterfaceValue {
+        const ptr = if (msg.len == 0)
+            ci.hostAllocGuest(1, 1) orelse return error.IoError
+        else
+            ci.hostAllocAndWrite(msg, 1) orelse return error.IoError;
+        const payload = try allocator.create(InterfaceValue);
+        payload.* = .{ .string = .{ .ptr = ptr, .len = @intCast(msg.len) } };
+        return .{ .result_val = .{ .is_ok = false, .payload = payload } };
+    }
+
+    fn blobstoreWriteGuestString(
+        ci: *ComponentInstance,
+        bytes: []const u8,
+    ) !InterfaceValue {
+        const ptr = if (bytes.len == 0)
+            ci.hostAllocGuest(1, 1) orelse return error.IoError
+        else
+            ci.hostAllocAndWrite(bytes, 1) orelse return error.IoError;
+        return .{ .string = .{ .ptr = ptr, .len = @intCast(bytes.len) } };
+    }
+
+    fn dropBlobstoreResourceTyped(
+        self: *WasiCliAdapter,
+        args: []const InterfaceValue,
+        expected_tag: std.meta.Tag(BlobstoreResourceKind),
+    ) !void {
+        if (args.len < 1) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        var lease = self.blobstore_resources.acquire(handle) orelse
+            return error.InvalidHandle;
+        var lease_active = true;
+        defer if (lease_active) lease.release();
+
+        const res = lease.value().*;
+        res.operation_claim.acquire();
+        var claimed = true;
+        defer if (claimed) res.operation_claim.release();
+
+        if (std.meta.activeTag(res.kind) != expected_tag) {
+            return error.InvalidHandle;
+        }
+        if (res.active_borrows.load(.acquire) != 0) {
+            return error.InvalidState;
+        }
+
+        res.operation_claim.release();
+        claimed = false;
+        lease.release();
+        lease_active = false;
+        if (!self.blobstore_resources.remove(handle)) {
+            return error.InvalidHandle;
+        }
+    }
+
+    fn syncBlobstoreOutgoingValue(
+        self: *WasiCliAdapter,
+        ov_handle: u32,
+    ) !void {
+        var lease = self.blobstore_resources.acquire(ov_handle) orelse return;
+        defer lease.release();
+        const res = lease.value().*;
+        res.operation_claim.acquire();
+        defer res.operation_claim.release();
+        const ov = switch (res.kind) {
+            .outgoing_value => |*v| v,
+            else => return,
+        };
+        if (ov.targets.items.len == 0) return;
+
+        const bytes: []const u8 = if (ov.stream_owner) |owner| blk: {
+            owner.operation_claim.acquire();
+            break :blk owner.stream.getBufferContents();
+        } else "";
+        defer if (ov.stream_owner) |owner| owner.operation_claim.release();
+
+        self.blobstore_state_claim.acquire();
+        defer self.blobstore_state_claim.release();
+        const now = self.blobstoreNowSeconds();
+        for (ov.targets.items) |target| {
+            const container = self.blobstore_containers_store.get(target.container_name) orelse continue;
+            try container.putObject(self.allocator, target.object_name, bytes, now);
+        }
+    }
+
+    // ── wasi:blobstore/blobstore ─────────────────────────────────────────
+
+    /// `wasi:blobstore/blobstore.create-container: (name: container-name) -> result<container, error>`.
+    pub fn blobstoreCreateContainer(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const name_bytes = extractArgBytes(ci, args[0]) orelse
+            return error.OutOfBoundsMemory;
+
+        const handle_name = try self.allocator.dupe(u8, name_bytes);
+        errdefer self.allocator.free(handle_name);
+
+        {
+            self.blobstore_state_claim.acquire();
+            defer self.blobstore_state_claim.release();
+
+            if (!self.blobstore_containers_store.contains(name_bytes)) {
+                const container = try self.allocator.create(BlobstoreBackingContainer);
+                errdefer self.allocator.destroy(container);
+                const owned_name = try self.allocator.dupe(u8, name_bytes);
+                errdefer self.allocator.free(owned_name);
+                container.* = .{
+                    .name = owned_name,
+                    .created_at = self.blobstoreNowSeconds(),
+                };
+                try self.blobstore_containers_store.put(self.allocator, owned_name, container);
+            }
+        }
+
+        const handle = try self.pushBlobstoreResource(.{
+            .container = .{ .container_name = handle_name },
+        });
+        errdefer _ = self.blobstore_resources.remove(handle);
+
+        results[0] = try blobstoreResultOk(allocator, .{ .handle = handle });
+    }
+
+    /// `wasi:blobstore/blobstore.get-container: (name: container-name) -> result<container, error>`.
+    pub fn blobstoreGetContainer(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const name_bytes = extractArgBytes(ci, args[0]) orelse
+            return error.OutOfBoundsMemory;
+
+        const exists = blk: {
+            self.blobstore_state_claim.acquire();
+            defer self.blobstore_state_claim.release();
+            break :blk self.blobstore_containers_store.contains(name_bytes);
+        };
+        if (!exists) {
+            results[0] = try blobstoreResultErr(ci, allocator, "container does not exist");
+            return;
+        }
+
+        const handle_name = try self.allocator.dupe(u8, name_bytes);
+        errdefer self.allocator.free(handle_name);
+        const handle = try self.pushBlobstoreResource(.{
+            .container = .{ .container_name = handle_name },
+        });
+        errdefer _ = self.blobstore_resources.remove(handle);
+
+        results[0] = try blobstoreResultOk(allocator, .{ .handle = handle });
+    }
+
+    /// `wasi:blobstore/blobstore.delete-container: (name: container-name) -> result<_, error>`.
+    pub fn blobstoreDeleteContainer(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const name_bytes = extractArgBytes(ci, args[0]) orelse
+            return error.OutOfBoundsMemory;
+
+        self.blobstore_state_claim.acquire();
+        defer self.blobstore_state_claim.release();
+
+        if (self.blobstore_containers_store.fetchRemove(name_bytes)) |kv| {
+            kv.value.deinit(self.allocator);
+            self.allocator.destroy(kv.value);
+        }
+        results[0] = blobstoreResultOkUnit();
+    }
+
+    /// `wasi:blobstore/blobstore.container-exists: (name: container-name) -> result<bool, error>`.
+    pub fn blobstoreContainerExists(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const name_bytes = extractArgBytes(ci, args[0]) orelse
+            return error.OutOfBoundsMemory;
+
+        const exists = blk: {
+            self.blobstore_state_claim.acquire();
+            defer self.blobstore_state_claim.release();
+            break :blk self.blobstore_containers_store.contains(name_bytes);
+        };
+        results[0] = try blobstoreResultOk(allocator, .{ .bool = exists });
+    }
+
+    const BlobstoreObjectIdPair = struct {
+        src_container: []const u8,
+        src_object: []const u8,
+        dest_container: []const u8,
+        dest_object: []const u8,
+    };
+
+    fn extractBlobstoreObjectIdFields(
+        ci: *ComponentInstance,
+        val: InterfaceValue,
+    ) !struct { container: []const u8, object: []const u8 } {
+        const fields = switch (val) {
+            .record_val => |r| r,
+            .tuple_val => |t| t,
+            else => return error.InvalidArgs,
+        };
+        if (fields.len < 2) return error.InvalidArgs;
+        const c = extractArgBytes(ci, fields[0]) orelse return error.OutOfBoundsMemory;
+        const o = extractArgBytes(ci, fields[1]) orelse return error.OutOfBoundsMemory;
+        return .{ .container = c, .object = o };
+    }
+
+    fn extractBlobstoreObjectIdPair(
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+    ) !BlobstoreObjectIdPair {
+        if (args.len >= 2 and
+            (args[0] == .record_val or args[0] == .tuple_val) and
+            (args[1] == .record_val or args[1] == .tuple_val))
+        {
+            const src = try extractBlobstoreObjectIdFields(ci, args[0]);
+            const dest = try extractBlobstoreObjectIdFields(ci, args[1]);
+            return .{
+                .src_container = src.container,
+                .src_object = src.object,
+                .dest_container = dest.container,
+                .dest_object = dest.object,
+            };
+        }
+        if (args.len >= 4) {
+            const sc = extractArgBytes(ci, args[0]) orelse return error.OutOfBoundsMemory;
+            const so = extractArgBytes(ci, args[1]) orelse return error.OutOfBoundsMemory;
+            const dc = extractArgBytes(ci, args[2]) orelse return error.OutOfBoundsMemory;
+            const do = extractArgBytes(ci, args[3]) orelse return error.OutOfBoundsMemory;
+            return .{
+                .src_container = sc,
+                .src_object = so,
+                .dest_container = dc,
+                .dest_object = do,
+            };
+        }
+        return error.InvalidArgs;
+    }
+
+    /// `wasi:blobstore/blobstore.copy-object: (src: object-id, dest: object-id) -> result<_, error>`.
+    pub fn blobstoreCopyObject(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (results.len == 0) return error.InvalidArgs;
+        const pair = try extractBlobstoreObjectIdPair(ci, args);
+
+        self.blobstore_state_claim.acquire();
+        defer self.blobstore_state_claim.release();
+
+        const src_container = self.blobstore_containers_store.get(pair.src_container) orelse {
+            results[0] = try blobstoreResultErr(ci, allocator, "source container does not exist");
+            return;
+        };
+        const dest_container = self.blobstore_containers_store.get(pair.dest_container) orelse {
+            results[0] = try blobstoreResultErr(ci, allocator, "destination container does not exist");
+            return;
+        };
+        const src_obj = src_container.objects.get(pair.src_object) orelse {
+            results[0] = try blobstoreResultErr(ci, allocator, "source object does not exist");
+            return;
+        };
+
+        try dest_container.putObject(
+            self.allocator,
+            pair.dest_object,
+            src_obj.data,
+            self.blobstoreNowSeconds(),
+        );
+        results[0] = blobstoreResultOkUnit();
+    }
+
+    /// `wasi:blobstore/blobstore.move-object: (src: object-id, dest: object-id) -> result<_, error>`.
+    pub fn blobstoreMoveObject(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (results.len == 0) return error.InvalidArgs;
+        const pair = try extractBlobstoreObjectIdPair(ci, args);
+
+        self.blobstore_state_claim.acquire();
+        defer self.blobstore_state_claim.release();
+
+        const src_container = self.blobstore_containers_store.get(pair.src_container) orelse {
+            results[0] = try blobstoreResultErr(ci, allocator, "source container does not exist");
+            return;
+        };
+        const dest_container = self.blobstore_containers_store.get(pair.dest_container) orelse {
+            results[0] = try blobstoreResultErr(ci, allocator, "destination container does not exist");
+            return;
+        };
+        const src_obj_ptr = src_container.objects.getPtr(pair.src_object) orelse {
+            results[0] = try blobstoreResultErr(ci, allocator, "source object does not exist");
+            return;
+        };
+
+        const now = self.blobstoreNowSeconds();
+        if (std.mem.eql(u8, pair.src_container, pair.dest_container) and
+            std.mem.eql(u8, pair.src_object, pair.dest_object))
+        {
+            src_obj_ptr.created_at = now;
+            results[0] = blobstoreResultOkUnit();
+            return;
+        }
+
+        try dest_container.putObject(
+            self.allocator,
+            pair.dest_object,
+            src_obj_ptr.data,
+            now,
+        );
+        _ = src_container.removeObject(self.allocator, pair.src_object);
+        results[0] = blobstoreResultOkUnit();
+    }
+
+    // ── wasi:blobstore/container ─────────────────────────────────────────
+
+    /// `wasi:blobstore/container.[method]container.name: (borrow<container>) -> result<string, error>`.
+    pub fn blobstoreContainerName(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        var lease = self.blobstore_resources.acquire(handle) orelse
+            return error.InvalidHandle;
+        defer lease.release();
+        const res = lease.value().*;
+        res.operation_claim.acquire();
+        defer res.operation_claim.release();
+        const c_rep = switch (res.kind) {
+            .container => |*c| c,
+            else => return error.InvalidHandle,
+        };
+        _ = res.active_borrows.fetchAdd(1, .acq_rel);
+        defer _ = res.active_borrows.fetchSub(1, .acq_rel);
+
+        self.blobstore_state_claim.acquire();
+        defer self.blobstore_state_claim.release();
+        if (!self.blobstore_containers_store.contains(c_rep.container_name)) {
+            results[0] = try blobstoreResultErr(ci, allocator, "container does not exist");
+            return;
+        }
+
+        const str_val = try blobstoreWriteGuestString(ci, c_rep.container_name);
+        results[0] = try blobstoreResultOk(allocator, str_val);
+    }
+
+    /// `wasi:blobstore/container.[method]container.info: (borrow<container>) -> result<container-metadata, error>`.
+    pub fn blobstoreContainerInfo(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        var lease = self.blobstore_resources.acquire(handle) orelse
+            return error.InvalidHandle;
+        defer lease.release();
+        const res = lease.value().*;
+        res.operation_claim.acquire();
+        defer res.operation_claim.release();
+        const c_rep = switch (res.kind) {
+            .container => |*c| c,
+            else => return error.InvalidHandle,
+        };
+        _ = res.active_borrows.fetchAdd(1, .acq_rel);
+        defer _ = res.active_borrows.fetchSub(1, .acq_rel);
+
+        const created_at: u64 = blk: {
+            self.blobstore_state_claim.acquire();
+            defer self.blobstore_state_claim.release();
+            const backing = self.blobstore_containers_store.get(c_rep.container_name) orelse {
+                results[0] = try blobstoreResultErr(ci, allocator, "container does not exist");
+                return;
+            };
+            break :blk backing.created_at;
+        };
+
+        const name_val = try blobstoreWriteGuestString(ci, c_rep.container_name);
+        const fields = try allocator.alloc(InterfaceValue, 2);
+        fields[0] = name_val;
+        fields[1] = .{ .u64 = created_at };
+        results[0] = try blobstoreResultOk(allocator, .{ .record_val = fields });
+    }
+
+    /// `wasi:blobstore/container.[method]container.get-data: (borrow<container>, name: object-name, start: u64, end: u64) -> result<incoming-value, error>`.
+    pub fn blobstoreContainerGetData(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 4 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const obj_name = extractArgBytes(ci, args[1]) orelse
+            return error.OutOfBoundsMemory;
+        const start = switch (args[2]) {
+            .u64 => |v| v,
+            else => return error.InvalidArgs,
+        };
+        const end = switch (args[3]) {
+            .u64 => |v| v,
+            else => return error.InvalidArgs,
+        };
+
+        var lease = self.blobstore_resources.acquire(handle) orelse
+            return error.InvalidHandle;
+        defer lease.release();
+        const res = lease.value().*;
+        res.operation_claim.acquire();
+        defer res.operation_claim.release();
+        const c_rep = switch (res.kind) {
+            .container => |*c| c,
+            else => return error.InvalidHandle,
+        };
+        _ = res.active_borrows.fetchAdd(1, .acq_rel);
+        defer _ = res.active_borrows.fetchSub(1, .acq_rel);
+
+        if (start > end) {
+            results[0] = try blobstoreResultErr(ci, allocator, "invalid byte range");
+            return;
+        }
+
+        const owned_slice: []u8 = blk: {
+            self.blobstore_state_claim.acquire();
+            defer self.blobstore_state_claim.release();
+            const backing = self.blobstore_containers_store.get(c_rep.container_name) orelse {
+                results[0] = try blobstoreResultErr(ci, allocator, "container does not exist");
+                return;
+            };
+            const obj = backing.objects.get(obj_name) orelse {
+                results[0] = try blobstoreResultErr(ci, allocator, "object does not exist");
+                return;
+            };
+            const slice: []const u8 = if (obj.data.len == 0 or start >= obj.data.len)
+                ""
+            else sub: {
+                const start_idx: usize = @intCast(start);
+                const max_idx: u64 = @intCast(obj.data.len - 1);
+                const clamped_end: usize = @intCast(@min(end, max_idx));
+                break :sub obj.data[start_idx .. clamped_end + 1];
+            };
+            break :blk try self.allocator.dupe(u8, slice);
+        };
+        errdefer self.allocator.free(owned_slice);
+
+        const iv_handle = try self.pushBlobstoreResource(.{
+            .incoming_value = .{
+                .data = owned_slice,
+                .byte_size = @intCast(owned_slice.len),
+                .consumed = false,
+            },
+        });
+        errdefer _ = self.blobstore_resources.remove(iv_handle);
+
+        results[0] = try blobstoreResultOk(allocator, .{ .handle = iv_handle });
+    }
+
+    /// `wasi:blobstore/container.[method]container.write-data: (borrow<container>, name: object-name, data: borrow<outgoing-value>) -> result<_, error>`.
+    pub fn blobstoreContainerWriteData(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 3 or results.len == 0) return error.InvalidArgs;
+        const container_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const obj_name = extractArgBytes(ci, args[1]) orelse
+            return error.OutOfBoundsMemory;
+        const ov_handle = switch (args[2]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+
+        var c_lease = self.blobstore_resources.acquire(container_handle) orelse
+            return error.InvalidHandle;
+        defer c_lease.release();
+        const c_res = c_lease.value().*;
+        if (std.meta.activeTag(c_res.kind) != .container) return error.InvalidHandle;
+
+        var ov_lease = self.blobstore_resources.acquire(ov_handle) orelse
+            return error.InvalidHandle;
+        defer ov_lease.release();
+        const ov_res = ov_lease.value().*;
+        if (std.meta.activeTag(ov_res.kind) != .outgoing_value) return error.InvalidHandle;
+
+        c_res.operation_claim.acquire();
+        defer c_res.operation_claim.release();
+        ov_res.operation_claim.acquire();
+        defer ov_res.operation_claim.release();
+
+        _ = c_res.active_borrows.fetchAdd(1, .acq_rel);
+        defer _ = c_res.active_borrows.fetchSub(1, .acq_rel);
+        _ = ov_res.active_borrows.fetchAdd(1, .acq_rel);
+        defer _ = ov_res.active_borrows.fetchSub(1, .acq_rel);
+
+        const c_rep = &c_res.kind.container;
+        const ov_rep = &ov_res.kind.outgoing_value;
+
+        var already_targeted = false;
+        for (ov_rep.targets.items) |t| {
+            if (std.mem.eql(u8, t.container_name, c_rep.container_name) and
+                std.mem.eql(u8, t.object_name, obj_name))
+            {
+                already_targeted = true;
+                break;
+            }
+        }
+        if (!already_targeted) {
+            const cname_copy = try self.allocator.dupe(u8, c_rep.container_name);
+            errdefer self.allocator.free(cname_copy);
+            const oname_copy = try self.allocator.dupe(u8, obj_name);
+            errdefer self.allocator.free(oname_copy);
+            try ov_rep.targets.append(self.allocator, .{
+                .container_name = cname_copy,
+                .object_name = oname_copy,
+            });
+        }
+
+        const bytes: []const u8 = if (ov_rep.stream_owner) |owner| blk: {
+            owner.operation_claim.acquire();
+            break :blk owner.stream.getBufferContents();
+        } else "";
+        defer if (ov_rep.stream_owner) |owner| owner.operation_claim.release();
+
+        self.blobstore_state_claim.acquire();
+        defer self.blobstore_state_claim.release();
+        const backing = self.blobstore_containers_store.get(c_rep.container_name) orelse {
+            results[0] = try blobstoreResultErr(ci, allocator, "container does not exist");
+            return;
+        };
+        try backing.putObject(self.allocator, obj_name, bytes, self.blobstoreNowSeconds());
+        results[0] = blobstoreResultOkUnit();
+    }
+
+    /// `wasi:blobstore/container.[method]container.list-objects: (borrow<container>) -> result<stream-object-names, error>`.
+    pub fn blobstoreContainerListObjects(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        var lease = self.blobstore_resources.acquire(handle) orelse
+            return error.InvalidHandle;
+        defer lease.release();
+        const res = lease.value().*;
+        res.operation_claim.acquire();
+        defer res.operation_claim.release();
+        const c_rep = switch (res.kind) {
+            .container => |*c| c,
+            else => return error.InvalidHandle,
+        };
+        _ = res.active_borrows.fetchAdd(1, .acq_rel);
+        defer _ = res.active_borrows.fetchSub(1, .acq_rel);
+
+        var names: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (names.items) |n| self.allocator.free(n);
+            names.deinit(self.allocator);
+        }
+
+        {
+            self.blobstore_state_claim.acquire();
+            defer self.blobstore_state_claim.release();
+            const backing = self.blobstore_containers_store.get(c_rep.container_name) orelse {
+                results[0] = try blobstoreResultErr(ci, allocator, "container does not exist");
+                return;
+            };
+            var it = backing.objects.iterator();
+            while (it.next()) |entry| {
+                const copy = try self.allocator.dupe(u8, entry.key_ptr.*);
+                errdefer self.allocator.free(copy);
+                try names.append(self.allocator, copy);
+            }
+        }
+
+        std.mem.sort([]u8, names.items, {}, struct {
+            fn lessThan(_: void, a: []u8, b: []u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lessThan);
+
+        const stream_handle = try self.pushBlobstoreResource(.{
+            .stream_object_names = .{ .names = names, .cursor = 0 },
+        });
+        errdefer _ = self.blobstore_resources.remove(stream_handle);
+
+        results[0] = try blobstoreResultOk(allocator, .{ .handle = stream_handle });
+    }
+
+    /// `wasi:blobstore/container.[method]container.delete-object: (borrow<container>, name: object-name) -> result<_, error>`.
+    pub fn blobstoreContainerDeleteObject(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const obj_name = extractArgBytes(ci, args[1]) orelse
+            return error.OutOfBoundsMemory;
+
+        var lease = self.blobstore_resources.acquire(handle) orelse
+            return error.InvalidHandle;
+        defer lease.release();
+        const res = lease.value().*;
+        res.operation_claim.acquire();
+        defer res.operation_claim.release();
+        const c_rep = switch (res.kind) {
+            .container => |*c| c,
+            else => return error.InvalidHandle,
+        };
+        _ = res.active_borrows.fetchAdd(1, .acq_rel);
+        defer _ = res.active_borrows.fetchSub(1, .acq_rel);
+
+        self.blobstore_state_claim.acquire();
+        defer self.blobstore_state_claim.release();
+        const backing = self.blobstore_containers_store.get(c_rep.container_name) orelse {
+            results[0] = try blobstoreResultErr(ci, allocator, "container does not exist");
+            return;
+        };
+        _ = backing.removeObject(self.allocator, obj_name);
+        results[0] = blobstoreResultOkUnit();
+    }
+
+    /// `wasi:blobstore/container.[method]container.delete-objects: (borrow<container>, names: list<object-name>) -> result<_, error>`.
+    pub fn blobstoreContainerDeleteObjects(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const names_pl = switch (args[1]) {
+            .list => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+
+        var lease = self.blobstore_resources.acquire(handle) orelse
+            return error.InvalidHandle;
+        defer lease.release();
+        const res = lease.value().*;
+        res.operation_claim.acquire();
+        defer res.operation_claim.release();
+        const c_rep = switch (res.kind) {
+            .container => |*c| c,
+            else => return error.InvalidHandle,
+        };
+        _ = res.active_borrows.fetchAdd(1, .acq_rel);
+        defer _ = res.active_borrows.fetchSub(1, .acq_rel);
+
+        const byte_len = std.math.mul(u32, names_pl.len, 8) catch
+            return error.OutOfBoundsMemory;
+        const table_bytes = if (byte_len == 0)
+            ""
+        else
+            ci.readGuestBytes(names_pl.ptr, byte_len) orelse
+                return error.OutOfBoundsMemory;
+
+        var i: u32 = 0;
+        while (i < names_pl.len) : (i += 1) {
+            const slot_off: usize = @as(usize, i) * 8;
+            const n_ptr = std.mem.readInt(u32, table_bytes[slot_off..][0..4], .little);
+            const n_len = std.mem.readInt(u32, table_bytes[slot_off + 4 ..][0..4], .little);
+            if (n_len != 0 and ci.readGuestBytes(n_ptr, n_len) == null) {
+                return error.OutOfBoundsMemory;
+            }
+        }
+
+        self.blobstore_state_claim.acquire();
+        defer self.blobstore_state_claim.release();
+        const backing = self.blobstore_containers_store.get(c_rep.container_name) orelse {
+            results[0] = try blobstoreResultErr(ci, allocator, "container does not exist");
+            return;
+        };
+
+        i = 0;
+        while (i < names_pl.len) : (i += 1) {
+            const slot_off: usize = @as(usize, i) * 8;
+            const n_ptr = std.mem.readInt(u32, table_bytes[slot_off..][0..4], .little);
+            const n_len = std.mem.readInt(u32, table_bytes[slot_off + 4 ..][0..4], .little);
+            const obj_name: []const u8 = if (n_len == 0)
+                ""
+            else
+                ci.readGuestBytes(n_ptr, n_len).?;
+            _ = backing.removeObject(self.allocator, obj_name);
+        }
+        results[0] = blobstoreResultOkUnit();
+    }
+
+    /// `wasi:blobstore/container.[method]container.has-object: (borrow<container>, name: object-name) -> result<bool, error>`.
+    pub fn blobstoreContainerHasObject(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const obj_name = extractArgBytes(ci, args[1]) orelse
+            return error.OutOfBoundsMemory;
+
+        var lease = self.blobstore_resources.acquire(handle) orelse
+            return error.InvalidHandle;
+        defer lease.release();
+        const res = lease.value().*;
+        res.operation_claim.acquire();
+        defer res.operation_claim.release();
+        const c_rep = switch (res.kind) {
+            .container => |*c| c,
+            else => return error.InvalidHandle,
+        };
+        _ = res.active_borrows.fetchAdd(1, .acq_rel);
+        defer _ = res.active_borrows.fetchSub(1, .acq_rel);
+
+        const present = blk: {
+            self.blobstore_state_claim.acquire();
+            defer self.blobstore_state_claim.release();
+            const backing = self.blobstore_containers_store.get(c_rep.container_name) orelse {
+                results[0] = try blobstoreResultErr(ci, allocator, "container does not exist");
+                return;
+            };
+            break :blk backing.objects.contains(obj_name);
+        };
+        results[0] = try blobstoreResultOk(allocator, .{ .bool = present });
+    }
+
+    /// `wasi:blobstore/container.[method]container.object-info: (borrow<container>, name: object-name) -> result<object-metadata, error>`.
+    pub fn blobstoreContainerObjectInfo(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const obj_name = extractArgBytes(ci, args[1]) orelse
+            return error.OutOfBoundsMemory;
+
+        var lease = self.blobstore_resources.acquire(handle) orelse
+            return error.InvalidHandle;
+        defer lease.release();
+        const res = lease.value().*;
+        res.operation_claim.acquire();
+        defer res.operation_claim.release();
+        const c_rep = switch (res.kind) {
+            .container => |*c| c,
+            else => return error.InvalidHandle,
+        };
+        _ = res.active_borrows.fetchAdd(1, .acq_rel);
+        defer _ = res.active_borrows.fetchSub(1, .acq_rel);
+
+        var created_at: u64 = 0;
+        var obj_size: u64 = 0;
+        {
+            self.blobstore_state_claim.acquire();
+            defer self.blobstore_state_claim.release();
+            const backing = self.blobstore_containers_store.get(c_rep.container_name) orelse {
+                results[0] = try blobstoreResultErr(ci, allocator, "container does not exist");
+                return;
+            };
+            const obj = backing.objects.get(obj_name) orelse {
+                results[0] = try blobstoreResultErr(ci, allocator, "object does not exist");
+                return;
+            };
+            created_at = obj.created_at;
+            obj_size = @intCast(obj.data.len);
+        }
+
+        const name_val = try blobstoreWriteGuestString(ci, obj_name);
+        const container_val = try blobstoreWriteGuestString(ci, c_rep.container_name);
+        const fields = try allocator.alloc(InterfaceValue, 4);
+        fields[0] = name_val;
+        fields[1] = container_val;
+        fields[2] = .{ .u64 = created_at };
+        fields[3] = .{ .u64 = obj_size };
+        results[0] = try blobstoreResultOk(allocator, .{ .record_val = fields });
+    }
+
+    /// `wasi:blobstore/container.[method]container.clear: (borrow<container>) -> result<_, error>`.
+    pub fn blobstoreContainerClear(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        var lease = self.blobstore_resources.acquire(handle) orelse
+            return error.InvalidHandle;
+        defer lease.release();
+        const res = lease.value().*;
+        res.operation_claim.acquire();
+        defer res.operation_claim.release();
+        const c_rep = switch (res.kind) {
+            .container => |*c| c,
+            else => return error.InvalidHandle,
+        };
+        _ = res.active_borrows.fetchAdd(1, .acq_rel);
+        defer _ = res.active_borrows.fetchSub(1, .acq_rel);
+
+        self.blobstore_state_claim.acquire();
+        defer self.blobstore_state_claim.release();
+        const backing = self.blobstore_containers_store.get(c_rep.container_name) orelse {
+            results[0] = try blobstoreResultErr(ci, allocator, "container does not exist");
+            return;
+        };
+        backing.clearObjects(self.allocator);
+        results[0] = blobstoreResultOkUnit();
+    }
+
+    /// `wasi:blobstore/container.[method]stream-object-names.read-stream-object-names:
+    ///   (borrow<stream-object-names>, len: u64) -> result<tuple<list<object-name>, bool>, error>`.
+    pub fn blobstoreStreamObjectNamesRead(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const len_u64 = switch (args[1]) {
+            .u64 => |v| v,
+            else => return error.InvalidArgs,
+        };
+
+        var lease = self.blobstore_resources.acquire(handle) orelse
+            return error.InvalidHandle;
+        defer lease.release();
+        const res = lease.value().*;
+        res.operation_claim.acquire();
+        defer res.operation_claim.release();
+        const s_rep = switch (res.kind) {
+            .stream_object_names => |*s| s,
+            else => return error.InvalidHandle,
+        };
+        _ = res.active_borrows.fetchAdd(1, .acq_rel);
+        defer _ = res.active_borrows.fetchSub(1, .acq_rel);
+
+        const total = s_rep.names.items.len;
+        const remaining = total - s_rep.cursor;
+        const take: usize = @min(remaining, @min(len_u64, std.math.maxInt(usize)));
+        const chunk = s_rep.names.items[s_rep.cursor .. s_rep.cursor + take];
+        s_rep.cursor += take;
+        const eof = s_rep.cursor >= total;
+
+        const table_ptr: u32 = if (chunk.len == 0)
+            ci.hostAllocGuest(1, 4) orelse return error.IoError
+        else blk: {
+            const ptrs = try allocator.alloc(u32, chunk.len);
+            defer allocator.free(ptrs);
+            for (chunk, 0..) |name, idx| {
+                ptrs[idx] = if (name.len == 0)
+                    ci.hostAllocGuest(1, 1) orelse return error.IoError
+                else
+                    ci.hostAllocAndWrite(name, 1) orelse return error.IoError;
+            }
+            const total_bytes: u32 = @intCast(chunk.len * 8);
+            const tptr = ci.hostAllocGuest(total_bytes, 4) orelse return error.IoError;
+            const table_buf = ci.writableGuestBytes(tptr, total_bytes) orelse return error.IoError;
+            for (chunk, 0..) |name, idx| {
+                std.mem.writeInt(u32, table_buf[idx * 8 ..][0..4], ptrs[idx], .little);
+                std.mem.writeInt(u32, table_buf[idx * 8 + 4 ..][0..4], @intCast(name.len), .little);
+            }
+            break :blk tptr;
+        };
+
+        const tuple_fields = try allocator.alloc(InterfaceValue, 2);
+        tuple_fields[0] = .{ .list = .{ .ptr = table_ptr, .len = @intCast(chunk.len) } };
+        tuple_fields[1] = .{ .bool = eof };
+        results[0] = try blobstoreResultOk(allocator, .{ .tuple_val = tuple_fields });
+    }
+
+    /// `wasi:blobstore/container.[method]stream-object-names.skip-stream-object-names:
+    ///   (borrow<stream-object-names>, num: u64) -> result<tuple<u64, bool>, error>`.
+    pub fn blobstoreStreamObjectNamesSkip(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const num_u64 = switch (args[1]) {
+            .u64 => |v| v,
+            else => return error.InvalidArgs,
+        };
+
+        var lease = self.blobstore_resources.acquire(handle) orelse
+            return error.InvalidHandle;
+        defer lease.release();
+        const res = lease.value().*;
+        res.operation_claim.acquire();
+        defer res.operation_claim.release();
+        const s_rep = switch (res.kind) {
+            .stream_object_names => |*s| s,
+            else => return error.InvalidHandle,
+        };
+        _ = res.active_borrows.fetchAdd(1, .acq_rel);
+        defer _ = res.active_borrows.fetchSub(1, .acq_rel);
+
+        const total = s_rep.names.items.len;
+        const remaining = total - s_rep.cursor;
+        const skipped: usize = @min(remaining, @min(num_u64, std.math.maxInt(usize)));
+        s_rep.cursor += skipped;
+        const eof = s_rep.cursor >= total;
+
+        const tuple_fields = try allocator.alloc(InterfaceValue, 2);
+        tuple_fields[0] = .{ .u64 = @intCast(skipped) };
+        tuple_fields[1] = .{ .bool = eof };
+        results[0] = try blobstoreResultOk(allocator, .{ .tuple_val = tuple_fields });
+    }
+
+    /// `wasi:blobstore/container.[resource-drop]container: (own<container>) -> ()`.
+    pub fn blobstoreContainerDrop(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        try self.dropBlobstoreResourceTyped(args, .container);
+    }
+
+    /// `wasi:blobstore/container.[resource-drop]stream-object-names: (own<stream-object-names>) -> ()`.
+    pub fn blobstoreStreamObjectNamesDrop(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        try self.dropBlobstoreResourceTyped(args, .stream_object_names);
+    }
+
+    // ── wasi:blobstore/types ─────────────────────────────────────────────
+
+    /// `wasi:blobstore/types.[static]outgoing-value.new-outgoing-value: () -> outgoing-value`.
+    pub fn blobstoreOutgoingValueNew(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (results.len == 0) return error.InvalidArgs;
+        const handle = try self.pushBlobstoreResource(.{
+            .outgoing_value = .{},
+        });
+        results[0] = .{ .handle = handle };
+    }
+
+    /// `wasi:blobstore/types.[method]outgoing-value.outgoing-value-write-body:
+    ///   (borrow<outgoing-value>) -> result<output-stream>`.
+    pub fn blobstoreOutgoingValueWriteBody(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+
+        var lease = self.blobstore_resources.acquire(handle) orelse
+            return error.InvalidHandle;
+        defer lease.release();
+        const res = lease.value().*;
+        res.operation_claim.acquire();
+        defer res.operation_claim.release();
+        const ov = switch (res.kind) {
+            .outgoing_value => |*v| v,
+            else => return error.InvalidHandle,
+        };
+        _ = res.active_borrows.fetchAdd(1, .acq_rel);
+        defer _ = res.active_borrows.fetchSub(1, .acq_rel);
+
+        if (ov.stream_taken or ov.finished) {
+            results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
+            return;
+        }
+        ov.stream_taken = true;
+
+        const s = self.allocator.create(streams.OutputStream) catch |err| {
+            ov.stream_taken = false;
+            return err;
+        };
+        s.* = streams.OutputStream.toBuffer();
+
+        const sh = self.allocOwnedStreamHandle(s, null, null) catch |err| {
+            s.deinit(self.allocator);
+            self.allocator.destroy(s);
+            ov.stream_taken = false;
+            return err;
+        };
+        errdefer _ = self.stream_table.remove(sh);
+
+        var stream_lease = self.stream_table.acquire(sh).?;
+        const stream_resource = stream_lease.value();
+        stream_resource.blobstore_outgoing_value_handle = handle;
+        const owner = stream_resource.owner.?;
+        owner.retain();
+        stream_lease.release();
+
+        ov.stream_owner = owner;
+        ov.child_stream_handle = sh;
+        errdefer {
+            if (ov.stream_owner) |owned| owned.release();
+            ov.stream_owner = null;
+            ov.child_stream_handle = null;
+            ov.stream_taken = false;
+        }
+
+        results[0] = try blobstoreResultOk(allocator, .{ .handle = sh });
+    }
+
+    /// `wasi:blobstore/types.[static]outgoing-value.finish: (this: outgoing-value) -> result<_, error>`.
+    pub fn blobstoreOutgoingValueFinish(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+
+        var lease = self.blobstore_resources.acquire(handle) orelse
+            return error.InvalidHandle;
+        defer lease.release();
+        const res = lease.value().*;
+        res.operation_claim.acquire();
+        defer res.operation_claim.release();
+        const ov = switch (res.kind) {
+            .outgoing_value => |*v| v,
+            else => return error.InvalidHandle,
+        };
+        if (res.active_borrows.load(.acquire) != 0) {
+            return error.InvalidState;
+        }
+        ov.finished = true;
+
+        if (ov.targets.items.len > 0) {
+            const bytes: []const u8 = if (ov.stream_owner) |owner| blk: {
+                owner.operation_claim.acquire();
+                break :blk owner.stream.getBufferContents();
+            } else "";
+            defer if (ov.stream_owner) |owner| owner.operation_claim.release();
+
+            self.blobstore_state_claim.acquire();
+            defer self.blobstore_state_claim.release();
+            const now = self.blobstoreNowSeconds();
+            for (ov.targets.items) |target| {
+                const backing = self.blobstore_containers_store.get(target.container_name) orelse {
+                    results[0] = try blobstoreResultErr(ci, allocator, "container does not exist");
+                    return;
+                };
+                try backing.putObject(self.allocator, target.object_name, bytes, now);
+            }
+        }
+
+        results[0] = blobstoreResultOkUnit();
+    }
+
+    /// `wasi:blobstore/types.[method]incoming-value.incoming-value-consume-sync:
+    ///   (borrow<incoming-value>) -> result<incoming-value-sync-body, error>`.
+    pub fn blobstoreIncomingValueConsumeSync(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+
+        var lease = self.blobstore_resources.acquire(handle) orelse
+            return error.InvalidHandle;
+        defer lease.release();
+        const res = lease.value().*;
+        res.operation_claim.acquire();
+        defer res.operation_claim.release();
+        const iv = switch (res.kind) {
+            .incoming_value => |*v| v,
+            else => return error.InvalidHandle,
+        };
+        _ = res.active_borrows.fetchAdd(1, .acq_rel);
+        defer _ = res.active_borrows.fetchSub(1, .acq_rel);
+
+        if (iv.consumed) {
+            results[0] = try blobstoreResultErr(ci, allocator, "incoming-value already consumed");
+            return;
+        }
+        const data = iv.data orelse "";
+        const guest_ptr: u32 = if (data.len == 0)
+            ci.hostAllocGuest(1, 1) orelse return error.IoError
+        else
+            ci.hostAllocAndWrite(data, 1) orelse return error.IoError;
+
+        if (iv.data) |owned| {
+            self.allocator.free(owned);
+            iv.data = null;
+        }
+        iv.consumed = true;
+
+        results[0] = try blobstoreResultOk(
+            allocator,
+            .{ .list = .{ .ptr = guest_ptr, .len = @intCast(data.len) } },
+        );
+    }
+
+    /// `wasi:blobstore/types.[method]incoming-value.incoming-value-consume-async:
+    ///   (borrow<incoming-value>) -> result<incoming-value-async-body, error>`.
+    pub fn blobstoreIncomingValueConsumeAsync(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+
+        var lease = self.blobstore_resources.acquire(handle) orelse
+            return error.InvalidHandle;
+        defer lease.release();
+        const res = lease.value().*;
+        res.operation_claim.acquire();
+        defer res.operation_claim.release();
+        const iv = switch (res.kind) {
+            .incoming_value => |*v| v,
+            else => return error.InvalidHandle,
+        };
+        _ = res.active_borrows.fetchAdd(1, .acq_rel);
+        defer _ = res.active_borrows.fetchSub(1, .acq_rel);
+
+        if (iv.consumed) {
+            results[0] = try blobstoreResultErr(ci, allocator, "incoming-value already consumed");
+            return;
+        }
+        const owned_data = iv.data orelse try self.allocator.dupe(u8, "");
+        errdefer if (iv.data == null) self.allocator.free(owned_data);
+
+        const stream = try self.allocator.create(streams.InputStream);
+        errdefer self.allocator.destroy(stream);
+        stream.* = streams.InputStream.fromBuffer(owned_data);
+
+        const stream_handle = try self.allocOwnedInputStreamHandle(
+            stream,
+            owned_data,
+            null,
+            null,
+        );
+        errdefer _ = self.input_stream_table.remove(stream_handle);
+
+        iv.data = null;
+        iv.consumed = true;
+
+        results[0] = try blobstoreResultOk(allocator, .{ .handle = stream_handle });
+    }
+
+    /// `wasi:blobstore/types.[method]incoming-value.size: (borrow<incoming-value>) -> u64`.
+    pub fn blobstoreIncomingValueSize(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+
+        var lease = self.blobstore_resources.acquire(handle) orelse
+            return error.InvalidHandle;
+        defer lease.release();
+        const res = lease.value().*;
+        res.operation_claim.acquire();
+        defer res.operation_claim.release();
+        const iv = switch (res.kind) {
+            .incoming_value => |*v| v,
+            else => return error.InvalidHandle,
+        };
+        _ = res.active_borrows.fetchAdd(1, .acq_rel);
+        defer _ = res.active_borrows.fetchSub(1, .acq_rel);
+
+        results[0] = .{ .u64 = iv.byte_size };
+    }
+
+    /// `wasi:blobstore/types.[resource-drop]outgoing-value: (own<outgoing-value>) -> ()`.
+    pub fn blobstoreOutgoingValueDrop(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        try self.dropBlobstoreResourceTyped(args, .outgoing_value);
+    }
+
+    /// `wasi:blobstore/types.[resource-drop]incoming-value: (own<incoming-value>) -> ()`.
+    pub fn blobstoreIncomingValueDrop(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        try self.dropBlobstoreResourceTyped(args, .incoming_value);
+    }
 };
 
 /// `wasi:clocks/wall-clock.datetime`: a record of `(seconds: u64, nanoseconds: u32)`.
@@ -30748,6 +32445,10 @@ pub fn populateWasiProviders(
     var matched_keyvalue_store: ?[]const u8 = null;
     var matched_keyvalue_atomics: ?[]const u8 = null;
     var matched_keyvalue_batch: ?[]const u8 = null;
+    // #972 E2: wasi:blobstore@0.2.x interfaces (`blobstore`, `container`, `types`).
+    var matched_blobstore: ?[]const u8 = null;
+    var matched_blobstore_container: ?[]const u8 = null;
+    var matched_blobstore_types: ?[]const u8 = null;
     // #583 B6: wasi:config/store@0.2.0-rc.1. Single interface, single
     // host instance — the version-multiplex accepts any `@x.y.z` suffix
     // since the only published WIT (0.2.0-rc.1) and any near-future
@@ -30963,6 +32664,13 @@ pub fn populateWasiProviders(
             matched_keyvalue_batch = imp.name;
         if (matched_keyvalue_store == null and matchesWasiPrefix(imp.name, "wasi:keyvalue/store"))
             matched_keyvalue_store = imp.name;
+        // #972 E2: wasi:blobstore/* — `blobstore`, `container`, `types`.
+        if (matched_blobstore == null and matchesWasiPrefix(imp.name, "wasi:blobstore/blobstore"))
+            matched_blobstore = imp.name;
+        if (matched_blobstore_container == null and matchesWasiPrefix(imp.name, "wasi:blobstore/container"))
+            matched_blobstore_container = imp.name;
+        if (matched_blobstore_types == null and matchesWasiPrefix(imp.name, "wasi:blobstore/types"))
+            matched_blobstore_types = imp.name;
         // wasi:config/store@0.2.0-rc.1 (#583 B6). All versions route
         // to the same single host instance — the interface shape is
         // stable across 0.2.x and (if it ships) 0.3.x.
@@ -31278,6 +32986,17 @@ pub fn populateWasiProviders(
     }
     if (matched_keyvalue_batch) |name| {
         try adapter.populateWasiKeyvalueBatch(providers, name);
+    }
+
+    // wasi:blobstore@0.2.x (#972 E2).
+    if (matched_blobstore) |name| {
+        try adapter.populateWasiBlobstore(providers, name);
+    }
+    if (matched_blobstore_container) |name| {
+        try adapter.populateWasiBlobstoreContainer(providers, name);
+    }
+    if (matched_blobstore_types) |name| {
+        try adapter.populateWasiBlobstoreTypes(providers, name);
     }
 
     // wasi:config/store@0.2.0-rc.1 (#583 B6). Conditionally bind only
@@ -59142,3 +60861,680 @@ test "#715: describeInterfaceValue formats common shapes" {
     const s3 = describeInterfaceValue(.{ .string = .{ .ptr = 0, .len = 5 } }, &ci, true);
     try testing.expect(std.mem.indexOf(u8, s3, "hex=\"68 65 6c 6c 6f\"") != null);
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// wasi:blobstore@0.2.0-draft unit tests (#972 E2)
+// ════════════════════════════════════════════════════════════════════════
+
+fn testBlobstoreWriteHelper(
+    adapter: *WasiCliAdapter,
+    ci: *ComponentInstance,
+    allocator: Allocator,
+    container_handle: u32,
+    obj_name: []const u8,
+    payload: []const u8,
+    write_data_first: bool,
+) !void {
+    const testing = std.testing;
+    var ov_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.blobstoreOutgoingValueNew(adapter, ci, &.{}, &ov_results, allocator);
+    const ov_handle = ov_results[0].handle;
+
+    if (write_data_first) {
+        const wd_args = [_]InterfaceValue{
+            .{ .handle = container_handle },
+            try testKeyvalueStringArg(ci, obj_name),
+            .{ .handle = ov_handle },
+        };
+        var wd_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreContainerWriteData(adapter, ci, &wd_args, &wd_results, allocator);
+        defer wd_results[0].deinit(allocator);
+        try testing.expect(wd_results[0].result_val.is_ok);
+    }
+
+    const wb_args = [_]InterfaceValue{.{ .handle = ov_handle }};
+    var wb_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.blobstoreOutgoingValueWriteBody(adapter, ci, &wb_args, &wb_results, allocator);
+    defer wb_results[0].deinit(allocator);
+    try testing.expect(wb_results[0].result_val.is_ok);
+    const stream_handle = wb_results[0].result_val.payload.?.handle;
+
+    const write_args = [_]InterfaceValue{
+        .{ .handle = stream_handle },
+        try testKeyvalueListArg(ci, payload),
+    };
+    var write_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.outputStreamWrite(adapter, ci, &write_args, &write_results, allocator);
+    defer write_results[0].deinit(allocator);
+    try testing.expect(write_results[0].result_val.is_ok);
+
+    const drop_stream_args = [_]InterfaceValue{.{ .handle = stream_handle }};
+    try WasiCliAdapter.dropOutputStream(adapter, ci, &drop_stream_args, &.{}, allocator);
+
+    if (!write_data_first) {
+        const wd_args = [_]InterfaceValue{
+            .{ .handle = container_handle },
+            try testKeyvalueStringArg(ci, obj_name),
+            .{ .handle = ov_handle },
+        };
+        var wd_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreContainerWriteData(adapter, ci, &wd_args, &wd_results, allocator);
+        defer wd_results[0].deinit(allocator);
+        try testing.expect(wd_results[0].result_val.is_ok);
+    }
+
+    const finish_args = [_]InterfaceValue{.{ .handle = ov_handle }};
+    var finish_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.blobstoreOutgoingValueFinish(adapter, ci, &finish_args, &finish_results, allocator);
+    defer finish_results[0].deinit(allocator);
+    try testing.expect(finish_results[0].result_val.is_ok);
+
+    const drop_ov_args = [_]InterfaceValue{.{ .handle = ov_handle }};
+    try WasiCliAdapter.blobstoreOutgoingValueDrop(adapter, ci, &drop_ov_args, &.{}, allocator);
+}
+
+test "adapter resource safety: wasi:blobstore populateWasiProviders registers blobstore, container, and types (#972 E2)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+
+    const imports = [_]ctypes_root.ImportDecl{
+        .{ .name = "wasi:blobstore/blobstore@0.2.0-draft", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:blobstore/container@0.2.0-draft", .desc = .{ .instance = 1 } },
+        .{ .name = "wasi:blobstore/types@0.2.0-draft", .desc = .{ .instance = 2 } },
+    };
+    const comp = ctypes_root.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
+    };
+    try populateWasiProviders(&adapter, &comp, &providers);
+
+    const bs_inst = providers.get("wasi:blobstore/blobstore@0.2.0-draft").?.host_instance;
+    try testing.expectEqual(@as(usize, 6), bs_inst.members.count());
+    try testing.expect(bs_inst.members.contains("create-container"));
+    try testing.expect(bs_inst.members.contains("get-container"));
+    try testing.expect(bs_inst.members.contains("delete-container"));
+    try testing.expect(bs_inst.members.contains("container-exists"));
+    try testing.expect(bs_inst.members.contains("copy-object"));
+    try testing.expect(bs_inst.members.contains("move-object"));
+
+    const cont_inst = providers.get("wasi:blobstore/container@0.2.0-draft").?.host_instance;
+    try testing.expectEqual(@as(usize, 14), cont_inst.members.count());
+    try testing.expect(cont_inst.members.contains("[method]container.name"));
+    try testing.expect(cont_inst.members.contains("[method]container.info"));
+    try testing.expect(cont_inst.members.contains("[method]container.get-data"));
+    try testing.expect(cont_inst.members.contains("[method]container.write-data"));
+    try testing.expect(cont_inst.members.contains("[method]container.list-objects"));
+    try testing.expect(cont_inst.members.contains("[method]container.delete-object"));
+    try testing.expect(cont_inst.members.contains("[method]container.delete-objects"));
+    try testing.expect(cont_inst.members.contains("[method]container.has-object"));
+    try testing.expect(cont_inst.members.contains("[method]container.object-info"));
+    try testing.expect(cont_inst.members.contains("[method]container.clear"));
+    try testing.expect(cont_inst.members.contains("[method]stream-object-names.read-stream-object-names"));
+    try testing.expect(cont_inst.members.contains("[method]stream-object-names.skip-stream-object-names"));
+    try testing.expect(cont_inst.members.contains("[resource-drop]container"));
+    try testing.expect(cont_inst.members.contains("[resource-drop]stream-object-names"));
+
+    const types_inst = providers.get("wasi:blobstore/types@0.2.0-draft").?.host_instance;
+    try testing.expectEqual(@as(usize, 8), types_inst.members.count());
+    try testing.expect(types_inst.members.contains("[static]outgoing-value.new-outgoing-value"));
+    try testing.expect(types_inst.members.contains("[method]outgoing-value.outgoing-value-write-body"));
+    try testing.expect(types_inst.members.contains("[static]outgoing-value.finish"));
+    try testing.expect(types_inst.members.contains("[method]incoming-value.incoming-value-consume-sync"));
+    try testing.expect(types_inst.members.contains("[method]incoming-value.incoming-value-consume-async"));
+    try testing.expect(types_inst.members.contains("[method]incoming-value.size"));
+    try testing.expect(types_inst.members.contains("[resource-drop]outgoing-value"));
+    try testing.expect(types_inst.members.contains("[resource-drop]incoming-value"));
+}
+
+test "adapter resource safety: wasi:blobstore container lifecycle (create, get, exists, name, info, delete) (#972 E2)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    adapter.wall_clock_override = .{ .seconds = 1_710_000_000, .nanoseconds = 0 };
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 64 * 1024);
+    defer ci.disableTestMem();
+
+    // container-exists("photos") -> false
+    {
+        const args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "photos")};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreContainerExists(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(results[0].result_val.is_ok);
+        try testing.expectEqual(false, results[0].result_val.payload.?.bool);
+    }
+
+    // get-container("photos") -> err
+    {
+        const args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "photos")};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreGetContainer(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(!results[0].result_val.is_ok);
+    }
+
+    // create-container("photos") -> ok(handle)
+    var c_handle: u32 = 0;
+    {
+        const args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "photos")};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreCreateContainer(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(results[0].result_val.is_ok);
+        c_handle = results[0].result_val.payload.?.handle;
+    }
+
+    // container-exists("photos") -> true
+    {
+        const args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "photos")};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreContainerExists(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(results[0].result_val.is_ok);
+        try testing.expectEqual(true, results[0].result_val.payload.?.bool);
+    }
+
+    // [method]container.name -> "photos"
+    {
+        const args = [_]InterfaceValue{.{ .handle = c_handle }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreContainerName(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(results[0].result_val.is_ok);
+        const s = results[0].result_val.payload.?.string;
+        try testing.expectEqualStrings("photos", ci.readGuestBytes(s.ptr, s.len).?);
+    }
+
+    // [method]container.info -> { name: "photos", created-at: 1_710_000_000 }
+    {
+        const args = [_]InterfaceValue{.{ .handle = c_handle }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreContainerInfo(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(results[0].result_val.is_ok);
+        const rec = results[0].result_val.payload.?.record_val;
+        try testing.expectEqual(@as(usize, 2), rec.len);
+        try testing.expectEqualStrings("photos", ci.readGuestBytes(rec[0].string.ptr, rec[0].string.len).?);
+        try testing.expectEqual(@as(u64, 1_710_000_000), rec[1].u64);
+    }
+
+    // get-container("photos") -> ok(c_handle_2)
+    {
+        const args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "photos")};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreGetContainer(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(results[0].result_val.is_ok);
+        const c_handle_2 = results[0].result_val.payload.?.handle;
+        const drop_args = [_]InterfaceValue{.{ .handle = c_handle_2 }};
+        try WasiCliAdapter.blobstoreContainerDrop(&adapter, &ci, &drop_args, &.{}, testing.allocator);
+    }
+
+    // delete-container("photos") -> ok
+    {
+        const args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "photos")};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreDeleteContainer(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(results[0].result_val.is_ok);
+    }
+
+    // container-exists("photos") -> false
+    {
+        const args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "photos")};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreContainerExists(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expectEqual(false, results[0].result_val.payload.?.bool);
+    }
+
+    // drop c_handle
+    {
+        const drop_args = [_]InterfaceValue{.{ .handle = c_handle }};
+        try WasiCliAdapter.blobstoreContainerDrop(&adapter, &ci, &drop_args, &.{}, testing.allocator);
+    }
+}
+
+test "adapter resource safety: wasi:blobstore write-data, get-data ranges, sync and async stream consumption (#972 E2)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    adapter.wall_clock_override = .{ .seconds = 1_720_000_000, .nanoseconds = 0 };
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 64 * 1024);
+    defer ci.disableTestMem();
+
+    const create_args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "bucket-a")};
+    var create_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.blobstoreCreateContainer(&adapter, &ci, &create_args, &create_results, testing.allocator);
+    defer create_results[0].deinit(testing.allocator);
+    const c_handle = create_results[0].result_val.payload.?.handle;
+    defer {
+        const drop_args = [_]InterfaceValue{.{ .handle = c_handle }};
+        WasiCliAdapter.blobstoreContainerDrop(&adapter, &ci, &drop_args, &.{}, testing.allocator) catch {};
+    }
+
+    // Pattern 1: write bytes to output-stream BEFORE write-data.
+    try testBlobstoreWriteHelper(&adapter, &ci, testing.allocator, c_handle, "greeting.txt", "Hello, Blobstore!", false);
+
+    // Pattern 2: call write-data BEFORE writing bytes to output-stream + finish.
+    try testBlobstoreWriteHelper(&adapter, &ci, testing.allocator, c_handle, "streamed.txt", "0123456789abcdef", true);
+
+    // Full get-data(0, u64::MAX) + size + incoming-value-consume-sync + double-consume error.
+    {
+        const gd_args = [_]InterfaceValue{
+            .{ .handle = c_handle },
+            try testKeyvalueStringArg(&ci, "greeting.txt"),
+            .{ .u64 = 0 },
+            .{ .u64 = std.math.maxInt(u64) },
+        };
+        var gd_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreContainerGetData(&adapter, &ci, &gd_args, &gd_results, testing.allocator);
+        defer gd_results[0].deinit(testing.allocator);
+        try testing.expect(gd_results[0].result_val.is_ok);
+        const iv_handle = gd_results[0].result_val.payload.?.handle;
+
+        const size_args = [_]InterfaceValue{.{ .handle = iv_handle }};
+        var size_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreIncomingValueSize(&adapter, &ci, &size_args, &size_results, testing.allocator);
+        try testing.expectEqual(@as(u64, 17), size_results[0].u64);
+
+        var sync_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreIncomingValueConsumeSync(&adapter, &ci, &size_args, &sync_results, testing.allocator);
+        defer sync_results[0].deinit(testing.allocator);
+        try testing.expect(sync_results[0].result_val.is_ok);
+        const list_pl = sync_results[0].result_val.payload.?.list;
+        try testing.expectEqualStrings("Hello, Blobstore!", ci.readGuestBytes(list_pl.ptr, list_pl.len).?);
+
+        // Second consume (sync or async) returns err("incoming-value already consumed").
+        var sync2_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreIncomingValueConsumeSync(&adapter, &ci, &size_args, &sync2_results, testing.allocator);
+        defer sync2_results[0].deinit(testing.allocator);
+        try testing.expect(!sync2_results[0].result_val.is_ok);
+
+        var async2_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreIncomingValueConsumeAsync(&adapter, &ci, &size_args, &async2_results, testing.allocator);
+        defer async2_results[0].deinit(testing.allocator);
+        try testing.expect(!async2_results[0].result_val.is_ok);
+
+        try WasiCliAdapter.blobstoreIncomingValueDrop(&adapter, &ci, &size_args, &.{}, testing.allocator);
+    }
+
+    // Partial inclusive range get-data(4, 9) on "0123456789abcdef" -> "456789" via consume-async (wasi:io/streams).
+    {
+        const gd_args = [_]InterfaceValue{
+            .{ .handle = c_handle },
+            try testKeyvalueStringArg(&ci, "streamed.txt"),
+            .{ .u64 = 4 },
+            .{ .u64 = 9 },
+        };
+        var gd_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreContainerGetData(&adapter, &ci, &gd_args, &gd_results, testing.allocator);
+        defer gd_results[0].deinit(testing.allocator);
+        try testing.expect(gd_results[0].result_val.is_ok);
+        const iv_handle = gd_results[0].result_val.payload.?.handle;
+
+        const iv_args = [_]InterfaceValue{.{ .handle = iv_handle }};
+        var size_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreIncomingValueSize(&adapter, &ci, &iv_args, &size_results, testing.allocator);
+        try testing.expectEqual(@as(u64, 6), size_results[0].u64);
+
+        var async_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreIncomingValueConsumeAsync(&adapter, &ci, &iv_args, &async_results, testing.allocator);
+        defer async_results[0].deinit(testing.allocator);
+        try testing.expect(async_results[0].result_val.is_ok);
+        const in_stream_handle = async_results[0].result_val.payload.?.handle;
+
+        // Read from input-stream via wasi:io/streams.blockingRead.
+        const read_args = [_]InterfaceValue{
+            .{ .handle = in_stream_handle },
+            .{ .u64 = 64 },
+        };
+        var read_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blockingRead(&adapter, &ci, &read_args, &read_results, testing.allocator);
+        defer read_results[0].deinit(testing.allocator);
+        try testing.expect(read_results[0].result_val.is_ok);
+        const list_pl = read_results[0].result_val.payload.?.list;
+        try testing.expectEqualStrings("456789", ci.readGuestBytes(list_pl.ptr, list_pl.len).?);
+
+        const drop_in_args = [_]InterfaceValue{.{ .handle = in_stream_handle }};
+        try WasiCliAdapter.dropInputStream(&adapter, &ci, &drop_in_args, &.{}, testing.allocator);
+        try WasiCliAdapter.blobstoreIncomingValueDrop(&adapter, &ci, &iv_args, &.{}, testing.allocator);
+    }
+
+    // Invalid range start > end -> err.
+    {
+        const gd_args = [_]InterfaceValue{
+            .{ .handle = c_handle },
+            try testKeyvalueStringArg(&ci, "streamed.txt"),
+            .{ .u64 = 10 },
+            .{ .u64 = 5 },
+        };
+        var gd_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreContainerGetData(&adapter, &ci, &gd_args, &gd_results, testing.allocator);
+        defer gd_results[0].deinit(testing.allocator);
+        try testing.expect(!gd_results[0].result_val.is_ok);
+    }
+}
+
+test "adapter resource safety: wasi:blobstore has-object, object-info, list-objects, copy, move, delete, clear (#972 E2)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    adapter.wall_clock_override = .{ .seconds = 1_730_000_000, .nanoseconds = 0 };
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 64 * 1024);
+    defer ci.disableTestMem();
+
+    // Create two containers: "src-c" and "dst-c".
+    var src_c: u32 = 0;
+    var dst_c: u32 = 0;
+    {
+        const args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "src-c")};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreCreateContainer(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        src_c = results[0].result_val.payload.?.handle;
+    }
+    defer {
+        const drop_args = [_]InterfaceValue{.{ .handle = src_c }};
+        WasiCliAdapter.blobstoreContainerDrop(&adapter, &ci, &drop_args, &.{}, testing.allocator) catch {};
+    }
+    {
+        const args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "dst-c")};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreCreateContainer(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        dst_c = results[0].result_val.payload.?.handle;
+    }
+    defer {
+        const drop_args = [_]InterfaceValue{.{ .handle = dst_c }};
+        WasiCliAdapter.blobstoreContainerDrop(&adapter, &ci, &drop_args, &.{}, testing.allocator) catch {};
+    }
+
+    try testBlobstoreWriteHelper(&adapter, &ci, testing.allocator, src_c, "obj-b", "beta", false);
+    try testBlobstoreWriteHelper(&adapter, &ci, testing.allocator, src_c, "obj-a", "alpha-data", false);
+    try testBlobstoreWriteHelper(&adapter, &ci, testing.allocator, src_c, "obj-c", "gamma", false);
+
+    // has-object & object-info
+    {
+        const has_args = [_]InterfaceValue{
+            .{ .handle = src_c },
+            try testKeyvalueStringArg(&ci, "obj-a"),
+        };
+        var has_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreContainerHasObject(&adapter, &ci, &has_args, &has_results, testing.allocator);
+        defer has_results[0].deinit(testing.allocator);
+        try testing.expectEqual(true, has_results[0].result_val.payload.?.bool);
+
+        var info_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreContainerObjectInfo(&adapter, &ci, &has_args, &info_results, testing.allocator);
+        defer info_results[0].deinit(testing.allocator);
+        try testing.expect(info_results[0].result_val.is_ok);
+        const rec = info_results[0].result_val.payload.?.record_val;
+        try testing.expectEqual(@as(usize, 4), rec.len);
+        try testing.expectEqualStrings("obj-a", ci.readGuestBytes(rec[0].string.ptr, rec[0].string.len).?);
+        try testing.expectEqualStrings("src-c", ci.readGuestBytes(rec[1].string.ptr, rec[1].string.len).?);
+        try testing.expectEqual(@as(u64, 1_730_000_000), rec[2].u64);
+        try testing.expectEqual(@as(u64, 10), rec[3].u64);
+    }
+
+    // list-objects: skip 1 ("obj-a"), then read 2 ("obj-b", "obj-c", eof=true)
+    {
+        const lo_args = [_]InterfaceValue{.{ .handle = src_c }};
+        var lo_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreContainerListObjects(&adapter, &ci, &lo_args, &lo_results, testing.allocator);
+        defer lo_results[0].deinit(testing.allocator);
+        try testing.expect(lo_results[0].result_val.is_ok);
+        const stream_h = lo_results[0].result_val.payload.?.handle;
+
+        const skip_args = [_]InterfaceValue{ .{ .handle = stream_h }, .{ .u64 = 1 } };
+        var skip_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreStreamObjectNamesSkip(&adapter, &ci, &skip_args, &skip_results, testing.allocator);
+        defer skip_results[0].deinit(testing.allocator);
+        try testing.expect(skip_results[0].result_val.is_ok);
+        const skip_tup = skip_results[0].result_val.payload.?.tuple_val;
+        try testing.expectEqual(@as(u64, 1), skip_tup[0].u64);
+        try testing.expectEqual(false, skip_tup[1].bool);
+
+        const read_args = [_]InterfaceValue{ .{ .handle = stream_h }, .{ .u64 = 5 } };
+        var read_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreStreamObjectNamesRead(&adapter, &ci, &read_args, &read_results, testing.allocator);
+        defer read_results[0].deinit(testing.allocator);
+        try testing.expect(read_results[0].result_val.is_ok);
+        const read_tup = read_results[0].result_val.payload.?.tuple_val;
+        try testing.expectEqual(@as(u32, 2), read_tup[0].list.len);
+        try testing.expectEqual(true, read_tup[1].bool);
+
+        const table_bytes = ci.readGuestBytes(read_tup[0].list.ptr, 16).?;
+        const p0 = std.mem.readInt(u32, table_bytes[0..4], .little);
+        const l0 = std.mem.readInt(u32, table_bytes[4..8], .little);
+        const p1 = std.mem.readInt(u32, table_bytes[8..12], .little);
+        const l1 = std.mem.readInt(u32, table_bytes[12..16], .little);
+        try testing.expectEqualStrings("obj-b", ci.readGuestBytes(p0, l0).?);
+        try testing.expectEqualStrings("obj-c", ci.readGuestBytes(p1, l1).?);
+
+        const drop_s_args = [_]InterfaceValue{.{ .handle = stream_h }};
+        try WasiCliAdapter.blobstoreStreamObjectNamesDrop(&adapter, &ci, &drop_s_args, &.{}, testing.allocator);
+    }
+
+    // copy-object across containers ("src-c"/"obj-a" -> "dst-c"/"copied-a")
+    {
+        var src_id = [_]InterfaceValue{
+            try testKeyvalueStringArg(&ci, "src-c"),
+            try testKeyvalueStringArg(&ci, "obj-a"),
+        };
+        var dst_id = [_]InterfaceValue{
+            try testKeyvalueStringArg(&ci, "dst-c"),
+            try testKeyvalueStringArg(&ci, "copied-a"),
+        };
+        const copy_args = [_]InterfaceValue{
+            .{ .record_val = &src_id },
+            .{ .record_val = &dst_id },
+        };
+        var copy_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreCopyObject(&adapter, &ci, &copy_args, &copy_results, testing.allocator);
+        defer copy_results[0].deinit(testing.allocator);
+        try testing.expect(copy_results[0].result_val.is_ok);
+    }
+
+    // move-object across containers ("src-c"/"obj-b" -> "dst-c"/"moved-b")
+    {
+        var src_id = [_]InterfaceValue{
+            try testKeyvalueStringArg(&ci, "src-c"),
+            try testKeyvalueStringArg(&ci, "obj-b"),
+        };
+        var dst_id = [_]InterfaceValue{
+            try testKeyvalueStringArg(&ci, "dst-c"),
+            try testKeyvalueStringArg(&ci, "moved-b"),
+        };
+        const move_args = [_]InterfaceValue{
+            .{ .record_val = &src_id },
+            .{ .record_val = &dst_id },
+        };
+        var move_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreMoveObject(&adapter, &ci, &move_args, &move_results, testing.allocator);
+        defer move_results[0].deinit(testing.allocator);
+        try testing.expect(move_results[0].result_val.is_ok);
+
+        // "obj-b" is gone from "src-c" and "moved-b" exists in "dst-c"
+        const has_src = [_]InterfaceValue{ .{ .handle = src_c }, try testKeyvalueStringArg(&ci, "obj-b") };
+        var has_src_res: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreContainerHasObject(&adapter, &ci, &has_src, &has_src_res, testing.allocator);
+        defer has_src_res[0].deinit(testing.allocator);
+        try testing.expectEqual(false, has_src_res[0].result_val.payload.?.bool);
+
+        const has_dst = [_]InterfaceValue{ .{ .handle = dst_c }, try testKeyvalueStringArg(&ci, "moved-b") };
+        var has_dst_res: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreContainerHasObject(&adapter, &ci, &has_dst, &has_dst_res, testing.allocator);
+        defer has_dst_res[0].deinit(testing.allocator);
+        try testing.expectEqual(true, has_dst_res[0].result_val.payload.?.bool);
+    }
+
+    // delete-objects on src-c (["obj-a", "obj-c", "nonexistent"])
+    {
+        const s_a = try testKeyvalueStringArg(&ci, "obj-a");
+        const s_c = try testKeyvalueStringArg(&ci, "obj-c");
+        var list_buf: [16]u8 = undefined;
+        std.mem.writeInt(u32, list_buf[0..4], s_a.string.ptr, .little);
+        std.mem.writeInt(u32, list_buf[4..8], s_a.string.len, .little);
+        std.mem.writeInt(u32, list_buf[8..12], s_c.string.ptr, .little);
+        std.mem.writeInt(u32, list_buf[12..16], s_c.string.len, .little);
+        const list_ptr = ci.hostAllocAndWrite(&list_buf, 4).?;
+        const del_args = [_]InterfaceValue{
+            .{ .handle = src_c },
+            .{ .list = .{ .ptr = list_ptr, .len = 2 } },
+        };
+        var del_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreContainerDeleteObjects(&adapter, &ci, &del_args, &del_results, testing.allocator);
+        defer del_results[0].deinit(testing.allocator);
+        try testing.expect(del_results[0].result_val.is_ok);
+
+        const has_a = [_]InterfaceValue{ .{ .handle = src_c }, s_a };
+        var has_a_res: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreContainerHasObject(&adapter, &ci, &has_a, &has_a_res, testing.allocator);
+        defer has_a_res[0].deinit(testing.allocator);
+        try testing.expectEqual(false, has_a_res[0].result_val.payload.?.bool);
+    }
+
+    // delete-object and clear on dst-c
+    {
+        const del_args = [_]InterfaceValue{
+            .{ .handle = dst_c },
+            try testKeyvalueStringArg(&ci, "copied-a"),
+        };
+        var del_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreContainerDeleteObject(&adapter, &ci, &del_args, &del_results, testing.allocator);
+        defer del_results[0].deinit(testing.allocator);
+        try testing.expect(del_results[0].result_val.is_ok);
+
+        const clear_args = [_]InterfaceValue{.{ .handle = dst_c }};
+        var clear_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreContainerClear(&adapter, &ci, &clear_args, &clear_results, testing.allocator);
+        defer clear_results[0].deinit(testing.allocator);
+        try testing.expect(clear_results[0].result_val.is_ok);
+
+        const has_moved = [_]InterfaceValue{ .{ .handle = dst_c }, try testKeyvalueStringArg(&ci, "moved-b") };
+        var has_moved_res: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreContainerHasObject(&adapter, &ci, &has_moved, &has_moved_res, testing.allocator);
+        defer has_moved_res[0].deinit(testing.allocator);
+        try testing.expectEqual(false, has_moved_res[0].result_val.payload.?.bool);
+    }
+}
+
+test "adapter resource safety: wasi:blobstore resource handle safety, cross-type rejection, and active-borrow drop trap (#972 E2)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 16 * 1024);
+    defer ci.disableTestMem();
+
+    // Forged handle 0 and out-of-range handle trap with error.InvalidHandle.
+    {
+        const zero_args = [_]InterfaceValue{.{ .handle = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try testing.expectError(
+            error.InvalidHandle,
+            WasiCliAdapter.blobstoreContainerName(&adapter, &ci, &zero_args, &results, testing.allocator),
+        );
+        try testing.expectError(
+            error.InvalidHandle,
+            WasiCliAdapter.blobstoreContainerDrop(&adapter, &ci, &zero_args, &.{}, testing.allocator),
+        );
+    }
+
+    // Create a container and an outgoing-value; verify cross-type calls trap.
+    const create_args = [_]InterfaceValue{try testKeyvalueStringArg(&ci, "typed-c")};
+    var create_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.blobstoreCreateContainer(&adapter, &ci, &create_args, &create_results, testing.allocator);
+    defer create_results[0].deinit(testing.allocator);
+    const c_handle = create_results[0].result_val.payload.?.handle;
+
+    var ov_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.blobstoreOutgoingValueNew(&adapter, &ci, &.{}, &ov_results, testing.allocator);
+    const ov_handle = ov_results[0].handle;
+
+    // Passing container handle to outgoing-value or incoming-value methods traps.
+    {
+        const c_as_ov = [_]InterfaceValue{.{ .handle = c_handle }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try testing.expectError(
+            error.InvalidHandle,
+            WasiCliAdapter.blobstoreOutgoingValueWriteBody(&adapter, &ci, &c_as_ov, &results, testing.allocator),
+        );
+        try testing.expectError(
+            error.InvalidHandle,
+            WasiCliAdapter.blobstoreIncomingValueSize(&adapter, &ci, &c_as_ov, &results, testing.allocator),
+        );
+        try testing.expectError(
+            error.InvalidHandle,
+            WasiCliAdapter.blobstoreOutgoingValueDrop(&adapter, &ci, &c_as_ov, &.{}, testing.allocator),
+        );
+    }
+
+    // Calling outgoing-value-write-body a second time returns result::err (unit payload).
+    {
+        const wb_args = [_]InterfaceValue{.{ .handle = ov_handle }};
+        var wb1: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreOutgoingValueWriteBody(&adapter, &ci, &wb_args, &wb1, testing.allocator);
+        defer wb1[0].deinit(testing.allocator);
+        try testing.expect(wb1[0].result_val.is_ok);
+        const sh = wb1[0].result_val.payload.?.handle;
+
+        var wb2: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.blobstoreOutgoingValueWriteBody(&adapter, &ci, &wb_args, &wb2, testing.allocator);
+        defer wb2[0].deinit(testing.allocator);
+        try testing.expect(!wb2[0].result_val.is_ok);
+        try testing.expect(wb2[0].result_val.payload == null);
+
+        const drop_sh = [_]InterfaceValue{.{ .handle = sh }};
+        try WasiCliAdapter.dropOutputStream(&adapter, &ci, &drop_sh, &.{}, testing.allocator);
+    }
+
+    // Dropping a resource while it has an active borrow traps with error.InvalidState.
+    {
+        var lease = adapter.blobstore_resources.acquire(c_handle).?;
+        const res = lease.value().*;
+        _ = res.active_borrows.fetchAdd(1, .acq_rel);
+        lease.release();
+
+        const drop_c = [_]InterfaceValue{.{ .handle = c_handle }};
+        try testing.expectError(
+            error.InvalidState,
+            WasiCliAdapter.blobstoreContainerDrop(&adapter, &ci, &drop_c, &.{}, testing.allocator),
+        );
+
+        lease = adapter.blobstore_resources.acquire(c_handle).?;
+        _ = lease.value().*.active_borrows.fetchSub(1, .acq_rel);
+        lease.release();
+
+        try WasiCliAdapter.blobstoreContainerDrop(&adapter, &ci, &drop_c, &.{}, testing.allocator);
+        // Double drop traps with error.InvalidHandle.
+        try testing.expectError(
+            error.InvalidHandle,
+            WasiCliAdapter.blobstoreContainerDrop(&adapter, &ci, &drop_c, &.{}, testing.allocator),
+        );
+    }
+
+    const drop_ov = [_]InterfaceValue{.{ .handle = ov_handle }};
+    try WasiCliAdapter.blobstoreOutgoingValueDrop(&adapter, &ci, &drop_ov, &.{}, testing.allocator);
+}
+

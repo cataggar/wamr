@@ -1,0 +1,5 @@
+repository: https://github.com/WebAssembly/wasi-blobstore
+package: wasi:blobstore@0.2.0-draft
+tag: v0.2.0-draft
+commit: 005c4252bf6d9d9a487f817675db91a7eb942f01
+path: wit/
