@@ -24,6 +24,7 @@ without re-doing the upstream survey or the state inventory.
 - [Design options](#design-options)
 - [Recommendation](#recommendation)
 - [Implementation plan (multi-wave)](#implementation-plan-multi-wave)
+- [Relationship to WASI 0.3 / Component Model](#relationship-to-wasi-03--component-model)
 - [Open questions](#open-questions)
 - [Acceptance criteria for the design to land](#acceptance-criteria-for-the-design-to-land)
 - [Out of scope](#out-of-scope)
@@ -862,11 +863,11 @@ joined trapped outcome, and never detach or terminate the embedding host.
 
 **Scope (one mini-wave each).**
 
-* **5a — Cancellation across threads.** Implemented for group termination:
-  the first `proc_exit`/trap publishes the terminal outcome, wakes futex
-  waiters and blocking host calls, and teardown is bounded (see "Group
-  termination" above). Binding component-level `wasi:task.cancel` to the same
-  interrupt path remains open.
+* **5a — Cancellation across threads (implemented).** Group termination and
+  component task cancellation are wired: the first `proc_exit`/trap publishes
+  the terminal outcome, wakes futex waiters and blocking host calls, and
+  `TaskCancelGroup` propagates `task.cancel` / `subtask.cancel` across active
+  `ExecEnv` and `AotExecutionContext` instances (see "Group termination" above).
 * **5b — Thread joining for embedders.** The lifecycle now provides exact
   `joinOne(tid: i32)` and process-wide batched `joinAll`; wiring those APIs
   into repeated `runLoadedComponent` ownership remains part of the host-binding
@@ -874,15 +875,91 @@ joined trapped outcome, and never detach or terminate the embedding host.
 * **5c — Process/per-thread context split.** Implemented: each execution
   environment has private task/cancel/trap/TLS metadata and a retained handle
   to one shared, synchronized WASI process state.
-* **5d — `shared-everything-threads` canon built-ins.** When upstream
-  pins a WIT, add `populateWasiThreads` to `populateWasiProviders`
-  and route `thread.spawn` (component-level) to the same
-  `ThreadManager.spawnThread` already used by `wasi.thread-spawn`
-  (core-level).
+* **5d — `shared-everything-threads` canon built-ins (implemented).** The
+  Component Model thread canonical built-ins (`0x08`, `0x24`–`0x2d`, and
+  `0x40`–`0x42`) are decoded by `src/component/loader.zig`, tracked in
+  `ComponentThreadTable` (`src/component/async.zig`), and executed by
+  `src/component/executor.zig` (cooperative scheduling when `is_shared = false`,
+  and OS-thread-backed worker execution integrated with `ThreadManager` when
+  `is_shared = true`).
 * **5e — Thread-local storage.** Preview-1 punts TLS to the guest
   (the `start_arg` is opaque). `shared-everything-threads` adds
   `thread-local globals`; binding them requires a wasm-runtime
-  feature (one global slot per thread). Defer until 5d.
+  feature (one global slot per thread).
+
+## Relationship to WASI 0.3 / Component Model
+
+The Component Model concurrency and `shared-everything-threads` specifications
+define canonical built-in opcodes for both cooperative (explicit/green) threads
+and OS-thread-backed shared-everything threads. All 14 thread canonical
+built-ins are implemented across `src/component/{types,loader,async,instance,executor}.zig`
+and `src/wasi/thread_manager.zig`:
+
+* **Canonical built-in opcodes (`AsyncCanonOp`)**:
+  * `0x08` — `backpressure.set`: legacy boolean backpressure toggle (maps `0` to
+    counter `0` and non-zero to `1` via atomic store on `comp_inst.backpressure`).
+  * `0x24` — `backpressure.inc` / `0x25` — `backpressure.dec`: saturating
+    atomic increment/decrement on `comp_inst.backpressure` (`0..0xffff`),
+    trapping on overflow/underflow.
+  * `0x26` — `thread.index`: returns the caller's 1-based component thread index
+    via `ComponentThreadTable.activeThreadIdx()`. On OS worker threads spawned by
+    `is_shared = true`, a thread-local (`tls_component_thread_idx`) returns each
+    worker's own 1-based thread index without racing against the main thread or
+    sibling workers; on the main/cooperative thread it falls back to
+    `comp_inst.threads.current_thread_idx` (`1` for the implicit main thread).
+  * `0x27` — `thread.new-indirect`: validates `(func (param i32))` against the
+    target core `table[table_idx][elem_idx]` and allocates a `.suspended`
+    cooperative thread in `ComponentThreadTable`.
+  * `0x28` — `thread.suspend-to-ref` (`cancellable`), `0x29` — `thread.suspend`
+    (`cancellable`), `0x2a` — `thread.suspend-to` (`cancellable`),
+    `0x2b` — `thread.unsuspend`, `0x2c` — `thread.yield-to-suspended`
+    (`cancellable`), and `0x2d` — `thread.switch-to` (`cancellable`):
+    cooperative thread state transitions (`thread.resume-later`,
+    `thread.suspend-then-resume`, `thread.yield-then-promote`) over the
+    per-component `ComponentThreadTable` ready queue.
+  * `0x40` — `thread.spawn-ref` (`is_shared`, `func_type_idx`) and
+    `0x41` — `thread.spawn-indirect` (`is_shared`, `func_type_idx`, `table_idx`):
+    allocate and immediately start a thread running `(func (param i32))` with the
+    caller-supplied `i32` context argument.
+  * `0x42` — `thread.available-parallelism` (`is_shared`): returns
+    `@max(1, std.Thread.getCpuCount())` when `is_shared = true` and `1` when
+    `is_shared = false`.
+
+* **`ComponentThreadTable` & dual execution model**:
+  * `ComponentThreadTable` (`src/component/async.zig`) is protected by a
+    spinlock (`ThreadTableMutex`) so concurrent OS threads calling
+    `thread.index`, `thread.spawn-indirect`, `thread.spawn-ref`, or completing
+    their start function are data-race-free.
+  * **Cooperative explicit threads (`is_shared = false`)**: `thread.new-indirect`
+    and non-shared `thread.spawn-ref` / `thread.spawn-indirect` enqueue entries
+    into `ComponentThreadTable`'s ready queue and run cooperatively during
+    `task.yield`, `thread.suspend*`, `thread.yield-to-suspended`, and at the end
+    of exported component function invocations (`runReadyComponentThreads`).
+  * **Shared-everything OS worker threads (`is_shared = true`)**: when
+    `config.lib_wasi_threads` is enabled, `thread.spawn-ref` and
+    `thread.spawn-indirect` with `is_shared = true` reserve a thread slot in
+    `comp_inst.thread_manager` (`acquireComponentThreadSlot`, sharing the same
+    `MAX_THREADS` cap as `wasi:threads`) and spawn a native `std.Thread`.
+    * **Interpreter target**: clones the core `ModuleInstance` via
+      `ModuleInstance.cloneForThread` (sharing `memories` and `tables` while
+      cloning mutable `globals`), allocates a per-worker auxiliary stack from
+      `comp_inst.thread_manager` (`allocateComponentAuxStack`) when `global[0]`
+      is a mutable `i32` stack pointer on shared memory, binds a worker `ExecEnv`
+      to `comp_inst.thread_manager` (inheriting `termination.State` and
+      `TaskCancelGroup`), sets `tls_component_thread_idx`, and invokes
+      `interpreter.callFunc`.
+    * **AOT target**: clones the `AotInstance` via `aot_runtime.cloneForThread`
+      (or executes against the shared instance), binds `tls_component_thread_idx`,
+      and invokes `aot_runtime.callFuncScalar`.
+    * **Joining & trap propagation**: spawned `std.Thread` handles are tracked in
+      `ComponentThreadTable.os_threads` and joined before an exported component
+      function returns (`joinSharedComponentThreads`) as well as in
+      `ComponentInstance.deinit()`. If any worker traps, it records the trap on
+      `ComponentThreadTable` (`recordSharedTrap`) and triggers
+      `comp_inst.thread_manager.signalTrap()`, which signals both
+      `termination.State` and `TaskCancelGroup` and wakes parked futex waiters
+      so sibling threads and the parent export call observe `error.Trap`
+      deterministically.
 
 ## Open questions
 

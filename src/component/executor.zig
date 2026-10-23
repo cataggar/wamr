@@ -1297,6 +1297,9 @@ fn callComponentFuncByLocalWithHostTaskContext(
     var frame: CallFrame = blk: {
         if (core_entry.module_inst) |mi| {
             const e = ExecEnv.create(mi, 4096, allocator) catch return error.OutOfMemory;
+            if (comptime config.lib_wasi_threads) {
+                e.setThreadManager(&@constCast(owner_inst).thread_manager);
+            }
             break :blk .{ .interp = InterpFrame.init(e) };
         }
         if (core_entry.aot_inst) |ai| {
@@ -1412,9 +1415,9 @@ fn callComponentFuncByLocalWithHostTaskContext(
         const tuple_size = computeTupleSize(registry, param_types);
         const tuple_align = computeTupleAlign(registry, param_types);
         const mut_owner: *ComponentInstance = @constCast(owner_inst);
-        const saved_may_leave = mut_owner.may_leave;
-        mut_owner.may_leave = false;
-        defer mut_owner.may_leave = saved_may_leave;
+        const saved_may_leave = @atomicLoad(bool, &mut_owner.may_leave, .acquire);
+        @atomicStore(bool, &mut_owner.may_leave, false, .release);
+        defer @atomicStore(bool, &mut_owner.may_leave, saved_may_leave, .release);
         const ptr = try callRealloc(&frame, realloc_idx, 0, 0, tuple_align, tuple_size);
         // Re-fetch memory: realloc may have grown it (relocating the slice).
         memory = frame.memory(default_mem_idx);
@@ -1494,6 +1497,17 @@ fn callComponentFuncByLocalWithHostTaskContext(
             },
             .aot => {},
         }
+        const mut_owner_on_trap: *ComponentInstance = @constCast(owner_inst);
+        const had_shared_trap = mut_owner_on_trap.threads.hasSharedTrap();
+        if (comptime config.lib_wasi_threads) {
+            if (mut_owner_on_trap.threads.hasActiveSharedThreads()) {
+                mut_owner_on_trap.thread_manager.signalTrap();
+            }
+        }
+        const shared_trap = mut_owner_on_trap.threads.joinSharedThreads();
+        if (had_shared_trap or shared_trap != null) {
+            return error.Trap;
+        }
         return error.TrapInCoreFunction;
     };
 
@@ -1538,9 +1552,9 @@ fn callComponentFuncByLocalWithHostTaskContext(
 
     // 7. Post-return callback
     if (resolved_post_return_idx) |pr_idx| {
-        const saved_may_leave = mut_owner.may_leave;
-        mut_owner.may_leave = false;
-        defer mut_owner.may_leave = saved_may_leave;
+        const saved_may_leave = @atomicLoad(bool, &mut_owner.may_leave, .acquire);
+        @atomicStore(bool, &mut_owner.may_leave, false, .release);
+        defer @atomicStore(bool, &mut_owner.may_leave, saved_may_leave, .release);
         // Per spec: post_return receives the flat result value(s).
         // For inline results (≤ MAX_FLAT_RESULTS): re-push the flat values.
         // For spilled results: re-push the result pointer as i32.
@@ -1695,6 +1709,9 @@ fn callComponentFuncByLocalAsyncLiftedWithHostTaskContext(
     var frame: CallFrame = blk: {
         if (core_entry.module_inst) |mi| {
             const env = ExecEnv.create(mi, 4096, allocator) catch return error.OutOfMemory;
+            if (comptime config.lib_wasi_threads) {
+                env.setThreadManager(&@constCast(owner_inst).thread_manager);
+            }
             break :blk .{ .interp = InterpFrame.init(env) };
         }
         if (core_entry.aot_inst) |ai| {
@@ -1741,9 +1758,9 @@ fn callComponentFuncByLocalAsyncLiftedWithHostTaskContext(
         const tuple_size = computeTupleSize(registry, param_types);
         const tuple_align = computeTupleAlign(registry, param_types);
         const mut_owner_realloc: *ComponentInstance = @constCast(owner_inst);
-        const saved_may_leave = mut_owner_realloc.may_leave;
-        mut_owner_realloc.may_leave = false;
-        defer mut_owner_realloc.may_leave = saved_may_leave;
+        const saved_may_leave = @atomicLoad(bool, &mut_owner_realloc.may_leave, .acquire);
+        @atomicStore(bool, &mut_owner_realloc.may_leave, false, .release);
+        defer @atomicStore(bool, &mut_owner_realloc.may_leave, saved_may_leave, .release);
         const ptr = try callRealloc(&frame, realloc_idx, 0, 0, tuple_align, tuple_size);
         memory = frame.memory(memory_idx);
         const refreshed_mem = memory orelse return error.MemoryNotAvailable;
@@ -1786,6 +1803,17 @@ fn callComponentFuncByLocalAsyncLiftedWithHostTaskContext(
                 }
             },
             .aot => {},
+        }
+        const mut_owner_on_trap: *ComponentInstance = @constCast(owner_inst);
+        const had_shared_trap = mut_owner_on_trap.threads.hasSharedTrap();
+        if (comptime config.lib_wasi_threads) {
+            if (mut_owner_on_trap.threads.hasActiveSharedThreads()) {
+                mut_owner_on_trap.thread_manager.signalTrap();
+            }
+        }
+        const shared_trap = mut_owner_on_trap.threads.joinSharedThreads();
+        if (had_shared_trap or shared_trap != null) {
+            return error.Trap;
         }
         return error.TrapInCoreFunction;
     };
@@ -2808,7 +2836,24 @@ pub fn dispatchCanonBuiltinWithCtx(
             // `canon thread.yield cancel?` — Binary.md tag 0x0c. Pushes
             // an i32 discriminant: 0 on normal resume, 1 if the task was
             // cancelled while parked (cancellable-only).
-            if (!comp_inst.may_leave) return error.Trap;
+            if (!@atomicLoad(bool, &comp_inst.may_leave, .acquire)) return error.Trap;
+            if (async_mod.tls_component_thread_idx != 0) {
+                std.Thread.yield() catch std.atomic.spinLoopHint();
+                if (comptime config.lib_wasi_threads) {
+                    if (thread_context) |tctx| {
+                        if (comp_inst.thread_manager.isTaskCancelledForContext(tctx) and info.cancellable) {
+                            env.pushI32(1) catch return error.StackOverflow;
+                            return;
+                        }
+                        if (comp_inst.thread_manager.isProcessTerminating()) {
+                            return error.Trap;
+                        }
+                    }
+                }
+                const outcome = threadCancellationOutcome(info.cancellable, task_manager, allocator);
+                env.pushI32(@bitCast(outcome)) catch return error.StackOverflow;
+                return;
+            }
             try runReadyComponentThreads(comp_inst, thread_context, task_manager, allocator);
             const outcome = threadCancellationOutcome(info.cancellable, task_manager, allocator);
             env.pushI32(@bitCast(outcome)) catch return error.StackOverflow;
@@ -4285,29 +4330,37 @@ fn dispatchAsyncCanon(
         // ── Backpressure & explicit thread canonical built-ins (#972) ───
         .backpressure_set => {
             const v = env.popI32() catch return error.StackUnderflow;
-            if (!comp_inst.may_leave) return error.Trap;
-            comp_inst.backpressure = if (v != 0) 1 else 0;
+            if (!@atomicLoad(bool, &comp_inst.may_leave, .acquire)) return error.Trap;
+            comp_inst.threads.mutex.lock();
+            defer comp_inst.threads.mutex.unlock();
+            @atomicStore(u16, &comp_inst.backpressure, if (v != 0) 1 else 0, .release);
         },
         .backpressure_inc => {
-            if (!comp_inst.may_leave) return error.Trap;
-            if (comp_inst.backpressure == std.math.maxInt(u16)) return error.Trap;
-            comp_inst.backpressure += 1;
+            if (!@atomicLoad(bool, &comp_inst.may_leave, .acquire)) return error.Trap;
+            comp_inst.threads.mutex.lock();
+            defer comp_inst.threads.mutex.unlock();
+            const cur = @atomicLoad(u16, &comp_inst.backpressure, .monotonic);
+            if (cur == std.math.maxInt(u16)) return error.Trap;
+            @atomicStore(u16, &comp_inst.backpressure, cur + 1, .release);
         },
         .backpressure_dec => {
-            if (!comp_inst.may_leave) return error.Trap;
-            if (comp_inst.backpressure == 0) return error.Trap;
-            comp_inst.backpressure -= 1;
+            if (!@atomicLoad(bool, &comp_inst.may_leave, .acquire)) return error.Trap;
+            comp_inst.threads.mutex.lock();
+            defer comp_inst.threads.mutex.unlock();
+            const cur = @atomicLoad(u16, &comp_inst.backpressure, .monotonic);
+            if (cur == 0) return error.Trap;
+            @atomicStore(u16, &comp_inst.backpressure, cur - 1, .release);
         },
         .thread_index => {
-            if (!comp_inst.may_leave) return error.Trap;
-            const idx = comp_inst.threads.current_thread_idx;
+            if (!@atomicLoad(bool, &comp_inst.may_leave, .acquire)) return error.Trap;
+            const idx = comp_inst.threads.activeThreadIdx();
             if (idx == 0 or comp_inst.threads.get(idx) == null) return error.Trap;
             env.pushI32(@bitCast(idx)) catch return error.StackOverflow;
         },
         .thread_new_indirect => |info| {
             const context_arg = env.popI32() catch return error.StackUnderflow;
             const func_table_idx = env.popI32() catch return error.StackUnderflow;
-            if (!comp_inst.may_leave) return error.Trap;
+            if (!@atomicLoad(bool, &comp_inst.may_leave, .acquire)) return error.Trap;
             const target = try resolveIndirectThreadTarget(
                 comp_inst,
                 env,
@@ -4322,22 +4375,24 @@ fn dispatchAsyncCanon(
         },
         .thread_resume_later => {
             const raw_idx = env.popI32() catch return error.StackUnderflow;
-            if (!comp_inst.may_leave) return error.Trap;
+            if (!@atomicLoad(bool, &comp_inst.may_leave, .acquire)) return error.Trap;
             if (raw_idx <= 0) return error.Trap;
             const target_idx: u32 = @bitCast(raw_idx);
-            if (target_idx == comp_inst.threads.current_thread_idx) return error.Trap;
+            if (target_idx == comp_inst.threads.activeThreadIdx()) return error.Trap;
             const entry = comp_inst.threads.get(target_idx) orelse return error.Trap;
             if (entry.state != .suspended) return error.Trap;
             comp_inst.threads.enqueueReady(allocator, target_idx) catch return error.OutOfMemory;
         },
         .thread_suspend => |info| {
-            if (!comp_inst.may_leave) return error.Trap;
-            const current_idx = comp_inst.threads.current_thread_idx;
+            if (!@atomicLoad(bool, &comp_inst.may_leave, .acquire)) return error.Trap;
+            const current_idx = comp_inst.threads.activeThreadIdx();
             if (current_idx == 0) return error.Trap;
             const current_entry = comp_inst.threads.get(current_idx) orelse return error.Trap;
             current_entry.state = .suspended;
             try runReadyComponentThreads(comp_inst, thread_context, task_manager, allocator);
+            comp_inst.threads.mutex.lock();
             comp_inst.threads.current_thread_idx = current_idx;
+            comp_inst.threads.mutex.unlock();
             if (comp_inst.threads.get(current_idx)) |ce| {
                 ce.state = .running;
                 comp_inst.threads.removeFromReadyQueue(current_idx);
@@ -4404,7 +4459,7 @@ fn dispatchAsyncCanon(
         .thread_spawn_ref => |info| {
             const context_arg = env.popI32() catch return error.StackUnderflow;
             const func_idx = try popFuncrefFuncIdx(env);
-            if (!comp_inst.may_leave) return error.Trap;
+            if (!@atomicLoad(bool, &comp_inst.may_leave, .acquire)) return error.Trap;
             const target = try resolveRefThreadTarget(
                 comp_inst,
                 env,
@@ -4412,15 +4467,18 @@ fn dispatchAsyncCanon(
                 func_idx,
                 context_arg,
             );
-            const new_idx = comp_inst.threads.allocThread(allocator, target, info.is_shared) catch
-                return error.OutOfMemory;
-            comp_inst.threads.enqueueReady(allocator, new_idx) catch return error.OutOfMemory;
+            const new_idx = try spawnComponentThreadTarget(
+                comp_inst,
+                target,
+                info.is_shared,
+                allocator,
+            );
             env.pushI32(@bitCast(new_idx)) catch return error.StackOverflow;
         },
         .thread_spawn_indirect => |info| {
             const context_arg = env.popI32() catch return error.StackUnderflow;
             const func_table_idx = env.popI32() catch return error.StackUnderflow;
-            if (!comp_inst.may_leave) return error.Trap;
+            if (!@atomicLoad(bool, &comp_inst.may_leave, .acquire)) return error.Trap;
             const target = try resolveIndirectThreadTarget(
                 comp_inst,
                 env,
@@ -4429,13 +4487,16 @@ fn dispatchAsyncCanon(
                 func_table_idx,
                 context_arg,
             );
-            const new_idx = comp_inst.threads.allocThread(allocator, target, info.is_shared) catch
-                return error.OutOfMemory;
-            comp_inst.threads.enqueueReady(allocator, new_idx) catch return error.OutOfMemory;
+            const new_idx = try spawnComponentThreadTarget(
+                comp_inst,
+                target,
+                info.is_shared,
+                allocator,
+            );
             env.pushI32(@bitCast(new_idx)) catch return error.StackOverflow;
         },
         .thread_available_parallelism => |info| {
-            if (!comp_inst.may_leave) return error.Trap;
+            if (!@atomicLoad(bool, &comp_inst.may_leave, .acquire)) return error.Trap;
             const count: u32 = if (!info.is_shared or !@import("config").lib_wasi_threads)
                 1
             else
@@ -4642,8 +4703,13 @@ fn validateAndBuildInterpTableTarget(
     if (comp_inst.component.core_types.len == 0 and func_type_idx < mi.module.types.len) {
         if (!isThreadStartCoreSig(mi.module.types[func_type_idx])) return error.Trap;
     }
-    if (elem_idx >= table.elements.len) return error.Trap;
-    const elem = table.elements[elem_idx];
+    table.lock();
+    const elem_opt: ?core_types.TableElement = if (elem_idx < table.elements.len)
+        table.elements[elem_idx]
+    else
+        null;
+    table.unlock();
+    const elem = elem_opt orelse return error.Trap;
     const target_func_idx: u32 = switch (elem.value) {
         .funcref => |opt| opt orelse return error.Trap,
         .nonfuncref => |opt| opt orelse return error.Trap,
@@ -4678,8 +4744,13 @@ fn validateAndBuildAotTableTarget(
     }
     if (table_idx >= ai.tables.len) return error.Trap;
     const tbl = ai.tables[table_idx];
-    if (elem_idx >= tbl.elements.len) return error.Trap;
-    const elem = tbl.elements[elem_idx];
+    tbl.lock();
+    const elem_opt: ?core_types.TableElement = if (elem_idx < tbl.elements.len)
+        tbl.elements[elem_idx]
+    else
+        null;
+    tbl.unlock();
+    const elem = elem_opt orelse return error.Trap;
     const target_func_idx: u32 = switch (elem.value) {
         .funcref => |opt| opt orelse return error.Trap,
         .nonfuncref => |opt| opt orelse return error.Trap,
@@ -4734,6 +4805,266 @@ fn resolveRefThreadTarget(
     return error.Trap;
 }
 
+const SharedComponentWorkerCtx = struct {
+    comp_inst: *ComponentInstance,
+    allocator: Allocator,
+    thread_idx: u32,
+    func_idx: u32,
+    context_arg: i32,
+    cancel_group: if (config.lib_wasi_threads) ?*thread_manager_mod.TaskCancelGroup else void,
+    aux_stack: if (config.lib_wasi_threads) ?execution_context.AuxiliaryStack else void,
+    start_gate: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    backend: union(enum) {
+        interp: struct {
+            child_mi: *core_types.ModuleInstance,
+            worker_env: *ExecEnv,
+        },
+        aot: struct {
+            inst: *aot_runtime.AotInstance,
+            owns_inst: bool,
+        },
+    },
+};
+
+fn destroySharedComponentWorkerCtx(ctx: *SharedComponentWorkerCtx) void {
+    const allocator = ctx.allocator;
+    switch (ctx.backend) {
+        .interp => |b| {
+            b.worker_env.destroy();
+            b.child_mi.destroyThreadClone();
+        },
+        .aot => |b| {
+            if (b.owns_inst) {
+                aot_runtime.destroy(b.inst);
+            }
+        },
+    }
+    if (comptime config.lib_wasi_threads) {
+        ctx.comp_inst.thread_manager.releaseComponentAuxStack(ctx.aux_stack);
+        ctx.comp_inst.thread_manager.releaseComponentThreadSlot(ctx.cancel_group);
+    }
+    allocator.destroy(ctx);
+}
+
+fn isIntentionalSharedWorkerStop(
+    comp_inst: *ComponentInstance,
+    thread_ctx: *const execution_context.ThreadExecutionContext,
+    err: anyerror,
+) bool {
+    if (comptime !config.lib_wasi_threads) return false;
+    if (err == error.ThreadCancelled) return true;
+    if (comp_inst.thread_manager.isTaskCancelledForContext(thread_ctx)) return true;
+    if (comp_inst.thread_termination.exitCode() != null) return true;
+    return false;
+}
+
+fn runSharedComponentWorker(ctx: *SharedComponentWorkerCtx) void {
+    while (ctx.start_gate.load(.acquire) == 0) {
+        std.atomic.spinLoopHint();
+    }
+    const comp_inst = ctx.comp_inst;
+    const thread_idx = ctx.thread_idx;
+    async_mod.tls_component_thread_idx = thread_idx;
+    defer {
+        async_mod.tls_component_thread_idx = 0;
+        destroySharedComponentWorkerCtx(ctx);
+        comp_inst.threads.finishSharedThread(thread_idx);
+    }
+
+    switch (ctx.backend) {
+        .interp => |b| {
+            var ctx_scope = b.worker_env.thread_context.enter();
+            defer ctx_scope.deinit();
+            b.worker_env.pushI32(ctx.context_arg) catch {
+                comp_inst.threads.recordSharedTrap(error.Trap);
+                if (comptime config.lib_wasi_threads) comp_inst.thread_manager.signalTrap();
+                return;
+            };
+            interp.executeFunction(b.worker_env, ctx.func_idx) catch |err| {
+                if (!isIntentionalSharedWorkerStop(comp_inst, &b.worker_env.thread_context, err)) {
+                    comp_inst.threads.recordSharedTrap(error.Trap);
+                    if (comptime config.lib_wasi_threads) comp_inst.thread_manager.signalTrap();
+                }
+                return;
+            };
+        },
+        .aot => |b| {
+            var ctx_scope = b.inst.thread_context.enter();
+            defer ctx_scope.deinit();
+            const param_types = [_]core_types.ValType{.i32};
+            const args = [_]core_types.Value{.{ .i32 = ctx.context_arg }};
+            var results_buf: [1]aot_runtime.ScalarResult = undefined;
+            _ = aot_runtime.callFuncScalar(
+                b.inst,
+                ctx.func_idx,
+                &param_types,
+                &.{},
+                &args,
+                &results_buf,
+            ) catch |err| {
+                if (!isIntentionalSharedWorkerStop(comp_inst, &b.inst.thread_context, err)) {
+                    comp_inst.threads.recordSharedTrap(error.Trap);
+                    if (comptime config.lib_wasi_threads) comp_inst.thread_manager.signalTrap();
+                }
+                return;
+            };
+        },
+    }
+}
+
+fn spawnComponentThreadTarget(
+    comp_inst: *ComponentInstance,
+    target: async_mod.ComponentThreadTarget,
+    is_shared: bool,
+    allocator: Allocator,
+) ExecutionError!u32 {
+    if (!is_shared or comptime (!config.lib_wasi_threads or @import("builtin").single_threaded)) {
+        const new_idx = comp_inst.threads.allocThread(allocator, target, is_shared) catch
+            return error.OutOfMemory;
+        comp_inst.threads.enqueueReady(allocator, new_idx) catch {
+            comp_inst.threads.remove(new_idx);
+            return error.OutOfMemory;
+        };
+        return new_idx;
+    }
+
+    const cancel_group = comp_inst.thread_manager.acquireComponentThreadSlot() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.Trap,
+    };
+    var slot_owned = true;
+    errdefer if (slot_owned) comp_inst.thread_manager.releaseComponentThreadSlot(cancel_group);
+
+    const new_idx = comp_inst.threads.allocSharedThread(allocator, target) catch
+        return error.OutOfMemory;
+    var entry_owned = true;
+    errdefer if (entry_owned) comp_inst.threads.rollbackSharedThreadSpawn(new_idx);
+
+    const aux_stack = comp_inst.thread_manager.allocateComponentAuxStack();
+    var stack_owned = true;
+    errdefer if (stack_owned) comp_inst.thread_manager.releaseComponentAuxStack(aux_stack);
+
+    const worker_ctx = allocator.create(SharedComponentWorkerCtx) catch return error.OutOfMemory;
+    var ctx_allocated = true;
+    errdefer if (ctx_allocated) allocator.destroy(worker_ctx);
+
+    switch (target) {
+        .implicit_main => return error.Trap,
+        .interp => |t| {
+            const parent_mi: *core_types.ModuleInstance = @ptrCast(@alignCast(t.module_inst_ptr));
+            if (parent_mi.thread_manager == null) {
+                parent_mi.thread_manager = &comp_inst.thread_manager;
+            }
+            if (parent_mi.memories.len > 0 and parent_mi.memories[0].shared_control != null) {
+                comp_inst.thread_manager.bindSharedMemory(parent_mi.memories[0]);
+            }
+            const child_mi = parent_mi.cloneForThread(allocator) catch return error.OutOfMemory;
+            errdefer child_mi.destroyThreadClone();
+            if (aux_stack) |stack| {
+                if (child_mi.module.findExport("__stack_pointer", .global)) |exp| {
+                    if (exp.index < child_mi.globals.len) {
+                        child_mi.globals[exp.index].value = .{ .i32 = @bitCast(stack.top) };
+                    }
+                }
+            }
+            const worker_env = ExecEnv.create(child_mi, 4096, allocator) catch return error.OutOfMemory;
+            worker_env.setThreadManager(&comp_inst.thread_manager);
+            worker_env.thread_context.setCancellationGroup(
+                if (cancel_group) |g| @ptrCast(g) else null,
+                if (cancel_group) |g| g.token else 0,
+            );
+            worker_env.thread_context.configureWasiThread(
+                @intCast(new_idx),
+                @bitCast(t.context_arg),
+                aux_stack,
+            );
+            if (execution_context.current()) |parent_ctx| {
+                worker_env.thread_context.implicit_task_context = parent_ctx.implicit_task_context;
+            }
+            worker_ctx.* = .{
+                .comp_inst = comp_inst,
+                .allocator = allocator,
+                .thread_idx = new_idx,
+                .func_idx = t.func_idx,
+                .context_arg = t.context_arg,
+                .cancel_group = cancel_group,
+                .aux_stack = aux_stack,
+                .backend = .{
+                    .interp = .{
+                        .child_mi = child_mi,
+                        .worker_env = worker_env,
+                    },
+                },
+            };
+        },
+        .aot => |t| {
+            const parent_ai: *aot_runtime.AotInstance = @ptrCast(@alignCast(t.aot_inst_ptr));
+            if (parent_ai.memories.len > 0 and parent_ai.memories[0].shared_control != null) {
+                comp_inst.thread_manager.bindSharedMemory(parent_ai.memories[0]);
+            }
+            var owns_inst = false;
+            const child_ai: *aot_runtime.AotInstance = if (parent_ai.code_mapping != null) blk: {
+                const cloned = aot_runtime.cloneForThread(parent_ai, allocator) catch return error.OutOfMemory;
+                owns_inst = true;
+                if (aux_stack) |stack| {
+                    if (cloned.module.findExport("__stack_pointer", .global)) |exp| {
+                        if (exp.index < cloned.globals.len) {
+                            cloned.globals[exp.index].value = .{ .i32 = @bitCast(stack.top) };
+                        }
+                    }
+                }
+                cloned.thread_context.setCancellationGroup(
+                    if (cancel_group) |g| @ptrCast(g) else null,
+                    if (cancel_group) |g| g.token else 0,
+                );
+                cloned.thread_context.configureWasiThread(
+                    @intCast(new_idx),
+                    @bitCast(t.context_arg),
+                    aux_stack,
+                );
+                cloned.setThreadManager(&comp_inst.thread_manager);
+                break :blk cloned;
+            } else parent_ai;
+
+            worker_ctx.* = .{
+                .comp_inst = comp_inst,
+                .allocator = allocator,
+                .thread_idx = new_idx,
+                .func_idx = t.func_idx,
+                .context_arg = t.context_arg,
+                .cancel_group = cancel_group,
+                .aux_stack = aux_stack,
+                .backend = .{
+                    .aot = .{
+                        .inst = child_ai,
+                        .owns_inst = owns_inst,
+                    },
+                },
+            };
+        },
+    }
+
+    slot_owned = false;
+    stack_owned = false;
+    ctx_allocated = false;
+
+    const os_thread = std.Thread.spawn(.{}, runSharedComponentWorker, .{worker_ctx}) catch {
+        destroySharedComponentWorkerCtx(worker_ctx);
+        return error.Trap;
+    };
+    entry_owned = false;
+    comp_inst.threads.registerSharedOsThread(new_idx, os_thread);
+    worker_ctx.start_gate.store(1, .release);
+    return new_idx;
+}
+
+fn joinSharedComponentThreads(comp_inst: *ComponentInstance) ExecutionError!void {
+    if (async_mod.tls_component_thread_idx != 0) return;
+    if (comp_inst.threads.joinSharedThreads() != null) {
+        return error.Trap;
+    }
+}
+
 fn executeComponentThread(
     comp_inst: *ComponentInstance,
     thread_idx: u32,
@@ -4748,14 +5079,18 @@ fn executeComponentThread(
         return;
     }
 
-    const prev_thread_idx = comp_inst.threads.current_thread_idx;
+    const prev_thread_idx = comp_inst.threads.activeThreadIdx();
     const target = entry.target;
     comp_inst.threads.removeFromReadyQueue(thread_idx);
     entry.state = .running;
     entry.in_flight = true;
+    comp_inst.threads.mutex.lock();
     comp_inst.threads.current_thread_idx = thread_idx;
+    comp_inst.threads.mutex.unlock();
     defer {
+        comp_inst.threads.mutex.lock();
         comp_inst.threads.current_thread_idx = prev_thread_idx;
+        comp_inst.threads.mutex.unlock();
         comp_inst.threads.remove(thread_idx);
     }
 
@@ -4765,6 +5100,9 @@ fn executeComponentThread(
             const mi: *core_types.ModuleInstance = @ptrCast(@alignCast(t.module_inst_ptr));
             const child_env = ExecEnv.create(mi, 4096, allocator) catch return error.OutOfMemory;
             defer child_env.destroy();
+            if (comptime config.lib_wasi_threads) {
+                child_env.setThreadManager(&comp_inst.thread_manager);
+            }
             if (thread_context) |parent_ctx| {
                 child_env.thread_context.implicit_task_context = parent_ctx.implicit_task_context;
             }
@@ -4807,6 +5145,7 @@ fn runReadyComponentThreads(
     while (comp_inst.threads.popReady()) |ready_idx| {
         try executeComponentThread(comp_inst, ready_idx, thread_context, task_manager, allocator);
     }
+    try joinSharedComponentThreads(comp_inst);
 }
 
 fn switchComponentThread(
@@ -4819,10 +5158,10 @@ fn switchComponentThread(
     task_manager: ?*async_mod.TaskManager,
     allocator: Allocator,
 ) ExecutionError!u32 {
-    if (!comp_inst.may_leave) return error.Trap;
+    if (!@atomicLoad(bool, &comp_inst.may_leave, .acquire)) return error.Trap;
     if (raw_target_idx <= 0) return error.Trap;
     const target_idx: u32 = @bitCast(raw_target_idx);
-    const current_idx = comp_inst.threads.current_thread_idx;
+    const current_idx = comp_inst.threads.activeThreadIdx();
     if (current_idx == 0 or target_idx == current_idx) return error.Trap;
 
     const current_entry = comp_inst.threads.get(current_idx) orelse return error.Trap;
@@ -4844,7 +5183,9 @@ fn switchComponentThread(
     }
     try runReadyComponentThreads(comp_inst, thread_context, task_manager, allocator);
 
+    comp_inst.threads.mutex.lock();
     comp_inst.threads.current_thread_idx = current_idx;
+    comp_inst.threads.mutex.unlock();
     if (comp_inst.threads.get(current_idx)) |ce| {
         ce.state = .running;
         comp_inst.threads.removeFromReadyQueue(current_idx);
@@ -13198,4 +13539,424 @@ test "dispatchCanonBuiltin: thread.index, thread.new-indirect, resume/yield/susp
     );
     try testing.expect((try env.popI32()) >= 1);
 }
+
+test "component shared-everything threads: thread.spawn-indirect (is_shared=true) runs parallel OS workers with atomic RMW and distinct thread.index (#972)" {
+    if (!config.lib_wasi_threads or @import("builtin").single_threaded) return error.SkipZigTest;
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    // Import 0: thread.index () -> i32
+    // Import 1: thread.spawn-indirect (shared) (i32, i32) -> i32
+    // Import 2: thread.available-parallelism (shared) () -> i32
+    // Import 3: thread.available-parallelism (non-shared) () -> i32
+    // Local func 4: worker(slot: i32) -> () {
+    //   atomic_add(&mem[0], (slot + 1) * 10);
+    //   mem[16 + slot * 4] = thread.index();
+    // }
+    // Local func 5: run() -> i32 {
+    //   mem[4] = thread.index();
+    //   mem[8] = available_parallelism_shared();
+    //   mem[12] = available_parallelism_unshared();
+    //   for slot in 0..3:
+    //     mem[32 + slot * 4] = spawn_indirect(0, slot);
+    //   return 1;
+    // }
+    const imports = [_]core_types_mod.ImportDesc{
+        .{ .module_name = "$root", .field_name = "[thread-index]", .kind = .function, .func_type_idx = 0 },
+        .{ .module_name = "$root", .field_name = "[thread-spawn-indirect]", .kind = .function, .func_type_idx = 1 },
+        .{ .module_name = "$root", .field_name = "[thread-avail-shared]", .kind = .function, .func_type_idx = 0 },
+        .{ .module_name = "$root", .field_name = "[thread-avail-unshared]", .kind = .function, .func_type_idx = 0 },
+    };
+    const func_types = [_]core_types_mod.FuncType{
+        .{ .params = &.{}, .results = &.{.i32} },
+        .{ .params = &.{ .i32, .i32 }, .results = &.{.i32} },
+        .{ .params = &.{.i32}, .results = &.{} },
+    };
+    const worker_code = [_]u8{
+        // i32.atomic.rmw.add(&mem[0], (local 0 + 1) * 10)
+        0x41, 0x00, // i32.const 0
+        0x20, 0x00, // local.get 0
+        0x41, 0x01, // i32.const 1
+        0x6A, // i32.add
+        0x41, 0x0A, // i32.const 10
+        0x6C, // i32.mul
+        0xFE, 0x1E, 0x02, 0x00, // i32.atomic.rmw.add align=2 offset=0
+        0x1A, // drop
+        // mem[16 + local 0 * 4] = call 0 (thread.index)
+        0x20, 0x00, // local.get 0
+        0x41, 0x04, // i32.const 4
+        0x6C, // i32.mul
+        0x41, 0x10, // i32.const 16
+        0x6A, // i32.add
+        0x10, 0x00, // call 0 (thread.index)
+        0xFE, 0x17, 0x02, 0x00, // i32.atomic.store align=2 offset=0
+        0x0B, // end
+    };
+    const run_code = [_]u8{
+        // mem[4] = thread.index()
+        0x41, 0x04,
+        0x10, 0x00,
+        0x36, 0x02, 0x00,
+        // mem[8] = available_parallelism(shared=true)
+        0x41, 0x08,
+        0x10, 0x02,
+        0x36, 0x02, 0x00,
+        // mem[12] = available_parallelism(shared=false)
+        0x41, 0x0C,
+        0x10, 0x03,
+        0x36, 0x02, 0x00,
+        // mem[32] = spawn_indirect(elem=0, ctx=0)
+        0x41, 0x20,
+        0x41, 0x00,
+        0x41, 0x00,
+        0x10, 0x01,
+        0x36, 0x02, 0x00,
+        // mem[36] = spawn_indirect(elem=0, ctx=1)
+        0x41, 0x24,
+        0x41, 0x00,
+        0x41, 0x01,
+        0x10, 0x01,
+        0x36, 0x02, 0x00,
+        // mem[40] = spawn_indirect(elem=0, ctx=2)
+        0x41, 0x28,
+        0x41, 0x00,
+        0x41, 0x02,
+        0x10, 0x01,
+        0x36, 0x02, 0x00,
+        // mem[44] = spawn_indirect(elem=0, ctx=3)
+        0x41, 0x2C,
+        0x41, 0x00,
+        0x41, 0x03,
+        0x10, 0x01,
+        0x36, 0x02, 0x00,
+        // return 1
+        0x41, 0x01,
+        0x0B,
+    };
+    const functions = [_]core_types_mod.WasmFunction{
+        .{
+            .type_idx = 2,
+            .func_type = func_types[2],
+            .local_count = 0,
+            .locals = &.{},
+            .code = &worker_code,
+        },
+        .{
+            .type_idx = 0,
+            .func_type = func_types[0],
+            .local_count = 0,
+            .locals = &.{},
+            .code = &run_code,
+        },
+    };
+    const tables = [_]core_types_mod.TableType{
+        .{ .elem_type = .funcref, .limits = .{ .min = 2, .max = 2 } },
+    };
+    const memories = [_]core_types_mod.MemoryType{
+        .{ .limits = .{ .min = 1, .max = 1 }, .is_shared = true },
+    };
+    var module = core_types_mod.WasmModule{
+        .types = &func_types,
+        .imports = &imports,
+        .import_function_count = 4,
+        .functions = &functions,
+        .tables = &tables,
+        .memories = &memories,
+    };
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    core_inst.tables[0].elements[0] = .{ .value = .{ .funcref = 4 }, .module_inst = @ptrCast(core_inst) };
+
+    const comp_types = [_]ctypes.ComponentType{
+        .{ .func = .{
+            .is_async = false,
+            .params = &.{},
+            .results = .{ .unnamed = .{ .prim = .s32 } },
+        } },
+    };
+    var comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &comp_types,
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+    const cis = try testing.allocator.alloc(ComponentInstance.CoreInstanceEntry, 1);
+    cis[0] = .{ .module_inst = core_inst };
+    inst.core_instances = cis;
+
+    var tidx_ctx = CanonBuiltinTrampolineCtx{
+        .comp_inst = inst,
+        .canon = .{ .async_canon = .thread_index },
+    };
+    var spawn_ctx = CanonBuiltinTrampolineCtx{
+        .comp_inst = inst,
+        .canon = .{ .async_canon = .{ .thread_spawn_indirect = .{
+            .is_shared = true,
+            .func_type_idx = 2,
+            .table_idx = 0,
+        } } },
+    };
+    var avail_shared_ctx = CanonBuiltinTrampolineCtx{
+        .comp_inst = inst,
+        .canon = .{ .async_canon = .{ .thread_available_parallelism = .{ .is_shared = true } } },
+    };
+    var avail_unshared_ctx = CanonBuiltinTrampolineCtx{
+        .comp_inst = inst,
+        .canon = .{ .async_canon = .{ .thread_available_parallelism = .{ .is_shared = false } } },
+    };
+    const host_entries = try testing.allocator.alloc(?core_types_mod.HostFnEntry, 4);
+    host_entries[0] = .{ .func = &canonBuiltinTrampoline, .ctx = @ptrCast(&tidx_ctx) };
+    host_entries[1] = .{ .func = &canonBuiltinTrampoline, .ctx = @ptrCast(&spawn_ctx) };
+    host_entries[2] = .{ .func = &canonBuiltinTrampoline, .ctx = @ptrCast(&avail_shared_ctx) };
+    host_entries[3] = .{ .func = &canonBuiltinTrampoline, .ctx = @ptrCast(&avail_unshared_ctx) };
+    inst_mod_core.attachHostFuncEntries(core_inst, host_entries);
+
+    try inst.exports.put(testing.allocator, "run", .{
+        .local = .{
+            .core_func_idx = 5,
+            .func_type_idx = 0,
+            .opts = &.{},
+        },
+    });
+
+    var results: [1]InterfaceValue = undefined;
+    try callComponentFunc(inst, "run", &.{}, &results, testing.allocator);
+    try testing.expectEqual(@as(i32, 1), results[0].s32);
+
+    const mem = core_inst.memories[0].data;
+    // Final atomic sum = 10 + 20 + 30 + 40 = 100.
+    try testing.expectEqual(@as(u32, 100), std.mem.readInt(u32, mem[0..4], .little));
+    // Main thread observed thread.index == 1.
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, mem[4..8], .little));
+    // available-parallelism: shared >= 1, unshared == 1.
+    try testing.expect(std.mem.readInt(u32, mem[8..12], .little) >= 1);
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, mem[12..16], .little));
+
+    // Each OS worker thread observed its own distinct thread.index (2, 3, 4, 5)
+    // matching the handle returned by thread.spawn-indirect.
+    var seen_mask: u32 = 0;
+    for (0..4) |slot| {
+        const observed_tid = std.mem.readInt(u32, mem[16 + slot * 4 ..][0..4], .little);
+        const spawned_tid = std.mem.readInt(u32, mem[32 + slot * 4 ..][0..4], .little);
+        try testing.expectEqual(spawned_tid, observed_tid);
+        try testing.expect(observed_tid >= 2 and observed_tid <= 5);
+        seen_mask |= (@as(u32, 1) << @intCast(observed_tid));
+    }
+    try testing.expectEqual(@as(u32, (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5)), seen_mask);
+    try testing.expectEqual(@as(usize, 0), inst.thread_manager.activeComponentThreadCount());
+}
+
+test "component shared-everything threads: thread.spawn-ref (is_shared=true) runs on OS worker and writes thread.index + context_arg (#972)" {
+    if (!config.lib_wasi_threads or @import("builtin").single_threaded) return error.SkipZigTest;
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    const imports = [_]core_types_mod.ImportDesc{
+        .{ .module_name = "$root", .field_name = "[thread-index]", .kind = .function, .func_type_idx = 0 },
+    };
+    const func_types = [_]core_types_mod.FuncType{
+        .{ .params = &.{}, .results = &.{.i32} },
+        .{ .params = &.{.i32}, .results = &.{} },
+    };
+    const worker_code = [_]u8{
+        0x41, 0x00, // i32.const 0
+        0x20, 0x00, // local.get 0 (context_arg)
+        0xFE, 0x17, 0x02, 0x00, // i32.atomic.store align=2 offset=0
+        0x41, 0x04, // i32.const 4
+        0x10, 0x00, // call 0 (thread.index)
+        0xFE, 0x17, 0x02, 0x00, // i32.atomic.store align=2 offset=0
+        0x0B,
+    };
+    const functions = [_]core_types_mod.WasmFunction{
+        .{
+            .type_idx = 1,
+            .func_type = func_types[1],
+            .local_count = 0,
+            .locals = &.{},
+            .code = &worker_code,
+        },
+    };
+    const memories = [_]core_types_mod.MemoryType{
+        .{ .limits = .{ .min = 1, .max = 1 }, .is_shared = true },
+    };
+    var module = core_types_mod.WasmModule{
+        .types = &func_types,
+        .imports = &imports,
+        .import_function_count = 1,
+        .functions = &functions,
+        .memories = &memories,
+    };
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+    const cis = try testing.allocator.alloc(ComponentInstance.CoreInstanceEntry, 1);
+    cis[0] = .{ .module_inst = core_inst };
+    inst.core_instances = cis;
+
+    var tidx_ctx = CanonBuiltinTrampolineCtx{
+        .comp_inst = inst,
+        .canon = .{ .async_canon = .thread_index },
+    };
+    const host_entries = try testing.allocator.alloc(?core_types_mod.HostFnEntry, 1);
+    host_entries[0] = .{ .func = &canonBuiltinTrampoline, .ctx = @ptrCast(&tidx_ctx) };
+    inst_mod_core.attachHostFuncEntries(core_inst, host_entries);
+
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    try env.push(.{ .funcref = 1 });
+    try env.pushI32(0x55AA_1234);
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .thread_spawn_ref = .{
+            .is_shared = true,
+            .func_type_idx = 1,
+        } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const tid = try env.popI32();
+    try testing.expectEqual(@as(i32, 2), tid);
+
+    try runReadyComponentThreads(inst, null, null, testing.allocator);
+    try testing.expectEqual(@as(u32, 0x55AA_1234), std.mem.readInt(u32, core_inst.memories[0].data[0..4], .little));
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, core_inst.memories[0].data[4..8], .little));
+    try testing.expectEqual(@as(usize, 0), inst.thread_manager.activeComponentThreadCount());
+}
+
+test "component shared-everything threads: worker trap in thread.spawn-indirect (is_shared=true) propagates error.Trap to parent export (#972)" {
+    if (!config.lib_wasi_threads or @import("builtin").single_threaded) return error.SkipZigTest;
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    const imports = [_]core_types_mod.ImportDesc{
+        .{ .module_name = "$root", .field_name = "[thread-spawn-indirect]", .kind = .function, .func_type_idx = 0 },
+    };
+    const func_types = [_]core_types_mod.FuncType{
+        .{ .params = &.{ .i32, .i32 }, .results = &.{.i32} },
+        .{ .params = &.{.i32}, .results = &.{} },
+        .{ .params = &.{}, .results = &.{} },
+    };
+    const trapping_worker_code = [_]u8{
+        0x00, // unreachable
+        0x0B,
+    };
+    const run_trap_code = [_]u8{
+        0x41, 0x00, // elem 0 (trapping_worker)
+        0x41, 0x2A, // context_arg = 42
+        0x10, 0x00, // call 0 (thread.spawn-indirect)
+        0x1A, // drop
+        0x0B,
+    };
+    const functions = [_]core_types_mod.WasmFunction{
+        .{
+            .type_idx = 1,
+            .func_type = func_types[1],
+            .local_count = 0,
+            .locals = &.{},
+            .code = &trapping_worker_code,
+        },
+        .{
+            .type_idx = 2,
+            .func_type = func_types[2],
+            .local_count = 0,
+            .locals = &.{},
+            .code = &run_trap_code,
+        },
+    };
+    const tables = [_]core_types_mod.TableType{
+        .{ .elem_type = .funcref, .limits = .{ .min = 1, .max = 1 } },
+    };
+    const memories = [_]core_types_mod.MemoryType{
+        .{ .limits = .{ .min = 1, .max = 1 }, .is_shared = true },
+    };
+    var module = core_types_mod.WasmModule{
+        .types = &func_types,
+        .imports = &imports,
+        .import_function_count = 1,
+        .functions = &functions,
+        .tables = &tables,
+        .memories = &memories,
+    };
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    core_inst.tables[0].elements[0] = .{ .value = .{ .funcref = 1 }, .module_inst = @ptrCast(core_inst) };
+
+    const comp_types = [_]ctypes.ComponentType{
+        .{ .func = .{
+            .is_async = false,
+            .params = &.{},
+            .results = .none,
+        } },
+    };
+    var comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &comp_types,
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+    const cis = try testing.allocator.alloc(ComponentInstance.CoreInstanceEntry, 1);
+    cis[0] = .{ .module_inst = core_inst };
+    inst.core_instances = cis;
+
+    var spawn_ctx = CanonBuiltinTrampolineCtx{
+        .comp_inst = inst,
+        .canon = .{ .async_canon = .{ .thread_spawn_indirect = .{
+            .is_shared = true,
+            .func_type_idx = 1,
+            .table_idx = 0,
+        } } },
+    };
+    const host_entries = try testing.allocator.alloc(?core_types_mod.HostFnEntry, 1);
+    host_entries[0] = .{ .func = &canonBuiltinTrampoline, .ctx = @ptrCast(&spawn_ctx) };
+    inst_mod_core.attachHostFuncEntries(core_inst, host_entries);
+
+    try inst.exports.put(testing.allocator, "run-trap", .{
+        .local = .{
+            .core_func_idx = 2,
+            .func_type_idx = 0,
+            .opts = &.{},
+        },
+    });
+
+    var out: [0]InterfaceValue = .{};
+    try testing.expectError(
+        error.Trap,
+        callComponentFunc(inst, "run-trap", &.{}, &out, testing.allocator),
+    );
+    try testing.expect(inst.thread_termination.isTerminating());
+    try testing.expectEqual(@as(usize, 0), inst.thread_manager.activeComponentThreadCount());
+}
+
 

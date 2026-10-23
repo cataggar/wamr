@@ -552,6 +552,10 @@ pub const ThreadManager = struct {
     shutting_down: bool = false,
     spawning_count: usize = 0,
     joining_count: usize = 0,
+    /// Active Component Model shared-everything worker threads (`thread.spawn-ref` /
+    /// `thread.spawn-indirect` with `is_shared = true`) sharing this manager's
+    /// `max_thread_slots` (`MAX_THREADS`) cap, `TaskCancelGroup`, and termination state.
+    active_component_threads: usize = 0,
     test_hooks: ?*const TestHooks = null,
     /// The group's first-wins terminal outcome, owned by the shared process
     /// state. Bound by the embedder; when null every termination path stays
@@ -671,6 +675,103 @@ pub const ThreadManager = struct {
             global.value = .{ .i32 = @bitCast(reserved_end) };
         }
         self.shared_memory = memory;
+    }
+
+    /// Record a shared memory for futex waiter cancellation when a component uses
+    /// shared-everything threads without reserving a Preview-1 auxiliary stack pool.
+    pub fn bindSharedMemory(self: *ThreadManager, memory: *types.MemoryInstance) void {
+        if (memory.shared_control == null) return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.shared_memory == null) {
+            self.shared_memory = memory;
+        }
+    }
+
+    /// Reserve a shared `max_thread_slots` (`MAX_THREADS`) slot and capture any active
+    /// `TaskCancelGroup` for a Component Model `is_shared = true` worker thread.
+    pub fn acquireComponentThreadSlot(self: *ThreadManager) SpawnError!?*TaskCancelGroup {
+        if (comptime !config.lib_wasi_threads or !config.thread_mgr or builtin.single_threaded)
+            return error.ThreadFeatureDisabled;
+
+        self.mutex.lock();
+        if (self.shutting_down or self.isProcessTerminating()) {
+            self.mutex.unlock();
+            return error.ThreadGroupShuttingDown;
+        }
+        if (self.retainedSlotCountLocked() + self.active_component_threads >= max_thread_slots) {
+            self.mutex.unlock();
+            return error.ThreadIdExhausted;
+        }
+        self.active_component_threads += 1;
+        self.mutex.unlock();
+        errdefer {
+            self.mutex.lock();
+            std.debug.assert(self.active_component_threads > 0);
+            self.active_component_threads -= 1;
+            self.mutex.unlock();
+        }
+
+        const source_context = execution_context.current();
+        const cancellation_group: ?*TaskCancelGroup = if (source_context) |context| blk: {
+            if (context.threadGroup(ThreadManager) != self) break :blk null;
+            break :blk context.cancellationGroup(TaskCancelGroup);
+        } else null;
+        if (cancellation_group) |group| {
+            self.retainTaskGroup(group);
+            if (group.isCancelled()) {
+                self.releaseTaskGroup(group);
+                return error.ThreadGroupShuttingDown;
+            }
+        }
+        return cancellation_group;
+    }
+
+    /// Release a slot and optional `TaskCancelGroup` previously acquired via
+    /// `acquireComponentThreadSlot`.
+    pub fn releaseComponentThreadSlot(
+        self: *ThreadManager,
+        cancellation_group: ?*TaskCancelGroup,
+    ) void {
+        if (cancellation_group) |group| {
+            self.releaseTaskGroup(group);
+        }
+        self.mutex.lock();
+        std.debug.assert(self.active_component_threads > 0);
+        self.active_component_threads -= 1;
+        self.mutex.unlock();
+    }
+
+    pub fn activeComponentThreadCount(self: *ThreadManager) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.active_component_threads;
+    }
+
+    pub fn allocateComponentAuxStack(self: *ThreadManager) ?execution_context.AuxiliaryStack {
+        if (!self.aux_stack_pool.isConfigured()) return null;
+        const top = self.aux_stack_pool.allocate() orelse return null;
+        return execution_context.AuxiliaryStack.fromTop(top, self.aux_stack_pool.stack_size);
+    }
+
+    pub fn releaseComponentAuxStack(
+        self: *ThreadManager,
+        stack: ?execution_context.AuxiliaryStack,
+    ) void {
+        if (stack) |s| {
+            self.aux_stack_pool.release(s.top);
+        }
+    }
+
+    fn retainedSlotCountLocked(self: *const ThreadManager) usize {
+        var count: usize = 0;
+        for (self.slots.items) |slot| {
+            switch (slot.state) {
+                .live, .joining => count += 1,
+                .free, .retired => {},
+            }
+        }
+        return count;
     }
 
     fn initWithTestHooks(allocator: std.mem.Allocator, hooks: *const TestHooks) ThreadManager {
@@ -1397,6 +1498,8 @@ pub const ThreadManager = struct {
         OutOfMemory,
         ThreadIdExhausted,
     }!i32 {
+        if (self.retainedSlotCountLocked() + self.active_component_threads >= max_thread_slots)
+            return error.ThreadIdExhausted;
         for (self.slots.items, 0..) |*slot, slot_index| {
             if (slot.state != .free) continue;
             if (slot.generation == max_tid_generation) {
