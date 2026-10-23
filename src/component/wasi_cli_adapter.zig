@@ -7006,6 +7006,228 @@ pub const WasiLogLevel = enum(u32) {
     }
 };
 
+/// Output format for `wasi:logging/logging.{log, kv-log}` (#972 E5).
+pub const WasiLogFormat = enum(u8) {
+    text = 0,
+    json = 1,
+
+    /// Parse a case-insensitive format name (`"text"` or `"json"`).
+    pub fn fromName(raw: []const u8) ?WasiLogFormat {
+        if (std.ascii.eqlIgnoreCase(raw, "text")) return .text;
+        if (std.ascii.eqlIgnoreCase(raw, "json")) return .json;
+        return null;
+    }
+
+    pub const fromString = fromName;
+
+    pub fn name(self: WasiLogFormat) []const u8 {
+        return switch (self) {
+            .text => "text",
+            .json => "json",
+        };
+    }
+};
+
+/// Structured `(key, value)` pair for `wasi:logging/logging.kv-log` and
+/// structured context parsing (#972 E5).
+pub const WasiLogField = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+fn isValidLogFieldKeyChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '-';
+}
+
+fn isValidLogTargetChar(c: u8) bool {
+    return isValidLogFieldKeyChar(c) or c == ':' or c == '/';
+}
+
+fn putMergedLogField(
+    fields: *std.ArrayListUnmanaged(WasiLogField),
+    allocator: Allocator,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    for (fields.items) |*existing| {
+        if (std.mem.eql(u8, existing.key, key)) {
+            existing.value = value;
+            return;
+        }
+    }
+    try fields.append(allocator, .{ .key = key, .value = value });
+}
+
+/// Extract structured `key`/`value` pairs from a `wasi:logging` `context`
+/// string when it encodes either:
+///   (a) a JSON object with scalar string/number/bool/null fields, or
+///   (b) whitespace-, comma-, or semicolon-separated `key=value` pairs
+///       (with an optional leading target name before `:`, `;`, or space).
+pub fn parseStructuredLogContext(
+    arena_alloc: Allocator,
+    context_bytes: []const u8,
+    out_fields: *std.ArrayListUnmanaged(WasiLogField),
+) !void {
+    const trimmed = std.mem.trim(u8, context_bytes, " \t\r\n");
+    if (trimmed.len == 0) return;
+
+    // (a) JSON object context.
+    if (trimmed.len >= 2 and trimmed[0] == '{' and trimmed[trimmed.len - 1] == '}') {
+        if (std.json.parseFromSlice(std.json.Value, arena_alloc, trimmed, .{})) |parsed| {
+            if (parsed.value == .object) {
+                var all_scalar = true;
+                var it = parsed.value.object.iterator();
+                while (it.next()) |entry| {
+                    if (entry.key_ptr.*.len == 0) {
+                        all_scalar = false;
+                        break;
+                    }
+                    switch (entry.value_ptr.*) {
+                        .string, .integer, .float, .number_string, .bool, .null => {},
+                        .object, .array => {
+                            all_scalar = false;
+                            break;
+                        },
+                    }
+                }
+                if (all_scalar) {
+                    var it2 = parsed.value.object.iterator();
+                    while (it2.next()) |entry| {
+                        const val_str: []const u8 = switch (entry.value_ptr.*) {
+                            .string => |s| s,
+                            .number_string => |s| s,
+                            .integer => |n| try std.fmt.allocPrint(arena_alloc, "{d}", .{n}),
+                            .float => |f| try std.fmt.allocPrint(arena_alloc, "{d}", .{f}),
+                            .bool => |b| if (b) "true" else "false",
+                            .null => "null",
+                            .object, .array => unreachable,
+                        };
+                        try putMergedLogField(out_fields, arena_alloc, entry.key_ptr.*, val_str);
+                    }
+                    return;
+                }
+            }
+        } else |_| {}
+        return;
+    }
+
+    // (b) Whitespace- or comma/semicolon-separated `key=value` tokens,
+    // optionally preceded by a leading target name before `:`, `;`, or space.
+    const first_eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse return;
+    var key_start: usize = first_eq;
+    while (key_start > 0 and isValidLogFieldKeyChar(trimmed[key_start - 1])) {
+        key_start -= 1;
+    }
+    if (key_start == first_eq) return;
+
+    if (key_start > 0) {
+        const prefix = trimmed[0..key_start];
+        const delim = prefix[prefix.len - 1];
+        if (delim != ' ' and delim != '\t' and delim != ';' and delim != ':') return;
+        const target = std.mem.trimEnd(u8, prefix, " \t;:");
+        if (target.len == 0) return;
+        if (std.mem.indexOf(u8, target, "//") != null) return;
+        for (target) |c| {
+            if (!isValidLogTargetChar(c)) return;
+        }
+    }
+
+    const rest = trimmed[key_start..];
+    var temp_fields: std.ArrayListUnmanaged(WasiLogField) = .empty;
+    var pos: usize = 0;
+    while (pos < rest.len) {
+        while (pos < rest.len and (rest[pos] == ' ' or rest[pos] == '\t' or rest[pos] == ',' or rest[pos] == ';')) {
+            pos += 1;
+        }
+        if (pos >= rest.len) break;
+
+        const k_start = pos;
+        while (pos < rest.len and isValidLogFieldKeyChar(rest[pos])) {
+            pos += 1;
+        }
+        const key = rest[k_start..pos];
+        if (key.len == 0 or pos >= rest.len or rest[pos] != '=') return;
+        pos += 1; // skip '='
+
+        if (pos < rest.len and rest[pos] == '"') {
+            pos += 1; // skip opening '"'
+            var unescaped: std.ArrayListUnmanaged(u8) = .empty;
+            var closed = false;
+            while (pos < rest.len) {
+                const c = rest[pos];
+                pos += 1;
+                if (c == '"') {
+                    closed = true;
+                    break;
+                }
+                if (c == '\\') {
+                    if (pos >= rest.len) return;
+                    const esc = rest[pos];
+                    pos += 1;
+                    const mapped: u8 = switch (esc) {
+                        '"' => '"',
+                        '\\' => '\\',
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        else => esc,
+                    };
+                    try unescaped.append(arena_alloc, mapped);
+                } else {
+                    try unescaped.append(arena_alloc, c);
+                }
+            }
+            if (!closed) return;
+            if (pos < rest.len and rest[pos] != ' ' and rest[pos] != '\t' and rest[pos] != ',' and rest[pos] != ';') {
+                return;
+            }
+            try putMergedLogField(&temp_fields, arena_alloc, key, unescaped.items);
+        } else {
+            const v_start = pos;
+            while (pos < rest.len and rest[pos] != ' ' and rest[pos] != '\t' and rest[pos] != ',' and rest[pos] != ';' and rest[pos] != '\r' and rest[pos] != '\n') {
+                if (rest[pos] == '=' or rest[pos] == '"') return;
+                pos += 1;
+            }
+            const val = rest[v_start..pos];
+            if (val.len == 0) return;
+            try putMergedLogField(&temp_fields, arena_alloc, key, val);
+        }
+    }
+
+    for (temp_fields.items) |f| {
+        try putMergedLogField(out_fields, arena_alloc, f.key, f.value);
+    }
+}
+
+fn needsTextLogValueQuoting(val: []const u8) bool {
+    if (val.len == 0) return true;
+    for (val) |c| {
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '"' or c == '\\') {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn writeTextLogFieldValue(writer: *std.Io.Writer, val: []const u8) !void {
+    if (!needsTextLogValueQuoting(val)) {
+        try writer.writeAll(val);
+        return;
+    }
+    try writer.writeByte('"');
+    for (val) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => try writer.writeByte(c),
+        }
+    }
+    try writer.writeByte('"');
+}
+
 /// `wasi:keyvalue/store@0.2.0-draft2` `bucket` resource (#583 B4).
 ///
 /// A memory-store backed bucket. The `identifier` field is the name
@@ -8018,6 +8240,10 @@ pub const WasiCliAdapter = struct {
     /// `--log-level=<trace|debug|info|warn|error>` and env var
     /// `WAMR_LOG_LEVEL` both write here via `setLogLevel`.
     log_level: WasiLogLevel = .trace,
+    /// Host-side output format for `wasi:logging/logging.{log, kv-log}`
+    /// (#972 E5). Default `.text` preserves `[wasi_guest] [<level>]
+    /// [<context>] <message>\n`; `.json` emits single-line NDJSON.
+    log_format: WasiLogFormat = .text,
 
     stream_table: OutputStreamTable,
     input_stream_table: InputStreamTable,
@@ -8769,6 +8995,13 @@ pub const WasiCliAdapter = struct {
     /// and `warning` aliases).
     pub fn setLogLevel(self: *WasiCliAdapter, level: WasiLogLevel) void {
         self.log_level = level;
+    }
+
+    /// Configure the host-side `wasi:logging` output format (#972 E5).
+    /// Default `.text` preserves human-readable lines; `.json` emits
+    /// single-line NDJSON records.
+    pub fn setLogFormat(self: *WasiCliAdapter, format: WasiLogFormat) void {
+        self.log_format = format;
     }
 
     /// Toggle the per-member adapter-call trace described on
@@ -10594,8 +10827,9 @@ pub const WasiCliAdapter = struct {
     // admit-all). Calls strictly below the threshold are dropped
     // before formatting / writing.
 
-    /// Register `wasi:logging/logging` (#583 B5). Members:
-    ///   - `log: func(level: level, context: string, message: string)`.
+    /// Register `wasi:logging/logging` (#583 B5, #972 E5). Members:
+    ///   - `log: func(level: level, context: string, message: string)`
+    ///   - `kv-log: func(level: level, context: string, message: string, fields: list<tuple<string, string>>)`.
     ///
     /// The 0.1 surface is the only published WIT today. A future 0.2
     /// revision would register against `logging_p2_iface` with the
@@ -10609,12 +10843,15 @@ pub const WasiCliAdapter = struct {
         try self.logging_iface.members.put(self.allocator, "log", .{
             .func = .{ .context = self, .call = &wasiLog },
         });
+        try self.logging_iface.members.put(self.allocator, "kv-log", .{
+            .func = .{ .context = self, .call = &wasiKvLog },
+        });
         try providers.put(self.allocator, logging_name, .{
             .host_instance = &self.logging_iface,
         });
     }
 
-    /// 0.2.x version-multiplex (#583 B5). Reserved for the day the
+    /// 0.2.x version-multiplex (#583 B5, #972 E5). Reserved for the day the
     /// upstream WIT publishes a `wasi:logging@0.2.x` package — today
     /// it's stub-equivalent to `populateWasiLogging`, registered
     /// against a separate HostInstance so 0.1 and 0.2 imports route
@@ -10626,6 +10863,9 @@ pub const WasiCliAdapter = struct {
     ) !void {
         try self.logging_p2_iface.members.put(self.allocator, "log", .{
             .func = .{ .context = self, .call = &wasiLog },
+        });
+        try self.logging_p2_iface.members.put(self.allocator, "kv-log", .{
+            .func = .{ .context = self, .call = &wasiKvLog },
         });
         try providers.put(self.allocator, logging_name, .{
             .host_instance = &self.logging_p2_iface,
@@ -10685,6 +10925,72 @@ pub const WasiCliAdapter = struct {
         try self.emitWasiLog(level, ctx_bytes, msg_bytes, allocator);
     }
 
+    /// `wasi:logging/logging.kv-log: (level, string, string, list<tuple<string, string>>) -> ()` (#972 E5).
+    fn wasiKvLog(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 4) return error.InvalidArgs;
+        const disc: u32 = switch (args[0]) {
+            .enum_val => |d| d,
+            .u8 => |v| v,
+            .u32 => |v| v,
+            else => return error.InvalidArgs,
+        };
+        if (disc > @backingInt(WasiLogLevel.critical)) return;
+        const level: WasiLogLevel = @fromBackingInt(@intCast(disc));
+        const ctx_pl = switch (args[1]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        const msg_pl = switch (args[2]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        const fields_pl = switch (args[3]) {
+            .list => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        // Filter below threshold *before* reading guest strings or the
+        // `list<tuple<string, string>>` from linear memory.
+        if (@backingInt(level) < @backingInt(self.log_level)) return;
+
+        const ctx_bytes = ci.readGuestBytes(ctx_pl.ptr, ctx_pl.len) orelse
+            return error.OutOfBoundsMemory;
+        const msg_bytes = ci.readGuestBytes(msg_pl.ptr, msg_pl.len) orelse
+            return error.OutOfBoundsMemory;
+
+        const stride: u32 = 16;
+        const count = fields_pl.len;
+        const list_bytes_len = std.math.mul(u32, count, stride) catch
+            return error.OutOfBoundsMemory;
+        const list_bytes = ci.readGuestBytes(fields_pl.ptr, list_bytes_len) orelse
+            return error.OutOfBoundsMemory;
+
+        const fields = try allocator.alloc(WasiLogField, count);
+        defer allocator.free(fields);
+
+        var idx: u32 = 0;
+        while (idx < count) : (idx += 1) {
+            const off = idx * stride;
+            const k_ptr = std.mem.readInt(u32, list_bytes[off..][0..4], .little);
+            const k_len = std.mem.readInt(u32, list_bytes[off + 4 ..][0..4], .little);
+            const v_ptr = std.mem.readInt(u32, list_bytes[off + 8 ..][0..4], .little);
+            const v_len = std.mem.readInt(u32, list_bytes[off + 12 ..][0..4], .little);
+            const k_bytes = ci.readGuestBytes(k_ptr, k_len) orelse
+                return error.OutOfBoundsMemory;
+            const v_bytes = ci.readGuestBytes(v_ptr, v_len) orelse
+                return error.OutOfBoundsMemory;
+            fields[idx] = .{ .key = k_bytes, .value = v_bytes };
+        }
+
+        try self.emitWasiStructuredLog(level, ctx_bytes, msg_bytes, fields, allocator);
+    }
+
     /// Test-friendly entry into the formatter (#583 B5). Public so the
     /// unit tests can drive it without standing up a full
     /// ComponentInstance + guest linmem.
@@ -10695,16 +11001,78 @@ pub const WasiCliAdapter = struct {
         message_bytes: []const u8,
         allocator: Allocator,
     ) !void {
+        return self.emitWasiStructuredLog(level, context_bytes, message_bytes, &.{}, allocator);
+    }
+
+    /// Format and emit a `wasi:logging` record with optional structured
+    /// fields in either `.text` or `.json` (NDJSON) mode (#972 E5).
+    pub fn emitWasiStructuredLog(
+        self: *WasiCliAdapter,
+        level: WasiLogLevel,
+        context_bytes: []const u8,
+        message_bytes: []const u8,
+        fields: []const WasiLogField,
+        allocator: Allocator,
+    ) !void {
         if (@backingInt(level) < @backingInt(self.log_level)) return;
-        // Format once, then emit to both std.log and the adapter's
-        // stderr sink. The `wasi_guest` scope tag lets embedders'
-        // `std.log.logFn` filter / route guest log lines distinctly
-        // from host-internal logs.
-        const line = try std.fmt.allocPrint(
-            allocator,
-            "[wasi_guest] [{s}] [{s}] {s}\n",
-            .{ level.name(), context_bytes, message_bytes },
-        );
+
+        const line = switch (self.log_format) {
+            .text => blk: {
+                if (fields.len == 0) {
+                    break :blk try std.fmt.allocPrint(
+                        allocator,
+                        "[wasi_guest] [{s}] [{s}] {s}\n",
+                        .{ level.name(), context_bytes, message_bytes },
+                    );
+                }
+                var aw: std.Io.Writer.Allocating = .init(allocator);
+                defer aw.deinit();
+                try aw.writer.print(
+                    "[wasi_guest] [{s}] [{s}] {s}",
+                    .{ level.name(), context_bytes, message_bytes },
+                );
+                for (fields) |f| {
+                    try aw.writer.writeByte(' ');
+                    try aw.writer.writeAll(f.key);
+                    try aw.writer.writeByte('=');
+                    try writeTextLogFieldValue(&aw.writer, f.value);
+                }
+                try aw.writer.writeByte('\n');
+                break :blk try aw.toOwnedSlice();
+            },
+            .json => blk: {
+                var arena = std.heap.ArenaAllocator.init(allocator);
+                defer arena.deinit();
+                const arena_alloc = arena.allocator();
+
+                var merged_fields: std.ArrayListUnmanaged(WasiLogField) = .empty;
+                try parseStructuredLogContext(arena_alloc, context_bytes, &merged_fields);
+                for (fields) |f| {
+                    try putMergedLogField(&merged_fields, arena_alloc, f.key, f.value);
+                }
+
+                var aw: std.Io.Writer.Allocating = .init(allocator);
+                defer aw.deinit();
+                var stringify: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
+                try stringify.beginObject();
+                try stringify.objectField("level");
+                try stringify.write(level.name());
+                try stringify.objectField("context");
+                try stringify.write(context_bytes);
+                try stringify.objectField("message");
+                try stringify.write(message_bytes);
+                try stringify.objectField("fields");
+                try stringify.beginObject();
+                for (merged_fields.items) |f| {
+                    try stringify.objectField(f.key);
+                    try stringify.write(f.value);
+                }
+                try stringify.endObject();
+                try stringify.endObject();
+                try aw.writer.writeByte('\n');
+                break :blk try aw.toOwnedSlice();
+            },
+        };
         defer allocator.free(line);
         // Skip the `std.log` path under Zig's test runner — the
         // default test logger promotes `std.log.warn` / `std.log.err`
@@ -55354,8 +55722,210 @@ test "populateWasiProviders: wasi:logging 0.1 and 0.2 route to distinct HostInst
 
     try testing.expect(providers.contains("wasi:logging/logging@0.1.0-draft"));
     try testing.expect(providers.contains("wasi:logging/logging@0.2.0"));
+    try testing.expect(adapter.logging_iface.members.contains("kv-log"));
+    try testing.expect(adapter.logging_p2_iface.members.contains("kv-log"));
     try testing.expect(providers.get("wasi:logging/logging@0.1.0-draft").?.host_instance !=
         providers.get("wasi:logging/logging@0.2.0").?.host_instance);
+}
+
+test "wasi:logging (#972 E5): WasiLogFormat.fromName parses text and json case-insensitively" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(?WasiLogFormat, .text), WasiLogFormat.fromName("text"));
+    try testing.expectEqual(@as(?WasiLogFormat, .text), WasiLogFormat.fromName("TEXT"));
+    try testing.expectEqual(@as(?WasiLogFormat, .text), WasiLogFormat.fromName("Text"));
+    try testing.expectEqual(@as(?WasiLogFormat, .json), WasiLogFormat.fromName("json"));
+    try testing.expectEqual(@as(?WasiLogFormat, .json), WasiLogFormat.fromName("JSON"));
+    try testing.expectEqual(@as(?WasiLogFormat, .json), WasiLogFormat.fromName("Json"));
+    try testing.expectEqual(@as(?WasiLogFormat, null), WasiLogFormat.fromName("xml"));
+    try testing.expectEqual(@as(?WasiLogFormat, null), WasiLogFormat.fromName(""));
+    try testing.expectEqualStrings("text", WasiLogFormat.text.name());
+    try testing.expectEqualStrings("json", WasiLogFormat.json.name());
+}
+
+test "wasi:logging (#972 E5): text mode preserves default format and appends kv-log fields" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    try adapter.emitWasiLog(.info, "auth", "login ok", testing.allocator);
+    try adapter.emitWasiStructuredLog(
+        .warn,
+        "auth",
+        "rate limit",
+        &.{
+            .{ .key = "user", .value = "alice" },
+            .{ .key = "reason", .value = "too many requests" },
+        },
+        testing.allocator,
+    );
+
+    const captured = adapter.getStderrBytes();
+    try testing.expectEqualStrings(
+        "[wasi_guest] [info] [auth] login ok\n" ++
+            "[wasi_guest] [warn] [auth] rate limit user=alice reason=\"too many requests\"\n",
+        captured,
+    );
+}
+
+test "wasi:logging (#972 E5): json mode emits single-line NDJSON with structured context and kv-log override" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    adapter.setLogFormat(.json);
+
+    // 1. Plain unstructured context -> uniform `"fields":{}`.
+    // Also exercises JSON escaping of quotes, backslashes, and control characters.
+    try adapter.emitWasiLog(.info, "plain-ctx", "line1\n\"quoted\"\\path\t\x01", testing.allocator);
+
+    // 2. Whitespace-separated `key=value` context.
+    try adapter.emitWasiLog(.debug, "service=auth request_id=42", "token verified", testing.allocator);
+
+    // 3. Leading target name + comma/semicolon-separated `key=value` context + quoted value.
+    try adapter.emitWasiLog(.warn, "component:service=auth,req=42;note=\"slow db\"", "retrying", testing.allocator);
+
+    // 4. JSON-object context with scalar string/number/bool/null fields + explicit kv-log override.
+    try adapter.emitWasiStructuredLog(
+        .err,
+        "{\"service\":\"auth\",\"attempt\":1,\"ok\":false,\"extra\":null}",
+        "login failed",
+        &.{
+            .{ .key = "attempt", .value = "2" },
+            .{ .key = "ip", .value = "10.0.0.1" },
+        },
+        testing.allocator,
+    );
+
+    const captured = adapter.getStderrBytes();
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, captured, "\n"), '\n');
+
+    const line1 = lines.next().?;
+    try testing.expectEqualStrings(
+        "{\"level\":\"info\",\"context\":\"plain-ctx\",\"message\":\"line1\\n\\\"quoted\\\"\\\\path\\t\\u0001\",\"fields\":{}}",
+        line1,
+    );
+
+    const line2 = lines.next().?;
+    try testing.expectEqualStrings(
+        "{\"level\":\"debug\",\"context\":\"service=auth request_id=42\",\"message\":\"token verified\",\"fields\":{\"service\":\"auth\",\"request_id\":\"42\"}}",
+        line2,
+    );
+
+    const line3 = lines.next().?;
+    try testing.expectEqualStrings(
+        "{\"level\":\"warn\",\"context\":\"component:service=auth,req=42;note=\\\"slow db\\\"\",\"message\":\"retrying\",\"fields\":{\"service\":\"auth\",\"req\":\"42\",\"note\":\"slow db\"}}",
+        line3,
+    );
+
+    const line4 = lines.next().?;
+    try testing.expectEqualStrings(
+        "{\"level\":\"error\",\"context\":\"{\\\"service\\\":\\\"auth\\\",\\\"attempt\\\":1,\\\"ok\\\":false,\\\"extra\\\":null}\",\"message\":\"login failed\",\"fields\":{\"service\":\"auth\",\"attempt\":\"2\",\"ok\":\"false\",\"extra\":\"null\",\"ip\":\"10.0.0.1\"}}",
+        line4,
+    );
+    try testing.expect(lines.next() == null);
+}
+
+test "wasi:logging (#972 E5): wasiKvLog reads guest tuples, filters before OOB read, and traps on OOB when above threshold" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    adapter.setLogFormat(.json);
+    adapter.setLogLevel(.info);
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    // 1. Below-threshold call with completely OOB pointers must return early without trapping.
+    {
+        var below_args = [_]InterfaceValue{
+            .{ .enum_val = @backingInt(WasiLogLevel.debug) },
+            .{ .string = .{ .ptr = 999_999, .len = 100 } },
+            .{ .string = .{ .ptr = 999_999, .len = 100 } },
+            .{ .list = .{ .ptr = 999_999, .len = 50 } },
+        };
+        var results: [0]InterfaceValue = .{};
+        try WasiCliAdapter.wasiKvLog(&adapter, &ci, &below_args, &results, testing.allocator);
+        try testing.expectEqual(@as(usize, 0), adapter.getStderrBytes().len);
+    }
+
+    // 2. Valid canonical-ABI `kv-log` call with 2 `tuple<string, string>` entries.
+    const ctx_ptr = ci.hostAllocAndWrite("svc;env=prod", 1).?;
+    const msg_ptr = ci.hostAllocAndWrite("request handled", 1).?;
+    const k1_ptr = ci.hostAllocAndWrite("req_id", 1).?;
+    const v1_ptr = ci.hostAllocAndWrite("abc-123", 1).?;
+    const k2_ptr = ci.hostAllocAndWrite("status", 1).?;
+    const v2_ptr = ci.hostAllocAndWrite("200", 1).?;
+
+    const stride: u32 = 16;
+    const list_ptr = ci.hostAllocGuest(2 * stride, 4).?;
+    const dst = ci.writableGuestBytes(list_ptr, 2 * stride).?;
+    std.mem.writeInt(u32, dst[0..4], k1_ptr, .little);
+    std.mem.writeInt(u32, dst[4..8], 6, .little);
+    std.mem.writeInt(u32, dst[8..12], v1_ptr, .little);
+    std.mem.writeInt(u32, dst[12..16], 7, .little);
+    std.mem.writeInt(u32, dst[16..20], k2_ptr, .little);
+    std.mem.writeInt(u32, dst[20..24], 6, .little);
+    std.mem.writeInt(u32, dst[24..28], v2_ptr, .little);
+    std.mem.writeInt(u32, dst[28..32], 3, .little);
+
+    {
+        var ok_args = [_]InterfaceValue{
+            .{ .enum_val = @backingInt(WasiLogLevel.info) },
+            .{ .string = .{ .ptr = ctx_ptr, .len = 12 } },
+            .{ .string = .{ .ptr = msg_ptr, .len = 15 } },
+            .{ .list = .{ .ptr = list_ptr, .len = 2 } },
+        };
+        var results: [0]InterfaceValue = .{};
+        try WasiCliAdapter.wasiKvLog(&adapter, &ci, &ok_args, &results, testing.allocator);
+        try testing.expectEqualStrings(
+            "{\"level\":\"info\",\"context\":\"svc;env=prod\",\"message\":\"request handled\",\"fields\":{\"env\":\"prod\",\"req_id\":\"abc-123\",\"status\":\"200\"}}\n",
+            adapter.getStderrBytes(),
+        );
+    }
+
+    // 3. Above-threshold call with OOB list pointer or element string pointer traps with OutOfBoundsMemory.
+    {
+        var oob_list_args = [_]InterfaceValue{
+            .{ .enum_val = @backingInt(WasiLogLevel.err) },
+            .{ .string = .{ .ptr = ctx_ptr, .len = 12 } },
+            .{ .string = .{ .ptr = msg_ptr, .len = 15 } },
+            .{ .list = .{ .ptr = 999_999, .len = 1 } },
+        };
+        var results: [0]InterfaceValue = .{};
+        try testing.expectError(
+            error.OutOfBoundsMemory,
+            WasiCliAdapter.wasiKvLog(&adapter, &ci, &oob_list_args, &results, testing.allocator),
+        );
+    }
+    {
+        // Overflow on `fields_pl.len * 16`.
+        var overflow_args = [_]InterfaceValue{
+            .{ .enum_val = @backingInt(WasiLogLevel.err) },
+            .{ .string = .{ .ptr = ctx_ptr, .len = 12 } },
+            .{ .string = .{ .ptr = msg_ptr, .len = 15 } },
+            .{ .list = .{ .ptr = list_ptr, .len = std.math.maxInt(u32) } },
+        };
+        var results: [0]InterfaceValue = .{};
+        try testing.expectError(
+            error.OutOfBoundsMemory,
+            WasiCliAdapter.wasiKvLog(&adapter, &ci, &overflow_args, &results, testing.allocator),
+        );
+    }
+    {
+        // Corrupt second tuple's value pointer to OOB.
+        std.mem.writeInt(u32, dst[24..28], 999_999, .little);
+        var oob_elem_args = [_]InterfaceValue{
+            .{ .enum_val = @backingInt(WasiLogLevel.err) },
+            .{ .string = .{ .ptr = ctx_ptr, .len = 12 } },
+            .{ .string = .{ .ptr = msg_ptr, .len = 15 } },
+            .{ .list = .{ .ptr = list_ptr, .len = 2 } },
+        };
+        var results: [0]InterfaceValue = .{};
+        try testing.expectError(
+            error.OutOfBoundsMemory,
+            WasiCliAdapter.wasiKvLog(&adapter, &ci, &oob_elem_args, &results, testing.allocator),
+        );
+    }
 }
 
 // ── wasi:keyvalue@0.2.x tests (#583 B4) ──────────────────────────────
