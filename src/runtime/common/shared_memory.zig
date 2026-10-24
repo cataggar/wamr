@@ -50,7 +50,7 @@ pub const Control = struct {
     current_bytes: std.atomic.Value(usize),
     ref_count: std.atomic.Value(u32) = .init(1),
     grow_mutex: SpinMutex = .{},
-    parking_lot: parking.ParkingLot = .init(),
+    parking_lot: parking.ParkingLot align(64) = .init(),
 
     pub fn create(
         initial_pages: u32,

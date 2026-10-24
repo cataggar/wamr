@@ -26,10 +26,17 @@ pub fn Result(comptime T: type) type {
 /// Decode an unsigned LEB128 value from `bytes` into a `T`-sized unsigned integer.
 ///
 /// `T` must be `u32` or `u64`.
-pub fn readUnsigned(comptime T: type, bytes: []const u8) Error!Result(T) {
+pub inline fn readUnsigned(comptime T: type, bytes: []const u8) Error!Result(T) {
     comptime {
         if (T != u32 and T != u64) @compileError("readUnsigned only supports u32 and u64");
     }
+    if (bytes.len > 0 and bytes[0] < 0x80) {
+        return .{ .value = bytes[0], .bytes_read = 1 };
+    }
+    return readUnsignedMulti(T, bytes);
+}
+
+fn readUnsignedMulti(comptime T: type, bytes: []const u8) Error!Result(T) {
     const maxbits: u7 = @bitSizeOf(T);
     const max_bytes: usize = (maxbits + 6) / 7;
 
@@ -62,10 +69,18 @@ pub fn readUnsigned(comptime T: type, bytes: []const u8) Error!Result(T) {
 /// Decode a signed LEB128 value from `bytes` into a `T`-sized signed integer.
 ///
 /// `T` must be `i32` or `i64`.
-pub fn readSigned(comptime T: type, bytes: []const u8) Error!Result(T) {
+pub inline fn readSigned(comptime T: type, bytes: []const u8) Error!Result(T) {
     comptime {
         if (T != i32 and T != i64) @compileError("readSigned only supports i32 and i64");
     }
+    if (bytes.len > 0 and bytes[0] < 0x80) {
+        const sign_extended: i8 = @as(i8, @bitCast(bytes[0] << 1)) >> 1;
+        return .{ .value = sign_extended, .bytes_read = 1 };
+    }
+    return readSignedMulti(T, bytes);
+}
+
+fn readSignedMulti(comptime T: type, bytes: []const u8) Error!Result(T) {
     const maxbits: u7 = @bitSizeOf(T);
     const max_bytes: usize = (maxbits + 6) / 7;
 
@@ -132,33 +147,95 @@ pub fn readSigned(comptime T: type, bytes: []const u8) Error!Result(T) {
 // prefer `readUnsigned` / `readSigned` and handle the error result.
 // ─────────────────────────────────────────────────────────────────────────
 
-fn skipToEnd(bytes: []const u8, pos: *usize) void {
+fn skipToEndPos(bytes: []const u8, start_pos: usize) usize {
     // Skip any continuation bytes so callers don't spin on malformed input.
-    while (pos.* < bytes.len and (bytes[pos.*] & 0x80) != 0) pos.* += 1;
-    if (pos.* < bytes.len) pos.* += 1;
+    var p = start_pos;
+    while (p < bytes.len and (bytes[p] & 0x80) != 0) p += 1;
+    if (p < bytes.len) p += 1;
+    return p;
+}
+
+fn LossyResult(comptime T: type) type {
+    return struct {
+        value: T,
+        next_pos: usize,
+    };
+}
+
+noinline fn readUnsignedLossySlow(comptime T: type, bytes: []const u8, p: usize) LossyResult(T) {
+    if (comptime @bitSizeOf(T) >= 32) {
+        if (p + 2 <= bytes.len) {
+            const b0 = bytes[p];
+            const b1 = bytes[p + 1];
+            if (b0 >= 0x80 and b1 < 0x80) {
+                return .{
+                    .value = @as(T, b0 & 0x7f) | (@as(T, b1) << 7),
+                    .next_pos = p + 2,
+                };
+            }
+            if (p + 5 <= bytes.len) {
+                const b2 = bytes[p + 2];
+                const b3 = bytes[p + 3];
+                const b4 = bytes[p + 4];
+                if ((b0 & b1 & b2 & b3) >= 0x80 and b4 < 0x10) {
+                    const v: u64 = @as(u64, b0 & 0x7f) |
+                        (@as(u64, b1 & 0x7f) << 7) |
+                        (@as(u64, b2 & 0x7f) << 14) |
+                        (@as(u64, b3 & 0x7f) << 21) |
+                        (@as(u64, b4) << 28);
+                    return .{
+                        .value = @intCast(v),
+                        .next_pos = p + 5,
+                    };
+                }
+            }
+        }
+    }
+    if (p >= bytes.len) return .{ .value = 0, .next_pos = p };
+    const r = readUnsignedMulti(T, bytes[p..]) catch {
+        return .{ .value = 0, .next_pos = skipToEndPos(bytes, p) };
+    };
+    return .{ .value = r.value, .next_pos = p + r.bytes_read };
+}
+
+noinline fn readSignedLossySlow(comptime T: type, bytes: []const u8, p: usize) LossyResult(T) {
+    if (p >= bytes.len) return .{ .value = 0, .next_pos = p };
+    const r = readSignedMulti(T, bytes[p..]) catch {
+        return .{ .value = 0, .next_pos = skipToEndPos(bytes, p) };
+    };
+    return .{ .value = r.value, .next_pos = p + r.bytes_read };
 }
 
 /// Decode an unsigned LEB128 from `bytes[pos.*..]`, advance `pos` past it,
 /// and return the value. Returns 0 on malformed or truncated input.
-pub fn readUnsignedLossy(comptime T: type, bytes: []const u8, pos: *usize) T {
-    if (pos.* >= bytes.len) return 0;
-    const r = readUnsigned(T, bytes[pos.*..]) catch {
-        skipToEnd(bytes, pos);
-        return 0;
-    };
-    pos.* += r.bytes_read;
+pub inline fn readUnsignedLossy(comptime T: type, bytes: []const u8, pos: *usize) T {
+    const p = pos.*;
+    if (p < bytes.len) {
+        const b0 = bytes[p];
+        if (b0 < 0x80) {
+            pos.* = p + 1;
+            return b0;
+        }
+    }
+    const r = readUnsignedLossySlow(T, bytes, p);
+    pos.* = r.next_pos;
     return r.value;
 }
 
 /// Decode a signed LEB128 from `bytes[pos.*..]`, advance `pos` past it,
 /// and return the value. Returns 0 on malformed or truncated input.
-pub fn readSignedLossy(comptime T: type, bytes: []const u8, pos: *usize) T {
-    if (pos.* >= bytes.len) return 0;
-    const r = readSigned(T, bytes[pos.*..]) catch {
-        skipToEnd(bytes, pos);
-        return 0;
-    };
-    pos.* += r.bytes_read;
+pub inline fn readSignedLossy(comptime T: type, bytes: []const u8, pos: *usize) T {
+    const p = pos.*;
+    if (p < bytes.len) {
+        const b0 = bytes[p];
+        if (b0 < 0x80) {
+            pos.* = p + 1;
+            const sign_extended: i8 = @as(i8, @bitCast(b0 << 1)) >> 1;
+            return sign_extended;
+        }
+    }
+    const r = readSignedLossySlow(T, bytes, p);
+    pos.* = r.next_pos;
     return r.value;
 }
 
@@ -400,6 +477,18 @@ test "lossy: advances correctly on back-to-back reads" {
     try testing.expectEqual(@as(u32, 1), readUnsignedLossy(u32, buf, &pos));
     try testing.expectEqual(@as(i32, -4), readSignedLossy(i32, buf, &pos));
     try testing.expectEqual(@as(u32, 624485), readUnsignedLossy(u32, buf, &pos));
+    try testing.expectEqual(buf.len, pos);
+}
+
+test "lossy: 2-byte and 5-byte relocation-padded u32 fast paths" {
+    const buf = &[_]u8{
+        0x80, 0x01, // 2-byte 128
+        0x88, 0xa6, 0x80, 0x80, 0x00, // 5-byte wasm-ld padded 4872
+    };
+    var pos: usize = 0;
+    try testing.expectEqual(@as(u32, 128), readUnsignedLossy(u32, buf, &pos));
+    try testing.expectEqual(@as(usize, 2), pos);
+    try testing.expectEqual(@as(u32, 4872), readUnsignedLossy(u32, buf, &pos));
     try testing.expectEqual(buf.len, pos);
 }
 

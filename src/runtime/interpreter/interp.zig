@@ -122,7 +122,7 @@ const Memarg = struct { mem_idx: u32, offset: u64 };
 
 /// Read a memarg from bytecode: alignment (with multi-memory bit 6) + offset.
 /// Returns the memory index and offset.
-fn readMemarg(code: []const u8, ip: *usize) Memarg {
+inline fn readMemarg(code: []const u8, ip: *usize) Memarg {
     const align_flags = readU32(code, ip);
     const mem_idx: u32 = if (align_flags & 0x40 != 0) readU32(code, ip) else 0;
     const offset = readU32(code, ip);
@@ -130,7 +130,7 @@ fn readMemarg(code: []const u8, ip: *usize) Memarg {
 }
 
 /// Pop address from the stack, handling memory64 (i64 address) vs i32.
-fn popMemAddr(env: *ExecEnv, mem_idx: u32) TrapError!u64 {
+inline fn popMemAddr(env: *ExecEnv, mem_idx: u32) TrapError!u64 {
     const mem = env.module_inst.getMemory(mem_idx) orelse return error.OutOfBoundsMemoryAccess;
     if (mem.memory_type.is_memory64) {
         return @bitCast(try env.popI64());
@@ -140,7 +140,7 @@ fn popMemAddr(env: *ExecEnv, mem_idx: u32) TrapError!u64 {
 }
 
 /// Pop a table index, handling table64 (i64 index). Returns u32 or OutOfBoundsTableAccess.
-fn popTableIdx(env: *ExecEnv, table: *types.TableInstance) TrapError!u32 {
+inline fn popTableIdx(env: *ExecEnv, table: *types.TableInstance) TrapError!u32 {
     if (table.table_type.is_table64) {
         const idx64: u64 = @bitCast(try env.popI64());
         if (idx64 > std.math.maxInt(u32)) return error.OutOfBoundsTableAccess;
@@ -150,16 +150,39 @@ fn popTableIdx(env: *ExecEnv, table: *types.TableInstance) TrapError!u32 {
     }
 }
 
-fn readU32(code: []const u8, ip: *usize) u32 {
+inline fn readU32(code: []const u8, ip: *usize) u32 {
     return leb128.readUnsignedLossy(u32, code, ip);
 }
 
-fn readI32(code: []const u8, ip: *usize) i32 {
+inline fn readI32(code: []const u8, ip: *usize) i32 {
     return leb128.readSignedLossy(i32, code, ip);
 }
 
-fn readI64(code: []const u8, ip: *usize) i64 {
+inline fn readI64(code: []const u8, ip: *usize) i64 {
     return leb128.readSignedLossy(i64, code, ip);
+}
+
+fn unwindBranchStackSlow(env: *ExecEnv, label: Label) TrapError!void {
+    @branchHint(.cold);
+    if (env.sp < label.arity) return error.StackUnderflow;
+    if (label.stack_height + label.arity > env.operand_stack.len) return error.StackOverflow;
+    const src_start = env.sp - label.arity;
+    if (label.stack_height != src_start) {
+        std.mem.copyForwards(
+            types.Value,
+            env.operand_stack[label.stack_height .. label.stack_height + label.arity],
+            env.operand_stack[src_start..env.sp],
+        );
+    }
+    env.sp = label.stack_height + label.arity;
+}
+
+inline fn unwindBranchStack(env: *ExecEnv, label: Label) TrapError!void {
+    if (label.arity == 0) {
+        env.sp = label.stack_height;
+        return;
+    }
+    return unwindBranchStackSlow(env, label);
 }
 
 /// Check if a ref value matches a target heap type for ref.test/ref.cast.
@@ -1554,45 +1577,59 @@ fn findElse(code: []const u8, start: usize) ?usize {
 /// Parse a block type from bytecode, advancing ip past it.
 /// Returns result arity and param arity (for multi-value type indices).
 const BlockTypeInfo = struct { result_arity: u32, param_arity: u32 };
+const BlockTypeDecode = struct { info: BlockTypeInfo, next_ip: usize };
 
-fn readBlockTypeInfo(code: []const u8, ip: *usize, module_types: []const types.FuncType) BlockTypeInfo {
-    const first = code[ip.*];
+fn readBlockTypeInfoSlow(code: []const u8, start_ip: usize, module_types: []const types.FuncType) BlockTypeDecode {
+    @branchHint(.cold);
+    var ip = start_ip;
+    const first = code[ip];
     // Typed reference block types: 0x63 (ref null) / 0x64 (ref) + heap type
     if (first == 0x63 or first == 0x64) {
-        ip.* += 1; // consume ref prefix
-        if (ip.* < code.len) {
-            const ht = code[ip.*];
+        ip += 1; // consume ref prefix
+        if (ip < code.len) {
+            const ht = code[ip];
             if (ht == 0x70 or ht == 0x6F or ht == 0x73 or ht == 0x72) {
-                ip.* += 1; // abstract heap type (1 byte)
+                ip += 1; // abstract heap type (1 byte)
             } else {
                 // Concrete type index (LEB128)
-                while (ip.* < code.len) {
-                    const b = code[ip.*];
-                    ip.* += 1;
+                while (ip < code.len) {
+                    const b = code[ip];
+                    ip += 1;
                     if (b & 0x80 == 0) break;
                 }
             }
         }
-        return .{ .result_arity = 1, .param_arity = 0 };
+        return .{ .info = .{ .result_arity = 1, .param_arity = 0 }, .next_ip = ip };
     }
-    // Inline types: bytes 0x40-0x7F are single-byte negative s33 values.
-    if (first >= 0x40 and first & 0x80 == 0) {
-        ip.* += 1;
+    // Type index (unsigned LEB128)
+    const type_idx = readU32(code, &ip);
+    if (type_idx < module_types.len) {
+        const ft = module_types[type_idx];
+        return .{
+            .info = .{
+                .result_arity = @intCast(ft.results.len),
+                .param_arity = @intCast(ft.params.len),
+            },
+            .next_ip = ip,
+        };
+    }
+    return .{ .info = .{ .result_arity = 0, .param_arity = 0 }, .next_ip = ip };
+}
+
+inline fn readBlockTypeInfo(code: []const u8, ip: *usize, module_types: []const types.FuncType) BlockTypeInfo {
+    const p = ip.*;
+    const first = code[p];
+    // Inline types: bytes 0x40-0x7F (except 0x63/0x64) are single-byte negative s33 values.
+    if (first >= 0x40 and first & 0x80 == 0 and first != 0x63 and first != 0x64) {
+        ip.* = p + 1;
         return .{
             .result_arity = if (first == 0x40) @as(u32, 0) else @as(u32, 1),
             .param_arity = 0,
         };
     }
-    // Type index (unsigned LEB128)
-    const type_idx = readU32(code, ip);
-    if (type_idx < module_types.len) {
-        const ft = module_types[type_idx];
-        return .{
-            .result_arity = @intCast(ft.results.len),
-            .param_arity = @intCast(ft.params.len),
-        };
-    }
-    return .{ .result_arity = 0, .param_arity = 0 };
+    const decoded = readBlockTypeInfoSlow(code, p, module_types);
+    ip.* = decoded.next_ip;
+    return decoded.info;
 }
 
 // ── Label for structured control flow ────────────────────────────────────
@@ -1657,6 +1694,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
     // overflow, fuel exhaustion, OOM at host imports, host-trap
     // recording) still flow through `TrapError`.
     @setRuntimeSafety(false);
+    @setEvalBranchQuota(10000);
     var ip: usize = 0;
 
     // Labels live in the shared stack owned by ExecEnv, not in a native
@@ -1672,7 +1710,11 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
     defer env.label_top = label_base;
 
     // Push implicit function-body label so br/br_if/br_table can target the function.
-    const return_arity: u32 = if (env.currentFrame()) |frame| frame.return_arity else 0;
+    const current_frame = env.currentFrame();
+    const has_frame = current_frame != null;
+    const frame_stack_base: u32 = if (current_frame) |frame| frame.stack_base else 0;
+    const frame_local_count: u32 = if (current_frame) |frame| frame.local_count else 0;
+    const return_arity: u32 = if (current_frame) |frame| frame.return_arity else 0;
     labels[0] = .{
         .kind = .block,
         .target_ip = code.len,
@@ -1789,94 +1831,15 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
 
             .throw => {
                 const tag_idx = readU32(code, &ip);
-                const tags = env.module_inst.tags;
-                if (tag_idx >= tags.len) return error.Unreachable;
-                const thrown_tag = tags[tag_idx];
-                const param_count = thrown_tag.param_arity;
-
-                // Save exception params from stack before any unwinding
-                var exc_params: [16]types.Value = undefined;
-                {
-                    var pi: u32 = param_count;
-                    while (pi > 0) {
-                        pi -= 1;
-                        exc_params[pi] = try env.pop();
-                    }
-                }
-
-                const catch_result_throw = searchCatchHandler(env, labels[0..label_sp], code, thrown_tag, tags);
-                if (catch_result_throw) |cr| {
-                    env.sp = cr.stack_height;
-                    {
-                        var pi: u32 = 0;
-                        while (pi < param_count) : (pi += 1) {
-                            try env.push(exc_params[pi]);
-                        }
-                    }
-                    // For catch_ref / catch_all_ref, also push exnref
-                    if (cr.is_ref) {
-                        const ref_idx = env.exception_ref_count;
-                        if (ref_idx < env.exception_refs.len) {
-                            env.exception_refs[ref_idx] = .{
-                                .tag = thrown_tag,
-                                .params = exc_params,
-                                .param_count = param_count,
-                            };
-                            env.exception_ref_count = ref_idx + 1;
-                        }
-                        try env.push(.{ .exnref = ref_idx });
-                    }
-                    label_sp = cr.label_sp;
-                    ip = cr.ip;
-                } else {
-                    // No handler in this function — propagate as uncaught exception
-                    env.pending_exception_tag = thrown_tag;
-                    env.pending_exception_param_count = param_count;
-                    var pi: u32 = 0;
-                    while (pi < param_count) : (pi += 1) {
-                        env.pending_exception_params[pi] = exc_params[pi];
-                    }
-                    return error.UncaughtException;
-                }
+                const catch_state = try executeThrow(env, code, labels[0..label_sp], tag_idx);
+                label_sp = catch_state.label_sp;
+                ip = catch_state.ip;
             },
 
             .throw_ref => {
-                // throw_ref: pop exnref from stack, re-throw it
-                const exnref_val = try env.pop();
-                const ref_idx = exnref_val.exnref orelse return error.Unreachable;
-                if (ref_idx >= env.exception_ref_count) return error.Unreachable;
-                const exc_ref = env.exception_refs[ref_idx];
-                const thrown_tag = exc_ref.tag orelse return error.Unreachable;
-                const param_count = thrown_tag.param_arity;
-                const tags = env.module_inst.tags;
-
-                var exc_params: [16]types.Value = undefined;
-                var pi: u32 = 0;
-                while (pi < param_count) : (pi += 1) {
-                    exc_params[pi] = exc_ref.params[pi];
-                }
-
-                const catch_result = searchCatchHandler(env, labels[0..label_sp], code, thrown_tag, tags);
-                if (catch_result) |cr| {
-                    env.sp = cr.stack_height;
-                    pi = 0;
-                    while (pi < param_count) : (pi += 1) {
-                        try env.push(exc_params[pi]);
-                    }
-                    if (cr.is_ref) {
-                        try env.push(.{ .exnref = ref_idx });
-                    }
-                    label_sp = cr.label_sp;
-                    ip = cr.ip;
-                } else {
-                    env.pending_exception_tag = thrown_tag;
-                    env.pending_exception_param_count = param_count;
-                    pi = 0;
-                    while (pi < param_count) : (pi += 1) {
-                        env.pending_exception_params[pi] = exc_params[pi];
-                    }
-                    return error.UncaughtException;
-                }
+                const catch_state = try executeThrowRef(env, code, labels[0..label_sp]);
+                label_sp = catch_state.label_sp;
+                ip = catch_state.ip;
             },
 
             .@"try", .@"catch", .rethrow, .delegate, .catch_all => {
@@ -1904,19 +1867,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 const depth = readU32(code, &ip);
                 if (depth >= label_sp) return error.StackUnderflow;
                 const label = labels[label_sp - 1 - depth];
-                // Preserve arity values on top of stack, unwind
-                {
-                    var results: [16]types.Value = undefined;
-                    var i: u32 = 0;
-                    while (i < label.arity) : (i += 1) {
-                        results[label.arity - 1 - i] = try env.pop();
-                    }
-                    env.sp = label.stack_height;
-                    i = 0;
-                    while (i < label.arity) : (i += 1) {
-                        try env.push(results[i]);
-                    }
-                }
+                try unwindBranchStack(env, label);
                 // Pop labels up to and including the target
                 label_sp -= depth + 1;
                 if (label.kind == .loop) {
@@ -1933,18 +1884,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 if (cond != 0) {
                     if (depth >= label_sp) return error.StackUnderflow;
                     const label = labels[label_sp - 1 - depth];
-                    {
-                        var results: [16]types.Value = undefined;
-                        var i: u32 = 0;
-                        while (i < label.arity) : (i += 1) {
-                            results[label.arity - 1 - i] = try env.pop();
-                        }
-                        env.sp = label.stack_height;
-                        i = 0;
-                        while (i < label.arity) : (i += 1) {
-                            try env.push(results[i]);
-                        }
-                    }
+                    try unwindBranchStack(env, label);
                     label_sp -= depth + 1;
                     if (label.kind == .loop) {
                         labels[label_sp] = label;
@@ -1979,18 +1919,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                 // Now branch to target_depth
                 if (target_depth >= label_sp) return error.StackUnderflow;
                 const label = labels[label_sp - 1 - target_depth];
-                {
-                    var results: [16]types.Value = undefined;
-                    var i: u32 = 0;
-                    while (i < label.arity) : (i += 1) {
-                        results[label.arity - 1 - i] = try env.pop();
-                    }
-                    env.sp = label.stack_height;
-                    i = 0;
-                    while (i < label.arity) : (i += 1) {
-                        try env.push(results[i]);
-                    }
-                }
+                try unwindBranchStack(env, label);
                 label_sp -= target_depth + 1;
                 if (label.kind == .loop) {
                     labels[label_sp] = label;
@@ -2139,18 +2068,26 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
             // ── Locals ──
             .local_get => {
                 const idx = readU32(code, &ip);
-                const frame = env.currentFrame() orelse return error.CallStackUnderflow;
-                try env.push(try env.getLocal(frame, idx));
+                if (!has_frame) return error.CallStackUnderflow;
+                if (idx >= frame_local_count) return error.StackUnderflow;
+                if (env.sp >= env.operand_stack.len) return error.StackOverflow;
+                env.operand_stack[env.sp] = env.operand_stack[frame_stack_base + idx];
+                env.sp += 1;
             },
             .local_set => {
                 const idx = readU32(code, &ip);
-                const frame = env.currentFrame() orelse return error.CallStackUnderflow;
-                try env.setLocal(frame, idx, try env.pop());
+                if (!has_frame) return error.CallStackUnderflow;
+                if (idx >= frame_local_count) return error.StackUnderflow;
+                if (env.sp == 0) return error.StackUnderflow;
+                env.sp -= 1;
+                env.operand_stack[frame_stack_base + idx] = env.operand_stack[env.sp];
             },
             .local_tee => {
                 const idx = readU32(code, &ip);
-                const frame = env.currentFrame() orelse return error.CallStackUnderflow;
-                try env.setLocal(frame, idx, try env.peek());
+                if (!has_frame) return error.CallStackUnderflow;
+                if (idx >= frame_local_count) return error.StackUnderflow;
+                if (env.sp == 0) return error.StackUnderflow;
+                env.operand_stack[frame_stack_base + idx] = env.operand_stack[env.sp - 1];
             },
 
             // ── Globals ──
@@ -2162,25 +2099,34 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
             .global_set => {
                 const idx = readU32(code, &ip);
                 if (idx >= env.module_inst.globals.len) return error.OutOfBoundsMemoryAccess;
-                env.module_inst.globals[idx].value = try env.pop();
+                if (env.sp == 0) return error.StackUnderflow;
+                env.sp -= 1;
+                env.module_inst.globals[idx].value = env.operand_stack[env.sp];
             },
 
             // ── Parametric ──
-            .drop => _ = try env.pop(),
+            .drop => {
+                if (env.sp == 0) return error.StackUnderflow;
+                env.sp -= 1;
+            },
             .select => {
                 const c = try env.popI32();
-                const b = try env.pop();
-                const a = try env.pop();
-                try env.push(if (c != 0) a else b);
+                if (env.sp < 2) return error.StackUnderflow;
+                if (c == 0) {
+                    env.operand_stack[env.sp - 2] = env.operand_stack[env.sp - 1];
+                }
+                env.sp -= 1;
             },
             .select_t => {
                 const num_types = readU32(code, &ip);
                 var j: u32 = 0;
                 while (j < num_types) : (j += 1) _ = readU32(code, &ip);
                 const c = try env.popI32();
-                const b = try env.pop();
-                const a = try env.pop();
-                try env.push(if (c != 0) a else b);
+                if (env.sp < 2) return error.StackUnderflow;
+                if (c == 0) {
+                    env.operand_stack[env.sp - 2] = env.operand_stack[env.sp - 1];
+                }
+                env.sp -= 1;
             },
 
             // ── i32 comparison ──
@@ -3021,18 +2967,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                     // Branch (same as br)
                     if (depth >= label_sp) return error.StackUnderflow;
                     const label = labels[label_sp - 1 - depth];
-                    {
-                        var results: [16]types.Value = undefined;
-                        var ri: u32 = 0;
-                        while (ri < label.arity) : (ri += 1) {
-                            results[label.arity - 1 - ri] = try env.pop();
-                        }
-                        env.sp = label.stack_height;
-                        ri = 0;
-                        while (ri < label.arity) : (ri += 1) {
-                            try env.push(results[ri]);
-                        }
-                    }
+                    try unwindBranchStack(env, label);
                     label_sp -= depth + 1;
                     if (label.kind == .loop) {
                         labels[label_sp] = label;
@@ -3074,18 +3009,7 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                     // Branch with the non-null ref on top
                     if (depth >= label_sp) return error.StackUnderflow;
                     const label = labels[label_sp - 1 - depth];
-                    {
-                        var results: [16]types.Value = undefined;
-                        var ri: u32 = 0;
-                        while (ri < label.arity) : (ri += 1) {
-                            results[label.arity - 1 - ri] = try env.pop();
-                        }
-                        env.sp = label.stack_height;
-                        ri = 0;
-                        while (ri < label.arity) : (ri += 1) {
-                            try env.push(results[ri]);
-                        }
-                    }
+                    try unwindBranchStack(env, label);
                     label_sp -= depth + 1;
                     if (label.kind == .loop) {
                         labels[label_sp] = label;
@@ -3230,387 +3154,22 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                             try env.pushI64(@bitCast(@as(u64, @intFromFloat(v))));
                         }
                     },
-                    8 => { // memory.init
-                        const data_idx = readU32(code, &ip);
-                        const mem_idx = readU32(code, &ip);
-                        const mem = env.module_inst.getMemory(mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                        const is_64 = mem.memory_type.is_memory64;
-                        const n: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
-                        const src: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
-                        const dst: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
-                        // Check if segment is dropped
-                        if (env.module_inst.isDataSegmentDropped(data_idx)) {
-                            if (n > 0) return error.OutOfBoundsMemoryAccess;
-                            continue;
-                        }
-                        const module = env.module_inst.module;
-                        if (data_idx >= module.data_segments.len) {
-                            if (n > 0) return error.OutOfBoundsMemoryAccess;
-                            continue;
-                        }
-                        const seg = module.data_segments[data_idx];
-                        if (!memInBounds(src, n, seg.data.len) or !memInBounds(dst, n, mem.byteLen()))
-                            return error.OutOfBoundsMemoryAccess;
-                        const d: usize = @intCast(dst);
-                        const s: usize = @intCast(src);
-                        const len: usize = @intCast(n);
-                        @memcpy(mem.data[d .. d + len], seg.data[s .. s + len]);
+                    else => {
+                        ip = try executeMiscBulkTable(env, code, ip, sub_op);
                     },
-                    9 => { // data.drop
-                        const data_idx = readU32(code, &ip);
-                        env.module_inst.dropDataSegment(data_idx);
-                    },
-                    10 => { // memory.copy
-                        const dst_mem_idx = readU32(code, &ip);
-                        const src_mem_idx = readU32(code, &ip);
-                        const dst_mem = env.module_inst.getMemory(dst_mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                        const src_mem = env.module_inst.getMemory(src_mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                        // Use the widest address type of either memory
-                        const is_64 = dst_mem.memory_type.is_memory64 or src_mem.memory_type.is_memory64;
-                        const n: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
-                        const src: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
-                        const dst: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
-                        if (!memInBounds(dst, n, dst_mem.byteLen()) or !memInBounds(src, n, src_mem.byteLen())) {
-                            return error.OutOfBoundsMemoryAccess;
-                        }
-                        const d: usize = @intCast(dst);
-                        const s: usize = @intCast(src);
-                        const len: usize = @intCast(n);
-                        if (dst_mem == src_mem) {
-                            if (d <= s) {
-                                std.mem.copyForwards(u8, dst_mem.data[d .. d + len], src_mem.data[s .. s + len]);
-                            } else {
-                                std.mem.copyBackwards(u8, dst_mem.data[d .. d + len], src_mem.data[s .. s + len]);
-                            }
-                        } else {
-                            @memcpy(dst_mem.data[d .. d + len], src_mem.data[s .. s + len]);
-                        }
-                    },
-                    11 => { // memory.fill
-                        const fill_mem_idx = readU32(code, &ip);
-                        const mem = env.module_inst.getMemory(fill_mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                        const is_64 = mem.memory_type.is_memory64;
-                        const n: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
-                        const val: u8 = @truncate(@as(u32, @bitCast(try env.popI32())));
-                        const dst: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
-                        if (!memInBounds(dst, n, mem.byteLen())) return error.OutOfBoundsMemoryAccess;
-                        const d: usize = @intCast(dst);
-                        const len: usize = @intCast(n);
-                        @memset(mem.data[d .. d + len], val);
-                    },
-                    12 => { // table.init
-                        const elem_idx = readU32(code, &ip);
-                        const table_idx = readU32(code, &ip);
-                        const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
-                        const n: u32 = @bitCast(try env.popI32());
-                        const s: u32 = @bitCast(try env.popI32());
-                        const d: u32 = try popTableIdx(env, table);
-                        const module = env.module_inst.module;
-                        if (elem_idx >= module.elements.len) return error.OutOfBoundsTableAccess;
-                        env.module_inst.lockState();
-                        defer env.module_inst.unlockState();
-                        if (elem_idx < env.module_inst.dropped_elems.len and env.module_inst.dropped_elems[elem_idx]) {
-                            if (n > 0) return error.OutOfBoundsTableAccess;
-                            continue;
-                        }
-
-                        table.lock();
-                        defer table.unlock();
-
-                        // Use cached evaluated values (spec requires one-time evaluation)
-                        if (elem_idx < env.module_inst.cached_elem_values.len) {
-                            if (env.module_inst.cached_elem_values[elem_idx]) |cached| {
-                                if (@as(u64, s) + n > cached.len or @as(u64, d) + n > table.elements.len) return error.OutOfBoundsTableAccess;
-                                for (0..n) |i_| {
-                                    const ii = @as(u32, @intCast(i_));
-                                    table.elements[d + ii] = types.TableElement.fromValue(cached[s + ii], env.module_inst);
-                                }
-                                continue;
-                            }
-                        }
-
-                        const elem = &module.elements[elem_idx];
-                        if (@as(u64, s) + n > elem.func_indices.len or @as(u64, d) + n > table.elements.len) return error.OutOfBoundsTableAccess;
-                        for (0..n) |i_| {
-                            const ii = @as(u32, @intCast(i_));
-                            const mfi = elem.func_indices[s + ii];
-                            table.elements[d + ii] = if (mfi) |fi|
-                                .{ .value = .{ .nonfuncref = fi }, .module_inst = env.module_inst }
-                            else
-                                types.TableElement.nullForType(table.table_type.elem_type);
-                        }
-                    },
-                    13 => { // elem.drop
-                        const idx = readU32(code, &ip);
-                        env.module_inst.dropElementSegment(idx);
-                    },
-                    14 => { // table.copy
-                        const dst_table_idx = readU32(code, &ip);
-                        const src_table_idx = readU32(code, &ip);
-                        const dst_table = if (dst_table_idx < env.module_inst.tables.len) env.module_inst.tables[dst_table_idx] else return error.OutOfBoundsTableAccess;
-                        const src_table = if (src_table_idx < env.module_inst.tables.len) env.module_inst.tables[src_table_idx] else return error.OutOfBoundsTableAccess;
-                        const is_64 = dst_table.table_type.is_table64 or src_table.table_type.is_table64;
-                        const n: u32 = if (is_64) blk: {
-                            const v: u64 = @bitCast(try env.popI64());
-                            break :blk if (v > std.math.maxInt(u32)) return error.OutOfBoundsTableAccess else @as(u32, @intCast(v));
-                        } else @bitCast(try env.popI32());
-                        const s: u32 = try popTableIdx(env, src_table);
-                        const d: u32 = try popTableIdx(env, dst_table);
-                        if (src_table == dst_table) {
-                            src_table.lock();
-                            defer src_table.unlock();
-                            if (@as(u64, s) + n > src_table.elements.len or @as(u64, d) + n > src_table.elements.len)
-                                return error.OutOfBoundsTableAccess;
-                            if (d <= s) {
-                                std.mem.copyForwards(
-                                    types.TableElement,
-                                    src_table.elements[d..][0..n],
-                                    src_table.elements[s..][0..n],
-                                );
-                            } else {
-                                std.mem.copyBackwards(
-                                    types.TableElement,
-                                    src_table.elements[d..][0..n],
-                                    src_table.elements[s..][0..n],
-                                );
-                            }
-                        } else {
-                            if (@as(u64, s) + n > src_table.elementCount() or
-                                @as(u64, d) + n > dst_table.elementCount())
-                                return error.OutOfBoundsTableAccess;
-                            for (0..n) |i_| {
-                                const offset: u32 = @intCast(i_);
-                                const value = src_table.getElement(s + offset) orelse
-                                    return error.OutOfBoundsTableAccess;
-                                if (!dst_table.setElement(d + offset, value))
-                                    return error.OutOfBoundsTableAccess;
-                            }
-                        }
-                    },
-                    15 => { // table.grow
-                        const table_idx = readU32(code, &ip);
-                        const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else {
-                            if (table_idx < env.module_inst.tables.len and env.module_inst.tables[table_idx].table_type.is_table64) try env.pushI64(-1) else try env.pushI32(-1);
-                            continue;
-                        };
-                        const delta: u32 = try popTableIdx(env, table);
-                        const init_ref = try env.pop();
-                        table.lock();
-                        defer table.unlock();
-                        const old_size: u32 = @intCast(table.elements.len);
-                        const new_size = @as(u64, old_size) + delta;
-                        if (new_size > std.math.maxInt(u32)) {
-                            if (table.table_type.is_table64) try env.pushI64(-1) else try env.pushI32(-1);
-                            continue;
-                        }
-                        if (table.table_type.limits.max) |max| {
-                            if (new_size > max) {
-                                if (table.table_type.is_table64) try env.pushI64(-1) else try env.pushI32(-1);
-                                continue;
-                            }
-                        }
-                        const new_elems = env.module_inst.allocator.realloc(table.elements, @intCast(new_size)) catch {
-                            if (table.table_type.is_table64) try env.pushI64(-1) else try env.pushI32(-1);
-                            continue;
-                        };
-                        const init_elem = types.TableElement.fromValue(init_ref, env.module_inst);
-                        for (new_elems[old_size..]) |*e| e.* = init_elem;
-                        table.elements = new_elems;
-                        if (table.table_type.is_table64) try env.pushI64(@as(i64, @intCast(old_size))) else try env.pushI32(@bitCast(old_size));
-                    },
-                    16 => { // table.size
-                        const table_idx = readU32(code, &ip);
-                        const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
-                        const size = table.elementCount();
-                        if (table.table_type.is_table64) try env.pushI64(@intCast(size)) else try env.pushI32(@intCast(size));
-                    },
-                    17 => { // table.fill
-                        const table_idx = readU32(code, &ip);
-                        const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
-                        const n: u32 = try popTableIdx(env, table);
-                        const val = try env.pop();
-                        const offset: u32 = try popTableIdx(env, table);
-                        table.lock();
-                        defer table.unlock();
-                        if (@as(u64, offset) + n > table.elements.len) return error.OutOfBoundsTableAccess;
-                        const fill_elem = types.TableElement.fromValue(val, env.module_inst);
-                        for (table.elements[offset..][0..n]) |*e| e.* = fill_elem;
-                    },
-                    else => return error.UnknownOpcode,
                 }
             },
 
             .gc_prefix => {
-                const sub_op = readU32(code, &ip);
-                switch (sub_op) {
-                    0x1C => { // ref.i31: [i32] -> [i31ref]
-                        const val = try env.popI32();
-                        const i31_val: u32 = @as(u32, @bitCast(val)) & 0x7FFF_FFFF;
-                        try env.push(.{ .i31ref = i31_val });
-                    },
-                    0x1D => { // i31.get_s: [i31ref] -> [i32]
-                        const ref = try env.pop();
-                        const raw = switch (ref) {
-                            .funcref, .nonfuncref, .i31ref, .anyref, .eqref => |r| r orelse return error.Unreachable,
-                            else => return error.Unreachable,
-                        };
-                        // Sign-extend from 31 bits
-                        const signed: i32 = if (raw & 0x4000_0000 != 0)
-                            @bitCast(raw | 0x8000_0000)
-                        else
-                            @bitCast(raw & 0x7FFF_FFFF);
-                        try env.pushI32(signed);
-                    },
-                    0x1E => { // i31.get_u: [i31ref] -> [i32]
-                        const ref = try env.pop();
-                        const raw = switch (ref) {
-                            .funcref, .nonfuncref, .i31ref, .anyref, .eqref => |r| r orelse return error.Unreachable,
-                            else => return error.Unreachable,
-                        };
-                        try env.pushI32(@bitCast(raw & 0x7FFF_FFFF));
-                    },
-                    0x1A => { // any.convert_extern: [externref] -> [anyref]
-                        const ref = try env.pop();
-                        const val: ?u32 = switch (ref) {
-                            .externref, .nonexternref => |r| r,
-                            .funcref, .nonfuncref => |r| r,
-                            else => null,
-                        };
-                        if (val) |v| {
-                            // Wrap externref in a sentinel GC object so refTestMatch can
-                            // distinguish externref-wrapped anyref from i31/struct/array.
-                            var extern_val = [1]types.Value{.{ .i32 = @bitCast(v) }};
-                            const obj_idx = try allocGcObject(env.module_inst, EXTERNREF_SENTINEL_TYPE, &extern_val);
-                            try env.push(.{ .anyref = obj_idx });
-                        } else {
-                            try env.push(.{ .anyref = null });
-                        }
-                    },
-                    0x1B => { // extern.convert_any: [anyref] -> [externref]
-                        const ref = try env.pop();
-                        const val: ?u32 = switch (ref) {
-                            .anyref, .eqref => |r| blk: {
-                                // Unwrap externref sentinel GC objects
-                                if (r) |idx| {
-                                    if (getGcObject(env.module_inst, idx)) |obj| {
-                                        if (obj.type_idx == EXTERNREF_SENTINEL_TYPE and obj.fields.len > 0) {
-                                            break :blk @as(?u32, @bitCast(obj.fields[0].i32));
-                                        }
-                                    }
-                                }
-                                break :blk r;
-                            },
-                            .i31ref, .structref, .arrayref => |r| r,
-                            .funcref, .nonfuncref => |r| r,
-                            .externref, .nonexternref => |r| r,
-                            .nullref => |r| r,
-                            .exnref => |r| r,
-                            else => null,
-                        };
-                        try env.push(.{ .externref = val });
-                    },
-                    0x14, 0x15 => { // ref.test, ref.test_nullable: [ref] -> [i32]
-                        const heap_type = readU32(code, &ip);
-                        const ref = try env.pop();
-                        const is_null = switch (ref) {
-                            .funcref, .nonfuncref, .i31ref, .anyref, .eqref, .structref, .arrayref, .nullref => |r| r == null,
-                            .externref, .nonexternref => |r| r == null,
-                            .exnref => |r| r == null,
-                            else => true,
-                        };
-                        if (is_null) {
-                            // For nullable test (0x15), null always matches; for non-nullable (0x14), null never matches
-                            try env.pushI32(if (sub_op == 0x15) @as(i32, 1) else @as(i32, 0));
-                        } else {
-                            try env.pushI32(refTestMatch(ref, heap_type, env.module_inst));
-                        }
-                    },
-                    0x16, 0x17 => { // ref.cast, ref.cast_nullable
-                        const heap_type = readU32(code, &ip);
-                        const ref = try env.pop();
-                        const is_null = switch (ref) {
-                            .funcref, .nonfuncref, .i31ref, .anyref, .eqref, .structref, .arrayref, .nullref => |r| r == null,
-                            .externref, .nonexternref => |r| r == null,
-                            else => true,
-                        };
-                        if (is_null) {
-                            if (sub_op == 0x16) return error.Unreachable;
-                        } else {
-                            if (refTestMatch(ref, heap_type, env.module_inst) == 0) return error.Unreachable;
-                        }
-                        try env.push(ref);
-                    },
-                    // ── GC struct operations ───────────────────────────
-                    0x00 => try gcStructNew(env, readU32(code, &ip), false),
-                    0x01 => try gcStructNew(env, readU32(code, &ip), true),
-                    0x02, 0x03, 0x04 => { // struct.get/get_s/get_u
-                        const ti = readU32(code, &ip);
-                        const fi = readU32(code, &ip);
-                        try gcStructGet(env, ti, fi, sub_op);
-                    },
-                    0x05 => {
-                        const ti = readU32(code, &ip);
-                        const fi = readU32(code, &ip);
-                        try gcStructSet(env, ti, fi);
-                    },
-                    // ── GC array operations ────────────────────────────
-                    0x06 => try gcArrayNew(env, readU32(code, &ip)),
-                    0x07 => try gcArrayNewDefault(env, readU32(code, &ip)),
-                    0x08 => {
-                        const ti = readU32(code, &ip);
-                        const n = readU32(code, &ip);
-                        try gcArrayNewFixed(env, ti, n);
-                    },
-                    0x09 => {
-                        const ti = readU32(code, &ip);
-                        const di = readU32(code, &ip);
-                        try gcArrayNewData(env, ti, di);
-                    },
-                    0x0A => {
-                        const ti = readU32(code, &ip);
-                        const ei = readU32(code, &ip);
-                        try gcArrayNewElem(env, ti, ei);
-                    },
-                    0x0B, 0x0C, 0x0D => try gcArrayGet(env, readU32(code, &ip), sub_op),
-                    0x0E => try gcArraySet(env, readU32(code, &ip)),
-                    0x0F => { // array.len
-                        const ref = try env.pop();
-                        const oi = switch (ref) {
-                            .arrayref, .anyref, .eqref, .structref => |r| r orelse return error.Unreachable,
-                            else => return error.Unreachable,
-                        };
-                        const obj = getGcObject(env.module_inst, oi) orelse return error.Unreachable;
-                        try env.pushI32(@intCast(obj.fields.len));
-                    },
-                    0x10 => {
-                        _ = readU32(code, &ip);
-                        try gcArrayFill(env);
-                    },
-                    0x11 => {
-                        _ = readU32(code, &ip);
-                        _ = readU32(code, &ip);
-                        try gcArrayCopy(env);
-                    },
-                    0x12 => {
-                        const ti = readU32(code, &ip);
-                        const di = readU32(code, &ip);
-                        try gcArrayInitData(env, ti, di);
-                    },
-                    0x13 => {
-                        const ti = readU32(code, &ip);
-                        const ei = readU32(code, &ip);
-                        try gcArrayInitElem(env, ti, ei);
-                    },
-                    0x18, 0x19 => { // br_on_cast (0x18), br_on_cast_fail (0x19)
-                        try handleBrOnCast(env, sub_op, code, &ip, labels, &label_sp);
-                    },
-                    else => return error.UnknownOpcode,
-                }
+                const gc_state = try executeGcPrefix(env, code, ip, labels, label_sp);
+                ip = gc_state.ip;
+                label_sp = gc_state.label_sp;
             },
 
             .simd_prefix => {
                 const save_ip = ip;
-                simd.executeSIMD(env, code, &ip) catch |err| switch (err) {
+                var tmp_ip = ip;
+                simd.executeSIMD(env, code, &tmp_ip) catch |err| switch (err) {
                     error.UnknownOpcode => {
                         ip = save_ip;
                         return error.UnknownOpcode;
@@ -3620,197 +3179,673 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                     error.StackOverflow => return error.StackOverflow,
                     error.StackUnderflow => return error.StackUnderflow,
                 };
+                ip = tmp_ip;
             },
 
             .atomic_prefix => {
-                const sub_op = readU32(code, &ip);
-                switch (sub_op) {
-                    0x03 => { // atomic.fence
-                        _ = readU32(code, &ip); // reserved byte (must be 0)
-                        // A sequentially-consistent barrier, matching the
-                        // MFENCE / DMB ISH that the AOT backends emit for the
-                        // `atomic_fence` IR op. The interpreter shares linear
-                        // memory with `wasi:threads` workers, so this must be
-                        // a real barrier and not a no-op.
-                        platform.memoryFenceSeqCst();
-                    },
-                    // atomic loads
-                    0x10 => try atomicLoad(env, code, &ip, u32, u32, 4), // i32.atomic.load
-                    0x11 => try atomicLoad64(env, code, &ip, u64, 8), // i64.atomic.load
-                    0x12 => try atomicLoad(env, code, &ip, u8, u32, 1), // i32.atomic.load8_u
-                    0x13 => try atomicLoad(env, code, &ip, u16, u32, 2), // i32.atomic.load16_u
-                    0x14 => try atomicLoad64(env, code, &ip, u8, 1), // i64.atomic.load8_u
-                    0x15 => try atomicLoad64(env, code, &ip, u16, 2), // i64.atomic.load16_u
-                    0x16 => try atomicLoad64(env, code, &ip, u32, 4), // i64.atomic.load32_u
-                    // atomic stores
-                    0x17 => try atomicStore(env, code, &ip, u32, 4), // i32.atomic.store
-                    0x18 => try atomicStore64(env, code, &ip, u64, 8), // i64.atomic.store
-                    0x19 => try atomicStore(env, code, &ip, u8, 1), // i32.atomic.store8
-                    0x1A => try atomicStore(env, code, &ip, u16, 2), // i32.atomic.store16
-                    0x1B => try atomicStore64(env, code, &ip, u8, 1), // i64.atomic.store8
-                    0x1C => try atomicStore64(env, code, &ip, u16, 2), // i64.atomic.store16
-                    0x1D => try atomicStore64(env, code, &ip, u32, 4), // i64.atomic.store32
-                    // RMW add
-                    0x1E => try atomicRmw(env, code, &ip, u32, 4, .Add),
-                    0x1F => try atomicRmw64(env, code, &ip, u64, 8, .Add),
-                    0x20 => try atomicRmw(env, code, &ip, u8, 1, .Add),
-                    0x21 => try atomicRmw(env, code, &ip, u16, 2, .Add),
-                    0x22 => try atomicRmw64(env, code, &ip, u8, 1, .Add),
-                    0x23 => try atomicRmw64(env, code, &ip, u16, 2, .Add),
-                    0x24 => try atomicRmw64(env, code, &ip, u32, 4, .Add),
-                    // RMW sub
-                    0x25 => try atomicRmw(env, code, &ip, u32, 4, .Sub),
-                    0x26 => try atomicRmw64(env, code, &ip, u64, 8, .Sub),
-                    0x27 => try atomicRmw(env, code, &ip, u8, 1, .Sub),
-                    0x28 => try atomicRmw(env, code, &ip, u16, 2, .Sub),
-                    0x29 => try atomicRmw64(env, code, &ip, u8, 1, .Sub),
-                    0x2A => try atomicRmw64(env, code, &ip, u16, 2, .Sub),
-                    0x2B => try atomicRmw64(env, code, &ip, u32, 4, .Sub),
-                    // RMW and
-                    0x2C => try atomicRmw(env, code, &ip, u32, 4, .And),
-                    0x2D => try atomicRmw64(env, code, &ip, u64, 8, .And),
-                    0x2E => try atomicRmw(env, code, &ip, u8, 1, .And),
-                    0x2F => try atomicRmw(env, code, &ip, u16, 2, .And),
-                    0x30 => try atomicRmw64(env, code, &ip, u8, 1, .And),
-                    0x31 => try atomicRmw64(env, code, &ip, u16, 2, .And),
-                    0x32 => try atomicRmw64(env, code, &ip, u32, 4, .And),
-                    // RMW or
-                    0x33 => try atomicRmw(env, code, &ip, u32, 4, .Or),
-                    0x34 => try atomicRmw64(env, code, &ip, u64, 8, .Or),
-                    0x35 => try atomicRmw(env, code, &ip, u8, 1, .Or),
-                    0x36 => try atomicRmw(env, code, &ip, u16, 2, .Or),
-                    0x37 => try atomicRmw64(env, code, &ip, u8, 1, .Or),
-                    0x38 => try atomicRmw64(env, code, &ip, u16, 2, .Or),
-                    0x39 => try atomicRmw64(env, code, &ip, u32, 4, .Or),
-                    // RMW xor
-                    0x3A => try atomicRmw(env, code, &ip, u32, 4, .Xor),
-                    0x3B => try atomicRmw64(env, code, &ip, u64, 8, .Xor),
-                    0x3C => try atomicRmw(env, code, &ip, u8, 1, .Xor),
-                    0x3D => try atomicRmw(env, code, &ip, u16, 2, .Xor),
-                    0x3E => try atomicRmw64(env, code, &ip, u8, 1, .Xor),
-                    0x3F => try atomicRmw64(env, code, &ip, u16, 2, .Xor),
-                    0x40 => try atomicRmw64(env, code, &ip, u32, 4, .Xor),
-                    // RMW xchg
-                    0x41 => try atomicRmw(env, code, &ip, u32, 4, .Xchg),
-                    0x42 => try atomicRmw64(env, code, &ip, u64, 8, .Xchg),
-                    0x43 => try atomicRmw(env, code, &ip, u8, 1, .Xchg),
-                    0x44 => try atomicRmw(env, code, &ip, u16, 2, .Xchg),
-                    0x45 => try atomicRmw64(env, code, &ip, u8, 1, .Xchg),
-                    0x46 => try atomicRmw64(env, code, &ip, u16, 2, .Xchg),
-                    0x47 => try atomicRmw64(env, code, &ip, u32, 4, .Xchg),
-                    // RMW cmpxchg
-                    0x48 => try atomicCmpxchg(env, code, &ip, u32, 4),
-                    0x49 => try atomicCmpxchg64(env, code, &ip, u64, 8),
-                    0x4A => try atomicCmpxchg(env, code, &ip, u8, 1),
-                    0x4B => try atomicCmpxchg(env, code, &ip, u16, 2),
-                    0x4C => try atomicCmpxchg64(env, code, &ip, u8, 1),
-                    0x4D => try atomicCmpxchg64(env, code, &ip, u16, 2),
-                    0x4E => try atomicCmpxchg64(env, code, &ip, u32, 4),
-                    // wait/notify
-                    0x00 => { // memory.atomic.notify
-                        _ = readU32(code, &ip); // align
-                        const offset = readU32(code, &ip);
-                        const count: u32 = @bitCast(try env.popI32());
-                        const addr: u32 = @bitCast(try env.popI32());
-                        const effective_addr = addr +% offset;
-                        // Alignment check: notify address must be 4-byte aligned
-                        if (effective_addr & 3 != 0) return error.UnalignedAtomicAccess;
-                        const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
-                        if (@as(u64, effective_addr) + 4 > mem.byteLen()) return error.OutOfBoundsMemoryAccess;
-                        const woken = mem.notify(effective_addr, count) catch |err| switch (err) {
-                            error.NotShared => 0,
-                            error.OutOfBounds => return error.OutOfBoundsMemoryAccess,
-                            error.Unaligned => return error.UnalignedAtomicAccess,
-                            error.InvalidAddress,
-                            error.InvalidArgument,
-                            error.Unsupported,
-                            error.SystemFailure,
-                            => return error.OutOfBoundsMemoryAccess,
-                        };
-                        try env.pushI32(@bitCast(woken));
-                    },
-                    0x01 => { // memory.atomic.wait32
-                        _ = readU32(code, &ip); // align
-                        const offset = readU32(code, &ip);
-                        const timeout = try env.popI64();
-                        const expected = try env.popI32();
-                        const addr: u32 = @bitCast(try env.popI32());
-                        const effective_addr = addr +% offset;
-                        if (effective_addr & 3 != 0) return error.UnalignedAtomicAccess;
-                        const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
-                        if (!memInBounds(effective_addr, 4, mem.byteLen())) return error.OutOfBoundsMemoryAccess;
-                        // Never park after the group's terminal outcome is
-                        // claimed: the wake sweep may already have passed.
-                        if (env.threadManager()) |tm| {
-                            if (tm.isTerminating()) return error.ThreadCancelled;
-                        }
-                        const result = mem.wait32Cancellable(
-                            effective_addr,
-                            @bitCast(expected),
-                            timeout,
-                            if (env.threadManager()) |tm|
-                                tm.cancellationForContext(&env.thread_context)
-                            else
-                                null,
-                        ) catch |err| switch (err) {
-                            error.NotShared => .not_equal,
-                            error.OutOfBounds => return error.OutOfBoundsMemoryAccess,
-                            error.Unaligned => return error.UnalignedAtomicAccess,
-                            error.InvalidAddress,
-                            error.InvalidArgument,
-                            error.Unsupported,
-                            error.SystemFailure,
-                            => return error.OutOfBoundsMemoryAccess,
-                        };
-                        switch (result) {
-                            .notified, .not_equal, .timed_out => try env.pushI32(@intCast(@backingInt(result))),
-                            .cancelled, .closed => return error.ThreadCancelled,
-                        }
-                    },
-                    0x02 => { // memory.atomic.wait64
-                        _ = readU32(code, &ip); // align
-                        const offset = readU32(code, &ip);
-                        const timeout = try env.popI64();
-                        const expected = try env.popI64();
-                        const addr: u32 = @bitCast(try env.popI32());
-                        const effective_addr = addr +% offset;
-                        if (effective_addr & 7 != 0) return error.UnalignedAtomicAccess;
-                        const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
-                        if (!memInBounds(effective_addr, 8, mem.byteLen())) return error.OutOfBoundsMemoryAccess;
-                        if (env.threadManager()) |tm| {
-                            if (tm.isTerminating()) return error.ThreadCancelled;
-                        }
-                        const result = mem.wait64Cancellable(
-                            effective_addr,
-                            @bitCast(expected),
-                            timeout,
-                            if (env.threadManager()) |tm|
-                                tm.cancellationForContext(&env.thread_context)
-                            else
-                                null,
-                        ) catch |err| switch (err) {
-                            error.NotShared => .not_equal,
-                            error.OutOfBounds => return error.OutOfBoundsMemoryAccess,
-                            error.Unaligned => return error.UnalignedAtomicAccess,
-                            error.InvalidAddress,
-                            error.InvalidArgument,
-                            error.Unsupported,
-                            error.SystemFailure,
-                            => return error.OutOfBoundsMemoryAccess,
-                        };
-                        switch (result) {
-                            .notified, .not_equal, .timed_out => try env.pushI32(@intCast(@backingInt(result))),
-                            .cancelled, .closed => return error.ThreadCancelled,
-                        }
-                    },
-                    else => return error.UnknownOpcode,
-                }
+                ip = try executeAtomicPrefix(env, code, ip);
             },
 
             else => return error.UnknownOpcode,
         }
     }
     return .normal;
+}
+
+const CatchTargetState = struct {
+    ip: usize,
+    label_sp: u32,
+};
+
+fn executeThrow(env: *ExecEnv, code: []const u8, active_labels: []const Label, tag_idx: u32) TrapError!CatchTargetState {
+    @branchHint(.cold);
+    @setRuntimeSafety(false);
+    const tags = env.module_inst.tags;
+    if (tag_idx >= tags.len) return error.Unreachable;
+    const thrown_tag = tags[tag_idx];
+    const param_count = thrown_tag.param_arity;
+
+    var exc_params: [16]types.Value = undefined;
+    {
+        var pi: u32 = param_count;
+        while (pi > 0) {
+            pi -= 1;
+            exc_params[pi] = try env.pop();
+        }
+    }
+
+    const catch_result_throw = searchCatchHandler(env, active_labels, code, thrown_tag, tags);
+    if (catch_result_throw) |cr| {
+        env.sp = cr.stack_height;
+        {
+            var pi: u32 = 0;
+            while (pi < param_count) : (pi += 1) {
+                try env.push(exc_params[pi]);
+            }
+        }
+        if (cr.is_ref) {
+            const ref_idx = env.exception_ref_count;
+            if (ref_idx < env.exception_refs.len) {
+                env.exception_refs[ref_idx] = .{
+                    .tag = thrown_tag,
+                    .params = exc_params,
+                    .param_count = param_count,
+                };
+                env.exception_ref_count = ref_idx + 1;
+            }
+            try env.push(.{ .exnref = ref_idx });
+        }
+        return .{ .ip = cr.ip, .label_sp = cr.label_sp };
+    } else {
+        env.pending_exception_tag = thrown_tag;
+        env.pending_exception_param_count = param_count;
+        var pi: u32 = 0;
+        while (pi < param_count) : (pi += 1) {
+            env.pending_exception_params[pi] = exc_params[pi];
+        }
+        return error.UncaughtException;
+    }
+}
+
+fn executeThrowRef(env: *ExecEnv, code: []const u8, active_labels: []const Label) TrapError!CatchTargetState {
+    @branchHint(.cold);
+    @setRuntimeSafety(false);
+    const exnref_val = try env.pop();
+    const ref_idx = exnref_val.exnref orelse return error.Unreachable;
+    if (ref_idx >= env.exception_ref_count) return error.Unreachable;
+    const exc_ref = env.exception_refs[ref_idx];
+    const thrown_tag = exc_ref.tag orelse return error.Unreachable;
+    const param_count = thrown_tag.param_arity;
+    const tags = env.module_inst.tags;
+
+    var exc_params: [16]types.Value = undefined;
+    var pi: u32 = 0;
+    while (pi < param_count) : (pi += 1) {
+        exc_params[pi] = exc_ref.params[pi];
+    }
+
+    const catch_result = searchCatchHandler(env, active_labels, code, thrown_tag, tags);
+    if (catch_result) |cr| {
+        env.sp = cr.stack_height;
+        pi = 0;
+        while (pi < param_count) : (pi += 1) {
+            try env.push(exc_params[pi]);
+        }
+        if (cr.is_ref) {
+            try env.push(.{ .exnref = ref_idx });
+        }
+        return .{ .ip = cr.ip, .label_sp = cr.label_sp };
+    } else {
+        env.pending_exception_tag = thrown_tag;
+        env.pending_exception_param_count = param_count;
+        pi = 0;
+        while (pi < param_count) : (pi += 1) {
+            env.pending_exception_params[pi] = exc_params[pi];
+        }
+        return error.UncaughtException;
+    }
+}
+
+fn executeMiscBulkTable(env: *ExecEnv, code: []const u8, start_ip: usize, sub_op: u32) TrapError!usize {
+    @branchHint(.cold);
+    @setRuntimeSafety(false);
+    @setEvalBranchQuota(10000);
+    var ip = start_ip;
+    switch (sub_op) {
+        8 => { // memory.init
+            const data_idx = readU32(code, &ip);
+            const mem_idx = readU32(code, &ip);
+            const mem = env.module_inst.getMemory(mem_idx) orelse return error.OutOfBoundsMemoryAccess;
+            const is_64 = mem.memory_type.is_memory64;
+            const n: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
+            const src: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
+            const dst: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
+            if (env.module_inst.isDataSegmentDropped(data_idx)) {
+                if (n > 0) return error.OutOfBoundsMemoryAccess;
+                return ip;
+            }
+            const module = env.module_inst.module;
+            if (data_idx >= module.data_segments.len) {
+                if (n > 0) return error.OutOfBoundsMemoryAccess;
+                return ip;
+            }
+            const seg = module.data_segments[data_idx];
+            if (!memInBounds(src, n, seg.data.len) or !memInBounds(dst, n, mem.byteLen()))
+                return error.OutOfBoundsMemoryAccess;
+            const d: usize = @intCast(dst);
+            const s: usize = @intCast(src);
+            const len: usize = @intCast(n);
+            @memcpy(mem.data[d .. d + len], seg.data[s .. s + len]);
+        },
+        9 => { // data.drop
+            const data_idx = readU32(code, &ip);
+            env.module_inst.dropDataSegment(data_idx);
+        },
+        10 => { // memory.copy
+            const dst_mem_idx = readU32(code, &ip);
+            const src_mem_idx = readU32(code, &ip);
+            const dst_mem = env.module_inst.getMemory(dst_mem_idx) orelse return error.OutOfBoundsMemoryAccess;
+            const src_mem = env.module_inst.getMemory(src_mem_idx) orelse return error.OutOfBoundsMemoryAccess;
+            const is_64 = dst_mem.memory_type.is_memory64 or src_mem.memory_type.is_memory64;
+            const n: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
+            const src: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
+            const dst: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
+            if (!memInBounds(dst, n, dst_mem.byteLen()) or !memInBounds(src, n, src_mem.byteLen())) {
+                return error.OutOfBoundsMemoryAccess;
+            }
+            const d: usize = @intCast(dst);
+            const s: usize = @intCast(src);
+            const len: usize = @intCast(n);
+            if (dst_mem == src_mem) {
+                if (d <= s) {
+                    std.mem.copyForwards(u8, dst_mem.data[d .. d + len], src_mem.data[s .. s + len]);
+                } else {
+                    std.mem.copyBackwards(u8, dst_mem.data[d .. d + len], src_mem.data[s .. s + len]);
+                }
+            } else {
+                @memcpy(dst_mem.data[d .. d + len], src_mem.data[s .. s + len]);
+            }
+        },
+        11 => { // memory.fill
+            const fill_mem_idx = readU32(code, &ip);
+            const mem = env.module_inst.getMemory(fill_mem_idx) orelse return error.OutOfBoundsMemoryAccess;
+            const is_64 = mem.memory_type.is_memory64;
+            const n: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
+            const val: u8 = @truncate(@as(u32, @bitCast(try env.popI32())));
+            const dst: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
+            if (!memInBounds(dst, n, mem.byteLen())) return error.OutOfBoundsMemoryAccess;
+            const d: usize = @intCast(dst);
+            const len: usize = @intCast(n);
+            @memset(mem.data[d .. d + len], val);
+        },
+        12 => { // table.init
+            const elem_idx = readU32(code, &ip);
+            const table_idx = readU32(code, &ip);
+            const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
+            const n: u32 = @bitCast(try env.popI32());
+            const s: u32 = @bitCast(try env.popI32());
+            const d: u32 = try popTableIdx(env, table);
+            const module = env.module_inst.module;
+            if (elem_idx >= module.elements.len) return error.OutOfBoundsTableAccess;
+            env.module_inst.lockState();
+            defer env.module_inst.unlockState();
+            if (elem_idx < env.module_inst.dropped_elems.len and env.module_inst.dropped_elems[elem_idx]) {
+                if (n > 0) return error.OutOfBoundsTableAccess;
+                return ip;
+            }
+
+            table.lock();
+            defer table.unlock();
+
+            if (elem_idx < env.module_inst.cached_elem_values.len) {
+                if (env.module_inst.cached_elem_values[elem_idx]) |cached| {
+                    if (@as(u64, s) + n > cached.len or @as(u64, d) + n > table.elements.len) return error.OutOfBoundsTableAccess;
+                    for (0..n) |i_| {
+                        const ii = @as(u32, @intCast(i_));
+                        table.elements[d + ii] = types.TableElement.fromValue(cached[s + ii], env.module_inst);
+                    }
+                    return ip;
+                }
+            }
+
+            const elem = &module.elements[elem_idx];
+            if (@as(u64, s) + n > elem.func_indices.len or @as(u64, d) + n > table.elements.len) return error.OutOfBoundsTableAccess;
+            for (0..n) |i_| {
+                const ii = @as(u32, @intCast(i_));
+                const mfi = elem.func_indices[s + ii];
+                table.elements[d + ii] = if (mfi) |fi|
+                    .{ .value = .{ .nonfuncref = fi }, .module_inst = env.module_inst }
+                else
+                    types.TableElement.nullForType(table.table_type.elem_type);
+            }
+        },
+        13 => { // elem.drop
+            const idx = readU32(code, &ip);
+            env.module_inst.dropElementSegment(idx);
+        },
+        14 => { // table.copy
+            const dst_table_idx = readU32(code, &ip);
+            const src_table_idx = readU32(code, &ip);
+            const dst_table = if (dst_table_idx < env.module_inst.tables.len) env.module_inst.tables[dst_table_idx] else return error.OutOfBoundsTableAccess;
+            const src_table = if (src_table_idx < env.module_inst.tables.len) env.module_inst.tables[src_table_idx] else return error.OutOfBoundsTableAccess;
+            const is_64 = dst_table.table_type.is_table64 or src_table.table_type.is_table64;
+            const n: u32 = if (is_64) blk: {
+                const v: u64 = @bitCast(try env.popI64());
+                break :blk if (v > std.math.maxInt(u32)) return error.OutOfBoundsTableAccess else @as(u32, @intCast(v));
+            } else @bitCast(try env.popI32());
+            const s: u32 = try popTableIdx(env, src_table);
+            const d: u32 = try popTableIdx(env, dst_table);
+            if (src_table == dst_table) {
+                src_table.lock();
+                defer src_table.unlock();
+                if (@as(u64, s) + n > src_table.elements.len or @as(u64, d) + n > src_table.elements.len)
+                    return error.OutOfBoundsTableAccess;
+                if (d <= s) {
+                    std.mem.copyForwards(
+                        types.TableElement,
+                        src_table.elements[d..][0..n],
+                        src_table.elements[s..][0..n],
+                    );
+                } else {
+                    std.mem.copyBackwards(
+                        types.TableElement,
+                        src_table.elements[d..][0..n],
+                        src_table.elements[s..][0..n],
+                    );
+                }
+            } else {
+                if (@as(u64, s) + n > src_table.elementCount() or
+                    @as(u64, d) + n > dst_table.elementCount())
+                    return error.OutOfBoundsTableAccess;
+                for (0..n) |i_| {
+                    const offset: u32 = @intCast(i_);
+                    const value = src_table.getElement(s + offset) orelse
+                        return error.OutOfBoundsTableAccess;
+                    if (!dst_table.setElement(d + offset, value))
+                        return error.OutOfBoundsTableAccess;
+                }
+            }
+        },
+        15 => { // table.grow
+            const table_idx = readU32(code, &ip);
+            const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else {
+                if (table_idx < env.module_inst.tables.len and env.module_inst.tables[table_idx].table_type.is_table64) try env.pushI64(-1) else try env.pushI32(-1);
+                return ip;
+            };
+            const delta: u32 = try popTableIdx(env, table);
+            const init_ref = try env.pop();
+            table.lock();
+            defer table.unlock();
+            const old_size: u32 = @intCast(table.elements.len);
+            const new_size = @as(u64, old_size) + delta;
+            if (new_size > std.math.maxInt(u32)) {
+                if (table.table_type.is_table64) try env.pushI64(-1) else try env.pushI32(-1);
+                return ip;
+            }
+            if (table.table_type.limits.max) |max| {
+                if (new_size > max) {
+                    if (table.table_type.is_table64) try env.pushI64(-1) else try env.pushI32(-1);
+                    return ip;
+                }
+            }
+            const new_elems = env.module_inst.allocator.realloc(table.elements, @intCast(new_size)) catch {
+                if (table.table_type.is_table64) try env.pushI64(-1) else try env.pushI32(-1);
+                return ip;
+            };
+            const init_elem = types.TableElement.fromValue(init_ref, env.module_inst);
+            for (new_elems[old_size..]) |*e| e.* = init_elem;
+            table.elements = new_elems;
+            if (table.table_type.is_table64) try env.pushI64(@as(i64, @intCast(old_size))) else try env.pushI32(@bitCast(old_size));
+        },
+        16 => { // table.size
+            const table_idx = readU32(code, &ip);
+            const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
+            const size = table.elementCount();
+            if (table.table_type.is_table64) try env.pushI64(@intCast(size)) else try env.pushI32(@intCast(size));
+        },
+        17 => { // table.fill
+            const table_idx = readU32(code, &ip);
+            const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
+            const n: u32 = try popTableIdx(env, table);
+            const val = try env.pop();
+            const offset: u32 = try popTableIdx(env, table);
+            table.lock();
+            defer table.unlock();
+            if (@as(u64, offset) + n > table.elements.len) return error.OutOfBoundsTableAccess;
+            const fill_elem = types.TableElement.fromValue(val, env.module_inst);
+            for (table.elements[offset..][0..n]) |*e| e.* = fill_elem;
+        },
+        else => return error.UnknownOpcode,
+    }
+    return ip;
+}
+
+fn executeGcPrefix(env: *ExecEnv, code: []const u8, start_ip: usize, labels: []Label, start_label_sp: u32) TrapError!CatchTargetState {
+    @branchHint(.cold);
+    @setRuntimeSafety(false);
+    @setEvalBranchQuota(10000);
+    var ip = start_ip;
+    var label_sp = start_label_sp;
+    const sub_op = readU32(code, &ip);
+    switch (sub_op) {
+        0x1C => { // ref.i31: [i32] -> [i31ref]
+            const val = try env.popI32();
+            const i31_val: u32 = @as(u32, @bitCast(val)) & 0x7FFF_FFFF;
+            try env.push(.{ .i31ref = i31_val });
+        },
+        0x1D => { // i31.get_s: [i31ref] -> [i32]
+            const ref = try env.pop();
+            const raw = switch (ref) {
+                .funcref, .nonfuncref, .i31ref, .anyref, .eqref => |r| r orelse return error.Unreachable,
+                else => return error.Unreachable,
+            };
+            const signed: i32 = if (raw & 0x4000_0000 != 0)
+                @bitCast(raw | 0x8000_0000)
+            else
+                @bitCast(raw & 0x7FFF_FFFF);
+            try env.pushI32(signed);
+        },
+        0x1E => { // i31.get_u: [i31ref] -> [i32]
+            const ref = try env.pop();
+            const raw = switch (ref) {
+                .funcref, .nonfuncref, .i31ref, .anyref, .eqref => |r| r orelse return error.Unreachable,
+                else => return error.Unreachable,
+            };
+            try env.pushI32(@bitCast(raw & 0x7FFF_FFFF));
+        },
+        0x1A => { // any.convert_extern: [externref] -> [anyref]
+            const ref = try env.pop();
+            const val: ?u32 = switch (ref) {
+                .externref, .nonexternref => |r| r,
+                .funcref, .nonfuncref => |r| r,
+                else => null,
+            };
+            if (val) |v| {
+                var extern_val = [1]types.Value{.{ .i32 = @bitCast(v) }};
+                const obj_idx = try allocGcObject(env.module_inst, EXTERNREF_SENTINEL_TYPE, &extern_val);
+                try env.push(.{ .anyref = obj_idx });
+            } else {
+                try env.push(.{ .anyref = null });
+            }
+        },
+        0x1B => { // extern.convert_any: [anyref] -> [externref]
+            const ref = try env.pop();
+            const val: ?u32 = switch (ref) {
+                .anyref, .eqref => |r| blk: {
+                    if (r) |idx| {
+                        if (getGcObject(env.module_inst, idx)) |obj| {
+                            if (obj.type_idx == EXTERNREF_SENTINEL_TYPE and obj.fields.len > 0) {
+                                break :blk @as(?u32, @bitCast(obj.fields[0].i32));
+                            }
+                        }
+                    }
+                    break :blk r;
+                },
+                .i31ref, .structref, .arrayref => |r| r,
+                .funcref, .nonfuncref => |r| r,
+                .externref, .nonexternref => |r| r,
+                .nullref => |r| r,
+                .exnref => |r| r,
+                else => null,
+            };
+            try env.push(.{ .externref = val });
+        },
+        0x14, 0x15 => { // ref.test, ref.test_nullable: [ref] -> [i32]
+            const heap_type = readU32(code, &ip);
+            const ref = try env.pop();
+            const is_null = switch (ref) {
+                .funcref, .nonfuncref, .i31ref, .anyref, .eqref, .structref, .arrayref, .nullref => |r| r == null,
+                .externref, .nonexternref => |r| r == null,
+                .exnref => |r| r == null,
+                else => true,
+            };
+            if (is_null) {
+                try env.pushI32(if (sub_op == 0x15) @as(i32, 1) else @as(i32, 0));
+            } else {
+                try env.pushI32(refTestMatch(ref, heap_type, env.module_inst));
+            }
+        },
+        0x16, 0x17 => { // ref.cast, ref.cast_nullable
+            const heap_type = readU32(code, &ip);
+            const ref = try env.pop();
+            const is_null = switch (ref) {
+                .funcref, .nonfuncref, .i31ref, .anyref, .eqref, .structref, .arrayref, .nullref => |r| r == null,
+                .externref, .nonexternref => |r| r == null,
+                else => true,
+            };
+            if (is_null) {
+                if (sub_op == 0x16) return error.Unreachable;
+            } else {
+                if (refTestMatch(ref, heap_type, env.module_inst) == 0) return error.Unreachable;
+            }
+            try env.push(ref);
+        },
+        0x00 => try gcStructNew(env, readU32(code, &ip), false),
+        0x01 => try gcStructNew(env, readU32(code, &ip), true),
+        0x02, 0x03, 0x04 => {
+            const ti = readU32(code, &ip);
+            const fi = readU32(code, &ip);
+            try gcStructGet(env, ti, fi, sub_op);
+        },
+        0x05 => {
+            const ti = readU32(code, &ip);
+            const fi = readU32(code, &ip);
+            try gcStructSet(env, ti, fi);
+        },
+        0x06 => try gcArrayNew(env, readU32(code, &ip)),
+        0x07 => try gcArrayNewDefault(env, readU32(code, &ip)),
+        0x08 => {
+            const ti = readU32(code, &ip);
+            const n = readU32(code, &ip);
+            try gcArrayNewFixed(env, ti, n);
+        },
+        0x09 => {
+            const ti = readU32(code, &ip);
+            const di = readU32(code, &ip);
+            try gcArrayNewData(env, ti, di);
+        },
+        0x0A => {
+            const ti = readU32(code, &ip);
+            const ei = readU32(code, &ip);
+            try gcArrayNewElem(env, ti, ei);
+        },
+        0x0B, 0x0C, 0x0D => try gcArrayGet(env, readU32(code, &ip), sub_op),
+        0x0E => try gcArraySet(env, readU32(code, &ip)),
+        0x0F => {
+            const ref = try env.pop();
+            const oi = switch (ref) {
+                .arrayref, .anyref, .eqref, .structref => |r| r orelse return error.Unreachable,
+                else => return error.Unreachable,
+            };
+            const obj = getGcObject(env.module_inst, oi) orelse return error.Unreachable;
+            try env.pushI32(@intCast(obj.fields.len));
+        },
+        0x10 => {
+            _ = readU32(code, &ip);
+            try gcArrayFill(env);
+        },
+        0x11 => {
+            _ = readU32(code, &ip);
+            _ = readU32(code, &ip);
+            try gcArrayCopy(env);
+        },
+        0x12 => {
+            const ti = readU32(code, &ip);
+            const di = readU32(code, &ip);
+            try gcArrayInitData(env, ti, di);
+        },
+        0x13 => {
+            const ti = readU32(code, &ip);
+            const ei = readU32(code, &ip);
+            try gcArrayInitElem(env, ti, ei);
+        },
+        0x18, 0x19 => {
+            try handleBrOnCast(env, sub_op, code, &ip, labels, &label_sp);
+        },
+        else => return error.UnknownOpcode,
+    }
+    return .{ .ip = ip, .label_sp = label_sp };
+}
+
+fn executeAtomicPrefix(env: *ExecEnv, code: []const u8, start_ip: usize) TrapError!usize {
+    @setRuntimeSafety(false);
+    @setEvalBranchQuota(10000);
+    var ip = start_ip;
+    const sub_op = readU32(code, &ip);
+    switch (sub_op) {
+        0x03 => { // atomic.fence
+            _ = readU32(code, &ip);
+            platform.memoryFenceSeqCst();
+        },
+        // atomic loads
+        0x10 => try atomicLoad(env, code, &ip, u32, u32, 4),
+        0x11 => try atomicLoad64(env, code, &ip, u64, 8),
+        0x12 => try atomicLoad(env, code, &ip, u8, u32, 1),
+        0x13 => try atomicLoad(env, code, &ip, u16, u32, 2),
+        0x14 => try atomicLoad64(env, code, &ip, u8, 1),
+        0x15 => try atomicLoad64(env, code, &ip, u16, 2),
+        0x16 => try atomicLoad64(env, code, &ip, u32, 4),
+        // atomic stores
+        0x17 => try atomicStore(env, code, &ip, u32, 4),
+        0x18 => try atomicStore64(env, code, &ip, u64, 8),
+        0x19 => try atomicStore(env, code, &ip, u8, 1),
+        0x1A => try atomicStore(env, code, &ip, u16, 2),
+        0x1B => try atomicStore64(env, code, &ip, u8, 1),
+        0x1C => try atomicStore64(env, code, &ip, u16, 2),
+        0x1D => try atomicStore64(env, code, &ip, u32, 4),
+        // RMW add
+        0x1E => try atomicRmw(env, code, &ip, u32, 4, .Add),
+        0x1F => try atomicRmw64(env, code, &ip, u64, 8, .Add),
+        0x20 => try atomicRmw(env, code, &ip, u8, 1, .Add),
+        0x21 => try atomicRmw(env, code, &ip, u16, 2, .Add),
+        0x22 => try atomicRmw64(env, code, &ip, u8, 1, .Add),
+        0x23 => try atomicRmw64(env, code, &ip, u16, 2, .Add),
+        0x24 => try atomicRmw64(env, code, &ip, u32, 4, .Add),
+        // RMW sub
+        0x25 => try atomicRmw(env, code, &ip, u32, 4, .Sub),
+        0x26 => try atomicRmw64(env, code, &ip, u64, 8, .Sub),
+        0x27 => try atomicRmw(env, code, &ip, u8, 1, .Sub),
+        0x28 => try atomicRmw(env, code, &ip, u16, 2, .Sub),
+        0x29 => try atomicRmw64(env, code, &ip, u8, 1, .Sub),
+        0x2A => try atomicRmw64(env, code, &ip, u16, 2, .Sub),
+        0x2B => try atomicRmw64(env, code, &ip, u32, 4, .Sub),
+        // RMW and
+        0x2C => try atomicRmw(env, code, &ip, u32, 4, .And),
+        0x2D => try atomicRmw64(env, code, &ip, u64, 8, .And),
+        0x2E => try atomicRmw(env, code, &ip, u8, 1, .And),
+        0x2F => try atomicRmw(env, code, &ip, u16, 2, .And),
+        0x30 => try atomicRmw64(env, code, &ip, u8, 1, .And),
+        0x31 => try atomicRmw64(env, code, &ip, u16, 2, .And),
+        0x32 => try atomicRmw64(env, code, &ip, u32, 4, .And),
+        // RMW or
+        0x33 => try atomicRmw(env, code, &ip, u32, 4, .Or),
+        0x34 => try atomicRmw64(env, code, &ip, u64, 8, .Or),
+        0x35 => try atomicRmw(env, code, &ip, u8, 1, .Or),
+        0x36 => try atomicRmw(env, code, &ip, u16, 2, .Or),
+        0x37 => try atomicRmw64(env, code, &ip, u8, 1, .Or),
+        0x38 => try atomicRmw64(env, code, &ip, u16, 2, .Or),
+        0x39 => try atomicRmw64(env, code, &ip, u32, 4, .Or),
+        // RMW xor
+        0x3A => try atomicRmw(env, code, &ip, u32, 4, .Xor),
+        0x3B => try atomicRmw64(env, code, &ip, u64, 8, .Xor),
+        0x3C => try atomicRmw(env, code, &ip, u8, 1, .Xor),
+        0x3D => try atomicRmw(env, code, &ip, u16, 2, .Xor),
+        0x3E => try atomicRmw64(env, code, &ip, u8, 1, .Xor),
+        0x3F => try atomicRmw64(env, code, &ip, u16, 2, .Xor),
+        0x40 => try atomicRmw64(env, code, &ip, u32, 4, .Xor),
+        // RMW xchg
+        0x41 => try atomicRmw(env, code, &ip, u32, 4, .Xchg),
+        0x42 => try atomicRmw64(env, code, &ip, u64, 8, .Xchg),
+        0x43 => try atomicRmw(env, code, &ip, u8, 1, .Xchg),
+        0x44 => try atomicRmw(env, code, &ip, u16, 2, .Xchg),
+        0x45 => try atomicRmw64(env, code, &ip, u8, 1, .Xchg),
+        0x46 => try atomicRmw64(env, code, &ip, u16, 2, .Xchg),
+        0x47 => try atomicRmw64(env, code, &ip, u32, 4, .Xchg),
+        // RMW cmpxchg
+        0x48 => try atomicCmpxchg(env, code, &ip, u32, 4),
+        0x49 => try atomicCmpxchg64(env, code, &ip, u64, 8),
+        0x4A => try atomicCmpxchg(env, code, &ip, u8, 1),
+        0x4B => try atomicCmpxchg(env, code, &ip, u16, 2),
+        0x4C => try atomicCmpxchg64(env, code, &ip, u8, 1),
+        0x4D => try atomicCmpxchg64(env, code, &ip, u16, 2),
+        0x4E => try atomicCmpxchg64(env, code, &ip, u32, 4),
+        // wait/notify
+        0x00 => { // memory.atomic.notify
+            _ = readU32(code, &ip); // align
+            const offset = readU32(code, &ip);
+            const count: u32 = @bitCast(try env.popI32());
+            const addr: u32 = @bitCast(try env.popI32());
+            const effective_addr = addr +% offset;
+            if (effective_addr & 3 != 0) return error.UnalignedAtomicAccess;
+            const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+            if (@as(u64, effective_addr) + 4 > mem.byteLen()) return error.OutOfBoundsMemoryAccess;
+            const woken = mem.notify(effective_addr, count) catch |err| switch (err) {
+                error.NotShared => 0,
+                error.OutOfBounds => return error.OutOfBoundsMemoryAccess,
+                error.Unaligned => return error.UnalignedAtomicAccess,
+                error.InvalidAddress,
+                error.InvalidArgument,
+                error.Unsupported,
+                error.SystemFailure,
+                => return error.OutOfBoundsMemoryAccess,
+            };
+            try env.pushI32(@bitCast(woken));
+        },
+        0x01 => { // memory.atomic.wait32
+            _ = readU32(code, &ip); // align
+            const offset = readU32(code, &ip);
+            const timeout = try env.popI64();
+            const expected = try env.popI32();
+            const addr: u32 = @bitCast(try env.popI32());
+            const effective_addr = addr +% offset;
+            if (effective_addr & 3 != 0) return error.UnalignedAtomicAccess;
+            const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+            if (!memInBounds(effective_addr, 4, mem.byteLen())) return error.OutOfBoundsMemoryAccess;
+            if (env.threadManager()) |tm| {
+                if (tm.isTerminating()) return error.ThreadCancelled;
+            }
+            const result = mem.wait32Cancellable(
+                effective_addr,
+                @bitCast(expected),
+                timeout,
+                if (env.threadManager()) |tm|
+                    tm.cancellationForContext(&env.thread_context)
+                else
+                    null,
+            ) catch |err| switch (err) {
+                error.NotShared => .not_equal,
+                error.OutOfBounds => return error.OutOfBoundsMemoryAccess,
+                error.Unaligned => return error.UnalignedAtomicAccess,
+                error.InvalidAddress,
+                error.InvalidArgument,
+                error.Unsupported,
+                error.SystemFailure,
+                => return error.OutOfBoundsMemoryAccess,
+            };
+            switch (result) {
+                .notified, .not_equal, .timed_out => try env.pushI32(@intCast(@backingInt(result))),
+                .cancelled, .closed => return error.ThreadCancelled,
+            }
+        },
+        0x02 => { // memory.atomic.wait64
+            _ = readU32(code, &ip); // align
+            const offset = readU32(code, &ip);
+            const timeout = try env.popI64();
+            const expected = try env.popI64();
+            const addr: u32 = @bitCast(try env.popI32());
+            const effective_addr = addr +% offset;
+            if (effective_addr & 7 != 0) return error.UnalignedAtomicAccess;
+            const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+            if (!memInBounds(effective_addr, 8, mem.byteLen())) return error.OutOfBoundsMemoryAccess;
+            if (env.threadManager()) |tm| {
+                if (tm.isTerminating()) return error.ThreadCancelled;
+            }
+            const result = mem.wait64Cancellable(
+                effective_addr,
+                @bitCast(expected),
+                timeout,
+                if (env.threadManager()) |tm|
+                    tm.cancellationForContext(&env.thread_context)
+                else
+                    null,
+            ) catch |err| switch (err) {
+                error.NotShared => .not_equal,
+                error.OutOfBounds => return error.OutOfBoundsMemoryAccess,
+                error.Unaligned => return error.UnalignedAtomicAccess,
+                error.InvalidAddress,
+                error.InvalidArgument,
+                error.Unsupported,
+                error.SystemFailure,
+                => return error.OutOfBoundsMemoryAccess,
+            };
+            switch (result) {
+                .notified, .not_equal, .timed_out => try env.pushI32(@intCast(@backingInt(result))),
+                .cancelled, .closed => return error.ThreadCancelled,
+            }
+        },
+        else => return error.UnknownOpcode,
+    }
+    return ip;
 }
 
 // ── Atomic operation helpers ─────────────────────────────────────────────
@@ -3867,7 +3902,7 @@ inline fn doAtomicCmpxchg(comptime T: type, ptr: *T, expected: T, replacement: T
     }
 }
 
-fn getAtomicAddr(env: *ExecEnv, code: []const u8, ip: *usize, comptime size: u32) !struct { ptr: [*]u8, addr: usize } {
+inline fn getAtomicAddr(env: *ExecEnv, code: []const u8, ip: *usize, comptime size: u32) !struct { ptr: [*]u8, addr: usize } {
     const ma = readMemarg(code, ip);
     const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
     if (addr % size != 0) return error.UnalignedAtomicAccess;
@@ -3876,21 +3911,21 @@ fn getAtomicAddr(env: *ExecEnv, code: []const u8, ip: *usize, comptime size: u32
     return .{ .ptr = mem.data.ptr + @as(usize, @intCast(addr)), .addr = @intCast(addr) };
 }
 
-fn atomicLoad(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime R: type, comptime size: u32) !void {
+inline fn atomicLoad(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime R: type, comptime size: u32) !void {
     const a = try getAtomicAddr(env, code, ip, size);
     const ptr: *const T = @ptrCast(@alignCast(a.ptr));
     const val = doAtomicLoad(T, ptr);
     try env.pushI32(@bitCast(@as(R, val)));
 }
 
-fn atomicLoad64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32) !void {
+inline fn atomicLoad64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32) !void {
     const a = try getAtomicAddr(env, code, ip, size);
     const ptr: *const T = @ptrCast(@alignCast(a.ptr));
     const val = doAtomicLoad(T, ptr);
     try env.pushI64(@bitCast(@as(u64, val)));
 }
 
-fn atomicStore(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32) !void {
+inline fn atomicStore(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32) !void {
     const ma = readMemarg(code, ip);
     const val: T = @truncate(@as(u32, @bitCast(try env.popI32())));
     const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
@@ -3901,7 +3936,7 @@ fn atomicStore(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, co
     doAtomicStore(T, ptr, val);
 }
 
-fn atomicStore64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32) !void {
+inline fn atomicStore64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32) !void {
     const ma = readMemarg(code, ip);
     const val: T = @truncate(@as(u64, @bitCast(try env.popI64())));
     const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
@@ -3912,7 +3947,7 @@ fn atomicStore64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, 
     doAtomicStore(T, ptr, val);
 }
 
-fn atomicRmw(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32, comptime op: std.builtin.AtomicRmwOp) !void {
+inline fn atomicRmw(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32, comptime op: std.builtin.AtomicRmwOp) !void {
     const ma = readMemarg(code, ip);
     const val: T = @truncate(@as(u32, @bitCast(try env.popI32())));
     const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
@@ -3924,7 +3959,7 @@ fn atomicRmw(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comp
     try env.pushI32(@bitCast(@as(u32, old)));
 }
 
-fn atomicRmw64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32, comptime op: std.builtin.AtomicRmwOp) !void {
+inline fn atomicRmw64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32, comptime op: std.builtin.AtomicRmwOp) !void {
     const ma = readMemarg(code, ip);
     const val: T = @truncate(@as(u64, @bitCast(try env.popI64())));
     const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
@@ -3936,7 +3971,7 @@ fn atomicRmw64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, co
     try env.pushI64(@bitCast(@as(u64, old)));
 }
 
-fn atomicCmpxchg(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32) !void {
+inline fn atomicCmpxchg(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32) !void {
     const ma = readMemarg(code, ip);
     const replacement: T = @truncate(@as(u32, @bitCast(try env.popI32())));
     const expected: T = @truncate(@as(u32, @bitCast(try env.popI32())));
@@ -3950,7 +3985,7 @@ fn atomicCmpxchg(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, 
     try env.pushI32(@bitCast(old));
 }
 
-fn atomicCmpxchg64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32) !void {
+inline fn atomicCmpxchg64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32) !void {
     const ma = readMemarg(code, ip);
     const replacement: T = @truncate(@as(u64, @bitCast(try env.popI64())));
     const expected: T = @truncate(@as(u64, @bitCast(try env.popI64())));

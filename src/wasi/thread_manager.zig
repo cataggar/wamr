@@ -538,6 +538,111 @@ const JoinClaim = struct {
     record: *ThreadRecord,
 };
 
+const ParentAffinityAction = union(enum) {
+    none,
+    pin_single: u16,
+    restore_initial: if (builtin.os.tag == .linux) std.os.linux.cpu_set_t else void,
+};
+
+const LinuxCpuAffinity = struct {
+    initialized: bool = false,
+    parent_pinned_single: bool = false,
+    saw_full_worker_set: bool = false,
+    count: u8 = 0,
+    cpus: [64]u16 = @splat(0),
+    initial_set: if (builtin.os.tag == .linux) std.os.linux.cpu_set_t else void =
+        if (builtin.os.tag == .linux) std.mem.zeroes(std.os.linux.cpu_set_t) else {},
+
+    fn ensureInitializedLocked(self: *LinuxCpuAffinity) void {
+        if (comptime builtin.os.tag != .linux) return;
+        if (self.initialized) return;
+        self.initialized = true;
+        var set = std.mem.zeroes(std.os.linux.cpu_set_t);
+        if (std.os.linux.sched_getaffinity(0, @sizeOf(std.os.linux.cpu_set_t), &set) != 0) return;
+        self.initial_set = set;
+        var n: u8 = 0;
+        const bits_per_word = @bitSizeOf(usize);
+        for (set, 0..) |word_val, word_idx| {
+            var w = word_val;
+            while (w != 0 and n < self.cpus.len) {
+                const bit: usize = @ctz(w);
+                self.cpus[n] = @intCast(word_idx * bits_per_word + bit);
+                n += 1;
+                w &= w - 1;
+            }
+        }
+        self.count = n;
+    }
+
+    fn singleCpuSet(cpu: u16) if (builtin.os.tag == .linux) std.os.linux.cpu_set_t else void {
+        if (comptime builtin.os.tag != .linux) return {};
+        var set = std.mem.zeroes(std.os.linux.cpu_set_t);
+        const bits_per_word = @bitSizeOf(usize);
+        const word_idx = @as(usize, cpu) / bits_per_word;
+        const bit_idx: std.math.Log2Int(usize) = @intCast(@as(usize, cpu) % bits_per_word);
+        if (word_idx < set.len) {
+            set[word_idx] = @as(usize, 1) << bit_idx;
+        }
+        return set;
+    }
+
+    fn planParentSpawnLocked(self: *LinuxCpuAffinity, slot_index: usize, generation: u16) ParentAffinityAction {
+        if (comptime builtin.os.tag != .linux) return .none;
+        self.ensureInitializedLocked();
+        if (self.count < 2 or self.saw_full_worker_set) return .none;
+        if (generation > 1 or slot_index >= self.count - 1) {
+            self.saw_full_worker_set = true;
+            if (self.parent_pinned_single) {
+                self.parent_pinned_single = false;
+                return .{ .restore_initial = self.initial_set };
+            }
+            return .none;
+        }
+        if (slot_index == 0 and !self.parent_pinned_single) {
+            self.parent_pinned_single = true;
+            return .{ .pin_single = self.cpus[self.count - 1] };
+        }
+        return .none;
+    }
+
+    fn restoreParentShutdownLocked(self: *LinuxCpuAffinity) ParentAffinityAction {
+        if (comptime builtin.os.tag != .linux) return .none;
+        if (self.parent_pinned_single) {
+            self.parent_pinned_single = false;
+            return .{ .restore_initial = self.initial_set };
+        }
+        return .none;
+    }
+
+    fn applyParentAction(action: ParentAffinityAction) void {
+        if (comptime builtin.os.tag != .linux) return;
+        switch (action) {
+            .none => {},
+            .pin_single => |cpu| {
+                const set = singleCpuSet(cpu);
+                std.os.linux.sched_setaffinity(0, &set) catch {};
+            },
+            .restore_initial => |set| {
+                std.os.linux.sched_setaffinity(0, &set) catch {};
+            },
+        }
+    }
+
+    fn workerCpuLocked(self: *LinuxCpuAffinity, slot_index: usize, generation: u16) ?u16 {
+        if (comptime builtin.os.tag != .linux) return null;
+        if (generation > 1) return null;
+        self.ensureInitializedLocked();
+        if (self.count < 2) return null;
+        return self.cpus[slot_index % self.count];
+    }
+
+    fn pinCurrentThread(cpu: u16) void {
+        if (comptime builtin.os.tag != .linux) return;
+        const set = singleCpuSet(cpu);
+        std.os.linux.sched_setaffinity(0, &set) catch {};
+    }
+};
+
 /// Thread manager for coordinating WASI threads.
 ///
 /// After first use the manager is address-stable. The host owner must keep it
@@ -549,6 +654,7 @@ pub const ThreadManager = struct {
     trap_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     allocator: std.mem.Allocator,
     aux_stack_pool: AuxStackPool = .{},
+    cpu_affinity: LinuxCpuAffinity = .{},
     shutting_down: bool = false,
     spawning_count: usize = 0,
     joining_count: usize = 0,
@@ -1188,7 +1294,9 @@ pub const ThreadManager = struct {
     pub fn shutdownWithSummary(self: *ThreadManager) JoinSummary {
         self.mutex.lock();
         self.shutting_down = true;
+        const parent_affinity_action = self.cpu_affinity.restoreParentShutdownLocked();
         self.mutex.unlock();
+        LinuxCpuAffinity.applyParentAction(parent_affinity_action);
         self.waitForSpawnsToDrain();
         return self.joinAllWithSummary();
     }
@@ -1208,7 +1316,9 @@ pub const ThreadManager = struct {
     ) TerminationSummary {
         self.mutex.lock();
         self.shutting_down = true;
+        const parent_affinity_action = self.cpu_affinity.restoreParentShutdownLocked();
         self.mutex.unlock();
+        LinuxCpuAffinity.applyParentAction(parent_affinity_action);
 
         var summary = TerminationSummary{};
         const deadline = monotonicNowNs() +| timeout_ns;
@@ -1488,8 +1598,13 @@ pub const ThreadManager = struct {
             return error.StartGateFailed;
         }
 
+        const parent_affinity_action = if (parseTid(tid)) |parsed|
+            self.cpu_affinity.planParentSpawnLocked(parsed.slot_index, parsed.generation)
+        else
+            ParentAffinityAction.none;
         record.start_gate.open();
         self.mutex.unlock();
+        LinuxCpuAffinity.applyParentAction(parent_affinity_action);
         record_owned_locally = false;
         return tid;
     }
@@ -1694,7 +1809,12 @@ fn threadEntry(record: *ThreadRecord) void {
     // The gate opens while publication still holds the manager lock. Taking
     // that lock once guarantees guest code cannot begin until publication ends.
     manager.mutex.lock();
+    const worker_cpu = if (parseTid(record.tid)) |parsed|
+        manager.cpu_affinity.workerCpuLocked(parsed.slot_index, parsed.generation)
+    else
+        null;
     manager.mutex.unlock();
+    if (worker_cpu) |cpu| LinuxCpuAffinity.pinCurrentThread(cpu);
 
     const outcome = record.backend_ops.run(record.backend_context);
     if (outcome == .trapped) {
@@ -3536,3 +3656,35 @@ test "group termination: an interpreter child that parks after termination traps
     try std.testing.expect(monotonicNowNs() - started_ns < std.time.ns_per_s);
     try std.testing.expectEqual(@as(?u32, 3), state.exitCode());
 }
+
+test "LinuxCpuAffinity: workerCpuLocked maps generation-1 slots across allowed CPUs" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var affinity: LinuxCpuAffinity = .{
+        .initialized = true,
+        .count = 4,
+    };
+    affinity.cpus[0] = 2;
+    affinity.cpus[1] = 4;
+    affinity.cpus[2] = 6;
+    affinity.cpus[3] = 8;
+
+    try std.testing.expectEqual(@as(?u16, 2), affinity.workerCpuLocked(0, 1));
+    try std.testing.expectEqual(@as(?u16, 4), affinity.workerCpuLocked(1, 1));
+    try std.testing.expectEqual(@as(?u16, 6), affinity.workerCpuLocked(2, 1));
+    try std.testing.expectEqual(@as(?u16, 8), affinity.workerCpuLocked(3, 1));
+    try std.testing.expectEqual(@as(?u16, 2), affinity.workerCpuLocked(4, 1));
+    try std.testing.expectEqual(@as(?u16, null), affinity.workerCpuLocked(0, 2));
+
+    switch (affinity.planParentSpawnLocked(0, 1)) {
+        .pin_single => |cpu| try std.testing.expectEqual(@as(u16, 8), cpu),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(affinity.parent_pinned_single);
+    try std.testing.expectEqual(ParentAffinityAction.none, affinity.planParentSpawnLocked(1, 1));
+    switch (affinity.restoreParentShutdownLocked()) {
+        .restore_initial => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(!affinity.parent_pinned_single);
+}
+

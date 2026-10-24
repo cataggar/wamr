@@ -62,6 +62,7 @@ const Waiter = struct {
     cancellation: if (config.lib_wasi_threads) ?CancellationEpoch.Ticket else void =
         if (config.lib_wasi_threads) null else {},
     outcome: std.atomic.Value(u32) = .init(@backingInt(Outcome.waiting)),
+    parked: std.atomic.Value(u32) = .init(0),
 };
 
 const Bucket = struct {
@@ -255,36 +256,28 @@ pub const ParkingLot = struct {
         bucket.head = &waiter;
         bucket.mutex.unlock();
 
-        const deadline_ns: ?u64 = if (timeout_ns < 0)
-            null
-        else
-            std.math.add(u64, monotonicNowNs(), @intCast(timeout_ns)) catch
-                std.math.maxInt(u64);
-
+        var deadline_ns: ?u64 = null;
         while (true) {
-            const outcome: Outcome = @fromBackingInt(@intCast(waiter.outcome.load(.acquire)));
-            if (outcome != .waiting) return outcomeToResult(outcome);
-
-            const remaining_ns: ?u64 = if (deadline_ns) |deadline| remaining: {
+            const remaining_ns: ?u64 = if (timeout_ns < 0)
+                null
+            else if (deadline_ns) |deadline| remaining: {
                 const now = monotonicNowNs();
                 if (now >= deadline) {
-                    bucket.mutex.lock();
-                    const final = self.removeTimedOutLocked(bucket, &waiter);
-                    bucket.mutex.unlock();
-                    return final;
+                    return self.finishTimedOut(bucket, &waiter);
                 }
                 break :remaining deadline - now;
-            } else null;
+            } else @intCast(timeout_ns);
 
             const os_result = osWait(
-                &waiter.outcome.raw,
-                @backingInt(Outcome.waiting),
+                &waiter.parked.raw,
+                0,
                 remaining_ns,
             ) catch |err| {
                 bucket.mutex.lock();
                 const final_outcome: Outcome = @fromBackingInt(@intCast(waiter.outcome.load(.acquire)));
                 if (final_outcome != .waiting) {
                     bucket.mutex.unlock();
+                    finishWokenWaiter(&waiter, false);
                     return outcomeToResult(final_outcome);
                 }
                 self.removeLocked(bucket, &waiter);
@@ -292,27 +285,41 @@ pub const ParkingLot = struct {
                 bucket.mutex.unlock();
                 return err;
             };
+            const outcome: Outcome = @fromBackingInt(@intCast(waiter.outcome.load(.acquire)));
+            if (outcome != .waiting) {
+                finishWokenWaiter(&waiter, os_result == .awakened);
+                return outcomeToResult(outcome);
+            }
             switch (os_result) {
-                .awakened, .spurious => continue,
+                .awakened, .spurious => {
+                    if (timeout_ns > 0 and deadline_ns == null) {
+                        deadline_ns = std.math.add(u64, monotonicNowNs(), @intCast(timeout_ns)) catch
+                            std.math.maxInt(u64);
+                    }
+                    continue;
+                },
                 .timed_out => {
                     if (deadline_ns) |deadline| {
                         if (monotonicNowNs() < deadline) continue;
                     }
-                    bucket.mutex.lock();
-                    const final = self.removeTimedOutLocked(bucket, &waiter);
-                    bucket.mutex.unlock();
-                    return final;
+                    return self.finishTimedOut(bucket, &waiter);
                 },
             }
         }
     }
 
-    fn removeTimedOutLocked(self: *ParkingLot, bucket: *Bucket, waiter: *Waiter) WaitResult {
+    fn finishTimedOut(self: *ParkingLot, bucket: *Bucket, waiter: *Waiter) WaitResult {
+        bucket.mutex.lock();
         const outcome: Outcome = @fromBackingInt(@intCast(waiter.outcome.load(.acquire)));
-        if (outcome != .waiting) return outcomeToResult(outcome);
+        if (outcome != .waiting) {
+            bucket.mutex.unlock();
+            finishWokenWaiter(waiter, false);
+            return outcomeToResult(outcome);
+        }
 
         self.removeLocked(bucket, waiter);
         waiter.outcome.store(@backingInt(Outcome.cancelled), .release);
+        bucket.mutex.unlock();
         return .timed_out;
     }
 
@@ -364,16 +371,15 @@ pub const ParkingLot = struct {
         for (0..bucket_count) |i| {
             const bucket = &self.buckets[i];
             bucket.mutex.lock();
-            while (bucket.head) |w| {
-                bucket.head = w.next;
+            const wake_head = bucket.head;
+            bucket.head = null;
+            var cursor = wake_head;
+            while (cursor) |w| : (cursor = w.next) {
                 w.outcome.store(@backingInt(Outcome.cancelled), .release);
-                osWake(&w.outcome.raw) catch |err| {
-                    bucket.mutex.unlock();
-                    return err;
-                };
                 total +|= 1;
             }
             bucket.mutex.unlock();
+            try wakeWaiterList(wake_head);
         }
         return total;
     }
@@ -395,6 +401,8 @@ pub const ParkingLot = struct {
             var total: u32 = 0;
             for (0..bucket_count) |i| {
                 const bucket = &self.buckets[i];
+                var wake_head: ?*Waiter = null;
+                var wake_tail: ?*Waiter = null;
                 bucket.mutex.lock();
                 var link = &bucket.head;
                 while (link.*) |waiter| {
@@ -407,14 +415,18 @@ pub const ParkingLot = struct {
                         continue;
                     }
                     link.* = waiter.next;
+                    waiter.next = null;
                     waiter.outcome.store(@backingInt(Outcome.cancelled), .release);
-                    osWake(&waiter.outcome.raw) catch |err| {
-                        bucket.mutex.unlock();
-                        return err;
-                    };
+                    if (wake_tail) |tail| {
+                        tail.next = waiter;
+                    } else {
+                        wake_head = waiter;
+                    }
+                    wake_tail = waiter;
                     total +|= 1;
                 }
                 bucket.mutex.unlock();
+                try wakeWaiterList(wake_head);
             }
             return total;
         }
@@ -422,10 +434,11 @@ pub const ParkingLot = struct {
 
     fn wakeKey(self: *ParkingLot, key: usize, count: u32, outcome: Outcome) BackendError!u32 {
         const bucket = self.bucketFor(key);
-        bucket.mutex.lock();
-        defer bucket.mutex.unlock();
-
         var woken: u32 = 0;
+        var wake_head: ?*Waiter = null;
+        var wake_tail: ?*Waiter = null;
+
+        bucket.mutex.lock();
         var link = &bucket.head;
         while (link.*) |waiter| {
             if (waiter.key != key or woken >= count) {
@@ -433,10 +446,19 @@ pub const ParkingLot = struct {
                 continue;
             }
             link.* = waiter.next;
+            waiter.next = null;
             waiter.outcome.store(@backingInt(outcome), .release);
-            try osWake(&waiter.outcome.raw);
+            if (wake_tail) |tail| {
+                tail.next = waiter;
+            } else {
+                wake_head = waiter;
+            }
+            wake_tail = waiter;
             woken += 1;
         }
+        bucket.mutex.unlock();
+
+        try wakeWaiterList(wake_head);
         return woken;
     }
 
@@ -489,20 +511,20 @@ pub const ParkingLot = struct {
         for (0..bucket_count) |i| {
             const bucket = &self.buckets[i];
             bucket.mutex.lock();
-            var waiter = bucket.head;
+            const wake_head = bucket.head;
             bucket.head = null;
-            while (waiter) |w| {
-                waiter = w.next;
+            var cursor = wake_head;
+            while (cursor) |w| : (cursor = w.next) {
                 w.outcome.store(@backingInt(Outcome.closed), .release);
-                osWake(&w.outcome.raw) catch |err| switch (err) {
-                    error.InvalidAddress,
-                    error.InvalidArgument,
-                    error.Unsupported,
-                    error.SystemFailure,
-                    => {},
-                };
             }
             bucket.mutex.unlock();
+            wakeWaiterList(wake_head) catch |err| switch (err) {
+                error.InvalidAddress,
+                error.InvalidArgument,
+                error.Unsupported,
+                error.SystemFailure,
+                => {},
+            };
         }
     }
 
@@ -556,6 +578,42 @@ fn monotonicNowNs() u64 {
         std.math.maxInt(u64);
 }
 
+fn wakeWaiterList(head: ?*Waiter) BackendError!void {
+    var first_err: ?BackendError = null;
+    var current = head;
+    while (current) |waiter| {
+        const next = waiter.next;
+        wakeWaiterAfterOutcome(waiter) catch |err| {
+            if (first_err == null) first_err = err;
+        };
+        current = next;
+    }
+    if (first_err) |err| return err;
+}
+
+fn wakeWaiterAfterOutcome(waiter: *Waiter) BackendError!void {
+    if (comptime is_linux) {
+        return linuxWakeWaiter(&waiter.parked);
+    }
+    waiter.parked.store(1, .release);
+    defer waiter.parked.store(2, .release);
+    return osWake(&waiter.parked.raw);
+}
+
+fn finishWokenWaiter(waiter: *Waiter, awakened: bool) void {
+    if (comptime is_linux) {
+        if (awakened and waiter.parked.load(.acquire) == 0) return;
+    }
+    var spins: u32 = 0;
+    while (waiter.parked.load(.acquire) != 2) : (spins += 1) {
+        if (spins < 64) {
+            std.atomic.spinLoopHint();
+        } else {
+            std.Thread.yield() catch std.atomic.spinLoopHint();
+        }
+    }
+}
+
 fn osWait(word: *const u32, expected: u32, timeout_ns: ?u64) BackendError!OsWaitResult {
     if (comptime is_linux) return linuxWait(word, expected, timeout_ns);
     if (comptime is_macos) return macosWait(word, expected, timeout_ns);
@@ -581,6 +639,26 @@ fn osWakeAll(word: *const u32) BackendError!void {
         return;
     }
     return error.Unsupported;
+}
+
+fn linuxWakeWaiter(parked: *std.atomic.Value(u32)) BackendError!void {
+    if (!is_linux) unreachable;
+    const linux = std.os.linux;
+    if (parked.load(.acquire) != 0) return;
+    const rc = linux.futex_3arg(&parked.raw, .{ .cmd = .WAKE, .private = true }, 1);
+    switch (linux.errno(rc)) {
+        .SUCCESS => {
+            if (rc > 0) return;
+            if (parked.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
+                _ = linux.futex_3arg(&parked.raw, .{ .cmd = .WAKE, .private = true }, 1);
+                parked.store(2, .release);
+            }
+        },
+        .FAULT => return error.InvalidAddress,
+        .INVAL => return error.InvalidArgument,
+        .NOSYS => return error.Unsupported,
+        else => return error.SystemFailure,
+    }
 }
 
 fn linuxWait(word: *const u32, expected: u32, timeout_ns: ?u64) BackendError!OsWaitResult {
