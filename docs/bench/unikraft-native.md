@@ -677,3 +677,57 @@ matching CRCs (`seedcrc=0xe9f5`, `crclist=0xe714`, `crcmatrix=0x1fd7`,
 | `coremark` (`coremark_wasi.wasm`, 100 iter) | `170,318` B (`f342cdfc...`) | `103,345` | `145,178` | `50,937` | `6,517,371` | `5,841,647`, `5,598,122` | `17,266`, `16,915` | `16,941,056` / `360,448` B | `455,054` / `0` B |
 | `coremark-nofp` (`coremark_wasi_nofp.wasm`, 100 iter) | `168,866` B (`4741c445...`) | `77,246` | `121,833` | `46,770` | `5,605,642` | `5,593,615`, `5,572,363` | `11,828`, `8,803` | `16,941,056` / `360,448` B | `452,837` / `0` B |
 
+### Closed CoreMark six-mode image-chain correctness profile (`coremark-qcow2-derived-vhd`)
+
+In `cataggar/unikraft` `e1222136`
+([#332](https://github.com/cataggar/unikraft/pull/332), building on standalone
+`uk-wamr-aot-build olddefconfig` `build/.config` seeding in `15e6b592`,
+[#331](https://github.com/cataggar/unikraft/pull/331)),
+`support/build/wamr-native-ci` adds the closed `coremark-qcow2-derived-vhd`
+profile (`ProductionProfile.coremark_exact_v2` /
+`CompatibleRecordSet.coremark_v2_qcow2_derived_vhd` /
+`Compatibility.coremark_qcow2_derived_vhd_v2`) alongside the unchanged default
+`qcow2-derived-vhd` (`tiny_exact_v2`) profile:
+
+* **Closed profile selection and SDK pin**: `uk-wamr-native-ci build --coremark`
+  (or `--profile coremark-qcow2-derived-vhd`) passes `--coremark` to
+  `uk-wamr-aot-build prepare` and requires the Zig `0.17.0` WAMR SDK pin
+  `bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20` (`identity_coremark` rejects the
+  historical `a53205d77be3b880eb8f8b96679512ba58e2331a` pin).
+* **Bound artifacts and archive layout**: `coremark-qcow2-derived-vhd` embeds the
+  tiny fixture (`answer() == 42`, `memory.grow(1) == 2`, `trap()`) together with
+  both pinned CoreMark WASI modules compiled via
+  `wamrc compile --target=x86_64 --profile=unikraft-x86_64` (`coremark.wasm` /
+  `coremark.cwasm` and `coremark-nofp.wasm` / `coremark-nofp.cwasm`). It binds
+  `30` artifact slots (`artifact_names_coremark_v2` vs `26` for `tiny_v2`), `89`
+  regular public-source ZIP members (`coremark_v2_zip_member_count` vs `85` for
+  `tiny_v2`), and `10` sorted `identity_coremark` keys (`minimal_wasi: true`),
+  refusing cross-profile relabeling between `qcow2-derived-vhd` and
+  `coremark-qcow2-derived-vhd`.
+* **Six-mode KVM execution and serial validation**: executes all six local
+  x86_64 KVM/OVMF boot modes (`raw-x2apic`, `raw-legacy-apic`, `qcow2-x2apic`,
+  `qcow2-legacy-apic`, `vpc-x2apic`, `vpc-legacy-apic`) with `WAMR_NATIVE_WASI=`
+  admitted only in `coremark_exact_v2` (still forbidden in `tiny_exact_v2`).
+  Both `uk-wamr-log-validate tiny --output json-v1` and
+  `support/build/wamr-native-ci/handoff/candidate.zig` (`checkSerial`) enforce
+  `minimal_wasi: true`, qualified UEFI UTC + Hyper-V reference realtime support
+  (`realtime_supported: true`), exact 100-iteration (`coremark 0 0 0 100 0`)
+  stdout fields (`Iterations: 100`, `seedcrc: 0xe9f5`, `[0]crclist: 0xe714`,
+  `[0]crcmatrix: 0x1fd7`, `[0]crcstate: 0x8e3a`, `[0]crcfinal: 0x988c`, plus the
+  short-duration warning markers, mirrored on the host by
+  `native_benchmark.validate_coremark_short_crc_output`), and zero post-teardown
+  counters (`teardown: 0`).
+* **Boundary with #1046 measurement campaigns**: `coremark-qcow2-derived-vhd`
+  closes six-mode native Unikraft image-lineage and 100-iteration WASI CoreMark
+  CRC correctness (`cataggar/wamr#1045` / `cataggar/unikraft#156`) with
+  `hardware_acceptance: "not_established"`, `cloud_authority: "not_admitted"`,
+  `benchmark: "not_measured"`, and all six direct-compute approval flags `false`.
+  It does **not** emit `WAMR_BENCH_RESULT=` (`wamr-embedding-v2`), does **not**
+  run the authoritative `400,000`-iteration (`>= 10 s`) CoreMark benchmark
+  configuration (`coremark 0 0 0 400000 0`, `[0]crcfinal: 0x382f`), and is
+  rejected by `native_benchmark.coremark_correctness` / `validate_result` if
+  presented as a successful v2 measurement record. An authorized paired Linux vs
+  Azure Unikraft hardware campaign (`Standard_D2s_v5`) remains separate; no cloud
+  resources were provisioned and no speedup is claimed.
+
+

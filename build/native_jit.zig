@@ -27,6 +27,8 @@ pub fn addTests(b: *std.Build, wamrc: *std.Build.Step.Compile, optimize: std.bui
         run.addArtifactArg(tests);
         step.dependOn(&run.step);
     }
+    const unikraft_jit_guest_step = b.step("test-unikraft-jit-guest", "Run opt-in native fast/full JIT guest tests");
+    unikraft_jit_guest_step.dependOn(step);
 }
 
 fn workload(b: *std.Build) std.Build.LazyPath {
@@ -96,6 +98,8 @@ fn addBenchmark(b: *std.Build, wamrc: *std.Build.Step.Compile, wasm: std.Build.L
     tests.step.dependOn(step);
     const test_step = b.step("test-native-jit-bench", "Validate real matched fast/full/AOT sampling and opt-in qualification gates");
     test_step.dependOn(&tests.step);
+    const compare_step = b.step("test-linux-unikraft-compare", "Validate matched Linux/Unikraft AOT and fast/full JIT sampling");
+    compare_step.dependOn(test_step);
 }
 
 pub fn configure(b: *std.Build, module: *std.Build.Module) void {
