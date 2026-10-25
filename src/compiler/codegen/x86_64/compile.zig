@@ -3156,6 +3156,12 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
     var const_vals = try buildConstVals(func, allocator);
     defer const_vals.deinit();
 
+    // Build iconst-mov suppression set (#523) before liveness/regalloc so
+    // fully-folded iconst vregs can also be excluded from live ranges
+    // (#1088) and never occupy physical registers or spill slots.
+    var suppress_iconst = try buildIconstSuppress(func, &const_vals, allocator);
+    defer suppress_iconst.deinit();
+
     // Collect clobber points and ABI register hints in a single walk.
     // Hints steer call-arg vregs into their target `param_regs[i+1]` so
     // emitCallRegArgMoves emits no inter-vreg movs. Hints are advisory:
@@ -3284,19 +3290,42 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
         }
     }
 
-    // Compute live ranges using the SAME block_order, then allocate registers.
+    // Compute live ranges using the SAME block_order, filter out suppressed
+    // iconst defs whose every use folds as an immediate (#1088), then
+    // allocate registers with constant rematerialization (#542, #798).
     if (timer) |t| t.end(.setup);
     if (timer) |t| t.begin();
     const live_ranges = try analysis.computeLiveRangesWithOrder(func, block_order, allocator);
     defer allocator.free(live_ranges);
+    var alloc_live_ranges: std.ArrayList(analysis.LiveRange) = .empty;
+    defer alloc_live_ranges.deinit(allocator);
+    try alloc_live_ranges.ensureTotalCapacity(allocator, live_ranges.len);
+    for (live_ranges) |range| {
+        if (!suppress_iconst.contains(range.vreg)) {
+            alloc_live_ranges.appendAssumeCapacity(range);
+        }
+    }
     if (timer) |t| t.end(.liveness);
     if (timer) |t| t.begin();
-    var alloc_result = try regalloc.allocateFromRangesWithHints(
+    const reg_set = x86_64_reg_set(func.local_count);
+    var remat_candidates: ?std.AutoHashMap(ir.VReg, regalloc.RematDef) =
+        if (alloc_live_ranges.items.len > reg_set.alloc_regs.len)
+            try regalloc.classifyRematCandidates(allocator, func)
+        else
+            null;
+    defer if (remat_candidates) |*rc| rc.deinit();
+    const remat_ptr: ?*const std.AutoHashMap(ir.VReg, regalloc.RematDef) =
+        if (remat_candidates) |*rc|
+            if (rc.count() > 0) rc else null
+        else
+            null;
+    var alloc_result = try regalloc.allocateFromRangesWithHintsRemat(
         allocator,
-        x86_64_reg_set(func.local_count),
+        reg_set,
         clobber_points.items,
-        live_ranges,
+        alloc_live_ranges.items,
         hint_points.items,
+        remat_ptr,
     );
     defer alloc_result.deinit();
     if (timer) |t| t.end(.regalloc);
@@ -3311,8 +3340,8 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
         spill_metric_value = try regalloc.computeSpillMetric(
             allocator,
             func,
-            x86_64_reg_set(func.local_count),
-            live_ranges,
+            reg_set,
+            alloc_live_ranges.items,
             &alloc_result,
         );
     }
@@ -3519,17 +3548,7 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
     var table_patches: std.ArrayList(TablePatch) = .empty;
     defer table_patches.deinit(allocator);
 
-    // Build iconst-mov suppression set (#523). An iconst dest vreg whose
-    // every IR use folds as an immediate operand on x86_64 (add/sub/mul/
-    // and/or/xor RHS with sign_extends_to_i32, shift count, or
-    // memory.copy/fill length via smallFixedBulkMemLen) doesn't need its
-    // mov: the consuming op encodes the value directly. Conjunctive: any
-    // non-foldable use (cmp, store, call arg, local_set, base address,
-    // float op, …) keeps the mov.
-    var suppress_iconst = try buildIconstSuppress(func, &const_vals, allocator);
-    defer suppress_iconst.deinit();
-
-    // block_order already computed above — reuse for emission.
+    // block_order and suppress_iconst already computed above — reuse for emission.
 
     const cancel_headers: ?[]bool = if (options.cancel_points or options.native_fuel)
         try markLoopHeaders(func, block_order, allocator)
@@ -3633,8 +3652,8 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
             allocator,
             fc,
             func,
-            x86_64_reg_set(func.local_count),
-            live_ranges,
+            reg_set,
+            alloc_live_ranges.items,
             &alloc_result,
             spill_metric_value.?,
             frame_size,
@@ -3655,6 +3674,32 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
     };
 }
 
+fn emitRematConst(
+    code: *emit.CodeBuffer,
+    dst: emit.Reg,
+    rd: regalloc.RematDef,
+) !void {
+    switch (rd) {
+        .iconst_32 => |v| {
+            if (v == 0) {
+                try code.xorReg32(dst);
+            } else {
+                try code.movRegImm32(dst, v);
+                if (v < 0) try code.zeroExtend32(dst);
+            }
+        },
+        .iconst_64 => |v| {
+            if (v == 0) {
+                try code.xorReg32(dst);
+            } else if (v >= std.math.minInt(i32) and v <= std.math.maxInt(i32)) {
+                try code.movRegImm32(dst, @intCast(v));
+            } else {
+                try code.movRegImm64(dst, @bitCast(v));
+            }
+        },
+    }
+}
+
 /// Get a VReg's value into a physical register, using scratch if spilled.
 fn useVReg(
     code: *emit.CodeBuffer,
@@ -3668,17 +3713,7 @@ fn useVReg(
     // value is needed after a call clobbers `scratch`, the next
     // `useVReg` call after the clobber re-emits again — no reload.
     if (alloc_result.getRemat(vreg)) |rd| {
-        switch (rd) {
-            .iconst_32 => |v| {
-                if (v == 0) {
-                    try code.xorReg32(scratch);
-                } else {
-                    try code.movRegImm32(scratch, v);
-                    try code.zeroExtend32(scratch);
-                }
-            },
-            .iconst_64 => |v| try code.movRegImm64(scratch, @bitCast(v)),
-        }
+        try emitRematConst(code, scratch, rd);
         return scratch;
     }
     const alloc = alloc_result.get(vreg) orelse return scratch;
@@ -3930,17 +3965,9 @@ fn emitCallRegArgMoves(
     // still read as a source.
     i = 0;
     while (i < max_reg_args) : (i += 1) {
-        if (infos[i].remat) |rd| switch (rd) {
-            .iconst_32 => |v| {
-                if (v == 0) {
-                    try code.xorReg32(infos[i].target);
-                } else {
-                    try code.movRegImm32(infos[i].target, v);
-                    try code.zeroExtend32(infos[i].target);
-                }
-            },
-            .iconst_64 => |v| try code.movRegImm64(infos[i].target, @bitCast(v)),
-        };
+        if (infos[i].remat) |rd| {
+            try emitRematConst(code, infos[i].target, rd);
+        }
     }
 }
 
@@ -4039,14 +4066,8 @@ fn compileInstRA(
             // use re-emits via `useVReg`.
             if (alloc_result.isRemat(dest)) return;
             const dr = destReg(alloc_result, dest);
-            if (val == 0) {
-                try code.xorReg32(dr);
-            } else {
-                try code.movRegImm32(dr, val);
-            }
-            // movRegImm32 uses MOV r64,imm32 which sign-extends negative
-            // values to 64 bits. Zero-extend to clear upper bits.
-            try writeDefTyped(code, alloc_result, dest, dr, .i32);
+            try emitRematConst(code, dr, .{ .iconst_32 = val });
+            try writeDef(code, alloc_result, dest, dr);
         },
         .iconst_64 => |val| {
             const dest = inst.dest orelse return;
@@ -4054,8 +4075,8 @@ fn compileInstRA(
             // #542: rematerialisable — see above.
             if (alloc_result.isRemat(dest)) return;
             const dr = destReg(alloc_result, dest);
-            try code.movRegImm64(dr, @bitCast(val));
-            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+            try emitRematConst(code, dr, .{ .iconst_64 = val });
+            try writeDef(code, alloc_result, dest, dr);
         },
         .fconst_32 => |val| {
             const dest = inst.dest orelse return;
@@ -7811,16 +7832,22 @@ test "compileFunctionRA: r12 allocated under register pressure" {
     try block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = v4, .type = .i32 });
     try block.append(.{ .op = .{ .iconst_32 = 6 }, .dest = v5, .type = .i32 });
     try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = v6, .type = .i32 });
-    // Consume all of them so their ranges extend here.
-    try block.append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v7, .type = .i32 });
-    // Use the rest (prevents range expiry) by re-summing.
+    // Consume all 7 constants in non-foldable (LHS) positions so none are
+    // suppressed into add-imm32 operands and all 7 ranges stay live.
+    try block.append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v0 } }, .dest = v7, .type = .i32 });
     const v8 = func.newVReg();
-    try block.append(.{ .op = .{ .add = .{ .lhs = v2, .rhs = v3 } }, .dest = v8, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v1, .rhs = v7 } }, .dest = v8, .type = .i32 });
     const v9 = func.newVReg();
-    try block.append(.{ .op = .{ .add = .{ .lhs = v4, .rhs = v5 } }, .dest = v9, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v2, .rhs = v8 } }, .dest = v9, .type = .i32 });
     const v10 = func.newVReg();
-    try block.append(.{ .op = .{ .add = .{ .lhs = v6, .rhs = v7 } }, .dest = v10, .type = .i32 });
-    try block.append(.{ .op = .{ .ret = v10 } });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v3, .rhs = v9 } }, .dest = v10, .type = .i32 });
+    const v11 = func.newVReg();
+    try block.append(.{ .op = .{ .add = .{ .lhs = v4, .rhs = v10 } }, .dest = v11, .type = .i32 });
+    const v12 = func.newVReg();
+    try block.append(.{ .op = .{ .add = .{ .lhs = v5, .rhs = v11 } }, .dest = v12, .type = .i32 });
+    const v13 = func.newVReg();
+    try block.append(.{ .op = .{ .add = .{ .lhs = v6, .rhs = v12 } }, .dest = v13, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v13 } });
 
     const compile_result = try compileFunctionRA(&func, 0, allocator);
     const code = compile_result.code;
@@ -9230,4 +9257,157 @@ test "#963 x86_64: non-threaded output keeps the disabled path byte-identical" {
 
     try std.testing.expectEqual(@as(usize, 0), countBytes(module_result.code, pattern.bytes.items));
     try std.testing.expectEqualSlices(u8, direct_result.code, module_result.code);
+}
+
+test "#798 x86_64: suppressed iconst vregs are excluded from live ranges before regalloc" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 1);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const b = func.getBlock(entry);
+    var acc = func.newVReg();
+    try b.append(.{ .op = .{ .local_get = 0 }, .dest = acc, .type = .i32 });
+
+    // Create 12 iconst_32 defs whose ONLY uses are foldable ADD-imm32 RHS
+    // operands, all defined upfront so their naive live ranges overlap.
+    // Excluding `suppress_iconst` from `alloc_live_ranges` keeps register
+    // pressure at 1 instead of 13, so no callee-saved r12..r14 are pushed.
+    var consts: [12]ir.VReg = undefined;
+    for (&consts, 0..) |*cv, idx| {
+        cv.* = func.newVReg();
+        try b.append(.{ .op = .{ .iconst_32 = @intCast(idx + 10) }, .dest = cv.*, .type = .i32 });
+    }
+    for (consts) |cv| {
+        const next = func.newVReg();
+        try b.append(.{ .op = .{ .add = .{ .lhs = acc, .rhs = cv } }, .dest = next, .type = .i32 });
+        acc = next;
+    }
+    try b.append(.{ .op = .{ .ret = acc } });
+
+    const result = try compileFunctionRA(&func, 0, allocator);
+    defer allocator.free(result.code);
+    defer allocator.free(result.call_patches);
+
+    // r12 (41 54) must not be pushed in the prologue since all 12 constants fold.
+    try std.testing.expect(!containsBytes(result.code, &.{ 0x41, 0x54 }));
+}
+
+test "#798 x86_64: high-pressure remat handles call reg/stack args, loop back-edges, and memory/ALU uses" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 2);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const loop_hdr = try func.newBlock();
+    const exit_blk = try func.newBlock();
+
+    const b0 = func.getBlock(entry);
+    // Define non-foldable iconst_32 and iconst_64 values upfront so they
+    // span a call clobber, a 7+ arg call (both register and stack args),
+    // a loop back-edge (`local_set`), a memory `store`, and an ALU LHS.
+    const c_zero = func.newVReg();
+    const c_pos32 = func.newVReg();
+    const c_neg32 = func.newVReg();
+    const c_small64 = func.newVReg();
+    const c_big64 = func.newVReg();
+    try b0.append(.{ .op = .{ .iconst_32 = 0 }, .dest = c_zero, .type = .i32 });
+    try b0.append(.{ .op = .{ .iconst_32 = 12345 }, .dest = c_pos32, .type = .i32 });
+    try b0.append(.{ .op = .{ .iconst_32 = -77 }, .dest = c_neg32, .type = .i32 });
+    try b0.append(.{ .op = .{ .iconst_64 = 4096 }, .dest = c_small64, .type = .i64 });
+    try b0.append(.{ .op = .{ .iconst_64 = 0x1_2345_6789 }, .dest = c_big64, .type = .i64 });
+
+    // Create 10 computed (non-remat) values live across the loop and call
+    // to force register pressure well above `x86_64_alloc_regs.len`.
+    var live_vals: [10]ir.VReg = undefined;
+    for (&live_vals, 0..) |*lv, i| {
+        const lg = func.newVReg();
+        try b0.append(.{ .op = .{ .local_get = 0 }, .dest = lg, .type = .i32 });
+        const kv = func.newVReg();
+        try b0.append(.{ .op = .{ .iconst_32 = @intCast(i + 1) }, .dest = kv, .type = .i32 });
+        lv.* = func.newVReg();
+        try b0.append(.{ .op = .{ .add = .{ .lhs = lg, .rhs = kv } }, .dest = lv.*, .type = .i32 });
+    }
+    try b0.append(.{ .op = .{ .br = loop_hdr } });
+
+    const b1 = func.getBlock(loop_hdr);
+    // 8-argument call: first args go in ABI registers (`emitCallRegArgMoves`),
+    // trailing args go on the outgoing stack frame (`useVReg` into `[rsp+off]`).
+    const call_args = try allocator.alloc(ir.VReg, 8);
+    call_args[0] = c_zero;
+    call_args[1] = c_pos32;
+    call_args[2] = c_neg32;
+    call_args[3] = c_small64;
+    call_args[4] = c_big64;
+    call_args[5] = c_pos32;
+    call_args[6] = c_neg32;
+    call_args[7] = c_big64;
+    const call_res = func.newVReg();
+    try b1.append(.{
+        .op = .{ .call = .{ .func_idx = 0, .args = call_args } },
+        .dest = call_res,
+        .type = .i32,
+    });
+
+    // Memory store using rematerialized address/value and ALU LHS use.
+    try b1.append(.{
+        .op = .{ .store = .{ .base = c_zero, .val = c_big64, .offset = 0, .size = 8 } },
+    });
+    const alu_lhs_use = func.newVReg();
+    try b1.append(.{
+        .op = .{ .add = .{ .lhs = c_pos32, .rhs = call_res } },
+        .dest = alu_lhs_use,
+        .type = .i32,
+    });
+    const i64_use = func.newVReg();
+    try b1.append(.{
+        .op = .{ .sub = .{ .lhs = c_big64, .rhs = c_small64 } },
+        .dest = i64_use,
+        .type = .i64,
+    });
+    const wrapped = func.newVReg();
+    try b1.append(.{ .op = .{ .wrap_i64 = i64_use }, .dest = wrapped, .type = .i32 });
+
+    // Loop back-edge state update via local_set with rematerialized value.
+    try b1.append(.{ .op = .{ .local_set = .{ .idx = 1, .val = c_neg32 } } });
+    try b1.append(.{
+        .op = .{ .br_if = .{ .cond = call_res, .then_block = loop_hdr, .else_block = exit_blk } },
+    });
+
+    const b2 = func.getBlock(exit_blk);
+    var sum = alu_lhs_use;
+    for (live_vals) |lv| {
+        const next = func.newVReg();
+        try b2.append(.{ .op = .{ .add = .{ .lhs = sum, .rhs = lv } }, .dest = next, .type = .i32 });
+        sum = next;
+    }
+    const final_sum = func.newVReg();
+    try b2.append(.{ .op = .{ .add = .{ .lhs = sum, .rhs = wrapped } }, .dest = final_sum, .type = .i32 });
+    try b2.append(.{ .op = .{ .ret = final_sum } });
+
+    const fa_ctx = FrameAttributionCtx{
+        .opts = .{ .enabled = true, .output_prefix = "test" },
+        .module_idx = 0,
+        .func_idx = 0,
+    };
+    var result = try compileFunctionRAWithGlobalOffsetsTimed(
+        &func,
+        0,
+        &.{},
+        allocator,
+        .{},
+        null,
+        null,
+        fa_ctx,
+    );
+    defer allocator.free(result.code);
+    defer allocator.free(result.call_patches);
+    defer if (result.frame_attribution) |*fa| fa.deinit(allocator);
+
+    const fa = result.frame_attribution.?;
+    // All 5 constants spanning the call must be rematerialized rather than spilled.
+    try std.testing.expectEqual(@as(u32, 5), fa.spill_metric.remat_vregs);
+    for (fa.spill_values) |sv| {
+        try std.testing.expect(!sv.rematerialization_eligible);
+    }
 }
