@@ -119,6 +119,28 @@ pub const AllocResult = struct {
 pub const ClobberPoint = struct {
     pos: u32,
     regs_clobbered: u64,
+    /// Optional exact set of VRegs live across this clobber point (immediately
+    /// after the clobber instruction executes). When non-null, a register is
+    /// only considered clobbered for `vreg` at `pos` if `live_vregs.isSet(vreg)`.
+    /// When null, falls back to the conservative `start < pos < end` interval
+    /// overlap check.
+    live_vregs: ?std.DynamicBitSetUnmanaged = null,
+
+    pub fn affectsVReg(self: ClobberPoint, vreg: ir.VReg, start: u32, end: u32) bool {
+        if (self.pos <= start or self.pos >= end) return false;
+        if (self.live_vregs) |bs| {
+            return if (vreg < bs.bit_length) bs.isSet(vreg) else false;
+        }
+        return true;
+    }
+
+    pub fn spansVReg(self: ClobberPoint, vreg: ir.VReg, start: u32, end: u32) bool {
+        if (self.pos < start or self.pos >= end) return false;
+        if (self.live_vregs) |bs| {
+            return if (vreg < bs.bit_length) bs.isSet(vreg) else false;
+        }
+        return true;
+    }
 };
 
 /// Hint that `vreg` should be allocated to a particular index in
@@ -805,10 +827,10 @@ pub fn allocateFromRangesWithHintsRematTraced(
         const hint_idx: ?u8 = hint_map.get(range.vreg);
 
         // Try to find a free register that is safe (not clobbered during this range)
-        if (findSafeReg(reg_set, reg_free, range.start, range.end, clobbers, hint_idx)) |reg_idx| {
+        if (findSafeReg(reg_set, reg_free, range.vreg, range.start, range.end, clobbers, hint_idx)) |reg_idx| {
             if (trace) |t| {
                 if (isTracedVreg(range.vreg)) {
-                try snapshotTrace(t, allocator, reg_set, clobbers, range, hint_idx, reg_free, active.items, remat_candidates, reg_idx, null, null);
+                    try snapshotTrace(t, allocator, reg_set, clobbers, range, hint_idx, reg_free, active.items, remat_candidates, reg_idx, null, null);
                 }
             }
             reg_free &= ~(@as(u64, 1) << @intCast(reg_idx));
@@ -863,7 +885,7 @@ pub fn allocateFromRangesWithHintsRematTraced(
                 // costs no stack slot or memory traffic whereas spilling
                 // `range` would. Otherwise require `ai.end > range.end`.
                 if (!(ai_is_remat and !range_is_remat) and ai.end <= range.end) continue;
-                if (!regSafeForRange(ai.reg_idx, range.start, range.end, clobbers)) continue;
+                if (!regSafeForRange(ai.reg_idx, range.vreg, range.start, range.end, clobbers)) continue;
                 if (!ai_is_remat and range_in_hot_loop and ai.max_loop_depth > range.max_loop_depth) continue;
                 if (best_evict) |bi| {
                     if (best_evict_is_remat and !ai_is_remat) continue;
@@ -981,7 +1003,7 @@ fn snapshotTrace(
     var clobbered: u64 = 0;
     var clobber_count: u32 = 0;
     for (clobbers) |cp| {
-        if (cp.pos > range.start and cp.pos < range.end) {
+        if (cp.affectsVReg(range.vreg, range.start, range.end)) {
             clobber_count += 1;
             clobbered |= cp.regs_clobbered;
         }
@@ -989,7 +1011,7 @@ fn snapshotTrace(
     const range_is_remat = if (remat_candidates) |rc| rc.contains(range.vreg) else false;
     const start = trace.competitors.items.len;
     for (active) |ai| {
-        const safe = regSafeForRange(ai.reg_idx, range.start, range.end, clobbers);
+        const safe = regSafeForRange(ai.reg_idx, range.vreg, range.start, range.end, clobbers);
         const ai_is_remat = if (remat_candidates) |rc| rc.contains(ai.vreg) else false;
         const can_evict = !(range_is_remat and !ai_is_remat) and
             ((ai_is_remat and !range_is_remat) or ai.end > range.end) and
@@ -1006,7 +1028,7 @@ fn snapshotTrace(
     }
     var safe_regs: u64 = 0;
     for (reg_set.alloc_regs, 0..) |_, i| {
-        if (regSafeForRange(@intCast(i), range.start, range.end, clobbers)) {
+        if (regSafeForRange(@intCast(i), range.vreg, range.start, range.end, clobbers)) {
             safe_regs |= @as(u64, 1) << @intCast(i);
         }
     }
@@ -1019,7 +1041,7 @@ fn snapshotTrace(
         .end = range.end,
         .depth = range.max_loop_depth,
         .hint = hint,
-        .spans_clobber = spansClobber(range.start, range.end, clobbers),
+        .spans_clobber = spansClobber(range.vreg, range.start, range.end, clobbers),
         .clobber_count = clobber_count,
         .clobbered_regs = clobbered,
         .free_regs = free,
@@ -1140,7 +1162,7 @@ pub fn coalesceMoves(
         // Clobber safety: same predicate as the allocator. Note we use
         // the strict-inside check (start < pos < end) consistent with
         // `regSafeForRange`.
-        if (!regSafeForRange(r_s_alloc_idx, dest_range.start, dest_range.end, clobbers)) continue;
+        if (!regSafeForRange(r_s_alloc_idx, ch.dest, dest_range.start, dest_range.end, clobbers)) continue;
 
         // Interference check: any *other* interval already on r_s
         // whose range overlaps dest's range blocks the retarget.
@@ -1229,20 +1251,21 @@ fn expireOldIntervals(
 }
 
 /// Check if register at `reg_idx` is safe for a live range [start, end].
-/// A register is unsafe if it's clobbered at any point strictly inside the range.
-fn regSafeForRange(reg_idx: u8, start: u32, end: u32, clobbers: []const ClobberPoint) bool {
+/// A register is unsafe if it's clobbered at any point strictly inside the range
+/// where `vreg` is live across the clobber.
+fn regSafeForRange(reg_idx: u8, vreg: ir.VReg, start: u32, end: u32, clobbers: []const ClobberPoint) bool {
     const bit = @as(u64, 1) << @intCast(reg_idx);
     for (clobbers) |cp| {
-        if (cp.pos > start and cp.pos < end and (cp.regs_clobbered & bit) != 0) return false;
+        if (cp.affectsVReg(vreg, start, end) and (cp.regs_clobbered & bit) != 0) return false;
     }
     return true;
 }
 
 /// Whether a vreg's live range spans any clobber point (e.g., a call).
 /// If so, callee-saved registers are preferred to avoid save/restore.
-fn spansClobber(start: u32, end: u32, clobbers: []const ClobberPoint) bool {
+fn spansClobber(vreg: ir.VReg, start: u32, end: u32, clobbers: []const ClobberPoint) bool {
     for (clobbers) |cp| {
-        if (cp.pos >= start and cp.pos < end) return true;
+        if (cp.spansVReg(vreg, start, end)) return true;
         if (cp.pos >= end) break; // clobbers are position-ordered
     }
     return false;
@@ -1260,6 +1283,7 @@ fn spansClobber(start: u32, end: u32, clobbers: []const ClobberPoint) bool {
 fn findSafeReg(
     reg_set: RegSet,
     reg_free: u64,
+    vreg: ir.VReg,
     start: u32,
     end: u32,
     clobbers: []const ClobberPoint,
@@ -1268,19 +1292,19 @@ fn findSafeReg(
     if (hint_idx) |i| {
         if (i < reg_set.alloc_regs.len) {
             const bit = @as(u64, 1) << @intCast(i);
-            if ((reg_free & bit) != 0 and regSafeForRange(i, start, end, clobbers)) return i;
+            if ((reg_free & bit) != 0 and regSafeForRange(i, vreg, start, end, clobbers)) return i;
         }
     }
-    const prefer_callee = spansClobber(start, end, clobbers);
+    const prefer_callee = spansClobber(vreg, start, end, clobbers);
     const first: []const u8 = if (prefer_callee) reg_set.callee_saved_indices else reg_set.caller_saved_indices;
     const second: []const u8 = if (prefer_callee) reg_set.caller_saved_indices else reg_set.callee_saved_indices;
     for (first) |i| {
         const bit = @as(u64, 1) << @intCast(i);
-        if ((reg_free & bit) != 0 and regSafeForRange(i, start, end, clobbers)) return i;
+        if ((reg_free & bit) != 0 and regSafeForRange(i, vreg, start, end, clobbers)) return i;
     }
     for (second) |i| {
         const bit = @as(u64, 1) << @intCast(i);
-        if ((reg_free & bit) != 0 and regSafeForRange(i, start, end, clobbers)) return i;
+        if ((reg_free & bit) != 0 and regSafeForRange(i, vreg, start, end, clobbers)) return i;
     }
     return null;
 }
