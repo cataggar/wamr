@@ -185,6 +185,114 @@ pub const CodeBuffer = struct {
             (@as(u32, rn.encoding()) << 5) | rd.encoding());
     }
 
+    /// AArch64 logical immediate encoding (`N:immr:imms`) for `AND`, `ORR`,
+    /// and `EOR` immediate instructions.
+    pub const LogicalImm = struct {
+        n: u1,
+        immr: u6,
+        imms: u6,
+
+        pub fn bits(self: LogicalImm) u32 {
+            return (@as(u32, self.n) << 22) |
+                (@as(u32, self.immr) << 16) |
+                (@as(u32, self.imms) << 10);
+        }
+    };
+
+    /// Encode a 64-bit bitmask as an AArch64 logical immediate (`N:immr:imms`),
+    /// or return `null` if `val` cannot be represented as a repeating rotated
+    /// contiguous run of ones.
+    pub fn encodeLogicalImm64(val: u64) ?LogicalImm {
+        if (val == 0 or val == std.math.maxInt(u64)) return null;
+
+        // Find the smallest repeating power-of-two element width in {2, 4, 8, 16, 32, 64}.
+        var size: u7 = 64;
+        while (size > 2) {
+            const half: u6 = @intCast(size / 2);
+            const mask: u64 = (@as(u64, 1) << half) - 1;
+            if ((val & mask) != ((val >> half) & mask)) break;
+            size = half;
+        }
+
+        const elem_mask: u64 = if (size == 64)
+            std.math.maxInt(u64)
+        else
+            (@as(u64, 1) << @intCast(size)) - 1;
+        const elem: u64 = val & elem_mask;
+
+        var ones: u7 = 0;
+        var immr: u6 = 0;
+        if ((elem & 1) == 0) {
+            // Ones do not wrap around bit 0: must be a single contiguous run.
+            const tz: u6 = @intCast(@ctz(elem));
+            const shifted = elem >> tz;
+            if ((shifted & (shifted + 1)) != 0) return null;
+            ones = @intCast(@popCount(elem));
+            immr = @intCast(size - tz);
+        } else {
+            // Bit 0 is 1: zeros in the element must form a single contiguous run.
+            const inv = (~elem) & elem_mask;
+            const tz0: u6 = @intCast(@ctz(inv));
+            const shifted_inv = inv >> tz0;
+            if ((shifted_inv & (shifted_inv + 1)) != 0) return null;
+            const zeros: u7 = @intCast(@popCount(inv));
+            ones = size - zeros;
+            immr = @intCast(ones - tz0);
+        }
+
+        const n: u1 = if (size == 64) 1 else 0;
+        const size_prefix: u6 = if (size == 64)
+            0
+        else
+            @truncate(~(@as(u7, size) * 2 - 1));
+        const imms: u6 = size_prefix | @as(u6, @intCast(ones - 1));
+        return .{ .n = n, .immr = immr, .imms = imms };
+    }
+
+    /// Encode a 32-bit bitmask as an AArch64 32-bit logical immediate (`N=0, immr, imms`),
+    /// or return `null` if `val` cannot be represented.
+    pub fn encodeLogicalImm32(val: u32) ?LogicalImm {
+        if (val == 0 or val == std.math.maxInt(u32)) return null;
+        const rep: u64 = (@as(u64, val) << 32) | @as(u64, val);
+        return encodeLogicalImm64(rep);
+    }
+
+    /// AND Xd, Xn, #imm (64-bit logical immediate)
+    pub fn andImm64(self: *CodeBuffer, rd: Reg, rn: Reg, imm: LogicalImm) !void {
+        std.debug.assert(rd != .sp and rn != .sp);
+        try self.emit32(0x92000000 | imm.bits() | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// AND Wd, Wn, #imm (32-bit logical immediate)
+    pub fn andImm32(self: *CodeBuffer, rd: Reg, rn: Reg, imm: LogicalImm) !void {
+        std.debug.assert(rd != .sp and rn != .sp and imm.n == 0);
+        try self.emit32(0x12000000 | imm.bits() | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// ORR Xd, Xn, #imm (64-bit logical immediate)
+    pub fn orrImm64(self: *CodeBuffer, rd: Reg, rn: Reg, imm: LogicalImm) !void {
+        std.debug.assert(rd != .sp and rn != .sp);
+        try self.emit32(0xB2000000 | imm.bits() | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// ORR Wd, Wn, #imm (32-bit logical immediate)
+    pub fn orrImm32(self: *CodeBuffer, rd: Reg, rn: Reg, imm: LogicalImm) !void {
+        std.debug.assert(rd != .sp and rn != .sp and imm.n == 0);
+        try self.emit32(0x32000000 | imm.bits() | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// EOR Xd, Xn, #imm (64-bit logical immediate)
+    pub fn eorImm64(self: *CodeBuffer, rd: Reg, rn: Reg, imm: LogicalImm) !void {
+        std.debug.assert(rd != .sp and rn != .sp);
+        try self.emit32(0xD2000000 | imm.bits() | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// EOR Wd, Wn, #imm (32-bit logical immediate)
+    pub fn eorImm32(self: *CodeBuffer, rd: Reg, rn: Reg, imm: LogicalImm) !void {
+        std.debug.assert(rd != .sp and rn != .sp and imm.n == 0);
+        try self.emit32(0x52000000 | imm.bits() | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
     /// AND Xd, Xn, Xm
     pub fn andRegReg(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg) !void {
         // 1|00|01010|00|0|Rm|000000|Rn|Rd
@@ -2269,10 +2377,20 @@ pub const CodeBuffer = struct {
     /// #63-shift. Use for scaling an index by a power of 2 at the emit
     /// level without materializing the shift amount into a register.
     pub fn lslImm(self: *CodeBuffer, rd: Reg, rn: Reg, shift: u6) !void {
-        const immr: u32 = @as(u32, 64 - @as(u32, shift)) & 0x3F;
+        const immr: u32 = (@as(u32, 64) - @as(u32, shift)) & 0x3F;
         const imms: u32 = 63 - @as(u32, shift);
         // sf=1, N=1, UBFM: 1|10|100110|1|immr(6)|imms(6)|Rn|Rd
         try self.emit32(0xD3400000 | (immr << 16) | (imms << 10) |
+            (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// LSL Wd, Wn, #shift (32-bit). Alias of UBFM Wd, Wn, #-shift mod 32,
+    /// #31-shift.
+    pub fn lslImm32(self: *CodeBuffer, rd: Reg, rn: Reg, shift: u5) !void {
+        const immr: u32 = (@as(u32, 32) - @as(u32, shift)) & 0x1F;
+        const imms: u32 = 31 - @as(u32, shift);
+        // sf=0, N=0, UBFM: 0|10|100110|0|immr(6)|imms(6)|Rn|Rd
+        try self.emit32(0x53000000 | (immr << 16) | (imms << 10) |
             (@as(u32, rn.encoding()) << 5) | rd.encoding());
     }
 
@@ -2282,6 +2400,46 @@ pub const CodeBuffer = struct {
         const imms: u32 = 63;
         try self.emit32(0xD3400000 | (immr << 16) | (imms << 10) |
             (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// LSR Wd, Wn, #shift (32-bit). Alias of UBFM Wd, Wn, #shift, #31.
+    pub fn lsrImm32(self: *CodeBuffer, rd: Reg, rn: Reg, shift: u5) !void {
+        const immr: u32 = @as(u32, shift);
+        const imms: u32 = 31;
+        try self.emit32(0x53000000 | (immr << 16) | (imms << 10) |
+            (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// ASR Xd, Xn, #shift (64-bit). Alias of SBFM Xd, Xn, #shift, #63.
+    pub fn asrImm(self: *CodeBuffer, rd: Reg, rn: Reg, shift: u6) !void {
+        const immr: u32 = @as(u32, shift);
+        const imms: u32 = 63;
+        // sf=1, N=1, SBFM: 1|00|100110|1|immr(6)|imms(6)|Rn|Rd
+        try self.emit32(0x93400000 | (immr << 16) | (imms << 10) |
+            (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// ASR Wd, Wn, #shift (32-bit). Alias of SBFM Wd, Wn, #shift, #31.
+    pub fn asrImm32(self: *CodeBuffer, rd: Reg, rn: Reg, shift: u5) !void {
+        const immr: u32 = @as(u32, shift);
+        const imms: u32 = 31;
+        // sf=0, N=0, SBFM: 0|00|100110|0|immr(6)|imms(6)|Rn|Rd
+        try self.emit32(0x13000000 | (immr << 16) | (imms << 10) |
+            (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// ROR Xd, Xn, #shift (64-bit). Alias of EXTR Xd, Xn, Xn, #shift.
+    pub fn rorImm(self: *CodeBuffer, rd: Reg, rn: Reg, shift: u6) !void {
+        // sf=1, op21=00, 100111, N=1, o0=0, Rm=Rn, imms=shift, Rn=Rn, Rd=Rd
+        try self.emit32(0x93C00000 | (@as(u32, rn.encoding()) << 16) |
+            (@as(u32, shift) << 10) | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// ROR Wd, Wn, #shift (32-bit). Alias of EXTR Wd, Wn, Wn, #shift.
+    pub fn rorImm32(self: *CodeBuffer, rd: Reg, rn: Reg, shift: u5) !void {
+        // sf=0, op21=00, 100111, N=0, o0=0, Rm=Rn, imms=shift, Rn=Rn, Rd=Rd
+        try self.emit32(0x13800000 | (@as(u32, rn.encoding()) << 16) |
+            (@as(u32, shift) << 10) | (@as(u32, rn.encoding()) << 5) | rd.encoding());
     }
 
     /// ADD Xd, Xn, Wm, UXTW #2 — add Xn + (zero_extend_32(Wm) << 2).
@@ -4682,4 +4840,102 @@ test "emit: MVN x0, x1" {
     defer code.deinit();
     try code.mvnReg64(.x0, .x1);
     try expectWord(0xAA2103E0, &code);
+}
+
+test "emit: encodeLogicalImm32 and encodeLogicalImm64" {
+    // 0 and all-ones are never valid AArch64 logical immediates.
+    try std.testing.expect(CodeBuffer.encodeLogicalImm32(0) == null);
+    try std.testing.expect(CodeBuffer.encodeLogicalImm32(0xFFFFFFFF) == null);
+    try std.testing.expect(CodeBuffer.encodeLogicalImm64(0) == null);
+    try std.testing.expect(CodeBuffer.encodeLogicalImm64(0xFFFFFFFFFFFFFFFF) == null);
+    // Non-contiguous non-repeating pattern (e.g. 0b101 = 5) is invalid.
+    try std.testing.expect(CodeBuffer.encodeLogicalImm32(5) == null);
+    try std.testing.expect(CodeBuffer.encodeLogicalImm64(5) == null);
+
+    // 32-bit 0xFF (8 contiguous low ones): N=0, immr=0, imms=7
+    const imm_ff_32 = CodeBuffer.encodeLogicalImm32(0xFF).?;
+    try std.testing.expectEqual(@as(u1, 0), imm_ff_32.n);
+    try std.testing.expectEqual(@as(u6, 0), imm_ff_32.immr);
+    try std.testing.expectEqual(@as(u6, 7), imm_ff_32.imms);
+
+    // 64-bit 0xFFFF (16 contiguous low ones): N=1, immr=0, imms=15
+    const imm_ffff_64 = CodeBuffer.encodeLogicalImm64(0xFFFF).?;
+    try std.testing.expectEqual(@as(u1, 1), imm_ffff_64.n);
+    try std.testing.expectEqual(@as(u6, 0), imm_ffff_64.immr);
+    try std.testing.expectEqual(@as(u6, 15), imm_ffff_64.imms);
+
+    // 32-bit rotated mask ~7 (0xFFFFFFF8): 29 ones rotated left by 3 -> ROR by 29 (immr=29, imms=28)
+    const imm_not7_32 = CodeBuffer.encodeLogicalImm32(0xFFFFFFF8).?;
+    try std.testing.expectEqual(@as(u1, 0), imm_not7_32.n);
+    try std.testing.expectEqual(@as(u6, 29), imm_not7_32.immr);
+    try std.testing.expectEqual(@as(u6, 28), imm_not7_32.imms);
+
+    // Sub-element repeating pattern: 0x00FF00FF in 32-bit (element size 16, 8 ones):
+    // N=0, immr=0, imms=0b100111 = 39.
+    const imm_rep16 = CodeBuffer.encodeLogicalImm32(0x00FF00FF).?;
+    try std.testing.expectEqual(@as(u1, 0), imm_rep16.n);
+    try std.testing.expectEqual(@as(u6, 0), imm_rep16.immr);
+    try std.testing.expectEqual(@as(u6, 0b100111), imm_rep16.imms);
+}
+
+test "emit: AND/ORR/EOR logical immediate 32-bit and 64-bit" {
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.andImm32(.x0, .x1, CodeBuffer.encodeLogicalImm32(0xFF).?);
+        // AND w0, w1, #0xff -> 0x12001C20
+        try expectWord(0x12001C20, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.andImm64(.x0, .x1, CodeBuffer.encodeLogicalImm64(0xFFFF).?);
+        // AND x0, x1, #0xffff -> 0x92403C20
+        try expectWord(0x92403C20, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.orrImm32(.x2, .x3, CodeBuffer.encodeLogicalImm32(1).?);
+        // ORR w2, w3, #1 -> 0x32000062
+        try expectWord(0x32000062, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.eorImm64(.x4, .x5, CodeBuffer.encodeLogicalImm64(1).?);
+        // EOR x4, x5, #1 -> 0xD24000A4
+        try expectWord(0xD24000A4, &code);
+    }
+}
+
+test "emit: 32-bit and 64-bit immediate shifts and rotates" {
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.lslImm32(.x0, .x1, 4);
+        // UBFM w0, w1, #28, #27 -> 0x531C6C20
+        try expectWord(0x531C6C20, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.lsrImm32(.x0, .x1, 4);
+        // UBFM w0, w1, #4, #31 -> 0x53047C20
+        try expectWord(0x53047C20, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.asrImm32(.x0, .x1, 4);
+        // SBFM w0, w1, #4, #31 -> 0x13047C20
+        try expectWord(0x13047C20, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.rorImm32(.x0, .x1, 5);
+        // EXTR w0, w1, w1, #5 -> 0x13811420
+        try expectWord(0x13811420, &code);
+    }
 }

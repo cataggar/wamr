@@ -197,7 +197,7 @@ fn decode(word: u32) Inst {
     }
 
     // ── Extract (EXTR) ──  `sf 00 100111 N0 Rm imms Rn Rd`
-    if ((word & 0x1FE00000) == 0x13800000) {
+    if ((word & 0x7FA00000) == 0x13800000) {
         const rd: u5 = @intCast(word & 0x1F);
         const rn: u5 = @intCast((word >> 5) & 0x1F);
         const rm: u5 = @intCast((word >> 16) & 0x1F);
@@ -545,7 +545,7 @@ fn rewriteReadReg(word: u32, old_reg: u5, new_reg: u5) ?u32 {
     }
 
     // EXTR — Rn at [9:5] and Rm at [20:16].
-    if ((word & 0x1FE00000) == 0x13800000) {
+    if ((word & 0x7FA00000) == 0x13800000) {
         _ = replaceField(&w, 5, old_reg, new_reg);
         _ = replaceField(&w, 16, old_reg, new_reg);
         return w;

@@ -2031,24 +2031,7 @@ pub fn compileFunctionImpl(
     // instruction numbering. Clobber points, live ranges, FMA positions,
     // flat indexing, kill lists, and code emission all must use THIS order.
     if (tmr) |t| t.begin();
-    const block_order = blk: {
-        var dom = try analysis.computeDominators(func, allocator);
-        defer dom.deinit();
-        const order = try allocator.alloc(ir.BlockId, func.blocks.items.len);
-        const po_len = dom.post_order.len;
-        for (dom.post_order, 0..) |bid, i| {
-            order[po_len - 1 - i] = bid;
-        }
-        var tail: usize = po_len;
-        for (0..func.blocks.items.len) |idx| {
-            const bid: ir.BlockId = @intCast(idx);
-            if (dom.post_num[bid] == null) {
-                order[tail] = bid;
-                tail += 1;
-            }
-        }
-        break :blk order;
-    };
+    const block_order = try computeLoopContiguousRpo(func, allocator);
     if (tmr) |t| t.end(.prepass);
     defer allocator.free(block_order);
 
@@ -2066,8 +2049,28 @@ pub fn compileFunctionImpl(
     // loops. Gated by a CompileOption to ease bisection of any regression.
     if (tmr) |t| t.begin();
     if (ctx.options.enable_range_split) {
+        const mut_func = @constCast(func);
+        for (mut_func.blocks.items) |*block| {
+            for (block.instructions.items) |*inst| {
+                switch (inst.op) {
+                    .iconst_32, .iconst_64 => inst.type = .void,
+                    else => {},
+                }
+            }
+        }
+        defer {
+            for (mut_func.blocks.items) |*block| {
+                for (block.instructions.items) |*inst| {
+                    switch (inst.op) {
+                        .iconst_32 => inst.type = .i32,
+                        .iconst_64 => inst.type = .i64,
+                        else => {},
+                    }
+                }
+            }
+        }
         const rs_stats = try range_split.splitLiveRangesAtLoopBoundariesWithConfig(
-            @constCast(func),
+            mut_func,
             &scheduled,
             allocator,
             .{
@@ -2075,6 +2078,7 @@ pub fn compileFunctionImpl(
                 // allocatable integer pool and its callee-saved subset.
                 .num_available_phys_regs = RegMap.scratch_regs.len,
                 .num_callee_saved_regs = RegMap.scratch_regs.len - RegMap.caller_saved_count,
+                .max_splits_per_function = 0,
             },
         );
         if (range_split_debug and rs_stats.loops_considered > 0) {
@@ -2097,7 +2101,12 @@ pub fn compileFunctionImpl(
     // iconst-mov suppression. Ends just before live-range computation.
     if (tmr) |t| t.begin();
     var clobbers = try collectClobberPoints(func, block_order, &scheduled, allocator);
-    defer clobbers.deinit(allocator);
+    defer {
+        for (clobbers.items) |*cp| {
+            if (cp.live_vregs) |*bs| bs.deinit(allocator);
+        }
+        clobbers.deinit(allocator);
+    }
 
     // Calling-convention regalloc hints (issue #423, mirrors x86_64 PR
     // #422). Steers call-arg vregs into their AAPCS64 target reg
@@ -2422,6 +2431,33 @@ pub fn compileFunctionImpl(
                         if (pick_lhs) try cls_ctx.bumpFold(b.lhs);
                         if (pick_rhs) try cls_ctx.bumpFold(b.rhs);
                     },
+                    .@"and", .@"or", .xor => |b| {
+                        try cls_ctx.bumpTotal(b.lhs);
+                        try cls_ctx.bumpTotal(b.rhs);
+                        if (inst.type == .i32 or inst.type == .i64) {
+                            var pick_rhs = false;
+                            var pick_lhs = false;
+                            if (cls_ctx.cv.get(b.rhs)) |v| {
+                                if (encodeLogicalImmForType(v, inst.type) != null) pick_rhs = true;
+                            }
+                            if (!pick_rhs) {
+                                if (cls_ctx.cv.get(b.lhs)) |v| {
+                                    if (encodeLogicalImmForType(v, inst.type) != null) pick_lhs = true;
+                                }
+                            }
+                            if (pick_lhs) try cls_ctx.bumpFold(b.lhs);
+                            if (pick_rhs) try cls_ctx.bumpFold(b.rhs);
+                        }
+                    },
+                    .shl, .shr_s, .shr_u, .rotl, .rotr => |b| {
+                        try cls_ctx.bumpTotal(b.lhs);
+                        try cls_ctx.bumpTotal(b.rhs);
+                        if (inst.type == .i32 or inst.type == .i64) {
+                            if (cls_ctx.cv.contains(b.rhs)) {
+                                try cls_ctx.bumpFold(b.rhs);
+                            }
+                        }
+                    },
                     .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u => |b| {
                         try cls_ctx.bumpTotal(b.lhs);
                         try cls_ctx.bumpTotal(b.rhs);
@@ -2460,7 +2496,15 @@ pub fn compileFunctionImpl(
 
     // Compute live ranges using the SAME block order as code emission.
     if (tmr) |t| t.begin();
-    const live_ranges = try computeLiveRangesScheduled(func, block_order, &scheduled, allocator);
+    const live_ranges = try computeLiveRangesScheduled(
+        func,
+        block_order,
+        &scheduled,
+        clobbers.items,
+        &fma_info,
+        &simd_fma_info,
+        allocator,
+    );
     defer allocator.free(live_ranges);
     if (fma_info.count() > 0) {
         // Build a vreg→range-index lookup for the patch loop.
@@ -3190,19 +3234,172 @@ pub fn compileFunctionImpl(
     return code.bytes.toOwnedSlice(allocator);
 }
 
+fn computeLoopContiguousRpo(
+    func: *const ir.IrFunction,
+    allocator: std.mem.Allocator,
+) ![]ir.BlockId {
+    const nblocks = func.blocks.items.len;
+    const order = try allocator.alloc(ir.BlockId, nblocks);
+    errdefer allocator.free(order);
+    if (nblocks == 0) return order;
+
+    var dom = try analysis.computeDominators(func, allocator);
+    defer dom.deinit();
+    var forest = try analysis.computeLoops(func, &dom, allocator);
+    defer forest.deinit();
+    const loop_depth = try analysis.loopDepthByBlockForFunc(func, allocator);
+    defer allocator.free(loop_depth);
+
+    var successors = try analysis.buildSuccessors(func, allocator);
+    defer {
+        var sit = successors.iterator();
+        while (sit.next()) |entry| allocator.free(entry.value_ptr.*);
+        successors.deinit();
+    }
+
+    const visit_succs = try allocator.alloc([]ir.BlockId, nblocks);
+    defer {
+        for (visit_succs) |s| allocator.free(s);
+        allocator.free(visit_succs);
+    }
+    for (visit_succs, 0..) |*slot, idx| {
+        const bid: ir.BlockId = @intCast(idx);
+        var list: std.ArrayList(ir.BlockId) = .empty;
+        errdefer list.deinit(allocator);
+
+        // If `bid` is a natural-loop header, prepend all exit targets of
+        // loops headed by `bid` before `bid`'s in-loop successors. In a
+        // post-order DFS, visiting exit targets first assigns the post-loop
+        // subgraph smaller post-order numbers than every block inside the
+        // loop, so reversing post-order into RPO places the entire loop
+        // contiguously before its exits (even when the exit edge originates
+        // deep inside one branch of the loop body).
+        for (forest.loops) |*loop| {
+            if (loop.header != bid) continue;
+            for (loop.blocks) |ub| {
+                const usuccs = successors.get(ub) orelse &[_]ir.BlockId{};
+                for (usuccs) |v| {
+                    if (!loop.containsBlock(v)) {
+                        if (std.mem.indexOfScalar(ir.BlockId, list.items, v) == null) {
+                            try list.append(allocator, v);
+                        }
+                    }
+                }
+            }
+        }
+
+        const src = successors.get(bid) orelse &[_]ir.BlockId{};
+        for (src) |v| {
+            if (std.mem.indexOfScalar(ir.BlockId, list.items, v) == null) {
+                try list.append(allocator, v);
+            }
+        }
+
+        slot.* = try list.toOwnedSlice(allocator);
+        if (slot.len < 2) continue;
+        // Stable insertion sort by ascending loop_depth so shallower
+        // loop-exit successors are visited first in the DFS (finishing
+        // first in post-order -> placed AFTER the loop in RPO).
+        const succs = slot.*;
+        var i: usize = 1;
+        while (i < succs.len) : (i += 1) {
+            var j: usize = i;
+            while (j > 0) : (j -= 1) {
+                const a = succs[j - 1];
+                const b = succs[j];
+                const da: u8 = if (a < loop_depth.len) loop_depth[a] else 0;
+                const db: u8 = if (b < loop_depth.len) loop_depth[b] else 0;
+                if (da <= db) break;
+                succs[j - 1] = b;
+                succs[j] = a;
+            }
+        }
+    }
+
+    var post_order: std.ArrayList(ir.BlockId) = .empty;
+    defer post_order.deinit(allocator);
+    try post_order.ensureTotalCapacity(allocator, nblocks);
+
+    const visited = try allocator.alloc(bool, nblocks);
+    defer allocator.free(visited);
+    @memset(visited, false);
+
+    const StackEntry = struct { bid: ir.BlockId, next_succ: usize };
+    var stack: std.ArrayList(StackEntry) = .empty;
+    defer stack.deinit(allocator);
+
+    visited[0] = true;
+    try stack.append(allocator, .{ .bid = 0, .next_succ = 0 });
+    while (stack.items.len > 0) {
+        const top = &stack.items[stack.items.len - 1];
+        const succs = visit_succs[top.bid];
+        if (top.next_succ < succs.len) {
+            const s = succs[top.next_succ];
+            top.next_succ += 1;
+            if (s < nblocks and !visited[s]) {
+                visited[s] = true;
+                try stack.append(allocator, .{ .bid = s, .next_succ = 0 });
+            }
+        } else {
+            post_order.appendAssumeCapacity(top.bid);
+            _ = stack.pop();
+        }
+    }
+
+    const po_len = post_order.items.len;
+    for (post_order.items, 0..) |bid, i| {
+        order[po_len - 1 - i] = bid;
+    }
+    var tail: usize = po_len;
+    for (0..nblocks) |idx| {
+        if (!visited[idx]) {
+            order[tail] = @intCast(idx);
+            tail += 1;
+        }
+    }
+    return order;
+}
+
 const LastUseCtx = struct {
     last_use_pos: *std.AutoHashMap(ir.VReg, u32),
+    max_access_depth: *std.AutoHashMap(ir.VReg, u8),
+    max_depth_hits: *std.AutoHashMap(ir.VReg, u8),
     pos: u32,
+    block_depth: u8,
 };
+
+fn recordAccessDepth(
+    max_access_depth: *std.AutoHashMap(ir.VReg, u8),
+    max_depth_hits: *std.AutoHashMap(ir.VReg, u8),
+    v: ir.VReg,
+    block_depth: u8,
+) !void {
+    const prev_d = max_access_depth.get(v) orelse 0;
+    if (block_depth > prev_d) {
+        try max_access_depth.put(v, block_depth);
+        try max_depth_hits.put(v, 1);
+    } else if (block_depth == prev_d) {
+        const prev_h = max_depth_hits.get(v) orelse 0;
+        try max_depth_hits.put(v, @min(@as(u8, 31), prev_h +| 1));
+    }
+}
 
 fn recordLastUse(ctx: *LastUseCtx, v: ir.VReg) !void {
     try ctx.last_use_pos.put(v, ctx.pos);
+    try recordAccessDepth(ctx.max_access_depth, ctx.max_depth_hits, v, ctx.block_depth);
+}
+
+fn setBitUse(bs: *std.DynamicBitSetUnmanaged, v: ir.VReg) !void {
+    if (v < bs.bit_length) bs.set(v);
 }
 
 fn computeLiveRangesScheduled(
     func: *const ir.IrFunction,
     block_order: []const ir.BlockId,
     scheduled: *const schedule.FunctionSchedule,
+    clobbers: []regalloc.ClobberPoint,
+    fma_info: *const std.AutoHashMap(ir.VReg, FmaInfo),
+    simd_fma_info: *const std.AutoHashMap(ir.VReg, FmaInfo),
     allocator: std.mem.Allocator,
 ) ![]analysis.LiveRange {
     const liveness = try analysis.computeLiveness(func, allocator);
@@ -3221,6 +3418,10 @@ fn computeLiveRangesScheduled(
     defer def_type.deinit();
     var last_use_pos = std.AutoHashMap(ir.VReg, u32).init(allocator);
     defer last_use_pos.deinit();
+    var max_access_depth = std.AutoHashMap(ir.VReg, u8).init(allocator);
+    defer max_access_depth.deinit();
+    var max_depth_hits = std.AutoHashMap(ir.VReg, u8).init(allocator);
+    defer max_depth_hits.deinit();
     // Earliest block-start position at which each vreg is live-in. A value
     // live-in to a block is live from that block's start, so its range must
     // begin no later than there — even when its only textual def sits
@@ -3233,6 +3434,12 @@ fn computeLiveRangesScheduled(
     var first_live_in_pos = std.AutoHashMap(ir.VReg, u32).init(allocator);
     defer first_live_in_pos.deinit();
 
+    // Per-block loop-nest depth. Kept as a separate helper so the
+    // scheduler-aware path here and the canonical `computeLiveRanges`
+    // path share the exact same eviction-priority signal.
+    const loop_depth_by_block: []u8 = try analysis.loopDepthByBlockForFunc(func, allocator);
+    defer allocator.free(loop_depth_by_block);
+
     // Per-order-position flat-index span (mirrors the same array used
     // by `analysis.computeLiveRangesWithOrder`). One extra slot acts as
     // a sentinel so `block_starts[i+1]` is always a valid exclusive end.
@@ -3242,6 +3449,7 @@ fn computeLiveRangesScheduled(
     var global_idx: u32 = 0;
     for (block_order, 0..) |bid, oi| {
         block_starts[oi] = global_idx;
+        const block_depth: u8 = if (bid < loop_depth_by_block.len) loop_depth_by_block[bid] else 0;
         if (liveness.getPtr(bid)) |bl| {
             var lit = bl.live_in.iterator();
             while (lit.next()) |entry| {
@@ -3259,6 +3467,7 @@ fn computeLiveRangesScheduled(
                     try def_pos.put(dest, global_idx);
                     try def_type.put(dest, inst.type);
                 }
+                try recordAccessDepth(&max_access_depth, &max_depth_hits, dest, block_depth);
             }
             // parallel_copy is a multi-def IR op (one def per pair).
             // Register each dst so it gets a live range and an
@@ -3269,11 +3478,15 @@ fn computeLiveRangesScheduled(
                         try def_pos.put(p.dst, global_idx);
                         try def_type.put(p.dst, p.ty);
                     }
+                    try recordAccessDepth(&max_access_depth, &max_depth_hits, p.dst, block_depth);
                 }
             }
             var use_ctx = LastUseCtx{
                 .last_use_pos = &last_use_pos,
+                .max_access_depth = &max_access_depth,
+                .max_depth_hits = &max_depth_hits,
                 .pos = global_idx,
+                .block_depth = block_depth,
             };
             try schedule.forEachUse(inst, &use_ctx, recordLastUse);
             global_idx += 1;
@@ -3290,11 +3503,67 @@ fn computeLiveRangesScheduled(
     }
     block_starts[block_order.len] = global_idx;
 
-    // Per-block loop-nest depth. Kept as a separate helper so the
-    // scheduler-aware path here and the canonical `computeLiveRanges`
-    // path share the exact same eviction-priority signal.
-    const loop_depth_by_block: []u8 = try analysis.loopDepthByBlockForFunc(func, allocator);
-    defer allocator.free(loop_depth_by_block);
+    if (clobbers.len > 0 and func.next_vreg > 0) {
+        var live_bs = try std.DynamicBitSetUnmanaged.initEmpty(allocator, func.next_vreg);
+        defer live_bs.deinit(allocator);
+        var cp_idx: usize = 0;
+        for (block_order, 0..) |bid, oi| {
+            const b_start = block_starts[oi];
+            const b_end = block_starts[oi + 1];
+            while (cp_idx < clobbers.len and clobbers[cp_idx].pos < b_start) : (cp_idx += 1) {}
+            if (cp_idx >= clobbers.len or clobbers[cp_idx].pos >= b_end) continue;
+
+            // Count how many clobbers fall in [b_start, b_end).
+            var block_cp_end = cp_idx;
+            while (block_cp_end < clobbers.len and clobbers[block_cp_end].pos < b_end) : (block_cp_end += 1) {}
+
+            live_bs.unsetAll();
+            if (liveness.getPtr(bid)) |bl| {
+                var lit = bl.live_out.iterator();
+                while (lit.next()) |entry| {
+                    const v = entry.key_ptr.*;
+                    if (v < live_bs.bit_length) live_bs.set(v);
+                }
+            }
+
+            const insts = scheduled.instructions(bid);
+            var cur_cp: usize = block_cp_end;
+            var i: usize = insts.len;
+            while (i > 0) {
+                i -= 1;
+                const inst = insts[i];
+                const pos: u32 = b_start + @as(u32, @intCast(i));
+                if (inst.dest) |d| {
+                    if (d < live_bs.bit_length) live_bs.unset(d);
+                }
+                if (inst.op == .parallel_copy) {
+                    for (inst.op.parallel_copy) |p| {
+                        if (p.dst < live_bs.bit_length) live_bs.unset(p.dst);
+                    }
+                }
+                if (cur_cp > cp_idx and clobbers[cur_cp - 1].pos == pos) {
+                    cur_cp -= 1;
+                    clobbers[cur_cp].live_vregs = try live_bs.clone(allocator);
+                }
+                if (inst.op != .phi) {
+                    try schedule.forEachUse(inst, &live_bs, setBitUse);
+                }
+                if (inst.dest) |d| {
+                    if (fma_info.get(d)) |fi| {
+                        try setBitUse(&live_bs, fi.mul_lhs);
+                        try setBitUse(&live_bs, fi.mul_rhs);
+                        try setBitUse(&live_bs, fi.addend);
+                    }
+                    if (simd_fma_info.get(d)) |fi| {
+                        try setBitUse(&live_bs, fi.mul_lhs);
+                        try setBitUse(&live_bs, fi.mul_rhs);
+                        try setBitUse(&live_bs, fi.addend);
+                    }
+                }
+            }
+            cp_idx = block_cp_end;
+        }
+    }
 
     var ranges: std.ArrayList(analysis.LiveRange) = .empty;
     errdefer ranges.deinit(allocator);
@@ -3310,13 +3579,19 @@ fn computeLiveRangesScheduled(
         const start = if (first_live_in_pos.get(vreg)) |li| @min(def_p, li) else def_p;
         const end = last_use_pos.get(vreg) orelse start;
         const final_end = @max(start, end);
-        const depth = analysis.maxLoopDepthOverSpan(
+        const span_depth = analysis.maxLoopDepthOverSpan(
             start,
             final_end,
             block_order,
             block_starts,
             loop_depth_by_block,
         );
+        const access_depth = max_access_depth.get(vreg) orelse 0;
+        const hits = max_depth_hits.get(vreg) orelse 0;
+        const depth: u8 = if (span_depth >= 2)
+            @intCast(@min(@as(u16, 255), @as(u16, 2) + (@as(u16, access_depth) * 32) + @as(u16, @min(hits, 31))))
+        else
+            span_depth;
         try ranges.append(allocator, .{
             .vreg = vreg,
             .start = start,
@@ -4324,11 +4599,11 @@ fn compileInst(
         .rem_u => |bin| try emitDivRem(code, inst, bin, reg_map, .rem_u),
 
         // ── Shifts / rotates ─────────────────────────────────────────
-        .shl => |bin| try emitShift(code, inst, bin, reg_map, .lsl),
-        .shr_u => |bin| try emitShift(code, inst, bin, reg_map, .lsr),
-        .shr_s => |bin| try emitShift(code, inst, bin, reg_map, .asr),
-        .rotr => |bin| try emitShift(code, inst, bin, reg_map, .ror),
-        .rotl => |bin| try emitRotl(code, inst, bin, reg_map),
+        .shl => |bin| try emitShift(code, inst, bin, reg_map, fctx, .lsl),
+        .shr_u => |bin| try emitShift(code, inst, bin, reg_map, fctx, .lsr),
+        .shr_s => |bin| try emitShift(code, inst, bin, reg_map, fctx, .asr),
+        .rotr => |bin| try emitShift(code, inst, bin, reg_map, fctx, .ror),
+        .rotl => |bin| try emitRotl(code, inst, bin, reg_map, fctx),
 
         // ── Comparisons ──────────────────────────────────────────────
         inline .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u => |bin, tag| {
@@ -7646,9 +7921,35 @@ fn emitShift(
     inst: ir.Inst,
     bin: ir.Inst.BinOp,
     reg_map: *RegMap,
+    fctx: *const FuncCompileCtx,
     op: emit.CodeBuffer.ShiftOp,
 ) !void {
     const dest = inst.dest orelse return;
+    if ((inst.type == .i32 or inst.type == .i64) and fctx.const_vals != null) {
+        if (fctx.const_vals.?.get(bin.rhs)) |v| {
+            const lhs = try useInto(code, reg_map, bin.lhs, RegMap.tmp0);
+            const info = try destBegin(reg_map, dest, RegMap.tmp2);
+            if (inst.type == .i32) {
+                const shift: u5 = @truncate(@as(u64, @bitCast(v)));
+                switch (op) {
+                    .lsl => try code.lslImm32(info.reg, lhs, shift),
+                    .lsr => try code.lsrImm32(info.reg, lhs, shift),
+                    .asr => try code.asrImm32(info.reg, lhs, shift),
+                    .ror => try code.rorImm32(info.reg, lhs, shift),
+                }
+            } else {
+                const shift: u6 = @truncate(@as(u64, @bitCast(v)));
+                switch (op) {
+                    .lsl => try code.lslImm(info.reg, lhs, shift),
+                    .lsr => try code.lsrImm(info.reg, lhs, shift),
+                    .asr => try code.asrImm(info.reg, lhs, shift),
+                    .ror => try code.rorImm(info.reg, lhs, shift),
+                }
+            }
+            try destCommit(code, reg_map, info);
+            return;
+        }
+    }
     const lhs = try useInto(code, reg_map, bin.lhs, RegMap.tmp0);
     const rhs = try useInto(code, reg_map, bin.rhs, RegMap.tmp1);
     const info = try destBegin(reg_map, dest, RegMap.tmp2);
@@ -7665,8 +7966,24 @@ fn emitRotl(
     inst: ir.Inst,
     bin: ir.Inst.BinOp,
     reg_map: *RegMap,
+    fctx: *const FuncCompileCtx,
 ) !void {
     const dest = inst.dest orelse return;
+    if ((inst.type == .i32 or inst.type == .i64) and fctx.const_vals != null) {
+        if (fctx.const_vals.?.get(bin.rhs)) |v| {
+            const lhs = try useInto(code, reg_map, bin.lhs, RegMap.tmp0);
+            const info = try destBegin(reg_map, dest, RegMap.tmp2);
+            if (inst.type == .i32) {
+                const shift: u5 = @truncate(@as(u64, @bitCast(v)));
+                try code.rorImm32(info.reg, lhs, 0 -% shift);
+            } else {
+                const shift: u6 = @truncate(@as(u64, @bitCast(v)));
+                try code.rorImm(info.reg, lhs, 0 -% shift);
+            }
+            try destCommit(code, reg_map, info);
+            return;
+        }
+    }
     const lhs = try useInto(code, reg_map, bin.lhs, RegMap.tmp0);
     const rhs = try useInto(code, reg_map, bin.rhs, RegMap.tmp1);
     // NEG output must not clobber lhs or rhs. Use tmp2 as the dedicated
@@ -9928,6 +10245,14 @@ const BinOpKind = enum { add, sub, mul, @"and", @"or", xor };
 /// (add↔sub), signaled by `flip_op`.
 const AddSubImmEnc = struct { imm12: u12, shift12: bool, flip_op: bool };
 
+fn encodeLogicalImmForType(value: i64, ty: ir.IrType) ?emit.CodeBuffer.LogicalImm {
+    return switch (ty) {
+        .i32 => emit.CodeBuffer.encodeLogicalImm32(@bitCast(@as(i32, @truncate(value)))),
+        .i64 => emit.CodeBuffer.encodeLogicalImm64(@bitCast(value)),
+        else => null,
+    };
+}
+
 fn encodeAddSubImm(value: i64) ?AddSubImmEnc {
     const flip = value < 0;
     const abs_val: u64 = if (flip) @intCast(-value) else @intCast(value);
@@ -10030,6 +10355,52 @@ fn emitBinOp(
                 dst_info.reg;
             const other_reg = try useInto(code, reg_map, p.other, other_scratch);
             try emitAddSubImm(code, dst_info.reg, other_reg, enc, kind);
+            try destCommit(code, reg_map, dst_info);
+            return;
+        }
+    }
+
+    // Try to fold a logical immediate (AND/ORR/EOR). All three are commutative.
+    if ((kind == .@"and" or kind == .@"or" or kind == .xor) and
+        (inst.type == .i32 or inst.type == .i64) and fctx.const_vals != null)
+    {
+        const cmap = fctx.const_vals.?;
+        const rhs_const = cmap.get(bin.rhs);
+        const lhs_const = cmap.get(bin.lhs);
+        const pick: ?struct { enc: emit.CodeBuffer.LogicalImm, other: ir.VReg } = blk: {
+            if (rhs_const) |v| {
+                if (encodeLogicalImmForType(v, inst.type)) |enc| {
+                    break :blk .{ .enc = enc, .other = bin.lhs };
+                }
+            }
+            if (lhs_const) |v| {
+                if (encodeLogicalImmForType(v, inst.type)) |enc| {
+                    break :blk .{ .enc = enc, .other = bin.rhs };
+                }
+            }
+            break :blk null;
+        };
+        if (pick) |p| {
+            const other_scratch: emit.Reg = if (dst_info.spill_slot == null)
+                RegMap.tmp0
+            else
+                dst_info.reg;
+            const other_reg = try useInto(code, reg_map, p.other, other_scratch);
+            if (inst.type == .i32) {
+                switch (kind) {
+                    .@"and" => try code.andImm32(dst_info.reg, other_reg, p.enc),
+                    .@"or" => try code.orrImm32(dst_info.reg, other_reg, p.enc),
+                    .xor => try code.eorImm32(dst_info.reg, other_reg, p.enc),
+                    else => unreachable,
+                }
+            } else {
+                switch (kind) {
+                    .@"and" => try code.andImm64(dst_info.reg, other_reg, p.enc),
+                    .@"or" => try code.orrImm64(dst_info.reg, other_reg, p.enc),
+                    .xor => try code.eorImm64(dst_info.reg, other_reg, p.enc),
+                    else => unreachable,
+                }
+            }
             try destCommit(code, reg_map, dst_info);
             return;
         }
@@ -17906,3 +18277,109 @@ test "compileFunction: call_indirect uses addExtUxtw2 and single tables_info loa
     try std.testing.expectEqual(@as(usize, 1), count);
 }
 
+test "suppress_iconst (#949): logical immediates (.and, .or, .xor) fold and suppress MOVZ" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const lt = try allocator.alloc(ir.IrType, 1);
+    lt[0] = .i32;
+    func.local_types = lt;
+    const bid = try func.newBlock();
+    const block = func.getBlock(bid);
+
+    const p0 = func.newVReg();
+    const c_and = func.newVReg();
+    const c_or = func.newVReg();
+    const c_xor = func.newVReg();
+    const r1 = func.newVReg();
+    const r2 = func.newVReg();
+    const r3 = func.newVReg();
+
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = p0, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 0xFF }, .dest = c_and, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 0x7 }, .dest = c_or, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 0x1 }, .dest = c_xor, .type = .i32 });
+    // Test both rhs constant and commutative lhs constant
+    try block.append(.{ .op = .{ .@"and" = .{ .lhs = p0, .rhs = c_and } }, .dest = r1, .type = .i32 });
+    try block.append(.{ .op = .{ .@"or" = .{ .lhs = c_or, .rhs = r1 } }, .dest = r2, .type = .i32 });
+    try block.append(.{ .op = .{ .xor = .{ .lhs = r2, .rhs = c_xor } }, .dest = r3, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = r3 } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // All three logical constants should fold into AND/ORR/EOR immediate with zero MOVZ.
+    try std.testing.expectEqual(@as(u32, 0), countMovzImm(code));
+}
+
+test "suppress_iconst (#949): constant shifts and rotates fold and suppress MOVZ" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const lt = try allocator.alloc(ir.IrType, 1);
+    lt[0] = .i32;
+    func.local_types = lt;
+    const bid = try func.newBlock();
+    const block = func.getBlock(bid);
+
+    const p0 = func.newVReg();
+    const c_shl = func.newVReg();
+    const c_shru = func.newVReg();
+    const c_shrs = func.newVReg();
+    const c_rotl = func.newVReg();
+    const c_rotr = func.newVReg();
+    const r1 = func.newVReg();
+    const r2 = func.newVReg();
+    const r3 = func.newVReg();
+    const r4 = func.newVReg();
+    const r5 = func.newVReg();
+
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = p0, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 4 }, .dest = c_shl, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 2 }, .dest = c_shru, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = c_shrs, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = c_rotl, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = c_rotr, .type = .i32 });
+
+    try block.append(.{ .op = .{ .shl = .{ .lhs = p0, .rhs = c_shl } }, .dest = r1, .type = .i32 });
+    try block.append(.{ .op = .{ .shr_u = .{ .lhs = r1, .rhs = c_shru } }, .dest = r2, .type = .i32 });
+    try block.append(.{ .op = .{ .shr_s = .{ .lhs = r2, .rhs = c_shrs } }, .dest = r3, .type = .i32 });
+    try block.append(.{ .op = .{ .rotl = .{ .lhs = r3, .rhs = c_rotl } }, .dest = r4, .type = .i32 });
+    try block.append(.{ .op = .{ .rotr = .{ .lhs = r4, .rhs = c_rotr } }, .dest = r5, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = r5 } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // All five shift/rotate counts should fold into immediate UBFM/SBFM/EXTR with zero MOVZ.
+    try std.testing.expectEqual(@as(u32, 0), countMovzImm(code));
+}
+
+test "suppress_iconst (#949): self-use (b.lhs == b.rhs) preserves register materialization" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const block = func.getBlock(bid);
+
+    const c_shift = func.newVReg();
+    const c_mask = func.newVReg();
+    const r_shl = func.newVReg();
+    const r_and = func.newVReg();
+    const r_sum = func.newVReg();
+
+    try block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = c_shift, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 0xFF }, .dest = c_mask, .type = .i32 });
+    // Self-uses: lhs is read from a register while rhs is folded as an immediate.
+    // Neither c_shift nor c_mask may be suppressed.
+    try block.append(.{ .op = .{ .shl = .{ .lhs = c_shift, .rhs = c_shift } }, .dest = r_shl, .type = .i32 });
+    try block.append(.{ .op = .{ .@"and" = .{ .lhs = c_mask, .rhs = c_mask } }, .dest = r_and, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = r_shl, .rhs = r_and } }, .dest = r_sum, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = r_sum } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // Both self-used constants must retain their MOVZ materializations (2 MOVZ instructions).
+    try std.testing.expectEqual(@as(u32, 2), countMovzImm(code));
+}
