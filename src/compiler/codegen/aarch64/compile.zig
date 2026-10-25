@@ -12244,7 +12244,6 @@ test "compileFunction: fuses single-use cmp across parallel_copy into br_if with
     try func.getBlock(b0).append(.{ .op = .{ .local_get = 1 }, .dest = v1, .type = .i32 });
     try func.getBlock(b0).append(.{ .op = .{ .lt_s = .{ .lhs = v0, .rhs = v1 } }, .dest = v_cmp, .type = .i32 });
     const pc_pairs = try allocator.alloc(ir.Inst.ParallelCopy, 1);
-    defer allocator.free(pc_pairs);
     pc_pairs[0] = .{ .dst = v_copy, .src = v0, .ty = .i32 };
     try func.getBlock(b0).append(.{ .op = .{ .parallel_copy = pc_pairs } });
     try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_cmp, .then_block = b1, .else_block = b2 } } });
