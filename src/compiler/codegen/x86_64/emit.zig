@@ -818,6 +818,20 @@ pub const CodeBuffer = struct {
         }
     }
 
+    /// CMP reg32, imm (32-bit, sign-extended). Uses imm8 form when possible.
+    pub fn cmpReg32Imm32(self: *CodeBuffer, dst: Reg, imm: i32) !void {
+        if (dst.isExtended()) try self.rex(false, .rax, dst);
+        if (imm >= -128 and imm <= 127) {
+            try self.emitByte(0x83);
+            try self.modrm(0b11, 7, dst.low3());
+            try self.emitByte(@bitCast(@as(i8, @intCast(imm))));
+        } else {
+            try self.emitByte(0x81);
+            try self.modrm(0b11, 7, dst.low3());
+            try self.emitI32(imm);
+        }
+    }
+
     /// Emit a shift/rotate with an immediate count: `SHL/SHR/SAR/ROL/ROR reg, imm8`.
     /// `digit` selects the operation via the ModR/M /r extension:
     /// 0=ROL, 1=ROR, 4=SHL, 5=SHR, 7=SAR. If `is64` is true, emits REX.W for

@@ -8059,7 +8059,7 @@ pub fn applyPostOptCodegenLowering(
     target: TargetArch,
     allocator: std.mem.Allocator,
 ) !void {
-    if (target != .aarch64) return;
+    if (target != .aarch64 and target != .x86_64) return;
     for (module.functions.items) |*f| {
         _ = try coalescePhiLocalsToParallelCopy(f, allocator);
     }
