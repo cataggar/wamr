@@ -432,11 +432,12 @@ jobs:
           objdump -i | grep -F aarch64 >/dev/null
 
       - name: Unit tests (Debug, includes #853/#854 JIT smoke tests)
-        # Run the full unit suite in Debug; the native Linux matrix also
-        # covers SIMD NaN conformance in ReleaseSafe. The build below reinstalls
-        # `zig-out/bin/wamr`/`wamrc` before the conformance steps run, so
-        # this doesn't leave a stale Debug binary behind for them.
-        run: zig build test -Djit=true
+        # Run the JIT-specific unit, smoke, and regression suite in Debug;
+        # the full non-JIT unit suite already runs in `build-and-test`.
+        # The build below reinstalls `zig-out/bin/wamr`/`wamrc` before the
+        # conformance steps run, so this doesn't leave a stale Debug binary
+        # behind for them.
+        run: zig build test-jit -Djit=true
 
       - name: Build wamr (ReleaseSafe, -Djit=true)
         # ReleaseSafe for the same reason as `wasi-p3-testsuite` above;

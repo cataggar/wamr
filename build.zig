@@ -1294,11 +1294,16 @@ pub fn build(b: *std.Build) void {
         "python3",
         "tests/test_compare_hot_function.py",
     });
+    const test_jit_step = b.step(
+        "test-jit",
+        "Run in-process JIT unit, smoke, and regression tests",
+    );
+    test_jit_step.dependOn(&run_exe_unit_tests.step);
+
     const test_lazy_jit_step = b.step(
         "test-lazy-jit",
-        "Run lazy-JIT and in-process JIT unit/regression tests",
+        "Run lazy-JIT unit, smoke, and regression tests",
     );
-    test_lazy_jit_step.dependOn(&run_lib_unit_tests.step);
     test_lazy_jit_step.dependOn(&run_exe_unit_tests.step);
 
     const test_step = b.step("test", "Run unit tests");
@@ -1342,7 +1347,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_wamrc_unit_tests = b.addRunArtifact(wamrc_unit_tests);
     test_step.dependOn(&run_wamrc_unit_tests.step);
-    test_lazy_jit_step.dependOn(&run_wamrc_unit_tests.step);
 
     // CLI smoke assertions: subcommand layout, exit codes, version stdout.
     {
@@ -1417,6 +1421,7 @@ pub fn build(b: *std.Build) void {
         jit_hello_smoke.expectExitCode(0);
         jit_hello_smoke.expectStdOutEqual("hello from jit\n");
         test_step.dependOn(&jit_hello_smoke.step);
+        test_jit_step.dependOn(&jit_hello_smoke.step);
         test_lazy_jit_step.dependOn(&jit_hello_smoke.step);
     }
 
@@ -1439,6 +1444,7 @@ pub fn build(b: *std.Build) void {
         jit_component_smoke.expectExitCode(0);
         jit_component_smoke.expectStdOutEqual("echo: hello\n");
         test_step.dependOn(&jit_component_smoke.step);
+        test_jit_step.dependOn(&jit_component_smoke.step);
         test_lazy_jit_step.dependOn(&jit_component_smoke.step);
 
         // #889 follow-up: `expectExitCode`/`expectStdOutEqual` above
@@ -1499,6 +1505,7 @@ pub fn build(b: *std.Build) void {
         run_http_shutdown.addFileArg(b.path("tests/wasi-testsuite/tests/rust/testsuite/wasm32-wasip3/http-service.wasm"));
         run_http_shutdown.expectExitCode(0);
         test_step.dependOn(&run_http_shutdown.step);
+        test_jit_step.dependOn(&run_http_shutdown.step);
     }
 
     // #760 regression: AOT `wasi:cli/exit.exit` must terminate the host
@@ -1625,7 +1632,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_passes_tests = b.addRunArtifact(passes_tests);
     test_step.dependOn(&run_passes_tests.step);
-    test_lazy_jit_step.dependOn(&run_passes_tests.step);
     const magic_passes_tests = b.addTest(.{
         .root_module = passes_test_module,
         .filters = &.{ "computeMagicU32", "strengthReduceDivRem" },
@@ -1785,7 +1791,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_jit_thread_safety_tests = b.addRunArtifact(jit_thread_safety_tests);
     test_step.dependOn(&run_jit_thread_safety_tests.step);
-    test_lazy_jit_step.dependOn(&run_jit_thread_safety_tests.step);
+    test_jit_step.dependOn(&run_jit_thread_safety_tests.step);
 
     // #860: fast/baseline compile preset correctness + compile-time
     // comparison against the full pipeline (CoreMark fixture).
@@ -1803,7 +1809,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_jit_fast_preset_tests = b.addRunArtifact(jit_fast_preset_tests);
     test_step.dependOn(&run_jit_fast_preset_tests.step);
-    test_lazy_jit_step.dependOn(&run_jit_fast_preset_tests.step);
+    test_jit_step.dependOn(&run_jit_fast_preset_tests.step);
 
     // #862/#890: lazy-JIT design-spike prototype (leaf functions only,
     // x86_64/aarch64). Self-skips via `config.lazy_jit`/arch checks when

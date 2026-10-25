@@ -54,23 +54,23 @@ pub const JitCodeCache = struct {
     /// Currently resident JIT/AOT executable code, summed across every
     /// live tracked executable mapping in this process.
     pub fn residentBytes() usize {
-        return resident_bytes;
+        return @atomicLoad(usize, &resident_bytes, .monotonic);
     }
 
     /// Number of currently-live tracked executable mappings in this
     /// process.
     pub fn mappingCount() usize {
-        return mapping_count;
+        return @atomicLoad(usize, &mapping_count, .monotonic);
     }
 
     fn register(size: usize) void {
-        resident_bytes += size;
-        mapping_count += 1;
+        _ = @atomicRmw(usize, &resident_bytes, .Add, size, .monotonic);
+        _ = @atomicRmw(usize, &mapping_count, .Add, 1, .monotonic);
     }
 
     fn unregister(size: usize) void {
-        resident_bytes -= size;
-        mapping_count -= 1;
+        _ = @atomicRmw(usize, &resident_bytes, .Sub, size, .monotonic);
+        _ = @atomicRmw(usize, &mapping_count, .Sub, 1, .monotonic);
     }
 
     /// Returns `error.CodeBudgetExceeded` if mapping `additional_bytes`
@@ -79,8 +79,9 @@ pub const JitCodeCache = struct {
     /// caller gets a clear typed error instead of the process
     /// eventually running out of memory from unbounded JIT growth.
     fn checkBudget(additional_bytes: usize) error{CodeBudgetExceeded}!void {
-        if (budget_bytes == 0) return;
-        if (resident_bytes + additional_bytes > budget_bytes) return error.CodeBudgetExceeded;
+        const budget = @atomicLoad(usize, &budget_bytes, .monotonic);
+        if (budget == 0) return;
+        if (residentBytes() +| additional_bytes > budget) return error.CodeBudgetExceeded;
     }
 };
 

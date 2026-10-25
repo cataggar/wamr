@@ -74,7 +74,7 @@ runs:
         echo "[zig-cache] ZIG_LOCAL_CACHE_DIR=$LOCAL"
 
     - name: Cache Zig global cache
-      if: runner.environment != 'self-hosted'
+      if: runner.environment != 'self-hosted' && inputs.global-cache-dir == ''
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ${{ runner.temp }}/zig-global-cache
