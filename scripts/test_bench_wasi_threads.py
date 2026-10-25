@@ -2541,6 +2541,71 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 timeout_seconds=plan["timeout_seconds"],
             )
 
+        fast_pilot_order = copy.deepcopy(plan["sizing"]["pilot_order"])
+        for spec in fast_pilot_order:
+            if spec["workload"] == "spawn-join":
+                spec["iterations"] = 10_000 // spec["threads"]
+        fast_spawn_pilots = copy.deepcopy(plan["sizing"]["resolved"]["pilots"])
+        for item in fast_spawn_pilots:
+            if item["workload"] == "spawn-join":
+                elapsed = 644_982_000
+                item["iterations"] = 10_000 // item["threads"]
+                item["operations"] = 10_000
+                item["guest_elapsed_ns"] = elapsed
+                item["elapsed_ns"] = elapsed
+                item["raw_guest_elapsed_ns"] = (
+                    elapsed + item["timing_overhead_ns"]
+                )
+                item["timing_overhead_ppm"] = (
+                    item["timing_overhead_ns"]
+                    * 1_000_000
+                    // item["raw_guest_elapsed_ns"]
+                )
+                item["host_wall_elapsed_ns"] = elapsed + 1_000_000
+        fast_plan, _ = bench.resolve_one_shot_sizing(
+            pilot_records=fast_spawn_pilots,
+            pilot_order=fast_pilot_order,
+            modes=tuple(plan["modes"]),
+            thread_counts=tuple(plan["thread_counts"]),
+            warmups=plan["warmups"],
+            samples=plan["samples"],
+            timeout_seconds=plan["timeout_seconds"],
+        )
+        for mode in plan["modes"]:
+            for threads in plan["thread_counts"]:
+                self.assertEqual(
+                    fast_plan[mode]["spawn-join"][str(threads)],
+                    bench.SPAWN_JOIN_THREAD_LIFECYCLE_CAP // threads,
+                )
+
+        too_fast_spawn_pilots = copy.deepcopy(fast_spawn_pilots)
+        for item in too_fast_spawn_pilots:
+            if item["workload"] == "spawn-join":
+                elapsed = 400_000_000
+                item["guest_elapsed_ns"] = elapsed
+                item["elapsed_ns"] = elapsed
+                item["raw_guest_elapsed_ns"] = (
+                    elapsed + item["timing_overhead_ns"]
+                )
+                item["timing_overhead_ppm"] = (
+                    item["timing_overhead_ns"]
+                    * 1_000_000
+                    // item["raw_guest_elapsed_ns"]
+                )
+                item["host_wall_elapsed_ns"] = elapsed + 1_000_000
+        with self.assertRaisesRegex(
+            bench.HarnessError, "below the evidence minimum"
+        ):
+            bench.resolve_one_shot_sizing(
+                pilot_records=too_fast_spawn_pilots,
+                pilot_order=fast_pilot_order,
+                modes=tuple(plan["modes"]),
+                thread_counts=tuple(plan["thread_counts"]),
+                warmups=plan["warmups"],
+                samples=plan["samples"],
+                timeout_seconds=plan["timeout_seconds"],
+            )
+
         same_cell = [
             item
             for item in pilots
@@ -5752,6 +5817,13 @@ class ThreadBenchmarkTests(unittest.TestCase):
             "comment:\n    if: always() && github.event_name == 'pull_request'\n"
             "    needs: benchmark\n    runs-on: ubuntu-22.04\n"
             "    timeout-minutes: 10",
+            workflow,
+        )
+        self.assertIn(
+            "wasi-thread-bench-gate:\n"
+            "    name: WASI thread benchmark\n"
+            "    if: always() && !cancelled() && github.event_name != 'workflow_dispatch'\n"
+            "    needs: [prepare, benchmark]",
             workflow,
         )
         for input_name in (

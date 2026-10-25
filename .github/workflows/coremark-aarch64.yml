@@ -32,20 +32,6 @@ on:
         required: false
         default: ""
   pull_request:
-    paths:
-      - src/compiler/**
-      - src/runtime/**
-      - tests/benchmarks/coremark/**
-      - scripts/bench_coremark.py
-      - scripts/aarch64_instruction_provenance.py
-      - scripts/profile_coremark_aarch64.py
-      - scripts/test_bench_coremark.py
-      - scripts/test_aarch64_instruction_provenance.py
-      - scripts/test_profile_coremark_aarch64.py
-      - scripts/compare_hot_function.py
-      - .github/skills/aot-perf-profile/aot_jit_attr.py
-      - tests/test_aot_jit_attr.py
-      - .github/workflows/coremark-aarch64.yml
 
 concurrency:
   # Isolate each PR and manual ref so unrelated branches cannot cancel a
@@ -59,7 +45,39 @@ permissions:
   pull-requests: write
 
 jobs:
-  coremark:
+  changes:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      should_run: ${{ steps.filter.outputs.should_run }}
+    steps:
+      - name: Check whether CoreMark aarch64 paths changed
+        id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          SHOULD_RUN=false
+          while IFS= read -r FILE; do
+            case "$FILE" in
+              src/compiler/*|src/runtime/*|tests/benchmarks/coremark/*|scripts/bench_coremark.py|scripts/aarch64_instruction_provenance.py|scripts/profile_coremark_aarch64.py|scripts/test_bench_coremark.py|scripts/test_aarch64_instruction_provenance.py|scripts/test_profile_coremark_aarch64.py|scripts/compare_hot_function.py|.github/skills/aot-perf-profile/aot_jit_attr.py|tests/test_aot_jit_attr.py|.github/workflows/coremark-aarch64.yml)
+                SHOULD_RUN=true
+                break
+                ;;
+            esac
+          done < <(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" --paginate --jq '.[].filename')
+          echo "should_run=$SHOULD_RUN" >> "$GITHUB_OUTPUT"
+
+  benchmark:
+    name: CoreMark benchmark (aarch64)
+    needs: changes
+    if: needs.changes.outputs.should_run == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     steps:
@@ -469,3 +487,24 @@ jobs:
           steps.paired_baseline_profile.outcome == 'failure' ||
           steps.paired_target_profile.outcome == 'failure')
         run: exit 1
+
+  coremark-aarch64:
+    runs-on: ubuntu-22.04
+    needs: [changes, benchmark]
+    if: always() && !cancelled()
+    steps:
+      - name: Check CoreMark (aarch64) gate
+        run: |
+          if [ "${{ needs.changes.result }}" != "success" ]; then
+            echo "::error::CoreMark aarch64 path filter failed"
+            exit 1
+          fi
+          if [ "${{ needs.changes.outputs.should_run }}" = "true" ] && [ "${{ needs.benchmark.result }}" != "success" ]; then
+            echo "::error::CoreMark (aarch64) benchmark failed (${{ needs.benchmark.result }})"
+            exit 1
+          fi
+          if [ "${{ needs.changes.outputs.should_run }}" != "true" ] && [ "${{ needs.benchmark.result }}" != "skipped" ]; then
+            echo "::error::Unexpected CoreMark (aarch64) benchmark state (${{ needs.benchmark.result }})"
+            exit 1
+          fi
+          echo "CoreMark (aarch64) gate satisfied"
