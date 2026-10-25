@@ -8337,16 +8337,14 @@ fn emitGlobalGet(
     const byte_offset = try globalByteOffset(fctx, idx);
     if (ty == .v128) {
         const vt = try v128_cache.defineFresh(code, v128_map, dest, null);
-        try code.movRegReg(RegMap.tmp0, .x19);
-        try code.ldrImm(RegMap.tmp0, RegMap.tmp0, vmctx_globals_slot);
+        try code.ldrImm(RegMap.tmp0, .x19, vmctx_globals_slot);
         try addGlobalByteOffset(code, RegMap.tmp0, byte_offset, RegMap.tmp1);
         try code.ldrQ(vt, RegMap.tmp0);
         return;
     }
 
-    // tmp0 = vmctx; tmp0 = globals_base
-    try code.movRegReg(RegMap.tmp0, .x19);
-    try code.ldrImm(RegMap.tmp0, RegMap.tmp0, vmctx_globals_slot);
+    // tmp0 = globals_base
+    try code.ldrImm(RegMap.tmp0, .x19, vmctx_globals_slot);
 
     const info = try destBegin(reg_map, dest, RegMap.tmp1);
     const is32 = (ty == .i32 or ty == .f32);
@@ -8375,17 +8373,15 @@ fn emitGlobalSet(
     const byte_offset = try globalByteOffset(fctx, gs.idx);
     if (ty == .v128) {
         const vt = try v128_cache.ensure(code, v128_map, gs.val, null);
-        try code.movRegReg(RegMap.tmp0, .x19);
-        try code.ldrImm(RegMap.tmp0, RegMap.tmp0, vmctx_globals_slot);
+        try code.ldrImm(RegMap.tmp0, .x19, vmctx_globals_slot);
         try addGlobalByteOffset(code, RegMap.tmp0, byte_offset, RegMap.tmp1);
         try code.strQ(vt, RegMap.tmp0);
         return;
     }
 
     const val_r = try useInto(code, reg_map, gs.val, RegMap.tmp1);
-    // tmp0 = vmctx; tmp0 = globals_base
-    try code.movRegReg(RegMap.tmp0, .x19);
-    try code.ldrImm(RegMap.tmp0, RegMap.tmp0, vmctx_globals_slot);
+    // tmp0 = globals_base
+    try code.ldrImm(RegMap.tmp0, .x19, vmctx_globals_slot);
     // Scalar/reference globals use 8-byte slots. i32/f32 consumers read the
     // low 32 bits, matching the pre-v128 layout and preserving old behaviour.
     if (byte_offset % 8 == 0 and byte_offset / 8 <= 0xFFF) {
@@ -8404,12 +8400,8 @@ fn emitMemorySize(
     reg_map: *RegMap,
 ) !void {
     const dest = inst.dest orelse return;
-    // Load vmctx into tmp0 first, then allocate dest (dest's scratch is
-    // tmp1, so even if dest spills we don't alias tmp0 until after the
-    // vmctx load).
-    try code.movRegReg(RegMap.tmp0, .x19);
     const info = try destBegin(reg_map, dest, RegMap.tmp1);
-    try code.ldrImm32(info.reg, RegMap.tmp0, vmctx_mem_pages_slot_w);
+    try code.ldrImm32(info.reg, .x19, vmctx_mem_pages_slot_w);
     try destCommit(code, reg_map, info);
 }
 
@@ -8465,8 +8457,7 @@ fn emitMemoryCopy(
 /// Uses `RegMap.tmp0` internally if `dest` == vmctx register (it won't,
 /// since `dest` is always a scratch caller like tmp0/tmp1 at call sites).
 fn loadTableInfoAddr(code: *emit.CodeBuffer, dest: emit.Reg, table_idx: u32) !void {
-    try code.movRegReg(dest, .x19);
-    try code.ldrImm(dest, dest, vmctx_tables_info_slot);
+    try code.ldrImm(dest, .x19, vmctx_tables_info_slot);
     const off: u32 = table_idx * table_info_stride;
     if (off != 0) {
         try code.movImm32(RegMap.tmp1, @intCast(off));
@@ -8758,8 +8749,7 @@ fn emitRefFunc(
     reg_map: *RegMap,
 ) !void {
     const dest = inst.dest orelse return;
-    try code.movRegReg(RegMap.tmp0, .x19);
-    try code.ldrImm(RegMap.tmp0, RegMap.tmp0, vmctx_funcptrs_slot);
+    try code.ldrImm(RegMap.tmp0, .x19, vmctx_funcptrs_slot);
     const info = try destBegin(reg_map, dest, RegMap.tmp1);
     const slot: u12 = @intCast(func_idx);
     try code.ldrImm(info.reg, RegMap.tmp0, slot);
@@ -8839,43 +8829,36 @@ fn emitCallIndirect(
     try emitTrapHelperCall(code, vmctx_trap_unreachable_fn_slot);
     patchBCondHere(code, skip_bounds);
 
-    // Sig check:
+    // Sig check + fn_ptr load (keeping tmp0 = &tables_info[table_idx] alive):
     //   tmp1 = ti.type_backing_ptr (at offset 16)
     //   actual_sig = type_backing_ptr[idx]        (u32, stride 4)
+    //   fn_ptr = ti.ptr[idx]                      (u64, stride 8)
     //   expected_sig = vmctx.sig_table_ptr[type_idx]  (u32, stride 4)
     //   cmp actual, expected; b.eq ok; trap; ok:
     try code.ldrImm(RegMap.tmp1, RegMap.tmp0, @intCast(table_info_type_backing_off / 8));
-    // tmp1 = type_backing_ptr + idx*4
-    try code.uxtw(RegMap.tmp0, RegMap.tmp2);
-    try code.lslImm(RegMap.tmp0, RegMap.tmp0, 2);
-    try code.addRegReg(RegMap.tmp1, RegMap.tmp1, RegMap.tmp0);
+    try code.addExtUxtw2(RegMap.tmp1, RegMap.tmp1, RegMap.tmp2);
     try code.ldrImm32(RegMap.tmp1, RegMap.tmp1, 0); // tmp1 = actual_sig
 
-    // Load expected_sig from vmctx.sig_table_ptr[type_idx].
-    try code.movRegReg(.x0, .x19);
-    try code.ldrImm(.x0, .x0, vmctx_sig_table_slot);
-    try code.ldrImm32(RegMap.tmp0, .x0, @intCast(ci.type_idx)); // scale 4
+    // Load fn_ptr: ti.ptr + idx*8 before clobbering tmp2 (bounds check
+    // already succeeded above).
+    try code.ldrImm(RegMap.tmp0, RegMap.tmp0, @intCast(table_info_ptr_off / 8));
+    try code.addExtUxtw3(RegMap.tmp0, RegMap.tmp0, RegMap.tmp2);
+    try code.ldrImm(RegMap.tmp0, RegMap.tmp0, 0); // tmp0 = fn_ptr
 
-    try code.cmpRegReg32(RegMap.tmp1, RegMap.tmp0);
+    // Load expected_sig from vmctx.sig_table_ptr[type_idx] into tmp2 without
+    // touching x0.
+    try code.ldrImm(RegMap.tmp2, .x19, vmctx_sig_table_slot);
+    try code.ldrImm32(RegMap.tmp2, RegMap.tmp2, @intCast(ci.type_idx)); // scale 4
+
+    try code.cmpRegReg32(RegMap.tmp1, RegMap.tmp2);
     const skip_sig = code.len();
     try code.bCond(.eq, 0);
     try emitTrapHelperCall(code, vmctx_trap_unreachable_fn_slot);
     patchBCondHere(code, skip_sig);
 
-    // Load fn_ptr: ti.ptr + idx*8. Recompute ti addr (x0 clobbered above).
-    try loadTableInfoAddr(code, RegMap.tmp0, ci.table_idx);
-    try code.ldrImm(RegMap.tmp0, RegMap.tmp0, @intCast(table_info_ptr_off / 8));
-    try code.addExtUxtw3(RegMap.tmp0, RegMap.tmp0, RegMap.tmp2);
-    try code.ldrImm(RegMap.tmp0, RegMap.tmp0, 0); // tmp0 = fn_ptr
-
-    // Park fn_ptr in the call_save slot for tmp0's scratch index so it
-    // survives arg staging. Actually tmp0 is x16 — non-allocatable — so
-    // arg staging won't clobber it (arg staging only uses x1..x7, x0,
-    // and reads from call_save). Safe to keep in tmp0 across arg moves.
-
-    // Stage args. The bounds/sig check sequence above clobbered x0, so seed
-    // the clobber mask with bit 0 to force x0-sourced args to read from the
-    // saved slot rather than the now-garbage register. Keep tmp0 for fn_ptr.
+    // tmp0 (x16) is non-allocatable, so arg staging won't clobber fn_ptr.
+    // Bounds/sig check above only touched tmp0/tmp1/tmp2 on the non-trapping
+    // path, leaving x0 intact.
     const dying_mask_ci: u16 = dyingCallerSaveMask(reg_map, fctx.current_kills);
     _ = try emitStageCallAbi(
         code,
@@ -8884,7 +8867,7 @@ fn emitCallIndirect(
         reg_map,
         v128_map,
         fctx,
-        1,
+        0,
         RegMap.tmp1,
         RegMap.tmp2,
         if (ci.extra_results > 0) (if (ci.tail) HrpSource.forwarded else HrpSource.caller_scratch) else null,
@@ -17889,3 +17872,37 @@ test "remat (#985): hoisted loop constants do not spill hot loop variables or br
     try std.testing.expectEqual(@as(u32, 0), pending_attr.?.frame_layout.spill_slots);
     try std.testing.expect(pending_attr.?.spill_metric.remat > 0);
 }
+
+test "compileFunction: call_indirect uses addExtUxtw2 and single tables_info load" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const block = func.getBlock(bid);
+    const v_idx = func.newVReg();
+    const v_res = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_idx, .type = .i32 });
+    try block.append(.{
+        .op = .{ .call_indirect = .{ .type_idx = 0, .table_idx = 0, .elem_idx = v_idx, .args = &.{} } },
+        .dest = v_res,
+        .type = .i32,
+    });
+    try block.append(.{ .op = .{ .ret = v_res } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // ADD X17, X17, W15, UXTW #2 = 0x8B2F4A31
+    try std.testing.expect(testCodeContainsWord(code, 0x8B2F4A31));
+    // ADD X16, X16, W15, UXTW #3 = 0x8B2F4E10
+    try std.testing.expect(testCodeContainsWord(code, 0x8B2F4E10));
+    // LDR X16, [X19, #(vmctx_tables_info_slot * 8)] should appear only once.
+    const ldr_tables_info: u32 = 0xF9400000 | (@as(u32, vmctx_tables_info_slot) << 10) | (@as(u32, 19) << 5) | 16;
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        if (std.mem.readInt(u32, code[i..][0..4], .little) == ldr_tables_info) count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
