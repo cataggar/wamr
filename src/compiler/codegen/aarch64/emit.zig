@@ -2284,6 +2284,15 @@ pub const CodeBuffer = struct {
             (@as(u32, rn.encoding()) << 5) | rd.encoding());
     }
 
+    /// ADD Xd, Xn, Wm, UXTW #2 — add Xn + (zero_extend_32(Wm) << 2).
+    /// Convenient for computing `base + idx*4` in one instruction when the
+    /// index is a 32-bit wasm table or signature index.
+    pub fn addExtUxtw2(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg) !void {
+        // ADD (extended register) 64-bit: 1|0|0|01011|00|1|Rm|option(010)|imm3(2)|Rn|Rd
+        try self.emit32(0x8B204800 | (@as(u32, rm.encoding()) << 16) |
+            (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
     /// ADD Xd, Xn, Wm, UXTW #3 — add Xn + (zero_extend_32(Wm) << 3).
     /// Convenient for computing `base + idx*8` in one instruction when the
     /// index is a 32-bit wasm table or memory index.
@@ -2961,6 +2970,14 @@ test "emit: LSL x3, x4, #3 (UBFM alias)" {
     // sf=1 N=1 UBFM base=0xD3400000. immr=61=0x3D -> <<16 = 0x3D0000.
     // imms=60=0x3C -> <<10 = 0xF000. Rn=4<<5=0x80. Rd=3.
     try expectWord(0xD37DF083, &code);
+}
+
+test "emit: ADD x3, x4, w5, UXTW #2" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.addExtUxtw2(.x3, .x4, .x5);
+    // Base 0x8B204800. Rm=5<<16=0x50000. Rn=4<<5=0x80. Rd=3.
+    try expectWord(0x8B254883, &code);
 }
 
 test "emit: ADD x3, x4, w5, UXTW #3" {
