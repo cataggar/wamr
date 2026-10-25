@@ -8282,8 +8282,13 @@ test "compileFunctionRA: comparison targets allocated dest register" {
     defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
-    // Key invariant: setcc must NOT use legacy rax path.
-    try std.testing.expect(!containsBytes(code, &.{ 0x0F, 0x94, 0xC0 }));
+    // Key invariant: setcc+movzx must target the allocated dest register
+    // (`sete sil; movzx rsi, sil` on SysV or `sete r8b; movzx r8, r8b` on
+    // Win64 once `v1` folds into `cmp edx, 2`), never legacy `sete al;
+    // movzx rax, al` (`0F 94 C0 48 0F B6 C0`). Note `sete r8b` encodes as
+    // `41 0F 94 C0` (`r8.low3() == 0`), so include the `movzx` bytes to
+    // distinguish `al` from `r8b`.
+    try std.testing.expect(!containsBytes(code, &.{ 0x0F, 0x94, 0xC0, 0x48, 0x0F, 0xB6, 0xC0 }));
     // Must contain a setcc (0F 94) somewhere
     try std.testing.expect(containsBytes(code, &.{ 0x0F, 0x94 }));
 }
