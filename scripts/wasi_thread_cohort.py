@@ -424,9 +424,17 @@ def validate_dispatch_options(
         raise HarnessError(
             "--runs must exceed one; dispatch counts and timeout must be positive"
         )
-    if args.runner_target == "trusted-calibration" and args.max_in_flight > 2:
+    resolved_x86_env = RUNNER_ENVIRONMENTS.get(args.runner_target, {}).get(
+        TRUSTED_X86_PLATFORM, "github-hosted"
+    )
+    max_trusted_in_flight = 2 if resolved_x86_env == "self-hosted" else 10
+    if (
+        args.runner_target == "trusted-calibration"
+        and args.max_in_flight > max_trusted_in_flight
+    ):
         raise HarnessError(
-            "trusted calibration --max-in-flight cannot exceed 2"
+            "trusted calibration --max-in-flight cannot exceed "
+            f"{max_trusted_in_flight}"
         )
     training_runs = (
         args.runs // 2 if args.training_runs is None else args.training_runs

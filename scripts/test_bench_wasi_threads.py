@@ -5239,7 +5239,34 @@ class ThreadBenchmarkTests(unittest.TestCase):
             ):
                 cohort.validate_dispatch_options(args)
 
-        trusted = Namespace(
+        trusted_hosted = Namespace(
+            **dict(
+                common,
+                baseline_sha="a" * 40,
+                candidate_sha="a" * 40,
+                purpose="noise-calibration",
+                runner_target="trusted-calibration",
+                workflow_ref="wasi-thread-calibration-966-v1",
+                max_in_flight=5,
+            )
+        )
+        cohort.validate_dispatch_options(trusted_hosted)
+
+        trusted_hosted_excess = Namespace(
+            **dict(
+                common,
+                baseline_sha="a" * 40,
+                candidate_sha="a" * 40,
+                purpose="noise-calibration",
+                runner_target="trusted-calibration",
+                workflow_ref="wasi-thread-calibration-966-v1",
+                max_in_flight=11,
+            )
+        )
+        with self.assertRaisesRegex(bench.HarnessError, "cannot exceed 10"):
+            cohort.validate_dispatch_options(trusted_hosted_excess)
+
+        trusted_self_hosted = Namespace(
             **dict(
                 common,
                 baseline_sha="a" * 40,
@@ -5250,8 +5277,14 @@ class ThreadBenchmarkTests(unittest.TestCase):
                 max_in_flight=3,
             )
         )
-        with self.assertRaisesRegex(bench.HarnessError, "cannot exceed 2"):
-            cohort.validate_dispatch_options(trusted)
+        with (
+            mock.patch.dict(
+                cohort.RUNNER_ENVIRONMENTS["trusted-calibration"],
+                {"ubuntu-22.04-x86_64": "self-hosted"},
+            ),
+            self.assertRaisesRegex(bench.HarnessError, "cannot exceed 2"),
+        ):
+            cohort.validate_dispatch_options(trusted_self_hosted)
 
         for workflow_ref in (
             "main",
