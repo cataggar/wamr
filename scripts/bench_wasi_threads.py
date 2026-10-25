@@ -1133,6 +1133,10 @@ def sizing_candidates_for_cell(
         for item in envelope_candidates
         if item["rounded_iterations"] == selected
     ]
+    if workload == "spawn-join":
+        selected = min(
+            selected, SPAWN_JOIN_THREAD_LIFECYCLE_CAP // threads
+        )
     return {
         "general_required_iterations": general_required,
         "general_rounded_iterations": general_rounded,
@@ -1423,9 +1427,15 @@ def resolve_one_shot_sizing(
         projected_host = ceil_div(
             record["host_wall_elapsed_ns"] * selected, record["iterations"]
         )
-        projected_minimum = max(
-            int(MIN_TIMED_INTERVAL_MS * 1_000_000),
-            projected_duration_floor_for_cell(*key),
+        projected_minimum = (
+            int(MIN_TIMED_INTERVAL_MS * 1_000_000)
+            if record["workload"] == "spawn-join"
+            and selected
+            == SPAWN_JOIN_THREAD_LIFECYCLE_CAP // record["threads"]
+            else max(
+                int(MIN_TIMED_INTERVAL_MS * 1_000_000),
+                projected_duration_floor_for_cell(*key),
+            )
         )
         if projected_guest < projected_minimum:
             raise HarnessError(
