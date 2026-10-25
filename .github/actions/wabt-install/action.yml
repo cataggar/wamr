@@ -26,9 +26,9 @@ runs:
   steps:
     - name: Set up verified ghr
       id: setup-ghr
-      uses: cataggar/ghr/actions/setup@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+      uses: cataggar/ghr/actions/setup@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1
       with:
-        ghr-version: v0.8.1
+        ghr-version: v0.9.1
         token: ${{ github.token }}
 
     - name: Install wabt via ghr (Linux + macOS)
@@ -41,7 +41,7 @@ runs:
         WABT_MINISIGN_KEY: RWSBnHWjwk/kkqdYc74cGupHMNVobpmF3lPc7b8RIllYMmYBr5G2EyF0
       run: |
         set -euo pipefail
-        test "$("$GHR" version)" = "0.8.1"
+        test "$("$GHR" version)" = "0.9.1"
         tool_dir="${GHR_TOOL_DIR:-${RUNNER_TEMP}/ghr-tools}"
         bin_dir="${GHR_BIN_DIR:-${RUNNER_TEMP}/ghr-bin}"
         cache_dir="${GHR_CACHE_DIR:-${RUNNER_TEMP}/ghr-cache}"
@@ -72,8 +72,8 @@ runs:
       run: |
         $ErrorActionPreference = "Stop"
         $ghrVersion = (& $env:GHR version).Trim()
-        if ($ghrVersion -ne "0.8.1") {
-          throw "expected ghr 0.8.1, got $ghrVersion"
+        if ($ghrVersion -ne "0.9.1") {
+          throw "expected ghr 0.9.1, got $ghrVersion"
         }
         $toolDir = if ($env:GHR_TOOL_DIR) {
           $env:GHR_TOOL_DIR
