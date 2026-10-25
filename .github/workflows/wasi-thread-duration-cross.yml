@@ -241,7 +241,7 @@ jobs:
             "/d/wamr-duration-cross/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-x86") ;;
             *) exit 2 ;;
           esac
-          rm -rf -- "$ROOT"
+          rm -rf -- "$ROOT" || { sleep 1; rm -rf -- "$ROOT"; }
 
   arm:
     name: Neoverse-N2 duration-cross
@@ -404,4 +404,4 @@ jobs:
             "/d/wamr-duration-cross/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-arm") ;;
             *) exit 2 ;;
           esac
-          rm -rf -- "$ROOT"
+          rm -rf -- "$ROOT" || { sleep 1; rm -rf -- "$ROOT"; }
