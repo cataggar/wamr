@@ -534,19 +534,16 @@ jobs:
         run: zig build install examples examples-run-wasmtime
 
   # Summary job matching the required status check name for branch protection.
-  # `component-examples-wasmtime` is intentionally NOT in the blocking set
-  # while the cross-runtime parity check beds in (cataggar/wamr#457).
-  # `jit-parity` is likewise non-blocking; `lazy-jit` is included because
-  # its architecture matrix is the required lazy-JIT coverage gate.
+  # Gates on every job in Zig CI so no PR can merge while any job is failing or still running.
   ci-summary:
     name: Build & Test
     runs-on: ubuntu-22.04
-    needs: [build-and-test, wasi-test, wasi-testsuite, component-examples, wasi-p2-testsuite, wasi-p3-testsuite, wasi-p3-testsuite-arm64, lazy-jit]
+    needs: [build-and-test, wasi-test, wasi-testsuite, component-examples, component-examples-wasmtime, wasi-p2-testsuite, wasi-p3-testsuite, wasi-p3-testsuite-arm64, lazy-jit, jit-parity]
     if: always() && !cancelled()
     steps:
       - name: Check results
         run: |
-          if [ "${{ needs.build-and-test.result }}" != "success" ] || [ "${{ needs.wasi-test.result }}" != "success" ] || [ "${{ needs.wasi-testsuite.result }}" != "success" ] || [ "${{ needs.component-examples.result }}" != "success" ] || [ "${{ needs.wasi-p2-testsuite.result }}" != "success" ] || [ "${{ needs.wasi-p3-testsuite.result }}" != "success" ] || [ "${{ needs.wasi-p3-testsuite-arm64.result }}" != "success" ] || [ "${{ needs.lazy-jit.result }}" != "success" ]; then
+          if [ "${{ needs.build-and-test.result }}" != "success" ] || [ "${{ needs.wasi-test.result }}" != "success" ] || [ "${{ needs.wasi-testsuite.result }}" != "success" ] || [ "${{ needs.component-examples.result }}" != "success" ] || [ "${{ needs.component-examples-wasmtime.result }}" != "success" ] || [ "${{ needs.wasi-p2-testsuite.result }}" != "success" ] || [ "${{ needs.wasi-p3-testsuite.result }}" != "success" ] || [ "${{ needs.wasi-p3-testsuite-arm64.result }}" != "success" ] || [ "${{ needs.lazy-jit.result }}" != "success" ] || [ "${{ needs.jit-parity.result }}" != "success" ]; then
             echo "::error::One or more CI jobs failed"
             exit 1
           fi

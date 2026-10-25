@@ -548,6 +548,7 @@ const LinuxCpuAffinity = struct {
     initialized: bool = false,
     parent_pinned_single: bool = false,
     saw_full_worker_set: bool = false,
+    sequential_lifecycle: bool = false,
     count: u8 = 0,
     cpus: [64]u16 = @splat(0),
     initial_set: if (builtin.os.tag == .linux) std.os.linux.cpu_set_t else void =
@@ -586,12 +587,23 @@ const LinuxCpuAffinity = struct {
         return set;
     }
 
-    fn planParentSpawnLocked(self: *LinuxCpuAffinity, slot_index: usize, generation: u16) ParentAffinityAction {
+    fn planParentSpawnLocked(
+        self: *LinuxCpuAffinity,
+        slot_index: usize,
+        generation: u16,
+        slot_zero_active: bool,
+    ) ParentAffinityAction {
         if (comptime builtin.os.tag != .linux) return .none;
         self.ensureInitializedLocked();
         if (self.count < 2 or self.saw_full_worker_set) return .none;
-        if (generation > 1 or slot_index >= self.count - 1) {
+        if (generation > 0 or
+            (slot_index > 0 and !slot_zero_active) or
+            slot_index >= self.count - 1)
+        {
             self.saw_full_worker_set = true;
+            if (slot_index > 0 and !slot_zero_active) {
+                self.sequential_lifecycle = true;
+            }
             if (self.parent_pinned_single) {
                 self.parent_pinned_single = false;
                 return .{ .restore_initial = self.initial_set };
@@ -630,10 +642,10 @@ const LinuxCpuAffinity = struct {
 
     fn workerCpuLocked(self: *LinuxCpuAffinity, slot_index: usize, generation: u16) ?u16 {
         if (comptime builtin.os.tag != .linux) return null;
-        if (generation > 1) return null;
+        if (generation > 0 or self.sequential_lifecycle) return null;
         self.ensureInitializedLocked();
-        if (self.count < 2) return null;
-        return self.cpus[slot_index % self.count];
+        if (self.count < 2 or slot_index >= self.count) return null;
+        return self.cpus[slot_index];
     }
 
     fn pinCurrentThread(cpu: u16) void {
@@ -1598,8 +1610,17 @@ pub const ThreadManager = struct {
             return error.StartGateFailed;
         }
 
+        const slot_zero_active = self.slots.items.len > 0 and
+            if (self.slots.items[0].record) |slot0_rec|
+                executionState(slot0_rec) == .pending
+            else
+                false;
         const parent_affinity_action = if (parseTid(tid)) |parsed|
-            self.cpu_affinity.planParentSpawnLocked(parsed.slot_index, parsed.generation)
+            self.cpu_affinity.planParentSpawnLocked(
+                parsed.slot_index,
+                parsed.generation,
+                slot_zero_active,
+            )
         else
             ParentAffinityAction.none;
         record.start_gate.open();
@@ -3657,7 +3678,7 @@ test "group termination: an interpreter child that parks after termination traps
     try std.testing.expectEqual(@as(?u32, 3), state.exitCode());
 }
 
-test "LinuxCpuAffinity: workerCpuLocked maps generation-1 slots across allowed CPUs" {
+test "LinuxCpuAffinity: workerCpuLocked maps generation-0 pool slots and restores on sequential spawn" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var affinity: LinuxCpuAffinity = .{
         .initialized = true,
@@ -3668,23 +3689,36 @@ test "LinuxCpuAffinity: workerCpuLocked maps generation-1 slots across allowed C
     affinity.cpus[2] = 6;
     affinity.cpus[3] = 8;
 
-    try std.testing.expectEqual(@as(?u16, 2), affinity.workerCpuLocked(0, 1));
-    try std.testing.expectEqual(@as(?u16, 4), affinity.workerCpuLocked(1, 1));
-    try std.testing.expectEqual(@as(?u16, 6), affinity.workerCpuLocked(2, 1));
-    try std.testing.expectEqual(@as(?u16, 8), affinity.workerCpuLocked(3, 1));
-    try std.testing.expectEqual(@as(?u16, 2), affinity.workerCpuLocked(4, 1));
-    try std.testing.expectEqual(@as(?u16, null), affinity.workerCpuLocked(0, 2));
+    try std.testing.expectEqual(@as(?u16, 2), affinity.workerCpuLocked(0, 0));
+    try std.testing.expectEqual(@as(?u16, 4), affinity.workerCpuLocked(1, 0));
+    try std.testing.expectEqual(@as(?u16, 6), affinity.workerCpuLocked(2, 0));
+    try std.testing.expectEqual(@as(?u16, 8), affinity.workerCpuLocked(3, 0));
+    try std.testing.expectEqual(@as(?u16, null), affinity.workerCpuLocked(4, 0));
+    try std.testing.expectEqual(@as(?u16, null), affinity.workerCpuLocked(0, 1));
 
-    switch (affinity.planParentSpawnLocked(0, 1)) {
+    switch (affinity.planParentSpawnLocked(0, 0, true)) {
         .pin_single => |cpu| try std.testing.expectEqual(@as(u16, 8), cpu),
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expect(affinity.parent_pinned_single);
-    try std.testing.expectEqual(ParentAffinityAction.none, affinity.planParentSpawnLocked(1, 1));
+    try std.testing.expectEqual(ParentAffinityAction.none, affinity.planParentSpawnLocked(1, 0, true));
     switch (affinity.restoreParentShutdownLocked()) {
         .restore_initial => {},
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expect(!affinity.parent_pinned_single);
-}
 
+    // Sequential spawn-and-join: if slot 0 has already completed when slot 1 spawns,
+    // restore the parent's initial affinity mask and stop pinning further spawns.
+    switch (affinity.planParentSpawnLocked(0, 0, true)) {
+        .pin_single => |cpu| try std.testing.expectEqual(@as(u16, 8), cpu),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (affinity.planParentSpawnLocked(1, 0, false)) {
+        .restore_initial => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(!affinity.parent_pinned_single);
+    try std.testing.expect(affinity.sequential_spawn_detected);
+    try std.testing.expectEqual(@as(?u16, null), affinity.workerCpuLocked(1, 0));
+}

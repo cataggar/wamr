@@ -7,9 +7,13 @@ run-name: >-
 
 on:
   pull_request:
+  push:
+    branches: [main]
     paths: &benchmark-paths
       - build.zig
+      - src/main.zig
       - src/compiler/**
+      - src/platform/**
       - src/runtime/**
       - src/wasi/**
       - scripts/benchmark_schema.py
@@ -19,9 +23,6 @@ on:
       - scripts/wasi_thread_cohort.py
       - tests/benchmarks/wasi-threads/**
       - .github/workflows/wasi-thread-bench.yml
-  push:
-    branches: [main]
-    paths: *benchmark-paths
   workflow_dispatch:
     inputs:
       baseline_sha:
@@ -81,7 +82,9 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+      pull-requests: read
     outputs:
+      should_run: ${{ steps.revisions.outputs.should_run }}
       baseline_sha: ${{ steps.revisions.outputs.baseline_sha }}
       candidate_sha: ${{ steps.revisions.outputs.candidate_sha }}
       purpose: ${{ steps.revisions.outputs.purpose }}
@@ -103,6 +106,8 @@ jobs:
         id: revisions
         env:
           EVENT: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           REF: ${{ github.ref }}
           CURRENT_SHA: ${{ github.sha }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -116,6 +121,7 @@ jobs:
           INPUT_RUNNER_TARGET: ${{ inputs.runner_target }}
         run: |
           set -euo pipefail
+          SHOULD_RUN=true
           case "$EVENT" in
             workflow_dispatch)
               BASELINE_SHA="$INPUT_BASELINE_SHA"
@@ -126,6 +132,15 @@ jobs:
               SAMPLES="$INPUT_SAMPLES"
               ;;
             pull_request)
+              SHOULD_RUN=false
+              while IFS= read -r FILE; do
+                case "$FILE" in
+                  build.zig|src/main.zig|src/compiler/*|src/platform/*|src/runtime/*|src/wasi/*|scripts/benchmark_schema.py|scripts/bench_wasi_threads.py|scripts/test_bench_wasi_threads.py|scripts/test_wasi_thread_budget_derivation.py|scripts/wasi_thread_cohort.py|tests/benchmarks/wasi-threads/*|.github/workflows/wasi-thread-bench.yml)
+                    SHOULD_RUN=true
+                    break
+                    ;;
+                esac
+              done < <(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" --paginate --jq '.[].filename')
               BASELINE_SHA="$PR_BASE_SHA"
               CANDIDATE_SHA="$CURRENT_SHA"
               PURPOSE=candidate-evaluation
@@ -219,6 +234,7 @@ jobs:
           fi
 
           {
+            echo "should_run=$SHOULD_RUN"
             echo "baseline_sha=$BASELINE_SHA"
             echo "candidate_sha=$CANDIDATE_SHA"
             echo "purpose=$PURPOSE"
@@ -229,8 +245,9 @@ jobs:
 
   benchmark:
     if: >-
-      github.event_name != 'workflow_dispatch' ||
-      inputs.runner_target == 'github-hosted'
+      needs.prepare.outputs.should_run == 'true' &&
+      (github.event_name != 'workflow_dispatch' ||
+       inputs.runner_target == 'github-hosted')
     needs: prepare
     timeout-minutes: 330
     permissions:
@@ -692,6 +709,7 @@ jobs:
     steps:
       - name: Download retained x86 report
         continue-on-error: true
+        if: needs.benchmark.result != 'skipped'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: wasi-thread-bench-ubuntu-22.04-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
@@ -717,3 +735,26 @@ jobs:
                 fs.readFileSync(path, 'utf8'),
               ].join('\n'),
             });
+
+  wasi-thread-bench-gate:
+    name: WASI thread benchmark
+    if: always() && !cancelled() && github.event_name != 'workflow_dispatch'
+    needs: [prepare, benchmark]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Check WASI thread benchmark gate
+        run: |
+          if [ "${{ needs.prepare.result }}" != "success" ]; then
+            echo "::error::WASI thread benchmark preparation failed (${{ needs.prepare.result }})"
+            exit 1
+          fi
+          if [ "${{ needs.prepare.outputs.should_run }}" = "true" ] && [ "${{ needs.benchmark.result }}" != "success" ]; then
+            echo "::error::WASI thread benchmark failed (${{ needs.benchmark.result }})"
+            exit 1
+          fi
+          if [ "${{ needs.prepare.outputs.should_run }}" != "true" ] && [ "${{ needs.benchmark.result }}" != "skipped" ]; then
+            echo "::error::Unexpected WASI thread benchmark state (${{ needs.benchmark.result }})"
+            exit 1
+          fi
+          echo "WASI thread benchmark gate satisfied"

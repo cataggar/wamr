@@ -5754,6 +5754,13 @@ class ThreadBenchmarkTests(unittest.TestCase):
             "    timeout-minutes: 10",
             workflow,
         )
+        self.assertIn(
+            "wasi-thread-bench-gate:\n"
+            "    name: WASI thread benchmark\n"
+            "    if: always() && !cancelled() && github.event_name != 'workflow_dispatch'\n"
+            "    needs: [prepare, benchmark]",
+            workflow,
+        )
         for input_name in (
             "baseline_sha:",
             "candidate_sha:",

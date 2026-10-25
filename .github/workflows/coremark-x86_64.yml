@@ -23,16 +23,6 @@ on:
         required: false
         default: "3"
   pull_request:
-    paths:
-      - src/compiler/**
-      - src/runtime/**
-      - tests/benchmarks/coremark/**
-      - tests/benchmarks/loop-passes/**
-      - scripts/bench_coremark.py
-      - scripts/bench_loop_passes.py
-      - scripts/test_bench_coremark.py
-      - scripts/test_bench_loop_passes.py
-      - .github/workflows/coremark-x86_64.yml
 
 concurrency:
   # Serialize per branch: parallel CoreMark invocations on the same runner
@@ -46,7 +36,39 @@ permissions:
   pull-requests: write
 
 jobs:
-  coremark:
+  changes:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      should_run: ${{ steps.filter.outputs.should_run }}
+    steps:
+      - name: Check whether CoreMark x86_64 paths changed
+        id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          SHOULD_RUN=false
+          while IFS= read -r FILE; do
+            case "$FILE" in
+              src/compiler/*|src/runtime/*|tests/benchmarks/coremark/*|tests/benchmarks/loop-passes/*|scripts/bench_coremark.py|scripts/bench_loop_passes.py|scripts/test_bench_coremark.py|scripts/test_bench_loop_passes.py|.github/workflows/coremark-x86_64.yml)
+                SHOULD_RUN=true
+                break
+                ;;
+            esac
+          done < <(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" --paginate --jq '.[].filename')
+          echo "should_run=$SHOULD_RUN" >> "$GITHUB_OUTPUT"
+
+  benchmark:
+    name: CoreMark benchmark (x86_64)
+    needs: changes
+    if: needs.changes.outputs.should_run == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
@@ -166,3 +188,24 @@ jobs:
       - name: Fail on benchmark regression
         if: steps.bench.outcome == 'failure' || steps.loop_bench.outcome == 'failure'
         run: exit 1
+
+  coremark:
+    runs-on: ubuntu-22.04
+    needs: [changes, benchmark]
+    if: always() && !cancelled()
+    steps:
+      - name: Check CoreMark (x86_64) gate
+        run: |
+          if [ "${{ needs.changes.result }}" != "success" ]; then
+            echo "::error::CoreMark x86_64 path filter failed"
+            exit 1
+          fi
+          if [ "${{ needs.changes.outputs.should_run }}" = "true" ] && [ "${{ needs.benchmark.result }}" != "success" ]; then
+            echo "::error::CoreMark (x86_64) benchmark failed (${{ needs.benchmark.result }})"
+            exit 1
+          fi
+          if [ "${{ needs.changes.outputs.should_run }}" != "true" ] && [ "${{ needs.benchmark.result }}" != "skipped" ]; then
+            echo "::error::Unexpected CoreMark (x86_64) benchmark state (${{ needs.benchmark.result }})"
+            exit 1
+          fi
+          echo "CoreMark (x86_64) gate satisfied"

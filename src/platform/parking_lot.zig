@@ -277,7 +277,7 @@ pub const ParkingLot = struct {
                 const final_outcome: Outcome = @fromBackingInt(@intCast(waiter.outcome.load(.acquire)));
                 if (final_outcome != .waiting) {
                     bucket.mutex.unlock();
-                    finishWokenWaiter(&waiter, false);
+                    finishWokenWaiter(&waiter);
                     return outcomeToResult(final_outcome);
                 }
                 self.removeLocked(bucket, &waiter);
@@ -287,7 +287,7 @@ pub const ParkingLot = struct {
             };
             const outcome: Outcome = @fromBackingInt(@intCast(waiter.outcome.load(.acquire)));
             if (outcome != .waiting) {
-                finishWokenWaiter(&waiter, os_result == .awakened);
+                finishWokenWaiter(&waiter);
                 return outcomeToResult(outcome);
             }
             switch (os_result) {
@@ -313,7 +313,7 @@ pub const ParkingLot = struct {
         const outcome: Outcome = @fromBackingInt(@intCast(waiter.outcome.load(.acquire)));
         if (outcome != .waiting) {
             bucket.mutex.unlock();
-            finishWokenWaiter(waiter, false);
+            finishWokenWaiter(waiter);
             return outcomeToResult(outcome);
         }
 
@@ -592,18 +592,12 @@ fn wakeWaiterList(head: ?*Waiter) BackendError!void {
 }
 
 fn wakeWaiterAfterOutcome(waiter: *Waiter) BackendError!void {
-    if (comptime is_linux) {
-        return linuxWakeWaiter(&waiter.parked);
-    }
     waiter.parked.store(1, .release);
     defer waiter.parked.store(2, .release);
     return osWake(&waiter.parked.raw);
 }
 
-fn finishWokenWaiter(waiter: *Waiter, awakened: bool) void {
-    if (comptime is_linux) {
-        if (awakened and waiter.parked.load(.acquire) == 0) return;
-    }
+fn finishWokenWaiter(waiter: *Waiter) void {
     var spins: u32 = 0;
     while (waiter.parked.load(.acquire) != 2) : (spins += 1) {
         if (spins < 64) {
@@ -639,26 +633,6 @@ fn osWakeAll(word: *const u32) BackendError!void {
         return;
     }
     return error.Unsupported;
-}
-
-fn linuxWakeWaiter(parked: *std.atomic.Value(u32)) BackendError!void {
-    if (!is_linux) unreachable;
-    const linux = std.os.linux;
-    if (parked.load(.acquire) != 0) return;
-    const rc = linux.futex_3arg(&parked.raw, .{ .cmd = .WAKE, .private = true }, 1);
-    switch (linux.errno(rc)) {
-        .SUCCESS => {
-            if (rc > 0) return;
-            if (parked.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
-                _ = linux.futex_3arg(&parked.raw, .{ .cmd = .WAKE, .private = true }, 1);
-                parked.store(2, .release);
-            }
-        },
-        .FAULT => return error.InvalidAddress,
-        .INVAL => return error.InvalidArgument,
-        .NOSYS => return error.Unsupported,
-        else => return error.SystemFailure,
-    }
 }
 
 fn linuxWait(word: *const u32, expected: u32, timeout_ns: ?u64) BackendError!OsWaitResult {

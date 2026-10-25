@@ -57,7 +57,7 @@ fn parseSubcommand(s: []const u8) ?Subcommand {
 pub fn main(init: std.process.Init) !u8 {
     // Keep the 0.16 allocator's bounded thread-start cost and leak diagnostics;
     // 0.17's startup SafeAllocator captures per-thread allocation traces.
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    var debug_allocator: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
     defer if (use_debug_allocator) {
         _ = debug_allocator.deinit();
     };
@@ -2476,4 +2476,3 @@ test "resolveLogFormat: CLI flag wins over WAMR_LOG_FORMAT and invalid env fails
     try std.testing.expect(std.mem.indexOf(u8, run_usage_options, "--log-format NAME") != null);
     try std.testing.expect(std.mem.indexOf(u8, serve_usage_options, "--log-format NAME") != null);
 }
-
