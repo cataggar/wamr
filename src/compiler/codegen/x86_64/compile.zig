@@ -9386,19 +9386,21 @@ test "#798 x86_64: high-pressure remat handles call reg/stack args, loop back-ed
     try b2.append(.{ .op = .{ .ret = final_sum } });
 
     const fa_ctx = FrameAttributionCtx{
-        .opts = .{ .enabled = true, .output_prefix = "test" },
+        .output_prefix = "test",
         .module_idx = 0,
         .func_idx = 0,
+        .cwasm_aot_version = 1,
+        .compiler_build_id = "test",
     };
     var result = try compileFunctionRAWithGlobalOffsetsTimed(
         &func,
         0,
         &.{},
         allocator,
-        .{},
         null,
         null,
         fa_ctx,
+        .{},
     );
     defer allocator.free(result.code);
     defer allocator.free(result.call_patches);
@@ -9406,8 +9408,8 @@ test "#798 x86_64: high-pressure remat handles call reg/stack args, loop back-ed
 
     const fa = result.frame_attribution.?;
     // All 5 constants spanning the call must be rematerialized rather than spilled.
-    try std.testing.expectEqual(@as(u32, 5), fa.spill_metric.remat_vregs);
-    for (fa.spill_values) |sv| {
+    try std.testing.expectEqual(@as(u32, 5), fa.spill_metric.remat);
+    for (fa.allocator_values) |sv| {
         try std.testing.expect(!sv.rematerialization_eligible);
     }
 }
