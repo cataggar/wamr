@@ -489,6 +489,14 @@ pub const CodeBuffer = struct {
         try self.emit32(0xD61F0000 | (@as(u32, rn.encoding()) << 5));
     }
 
+    /// ADR Xd, #offset_bytes (PC-relative address within ±1 MiB)
+    pub fn adr(self: *CodeBuffer, rd: Reg, offset_bytes: i21) !void {
+        const uoff: u21 = @bitCast(offset_bytes);
+        const immlo: u32 = @as(u32, uoff & 0b11) << 29;
+        const immhi: u32 = @as(u32, uoff >> 2) << 5;
+        try self.emit32(0x10000000 | immlo | immhi | rd.encoding());
+    }
+
     /// RET (return via LR, alias for BR X30)
     pub fn ret(self: *CodeBuffer) !void {
         try self.emit32(0xD65F03C0);

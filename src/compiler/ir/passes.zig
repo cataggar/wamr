@@ -7944,9 +7944,12 @@ fn findTerminatorIndex(block: *const ir.BasicBlock) usize {
 /// (CoreMark `core_list_mergesort` hung this way: a loop-counter phi's
 /// `br_if cond=v533` read the clobbered value and never terminated).
 ///
-/// We bail when `dest` has any use outside the natural loop(s) of the
-/// back-edge(s) into `join_block`. Simple in-loop counters (all uses inside
-/// the loop body) stay eligible; values live across the loop exit do not.
+/// Return `true` when coalescing a synthesized phi local (`dest` defined in
+/// `join_block`) would hit the Briggs/Cooper "lost-copy" hazard: a back-edge
+/// predecessor `P` (`dom.dominates(join_block, P)`) executes its `.parallel_copy`
+/// immediately before `P`'s terminator, and control can leave `P` along a
+/// non-`join_block` successor and reach a use of `dest` without passing through
+/// `join_block`.
 fn synthCoalesceLostCopyUnsafe(
     func: *const ir.IrFunction,
     dom: *const analysis.DomTree,
@@ -7956,49 +7959,77 @@ fn synthCoalesceLostCopyUnsafe(
     allocator: std.mem.Allocator,
 ) !bool {
     const nblocks = func.blocks.items.len;
-
-    // Back-edge predecessors of the join are CFG preds dominated by the
-    // join (the join is on every path to them ⇒ they close a loop).
     const join_preds = preds.get(join_block) orelse return false;
-    var has_back_edge = false;
-    for (join_preds) |p| {
-        if (dom.dominates(join_block, p)) {
-            has_back_edge = true;
-            break;
-        }
-    }
-    // No loop back-edge into the join ⇒ every copy is on a forward edge and
-    // defines `dest` once per path; no clobber is possible.
-    if (!has_back_edge) return false;
 
-    // Natural loop L = {join} ∪ {blocks reachable backward from a back-edge
-    // predecessor without crossing the join}. Uses of `dest` outside L are
-    // live across the loop exit and would observe a clobbered value.
-    var in_loop = try allocator.alloc(bool, nblocks);
-    defer allocator.free(in_loop);
-    @memset(in_loop, false);
-    in_loop[join_block] = true;
+    const visited = try allocator.alloc(bool, nblocks);
+    defer allocator.free(visited);
+    @memset(visited, false);
 
     var worklist: std.ArrayListUnmanaged(ir.BlockId) = .empty;
     defer worklist.deinit(allocator);
+
+    const enqueueIfNotJoin = struct {
+        fn call(
+            target: ir.BlockId,
+            join: ir.BlockId,
+            vis: []bool,
+            wl: *std.ArrayListUnmanaged(ir.BlockId),
+            alloc: std.mem.Allocator,
+        ) !void {
+            if (target == join or target >= vis.len) return;
+            if (!vis[target]) {
+                vis[target] = true;
+                try wl.append(alloc, target);
+            }
+        }
+    }.call;
+
+    // 1. Seed forward reachability from every non-`join_block` successor of
+    //    every back-edge predecessor `p` (`dom.dominates(join_block, p)`).
     for (join_preds) |p| {
         if (!dom.dominates(join_block, p)) continue;
-        if (!in_loop[p]) {
-            in_loop[p] = true;
-            try worklist.append(allocator, p);
-        }
-    }
-    while (worklist.pop()) |n| {
-        const np = preds.get(n) orelse continue;
-        for (np) |q| {
-            if (!in_loop[q]) {
-                in_loop[q] = true;
-                try worklist.append(allocator, q);
-            }
+        const term_idx = findTerminatorIndex(&func.blocks.items[p]);
+        if (term_idx >= func.blocks.items[p].instructions.items.len) continue;
+        const term = func.blocks.items[p].instructions.items[term_idx];
+        switch (term.op) {
+            .br => |target| try enqueueIfNotJoin(target, join_block, visited, &worklist, allocator),
+            .br_if => |bi| {
+                try enqueueIfNotJoin(bi.then_block, join_block, visited, &worklist, allocator);
+                try enqueueIfNotJoin(bi.else_block, join_block, visited, &worklist, allocator);
+            },
+            .br_table => |bt| {
+                for (bt.targets) |t| try enqueueIfNotJoin(t, join_block, visited, &worklist, allocator);
+                try enqueueIfNotJoin(bt.default, join_block, visited, &worklist, allocator);
+            },
+            else => {},
         }
     }
 
-    // Any use of `dest` in a block outside the natural loop is unsafe.
+    if (worklist.items.len == 0) return false;
+
+    // 2. Collect all blocks reachable forward in the CFG without passing
+    //    through `join_block`.
+    while (worklist.pop()) |b| {
+        const term_idx = findTerminatorIndex(&func.blocks.items[b]);
+        if (term_idx >= func.blocks.items[b].instructions.items.len) continue;
+        const term = func.blocks.items[b].instructions.items[term_idx];
+        switch (term.op) {
+            .br => |target| try enqueueIfNotJoin(target, join_block, visited, &worklist, allocator),
+            .br_if => |bi| {
+                try enqueueIfNotJoin(bi.then_block, join_block, visited, &worklist, allocator);
+                try enqueueIfNotJoin(bi.else_block, join_block, visited, &worklist, allocator);
+            },
+            .br_table => |bt| {
+                for (bt.targets) |t| try enqueueIfNotJoin(t, join_block, visited, &worklist, allocator);
+                try enqueueIfNotJoin(bt.default, join_block, visited, &worklist, allocator);
+            },
+            else => {},
+        }
+    }
+
+    // 3. Any use of `dest` in a block reachable from a back-edge predecessor's
+    //    exit without passing through `join_block` would observe the clobbered
+    //    latch value.
     const Probe = struct {
         target: ir.VReg,
         found: *bool,
@@ -8007,7 +8038,7 @@ fn synthCoalesceLostCopyUnsafe(
         }
     };
     for (func.blocks.items, 0..) |*block, bid| {
-        if (in_loop[bid]) continue;
+        if (!visited[bid]) continue;
         for (block.instructions.items) |inst| {
             var used = false;
             verifier.forEachOperand(inst, Probe{ .target = dest, .found = &used }, Probe.check);
@@ -9300,6 +9331,7 @@ pub const default_passes: []const PassFn = &.{
     &threadChainedConditionalBranches,
     &tailDuplicateSmallJoins,
     &foldSelectOnEqz,
+    &foldBranchOnEqz,
     &foldSignExtendingLoad,
     &foldFloatUnaryIdempotents,
     &foldWrapOfExtend,
@@ -9366,6 +9398,7 @@ const default_passes_no_iv: []const PassFn = &.{
     &threadChainedConditionalBranches,
     &tailDuplicateSmallJoins,
     &foldSelectOnEqz,
+    &foldBranchOnEqz,
     &foldSignExtendingLoad,
     &foldFloatUnaryIdempotents,
     &foldWrapOfExtend,
@@ -9393,6 +9426,7 @@ const default_passes_no_unroll: []const PassFn = &.{
     &threadChainedConditionalBranches,
     &tailDuplicateSmallJoins,
     &foldSelectOnEqz,
+    &foldBranchOnEqz,
     &foldSignExtendingLoad,
     &foldFloatUnaryIdempotents,
     &foldWrapOfExtend,
@@ -9420,6 +9454,7 @@ const default_passes_no_iv_no_unroll: []const PassFn = &.{
     &threadChainedConditionalBranches,
     &tailDuplicateSmallJoins,
     &foldSelectOnEqz,
+    &foldBranchOnEqz,
     &foldSignExtendingLoad,
     &foldFloatUnaryIdempotents,
     &foldWrapOfExtend,
@@ -15515,9 +15550,9 @@ fn pipelineContains(pass_list: []const PassFn, needle: PassFn) bool {
     return false;
 }
 
-test "default pipeline enables foldBranchOnEqz only for x86_64" {
+test "default pipeline enables foldBranchOnEqz for x86_64 and aarch64" {
     try std.testing.expect(pipelineContains(defaultPassesForTarget(.x86_64), &foldBranchOnEqz));
-    try std.testing.expect(!pipelineContains(defaultPassesForTarget(.aarch64), &foldBranchOnEqz));
+    try std.testing.expect(pipelineContains(defaultPassesForTarget(.aarch64), &foldBranchOnEqz));
 }
 
 test "x86_64 default pipeline enables bounded unroll but keeps IV simplify off" {
