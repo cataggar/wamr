@@ -683,6 +683,9 @@ const FuncCompileCtx = struct {
     simd_mul_fused: ?*const std.AutoHashMap(ir.VReg, void) = null,
     /// SIMD add/sub dest vreg → fused FMLA/FMLS source triple.
     simd_fma_info: ?*const std.AutoHashMap(ir.VReg, FmaInfo) = null,
+    /// Single-use integer comparison dest vreg → condition code consumed
+    /// directly by the same block's terminating `br_if` (skipping `cset`).
+    fused_cmp_cond: ?*const std.AutoHashMap(ir.VReg, emit.Cond) = null,
     /// Byte offsets of every callee-save save/restore block emitted. Each
     /// entry is the 10 STR/LDR offsets for one `emitCalleeSaveStore` or
     /// `emitCalleeSaveRestore` call. After the body is compiled, offsets
@@ -1056,16 +1059,20 @@ fn relaxOutOfRangeConditionalBranches(
             ins_points.appendAssumeCapacity(patches.items[idx].patch_offset);
         }
 
-        // 4. Rewrite every OOR B.cond word in place (flip its condition
-        //    bit and retarget to `+2 words` = +8 bytes). We do this
-        //    against the OLD buffer; the inserted B will be written
+        // 4. Rewrite every OOR B.cond / CBZ / CBNZ word in place (flip its
+        //    condition bit and retarget to `+2 words` = +8 bytes). We do
+        //    this against the OLD buffer; the inserted B will be written
         //    into the NEW buffer in step 5.
         const old_data = code.bytes.items;
         for (oor.items) |idx| {
             const orig_offset = patches.items[idx].patch_offset;
             const old_word = std.mem.readInt(u32, old_data[orig_offset..][0..4], .little);
-            const new_cond: u32 = (old_word & 0xF) ^ 1;
-            const new_bcond_word: u32 = 0x54000000 | (@as(u32, 2) << 5) | new_cond;
+            const new_bcond_word: u32 = if ((old_word & 0x7E000000) == 0x34000000)
+                ((old_word & 0xFF00001F) ^ 0x01000000) | (@as(u32, 2) << 5)
+            else blk: {
+                const new_cond: u32 = (old_word & 0xF) ^ 1;
+                break :blk 0x54000000 | (@as(u32, 2) << 5) | new_cond;
+            };
             std.mem.writeInt(u32, old_data[orig_offset..][0..4], new_bcond_word, .little);
         }
 
@@ -2492,6 +2499,49 @@ pub fn compileFunctionImpl(
         }
     }
     fctx.suppress_iconst_emit = &suppress_iconst;
+
+    // Identify single-use integer comparisons in the same block whose result
+    // feeds the block-terminating `br_if` across only flag-preserving ops
+    // (`.parallel_copy` or suppressed `.iconst_*`). When fused, `emitCmp`
+    // emits `CMP` without `CSET` and `emitBrIf` branches on NZCV directly.
+    var fused_cmp_cond = std.AutoHashMap(ir.VReg, emit.Cond).init(allocator);
+    defer fused_cmp_cond.deinit();
+    for (block_order) |bo_bid| {
+        const insts = scheduled.instructions(bo_bid);
+        if (insts.len < 2) continue;
+        const term = insts[insts.len - 1];
+        const br_op = switch (term.op) {
+            .br_if => |b| b,
+            else => continue,
+        };
+        if ((use_counts.get(br_op.cond) orelse 0) != 1) continue;
+        var j: usize = insts.len - 1;
+        while (j > 0) {
+            j -= 1;
+            const prev = insts[j];
+            if (prev.dest) |d| {
+                if (d == br_op.cond) {
+                    if (prev.type == .i32 or prev.type == .i64) {
+                        if (cmpOpToCond(prev.op)) |cc| {
+                            try fused_cmp_cond.put(br_op.cond, cc);
+                        }
+                    }
+                    break;
+                }
+            }
+            switch (prev.op) {
+                .parallel_copy => continue,
+                .iconst_32, .iconst_64 => {
+                    if (prev.dest) |d| {
+                        if (suppress_iconst.contains(d)) continue;
+                    }
+                    break;
+                },
+                else => break,
+            }
+        }
+    }
+    fctx.fused_cmp_cond = &fused_cmp_cond;
     if (tmr) |t| t.end(.prepass);
 
     // Compute live ranges using the SAME block order as code emission.
@@ -2559,7 +2609,7 @@ pub fn compileFunctionImpl(
         if (range.type == .v128) {
             legacy_v128_spill_slots += 1;
             try v128_live_ranges.append(allocator, range);
-        } else if (!ctx.options.enable_xreg_alloc or !suppress_iconst.contains(range.vreg)) {
+        } else if (!fused_cmp_cond.contains(range.vreg) and (!ctx.options.enable_xreg_alloc or !suppress_iconst.contains(range.vreg))) {
             try scalar_live_ranges.append(allocator, range);
         }
     }
@@ -6899,6 +6949,26 @@ fn emitEqz(
     try destCommit(code, reg_map, info);
 }
 
+fn cmpOpToCond(op: ir.Inst.Op) ?emit.Cond {
+    return switch (op) {
+        .eq => .eq,
+        .ne => .ne,
+        .lt_s => .lt,
+        .lt_u => .lo,
+        .gt_s => .gt,
+        .gt_u => .hi,
+        .le_s => .le,
+        .le_u => .ls,
+        .ge_s => .ge,
+        .ge_u => .hs,
+        else => null,
+    };
+}
+
+fn invertCond(cond: emit.Cond) emit.Cond {
+    return @enumFromInt(@backingInt(cond) ^ 1);
+}
+
 fn encodeCmpImm(value: i64) ?u12 {
     if (value >= 0 and value <= 4095) return @intCast(value);
     return null;
@@ -6913,10 +6983,20 @@ fn emitCmp(
     cond: emit.Cond,
 ) !void {
     const dest = inst.dest orelse return;
+    const is_fused = if (fctx.fused_cmp_cond) |fc| fc.contains(dest) else false;
     if ((inst.type == .i32 or inst.type == .i64) and fctx.const_vals != null) {
         if (fctx.const_vals.?.get(bin.rhs)) |v| {
             if (encodeCmpImm(v)) |imm12| {
                 const lhs = try useInto(code, reg_map, bin.lhs, RegMap.tmp0);
+                if (is_fused) {
+                    if (inst.type == .i32) {
+                        try code.cmpImm32(lhs, imm12);
+                    } else {
+                        try code.cmpImm(lhs, imm12);
+                    }
+                    code.peepholeBarrier();
+                    return;
+                }
                 const info = try destBegin(reg_map, dest, RegMap.tmp2);
                 if (inst.type == .i32) {
                     try code.cmpImm32(lhs, imm12);
@@ -6932,6 +7012,15 @@ fn emitCmp(
     }
     const lhs = try useInto(code, reg_map, bin.lhs, RegMap.tmp0);
     const rhs = try useInto(code, reg_map, bin.rhs, RegMap.tmp1);
+    if (is_fused) {
+        if (inst.type == .i32) {
+            try code.cmpRegReg32(lhs, rhs);
+        } else {
+            try code.cmpRegReg(lhs, rhs);
+        }
+        code.peepholeBarrier();
+        return;
+    }
     const info = try destBegin(reg_map, dest, RegMap.tmp2);
     if (inst.type == .i32) {
         try code.cmpRegReg32(lhs, rhs);
@@ -9791,6 +9880,44 @@ fn emitBrTable(
     allocator: std.mem.Allocator,
 ) !void {
     const idx_r = try useInto(code, reg_map, bt.index, RegMap.tmp0);
+    if (bt.targets.len >= 4) {
+        code.peepholeBarrier();
+        if (bt.targets.len <= 0xFFF) {
+            try code.cmpImm32(idx_r, @intCast(bt.targets.len));
+        } else {
+            try code.movImm32(RegMap.tmp1, @intCast(bt.targets.len));
+            try code.cmpRegReg32(idx_r, RegMap.tmp1);
+        }
+        // Skip the unconditional default branch (+2 words = +8 bytes) when
+        // idx < targets.len (unsigned). Using an inline `b.lo .+8` + `.b_uncond`
+        // keeps every patch in the table `.b_uncond` so branch relaxation
+        // never shifts `adr`'s PC-relative offset.
+        try code.bCond(.lo, 2);
+        const default_patch = code.len();
+        try code.b(0);
+        try patches.append(allocator, .{
+            .patch_offset = default_patch,
+            .target_block = bt.default,
+            .kind = .b_uncond,
+        });
+        // `table[0]` is 3 instructions (+12 bytes) after `adr`. Use `tmp1`
+        // for the table base so we never clobber `idx_r` when `bt.index`
+        // was loaded into `tmp0`.
+        try code.adr(RegMap.tmp1, 12);
+        try code.addExtUxtw2(RegMap.tmp1, RegMap.tmp1, idx_r);
+        try code.br(RegMap.tmp1);
+        for (bt.targets) |target| {
+            const patch_off = code.len();
+            try code.b(0);
+            try patches.append(allocator, .{
+                .patch_offset = patch_off,
+                .target_block = target,
+                .kind = .b_uncond,
+            });
+        }
+        code.peepholeBarrier();
+        return;
+    }
     for (bt.targets, 0..) |target, i| {
         if (i <= 0xFFF) {
             try code.cmpImm32(idx_r, @intCast(i));
@@ -10192,16 +10319,55 @@ fn emitBrIf(
     fctx: *const FuncCompileCtx,
 ) !void {
     const allocator = fctx.allocator;
+    if (fctx.fused_cmp_cond) |fc| {
+        if (fc.get(br.cond)) |cc| {
+            code.peepholeBarrier();
+            if (fctx.targetIsFallthrough(br.else_block)) {
+                const p = code.len();
+                try code.bCond(cc, 0);
+                try patches.append(allocator, .{
+                    .patch_offset = p,
+                    .target_block = br.then_block,
+                    .kind = .b_cond,
+                });
+                return;
+            }
+            if (fctx.targetIsFallthrough(br.then_block)) {
+                const p = code.len();
+                try code.bCond(invertCond(cc), 0);
+                try patches.append(allocator, .{
+                    .patch_offset = p,
+                    .target_block = br.else_block,
+                    .kind = .b_cond,
+                });
+                return;
+            }
+            const cond_patch = code.len();
+            try code.bCond(cc, 0);
+            try patches.append(allocator, .{
+                .patch_offset = cond_patch,
+                .target_block = br.then_block,
+                .kind = .b_cond,
+            });
+            const else_patch = code.len();
+            try code.b(0);
+            try patches.append(allocator, .{
+                .patch_offset = else_patch,
+                .target_block = br.else_block,
+                .kind = .b_uncond,
+            });
+            return;
+        }
+    }
+
     const cond_r = try useInto(code, reg_map, br.cond, RegMap.tmp0);
-    // wasm br_if: branch to then_block if cond != 0 (i32).
-    try code.cmpImm32(cond_r, 0);
 
     // Fall-through elision (#808): if a successor is the physical fall-through
     // block, drop the unconditional branch and (if it's the then-side) invert
     // the condition so the common path falls through instead of branching.
     if (fctx.targetIsFallthrough(br.else_block)) {
         const p = code.len();
-        try code.bCond(.ne, 0); // cond != 0 → then_block; else falls through
+        try code.cbnz32(cond_r, 0); // cond != 0 → then_block; else falls through
         try patches.append(allocator, .{
             .patch_offset = p,
             .target_block = br.then_block,
@@ -10211,7 +10377,7 @@ fn emitBrIf(
     }
     if (fctx.targetIsFallthrough(br.then_block)) {
         const p = code.len();
-        try code.bCond(.eq, 0); // cond == 0 → else_block; then falls through
+        try code.cbz32(cond_r, 0); // cond == 0 → else_block; then falls through
         try patches.append(allocator, .{
             .patch_offset = p,
             .target_block = br.else_block,
@@ -10221,7 +10387,7 @@ fn emitBrIf(
     }
 
     const cond_patch = code.len();
-    try code.bCond(.ne, 0); // placeholder
+    try code.cbnz32(cond_r, 0); // placeholder
     try patches.append(allocator, .{
         .patch_offset = cond_patch,
         .target_block = br.then_block,
@@ -12008,6 +12174,133 @@ test "coalescePhiLocalsToParallelCopy: coalesces loop phi used only inside the l
     // In-loop-only phi → safe → coalesced into parallel_copy(s).
     try std.testing.expect(changed);
     try std.testing.expect(countParallelCopies(&func) > 0);
+}
+
+test "coalescePhiLocalsToParallelCopy: coalesces loop phi when exit is from header and latch has no exit use (#949)" {
+    // Header b1 exits to b3 (which reads v_i), while back-edge latch b2
+    // ends with an unconditional `br b1`. Because b2's parallel_copy only
+    // executes along the back-edge into b1 (and cannot reach b3 without
+    // passing through b1), coalescing v_i is completely safe.
+    //   b0: v_init = 0; br b1
+    //   b1: v_i = phi(b0:v_init, b2:v_next); br_if v_i → b2 else b3
+    //   b2: v_next = v_i + 1; br b1
+    //   b3: ret v_i
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+
+    const v_init = func.newVReg();
+    const v_i = func.newVReg();
+    const v_one = func.newVReg();
+    const v_next = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_init, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    const edges = try allocator.alloc(ir.Inst.PhiEdge, 2);
+    edges[0] = .{ .block = b0, .val = v_init };
+    edges[1] = .{ .block = b2, .val = v_next };
+    try func.getBlock(b1).append(.{ .op = .{ .phi = edges }, .dest = v_i, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_i, .then_block = b2, .else_block = b3 } } });
+
+    try func.getBlock(b2).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_one, .type = .i32 });
+    try func.getBlock(b2).append(.{ .op = .{ .add = .{ .lhs = v_i, .rhs = v_one } }, .dest = v_next, .type = .i32 });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b1 } });
+
+    try func.getBlock(b3).append(.{ .op = .{ .ret = v_i } });
+
+    try func.getBlock(b1).addPredecessor(b0);
+    try func.getBlock(b1).addPredecessor(b2);
+    try func.getBlock(b2).addPredecessor(b1);
+    try func.getBlock(b3).addPredecessor(b1);
+
+    _ = try @import("../../ir/passes.zig").lowerPhisToLocals(&func, allocator);
+    const changed = try @import("../../ir/passes.zig").coalescePhiLocalsToParallelCopy(&func, allocator);
+
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(@as(u32, 2), countParallelCopies(&func));
+}
+
+test "compileFunction: fuses single-use cmp across parallel_copy into br_if without cset (#949)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 1, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v_cmp = func.newVReg();
+    const v_copy = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .local_get = 0 }, .dest = v0, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .local_get = 1 }, .dest = v1, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .lt_s = .{ .lhs = v0, .rhs = v1 } }, .dest = v_cmp, .type = .i32 });
+    const pc_pairs = try allocator.alloc(ir.Inst.ParallelCopy, 1);
+    defer allocator.free(pc_pairs);
+    pc_pairs[0] = .{ .dst = v_copy, .src = v0, .ty = .i32 };
+    try func.getBlock(b0).append(.{ .op = .{ .parallel_copy = pc_pairs } });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_cmp, .then_block = b1, .else_block = b2 } } });
+
+    try func.getBlock(b1).append(.{ .op = .{ .ret = v_copy } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v1 } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // No CSET (32-bit 0x1A9F_07E0 or 64-bit 0x9A9F_07E0 under mask 0x7FFF_07E0)
+    // should be emitted when the single-use comparison is fused into br_if.
+    try std.testing.expect(!testCodeContainsMasked(code, 0x7FFF_07E0, 0x1A9F_07E0));
+    // And a B.cond instruction (mask 0xFF00_0010 == 0x5400_0000) is emitted.
+    try std.testing.expect(testCodeContainsMasked(code, 0xFF00_0010, 0x5400_0000));
+}
+
+test "compileFunction: br_table with >= 4 targets emits PC-relative jump table (#949)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const b4 = try func.newBlock();
+    const b_def = try func.newBlock();
+
+    const idx = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .local_get = 0 }, .dest = idx, .type = .i32 });
+
+    const targets = try allocator.alloc(ir.BlockId, 4);
+    defer allocator.free(targets);
+    targets[0] = b1;
+    targets[1] = b2;
+    targets[2] = b3;
+    targets[3] = b4;
+    try func.getBlock(b0).append(.{ .op = .{ .br_table = .{
+        .index = idx,
+        .targets = targets,
+        .default = b_def,
+    } } });
+
+    inline for (.{ b1, b2, b3, b4, b_def }, 0..) |bid, k| {
+        const r = func.newVReg();
+        try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = @intCast(k + 10) }, .dest = r, .type = .i32 });
+        try func.getBlock(bid).append(.{ .op = .{ .ret = r } });
+    }
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // Expect `adr x17, .+12` (0x10000071) and `br x17` (0xD61F0220).
+    try std.testing.expect(testCodeContainsWord(code, 0x10000071));
+    try std.testing.expect(testCodeContainsWord(code, 0xD61F0220));
 }
 
 test "compileFunction: iconst_32 + ret" {
