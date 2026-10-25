@@ -312,7 +312,7 @@ jobs:
       - name: Configure Zig caches
         uses: ./candidate/.github/actions/zig-cache
         with:
-          global-cache-dir: ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.platform }}/zig-global-cache
+          global-cache-dir: ${{ runner.temp }}/zig-global-cache
           local-cache-dir: ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.platform }}/zig-local-cache
 
       - name: Test benchmark and cohort harness
@@ -392,7 +392,7 @@ jobs:
             "$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.platform }}") ;;
             *) exit 2 ;;
           esac
-          rm -rf -- "$EXPECTED_ROOT"
+          rm -rf -- "$EXPECTED_ROOT" || { sleep 1; rm -rf -- "$EXPECTED_ROOT"; }
 
   trusted-calibration-x86:
     if: >-
@@ -496,7 +496,7 @@ jobs:
         if: ${{ steps.acquire.outputs.should_run == 'true' }}
         uses: ./candidate/.github/actions/zig-cache
         with:
-          global-cache-dir: ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-x86/zig-global-cache
+          global-cache-dir: ${{ runner.temp }}/zig-global-cache
           local-cache-dir: ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-x86/zig-local-cache
 
       - name: Test benchmark and cohort harness
@@ -578,7 +578,7 @@ jobs:
             "$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-x86") ;;
             *) exit 2 ;;
           esac
-          rm -rf -- "$EXPECTED_ROOT"
+          rm -rf -- "$EXPECTED_ROOT" || { sleep 1; rm -rf -- "$EXPECTED_ROOT"; }
 
   trusted-calibration-arm:
     if: >-
@@ -642,7 +642,7 @@ jobs:
       - name: Configure Zig caches
         uses: ./candidate/.github/actions/zig-cache
         with:
-          global-cache-dir: ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-arm/zig-global-cache
+          global-cache-dir: ${{ runner.temp }}/zig-global-cache
           local-cache-dir: ${{ runner.temp }}/wasi-thread-${{ github.run_id }}-${{ github.run_attempt }}-arm/zig-local-cache
 
       - name: Run non-enforcing paired noise calibration
@@ -696,7 +696,7 @@ jobs:
             "$RUNNER_TEMP/wasi-thread-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-arm") ;;
             *) exit 2 ;;
           esac
-          rm -rf -- "$EXPECTED_ROOT"
+          rm -rf -- "$EXPECTED_ROOT" || { sleep 1; rm -rf -- "$EXPECTED_ROOT"; }
 
   comment:
     if: always() && github.event_name == 'pull_request'

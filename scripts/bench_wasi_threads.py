@@ -2180,10 +2180,76 @@ def measure_with_quality_diagnostic(
         )
 
 
+ZIG_BUILD_RETRY_ATTEMPTS = 3
+ZIG_BUILD_RETRY_BACKOFF_SECONDS = 2.0
+TRANSIENT_ZIG_FETCH_ERROR_MARKERS = (
+    "NameServerFailure",
+    "TemporaryNameServerFailure",
+    "ConnectionResetByPeer",
+    "ConnectionTimedOut",
+    "unable to discover remote git server capabilities",
+    "server connection failed",
+)
+
+
+def is_transient_zig_fetch_error(stderr: str | bytes | None) -> bool:
+    if not stderr:
+        return False
+    text = (
+        stderr.decode("UTF-8", errors="replace")
+        if isinstance(stderr, bytes)
+        else stderr
+    )
+    return any(marker in text for marker in TRANSIENT_ZIG_FETCH_ERROR_MARKERS)
+
+
+def _run_build_with_retry(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    name: str,
+    attempts: int = ZIG_BUILD_RETRY_ATTEMPTS,
+    backoff_seconds: float = ZIG_BUILD_RETRY_BACKOFF_SECONDS,
+) -> None:
+    for attempt in range(1, attempts + 1):
+        try:
+            subprocess.run(
+                command,
+                cwd=cwd,
+                env=env,
+                check=True,
+                text=True,
+                stderr=subprocess.PIPE,
+            )
+            return
+        except subprocess.CalledProcessError as exc:
+            stderr_text = (
+                exc.stderr.decode("UTF-8", errors="replace")
+                if isinstance(exc.stderr, bytes)
+                else (exc.stderr or "")
+            )
+            if stderr_text:
+                sys.stderr.write(stderr_text)
+                if not stderr_text.endswith("\n"):
+                    sys.stderr.write("\n")
+            if attempt < attempts and is_transient_zig_fetch_error(stderr_text):
+                time.sleep(backoff_seconds * attempt)
+                continue
+            raise HarnessError(
+                f"build failed for {name}: exit {exc.returncode}"
+            ) from exc
+
+
 def controlled_env(cache_root: Path) -> dict[str, str]:
     env = os.environ.copy()
     cache_root.mkdir(parents=True, exist_ok=True)
-    global_cache = cache_root / "global"
+    inherited_global = env.get("ZIG_GLOBAL_CACHE_DIR", "").strip()
+    global_cache = (
+        Path(inherited_global)
+        if inherited_global
+        else cache_root.parent / "global"
+    )
     local_cache = cache_root / "local"
     temp = cache_root / "tmp"
     for directory in (global_cache, local_cache, temp):
@@ -2262,10 +2328,7 @@ def build_variant(
     if target:
         command.insert(2, f"-Dtarget={target}")
     prefix.mkdir(parents=True, exist_ok=True)
-    try:
-        subprocess.run(command, cwd=repo, env=env, check=True)
-    except subprocess.CalledProcessError as exc:
-        raise HarnessError(f"build failed for {name}: exit {exc.returncode}") from exc
+    _run_build_with_retry(command, cwd=repo, env=env, name=name)
     if not all(path.is_file() for path in expected):
         raise HarnessError(f"build {name} did not produce expected binaries")
     atomic_write_json(
@@ -2278,6 +2341,9 @@ def build_variant(
         },
     )
     return Build(name, mode, threads_enabled, prefix, wamr, wamrc, key, command, False)
+
+
+build_binary = build_variant
 
 
 def resolve_fixtures(repo: Path) -> dict[str, dict[str, Any]]:

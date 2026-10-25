@@ -5788,7 +5788,32 @@ class ThreadBenchmarkTests(unittest.TestCase):
         self.assertEqual(
             workflow.count("Clean run-scoped benchmark output and caches"), 3
         )
-        self.assertEqual(workflow.count('rm -rf -- "$EXPECTED_ROOT"'), 3)
+        self.assertEqual(
+            workflow.count(
+                'rm -rf -- "$EXPECTED_ROOT" || { sleep 1; rm -rf -- "$EXPECTED_ROOT"; }'
+            ),
+            3,
+        )
+        self.assertEqual(
+            workflow.count("global-cache-dir: ${{ runner.temp }}/zig-global-cache"),
+            3,
+        )
+        zig_cache_action = (
+            ROOT / ".github/actions/zig-cache/action.yml"
+        ).read_text(encoding="UTF-8")
+        self.assertIn(
+            "if: runner.environment != 'self-hosted'",
+            zig_cache_action,
+        )
+        self.assertNotIn("inputs.global-cache-dir == ''", zig_cache_action)
+        self.assertIn(
+            "path: ${{ inputs.global-cache-dir || format('{0}/zig-global-cache', runner.temp) }}",
+            zig_cache_action,
+        )
+        self.assertIn(
+            "hashFiles('build.zig', 'build.zig.zon', 'candidate/build.zig', 'candidate/build.zig.zon')",
+            zig_cache_action,
+        )
         self.assertEqual(
             workflow.count('echo "WASI_THREAD_OUTPUT=$EXPECTED_ROOT/output"'),
             3,
@@ -5836,6 +5861,170 @@ class ThreadBenchmarkTests(unittest.TestCase):
             "runner_target:",
         ):
             self.assertIn(input_name, workflow)
+
+    def test_build_variant_retries_transient_zig_package_fetch_errors(self) -> None:
+        for marker in bench.TRANSIENT_ZIG_FETCH_ERROR_MARKERS:
+            with self.subTest(marker=marker):
+                self.assertTrue(
+                    bench.is_transient_zig_fetch_error(
+                        f"./build.zig.zon:8:20: error: {marker}\n"
+                    )
+                )
+        self.assertFalse(
+            bench.is_transient_zig_fetch_error(
+                "src/main.zig:10:5: error: undeclared identifier 'foo'\n"
+            )
+        )
+        self.assertFalse(bench.is_transient_zig_fetch_error(None))
+
+        root = self.scratch / "retry-build"
+        calls: list[list[str]] = []
+
+        def fake_run(
+            command: list[str], **kwargs: object
+        ) -> object:
+            calls.append(list(command))
+            if len(calls) < 3:
+                raise bench.subprocess.CalledProcessError(
+                    1,
+                    command,
+                    stderr=(
+                        "./build.zig.zon:8:20: error: unable to discover "
+                        "remote git server capabilities: NameServerFailure\n"
+                    ),
+                )
+            prefix = Path(command[command.index("--prefix") + 1])
+            bin_dir = prefix / "bin"
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            (bin_dir / "wamr").write_bytes(b"wamr")
+            return bench.subprocess.CompletedProcess(command, 0, "", "")
+
+        with (
+            mock.patch.object(
+                bench, "zig_build_command", return_value=["zig", "build"]
+            ),
+            mock.patch.object(bench, "command_identity", return_value="0.17.0"),
+            mock.patch.object(bench.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(bench.time, "sleep") as sleep_mock,
+            mock.patch.object(bench.sys, "stderr", io.StringIO()),
+        ):
+            build = bench.build_variant(
+                repo=ROOT,
+                root=root,
+                mode="interpreter",
+                threads_enabled=True,
+                optimize="ReleaseSafe",
+                target=None,
+                source={"build_source_sha256": "a" * 64},
+                rebuild=True,
+                compiler_toggle=False,
+            )
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(
+            [call.args[0] for call in sleep_mock.call_args_list],
+            [2.0, 4.0],
+        )
+        self.assertTrue(build.wamr.is_file())
+
+        exhausted_root = self.scratch / "retry-exhausted"
+        with (
+            mock.patch.object(
+                bench, "zig_build_command", return_value=["zig", "build"]
+            ),
+            mock.patch.object(bench, "command_identity", return_value="0.17.0"),
+            mock.patch.object(
+                bench.subprocess,
+                "run",
+                side_effect=bench.subprocess.CalledProcessError(
+                    1,
+                    ["zig", "build"],
+                    stderr="./build.zig.zon:12:20: error: server connection failed: TemporaryNameServerFailure\n",
+                ),
+            ) as run_mock,
+            mock.patch.object(bench.time, "sleep") as sleep_mock,
+            mock.patch.object(bench.sys, "stderr", io.StringIO()),
+            self.assertRaisesRegex(
+                bench.HarnessError,
+                "build failed for enabled-interpreter: exit 1",
+            ),
+        ):
+            bench.build_variant(
+                repo=ROOT,
+                root=exhausted_root,
+                mode="interpreter",
+                threads_enabled=True,
+                optimize="ReleaseSafe",
+                target=None,
+                source={"build_source_sha256": "b" * 64},
+                rebuild=True,
+                compiler_toggle=False,
+            )
+        self.assertEqual(run_mock.call_count, 3)
+        self.assertEqual(sleep_mock.call_count, 2)
+
+    def test_build_variant_fails_immediately_on_non_transient_build_error(self) -> None:
+        root = self.scratch / "non-transient-build"
+        with (
+            mock.patch.object(
+                bench, "zig_build_command", return_value=["zig", "build"]
+            ),
+            mock.patch.object(bench, "command_identity", return_value="0.17.0"),
+            mock.patch.object(
+                bench.subprocess,
+                "run",
+                side_effect=bench.subprocess.CalledProcessError(
+                    1,
+                    ["zig", "build"],
+                    stderr="src/main.zig:1:1: error: undeclared identifier\n",
+                ),
+            ) as run_mock,
+            mock.patch.object(bench.time, "sleep") as sleep_mock,
+            mock.patch.object(bench.sys, "stderr", io.StringIO()),
+            self.assertRaisesRegex(
+                bench.HarnessError,
+                "build failed for enabled-interpreter: exit 1",
+            ),
+        ):
+            bench.build_variant(
+                repo=ROOT,
+                root=root,
+                mode="interpreter",
+                threads_enabled=True,
+                optimize="ReleaseSafe",
+                target=None,
+                source={"build_source_sha256": "c" * 64},
+                rebuild=True,
+                compiler_toggle=False,
+            )
+        self.assertEqual(run_mock.call_count, 1)
+        sleep_mock.assert_not_called()
+
+    def test_controlled_env_preserves_inherited_zig_global_cache_dir(self) -> None:
+        shared_global = self.scratch / "shared-zig-global-cache"
+        variant_cache = self.scratch / "cache" / "enabled-interpreter"
+        with mock.patch.dict(
+            bench.os.environ,
+            {"ZIG_GLOBAL_CACHE_DIR": str(shared_global)},
+            clear=False,
+        ):
+            env = bench.controlled_env(variant_cache)
+        self.assertEqual(env["ZIG_GLOBAL_CACHE_DIR"], str(shared_global))
+        self.assertEqual(
+            env["ZIG_LOCAL_CACHE_DIR"], str(variant_cache / "local")
+        )
+        self.assertEqual(env["TMPDIR"], str(variant_cache / "tmp"))
+        self.assertTrue(shared_global.is_dir())
+
+        with mock.patch.dict(
+            bench.os.environ,
+            {"ZIG_GLOBAL_CACHE_DIR": ""},
+            clear=False,
+        ):
+            fallback_env = bench.controlled_env(variant_cache)
+        self.assertEqual(
+            fallback_env["ZIG_GLOBAL_CACHE_DIR"],
+            str(variant_cache.parent / "global"),
+        )
 
     def test_cohort_main_handles_report_schema_errors(self) -> None:
         with mock.patch.object(

@@ -1982,8 +1982,14 @@ class DurationCrossCohortTests(unittest.TestCase):
         self.assertNotIn("mlugg/setup-zig", workflow)
         self.assertNotIn("ziglang.org/download", workflow)
         self.assertIn(
-            "cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e",
+            "cataggar/ghr/actions/install@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9",
             workflow,
+        )
+        self.assertEqual(
+            workflow.count(
+                'rm -rf -- "$ROOT" || { sleep 1; rm -rf -- "$ROOT"; }'
+            ),
+            2,
         )
         self.assertIn("cataggar/zig@v0.17.0", workflow)
         self.assertIn(
