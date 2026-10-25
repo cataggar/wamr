@@ -1226,7 +1226,6 @@ pub fn build(b: *std.Build) void {
         "Run WASI thread lifecycle and rollback tests",
     );
     thread_lifecycle_test_step.dependOn(&run_thread_lifecycle_unit_tests.step);
-    aot_thread_spawn_step.dependOn(&run_thread_lifecycle_unit_tests.step);
 
     const windows_poll_unit_tests = b.addTest(.{
         .root_module = test_module,
@@ -1295,6 +1294,18 @@ pub fn build(b: *std.Build) void {
         "python3",
         "tests/test_compare_hot_function.py",
     });
+    const test_jit_step = b.step(
+        "test-jit",
+        "Run in-process JIT unit, smoke, and regression tests",
+    );
+    test_jit_step.dependOn(&run_exe_unit_tests.step);
+
+    const test_lazy_jit_step = b.step(
+        "test-lazy-jit",
+        "Run lazy-JIT unit, smoke, and regression tests",
+    );
+    test_lazy_jit_step.dependOn(&run_exe_unit_tests.step);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(minimal_wasi_test_step);
     test_step.dependOn(&run_lib_unit_tests.step);
@@ -1410,6 +1421,8 @@ pub fn build(b: *std.Build) void {
         jit_hello_smoke.expectExitCode(0);
         jit_hello_smoke.expectStdOutEqual("hello from jit\n");
         test_step.dependOn(&jit_hello_smoke.step);
+        test_jit_step.dependOn(&jit_hello_smoke.step);
+        test_lazy_jit_step.dependOn(&jit_hello_smoke.step);
     }
 
     // #854: in-process JIT smoke test for components. Only meaningful
@@ -1431,6 +1444,8 @@ pub fn build(b: *std.Build) void {
         jit_component_smoke.expectExitCode(0);
         jit_component_smoke.expectStdOutEqual("echo: hello\n");
         test_step.dependOn(&jit_component_smoke.step);
+        test_jit_step.dependOn(&jit_component_smoke.step);
+        test_lazy_jit_step.dependOn(&jit_component_smoke.step);
 
         // #889 follow-up: `expectExitCode`/`expectStdOutEqual` above
         // can't see this — Zig's `DebugAllocator` leak diagnostics print
@@ -1458,6 +1473,7 @@ pub fn build(b: *std.Build) void {
             check_no_leak.addFileArg(captured_stderr);
             check_no_leak.setName("check jit_component_smoke has no DebugAllocator leaks");
             test_step.dependOn(&check_no_leak.step);
+            test_lazy_jit_step.dependOn(&check_no_leak.step);
         }
     }
 
@@ -1489,6 +1505,7 @@ pub fn build(b: *std.Build) void {
         run_http_shutdown.addFileArg(b.path("tests/wasi-testsuite/tests/rust/testsuite/wasm32-wasip3/http-service.wasm"));
         run_http_shutdown.expectExitCode(0);
         test_step.dependOn(&run_http_shutdown.step);
+        test_jit_step.dependOn(&run_http_shutdown.step);
     }
 
     // #760 regression: AOT `wasi:cli/exit.exit` must terminate the host
@@ -1774,6 +1791,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_jit_thread_safety_tests = b.addRunArtifact(jit_thread_safety_tests);
     test_step.dependOn(&run_jit_thread_safety_tests.step);
+    test_jit_step.dependOn(&run_jit_thread_safety_tests.step);
 
     // #860: fast/baseline compile preset correctness + compile-time
     // comparison against the full pipeline (CoreMark fixture).
@@ -1791,6 +1809,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_jit_fast_preset_tests = b.addRunArtifact(jit_fast_preset_tests);
     test_step.dependOn(&run_jit_fast_preset_tests.step);
+    test_jit_step.dependOn(&run_jit_fast_preset_tests.step);
 
     // #862/#890: lazy-JIT design-spike prototype (leaf functions only,
     // x86_64/aarch64). Self-skips via `config.lazy_jit`/arch checks when
@@ -1809,6 +1828,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_lazy_jit_spike_tests = b.addRunArtifact(lazy_jit_spike_tests);
     test_step.dependOn(&run_lazy_jit_spike_tests.step);
+    test_lazy_jit_step.dependOn(&run_lazy_jit_spike_tests.step);
 
     // #625 phase 1: AOT-backed component-core smoke test. Lives in its
     // own test step for the same reason `differential.zig` does:
@@ -1840,6 +1860,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_component_precompile_tests = b.addRunArtifact(component_precompile_tests);
     test_step.dependOn(&run_component_precompile_tests.step);
+    test_lazy_jit_step.dependOn(&run_component_precompile_tests.step);
 
     // #676: wamrc compile-component must recurse into nested
     // sub-components (the dominant shape of `wabt component
@@ -1856,6 +1877,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_component_precompile_nested_tests = b.addRunArtifact(component_precompile_nested_tests);
     test_step.dependOn(&run_component_precompile_nested_tests.step);
+    test_lazy_jit_step.dependOn(&run_component_precompile_nested_tests.step);
 
     // Phase 3: canon.lift dispatches onto AOT cores (#625).
     const component_aot_canonlift_module = b.createModule(.{
@@ -1932,10 +1954,13 @@ pub fn build(b: *std.Build) void {
         .name = "codegen-bench",
         .root_module = bench_module,
     });
-    if (bench_target) b.installArtifact(bench_exe);
 
     const run_bench = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Run codegen benchmarks");
+    if (bench_target) {
+        const install_bench = b.addInstallArtifact(bench_exe, .{});
+        bench_step.dependOn(&install_bench.step);
+    }
     bench_step.dependOn(&run_bench.step);
 
     // ── Fuzz harnesses ────────────────────────────────────────────────
@@ -1968,7 +1993,6 @@ pub fn build(b: *std.Build) void {
         .name = "coremark-aot-runner",
         .root_module = coremark_module,
     });
-    if (aot_executable_target) b.installArtifact(coremark_exe);
 
     const run_coremark_nofp = b.addRunArtifact(coremark_exe);
     run_coremark_nofp.addArg("tests/benchmarks/coremark/coremark_wasi_nofp.wasm");
@@ -1978,6 +2002,10 @@ pub fn build(b: *std.Build) void {
         "coremark-aot",
         "Run the CoreMark wasi benchmarks through the Zig AOT backend",
     );
+    if (aot_executable_target) {
+        const install_coremark = b.addInstallArtifact(coremark_exe, .{});
+        coremark_step.dependOn(&install_coremark.step);
+    }
     coremark_step.dependOn(&run_coremark_nofp.step);
     coremark_step.dependOn(&run_coremark_fp.step);
 
@@ -1997,7 +2025,6 @@ pub fn build(b: *std.Build) void {
         .name = "coremark-profile-runner",
         .root_module = coremark_profile_module,
     });
-    if (aot_executable_target) b.installArtifact(coremark_profile_exe);
 
     const run_coremark_profile = b.addRunArtifact(coremark_profile_exe);
     run_coremark_profile.addArg("tests/benchmarks/coremark/coremark_wasi_nofp.wasm");
@@ -2005,6 +2032,10 @@ pub fn build(b: *std.Build) void {
         "coremark-profile",
         "Sampling-profile the CoreMark AOT and dump top-3 hot-function disassembly",
     );
+    if (aot_executable_target) {
+        const install_coremark_profile = b.addInstallArtifact(coremark_profile_exe, .{});
+        coremark_profile_step.dependOn(&install_coremark_profile.step);
+    }
     coremark_profile_step.dependOn(&run_coremark_profile.step);
 
     // ── SIMD benchmark runner ───────────────────────────────────────────
@@ -2014,7 +2045,7 @@ pub fn build(b: *std.Build) void {
     const simd_bench_module = b.createModule(.{
         .root_source_file = b.path("src/tests/simd_bench_runner.zig"),
         .target = target,
-        .optimize = .fast,
+        .optimize = if (optimize == .debug) .debug else .fast,
     });
     simd_bench_module.addImport("wamr", lib_module);
 
@@ -2051,11 +2082,12 @@ pub fn build(b: *std.Build) void {
         .name = "wasi-streams-bench",
         .root_module = wasi_streams_bench_module,
     });
-    b.installArtifact(wasi_streams_bench_exe);
     const wasi_streams_bench_step = b.step(
         "wasi-streams-bench",
         "Run the wasi:streams zero-copy microbench (#583 B2)",
     );
+    const install_wasi_streams_bench = b.addInstallArtifact(wasi_streams_bench_exe, .{});
+    wasi_streams_bench_step.dependOn(&install_wasi_streams_bench.step);
     const run_wasi_streams_bench = b.addRunArtifact(wasi_streams_bench_exe);
     run_wasi_streams_bench.addPassthruArgs();
     wasi_streams_bench_step.dependOn(&run_wasi_streams_bench.step);
@@ -2080,11 +2112,12 @@ pub fn build(b: *std.Build) void {
         .name = "wasi-microbench",
         .root_module = wasi_microbench_module,
     });
-    b.installArtifact(wasi_microbench_exe);
     const wasi_microbench_step = b.step(
         "wasi-microbench",
         "Run the WASI host-path microbench + regression check (#583 W11-6)",
     );
+    const install_wasi_microbench = b.addInstallArtifact(wasi_microbench_exe, .{});
+    wasi_microbench_step.dependOn(&install_wasi_microbench.step);
     const run_wasi_microbench = b.addRunArtifact(wasi_microbench_exe);
     run_wasi_microbench.addPassthruArgs();
     wasi_microbench_step.dependOn(&run_wasi_microbench.step);

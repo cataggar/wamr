@@ -217,11 +217,11 @@ jobs:
         run: |
           pip install --user -r tests/wasi-testsuite/test-runner/requirements.txt
 
-      - name: Build wamr (Debug)
-        run: zig build
+      - name: Build wamr (ReleaseSafe)
+        run: zig build -Doptimize=safe
 
       - name: Run wasi-testsuite conformance suite
-        run: zig build wasi-testsuite
+        run: zig build wasi-testsuite -Doptimize=safe
 
   component-examples:
     name: Build & Test (component-examples)
@@ -432,11 +432,12 @@ jobs:
           objdump -i | grep -F aarch64 >/dev/null
 
       - name: Unit tests (Debug, includes #853/#854 JIT smoke tests)
-        # Run the full unit suite in Debug; the native Linux matrix also
-        # covers SIMD NaN conformance in ReleaseSafe. The build below reinstalls
-        # `zig-out/bin/wamr`/`wamrc` before the conformance steps run, so
-        # this doesn't leave a stale Debug binary behind for them.
-        run: zig build test -Djit=true
+        # Run the JIT-specific unit, smoke, and regression suite in Debug;
+        # the full non-JIT unit suite already runs in `build-and-test`.
+        # The build below reinstalls `zig-out/bin/wamr`/`wamrc` before the
+        # conformance steps run, so this doesn't leave a stale Debug binary
+        # behind for them.
+        run: zig build test-jit -Djit=true
 
       - name: Build wamr (ReleaseSafe, -Djit=true)
         # ReleaseSafe for the same reason as `wasi-p3-testsuite` above;
@@ -494,7 +495,7 @@ jobs:
           objdump -i | grep -F aarch64 >/dev/null
 
       - name: Lazy-JIT unit and regression tests
-        run: zig build test -Djit=true -Dlazy_jit=true
+        run: zig build test-lazy-jit -Djit=true -Dlazy_jit=true
 
   component-examples-wasmtime:
     name: Build & Test (component-examples-wasmtime)
