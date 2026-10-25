@@ -332,9 +332,10 @@ pub fn LoadForwardingDomWalk(comptime Visitor: type) type {
         ) !bool {
             if (func.blocks.items.len == 0) return false;
 
+            const cfg_cache = analysis.currentCfgAnalysisCache();
             var owned_dom: ?analysis.DomTree = null;
             defer if (owned_dom) |*dom| dom.deinit();
-            const dom: *const analysis.DomTree = if (analysis.currentCfgAnalysisCache()) |cache|
+            const dom: *const analysis.DomTree = if (cfg_cache) |cache|
                 try cache.getDominators(func)
             else blk: {
                 owned_dom = try analysis.computeDominators(func, allocator);
@@ -358,10 +359,22 @@ pub fn LoadForwardingDomWalk(comptime Visitor: type) type {
             // the gap by verifying, at each forward, that no effecting block
             // lies on any CFG path between the value's defining block and the
             // use block (loop back-edges included).
-            var successors = try analysis.buildSuccessors(func, allocator);
-            defer analysis.freeBlockIdMap(&successors, allocator);
-            var predecessors = try analysis.buildPredecessors(func, allocator);
-            defer analysis.freeBlockIdMap(&predecessors, allocator);
+            var owned_successors: ?std.AutoHashMap(ir.BlockId, []const ir.BlockId) = null;
+            defer if (owned_successors) |*succs| analysis.freeBlockIdMap(succs, allocator);
+            const successors: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId) = if (cfg_cache) |cache|
+                try cache.getSuccessors(func)
+            else blk: {
+                owned_successors = try analysis.buildSuccessors(func, allocator);
+                break :blk &owned_successors.?;
+            };
+            var owned_predecessors: ?std.AutoHashMap(ir.BlockId, []const ir.BlockId) = null;
+            defer if (owned_predecessors) |*preds| analysis.freeBlockIdMap(preds, allocator);
+            const predecessors: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId) = if (cfg_cache) |cache|
+                try cache.getPredecessors(func)
+            else blk: {
+                owned_predecessors = try analysis.buildPredecessors(func, allocator);
+                break :blk &owned_predecessors.?;
+            };
 
             const nblk = func.blocks.items.len;
             const effect_blocks = try allocator.alloc(bool, nblk);
@@ -461,8 +474,8 @@ pub fn LoadForwardingDomWalk(comptime Visitor: type) type {
                                     break :blk !(try loadForwardCrossesEffect(
                                         a_block,
                                         bid,
-                                        &successors,
-                                        &predecessors,
+                                        successors,
+                                        predecessors,
                                         effect_blocks,
                                         fwd_stamp,
                                         bwd_stamp,
@@ -4473,11 +4486,14 @@ pub fn hoistLoopInvariantCode(func: *ir.IrFunction, allocator: std.mem.Allocator
     defer lf.deinit();
     if (lf.loops.len == 0) return false;
 
-    var predecessors = if (cfg_cache) |cache|
-        try analysis.cloneBlockIdMap(try cache.getPredecessors(func), allocator)
-    else
-        try analysis.buildPredecessors(func, allocator);
-    defer analysis.freeBlockIdMap(&predecessors, allocator);
+    var owned_predecessors: ?std.AutoHashMap(ir.BlockId, []const ir.BlockId) = null;
+    defer if (owned_predecessors) |*preds| analysis.freeBlockIdMap(preds, allocator);
+    const predecessors: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId) = if (cfg_cache) |cache|
+        try cache.getPredecessors(func)
+    else blk: {
+        owned_predecessors = try analysis.buildPredecessors(func, allocator);
+        break :blk &owned_predecessors.?;
+    };
 
     var def_block = std.AutoHashMap(ir.VReg, ir.BlockId).init(allocator);
     defer def_block.deinit();
@@ -4625,7 +4641,7 @@ pub fn hoistLoopInvariantCode(func: *ir.IrFunction, allocator: std.mem.Allocator
                     // header has no predecessor outside the loop, so nothing
                     // here can be hoisted — abandon this loop's hoisting.
                     if (!ph_resolved) {
-                        ph_opt = try obtainLoopPreheader(func, loop, &predecessors, dom, allocator);
+                        ph_opt = try obtainLoopPreheader(func, loop, predecessors, &owned_predecessors, dom, allocator);
                         ph_resolved = true;
                         if (ph_opt == null) break :hoist_loop;
                         // Synthesis may append a block and reallocate
@@ -4655,11 +4671,14 @@ pub fn hoistLoopInvariantCode(func: *ir.IrFunction, allocator: std.mem.Allocator
 fn obtainLoopPreheader(
     func: *ir.IrFunction,
     loop: *const analysis.Loop,
-    predecessors: *std.AutoHashMap(ir.BlockId, []const ir.BlockId),
+    predecessors: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId),
+    owned_predecessors: *?std.AutoHashMap(ir.BlockId, []const ir.BlockId),
     dom: *const analysis.DomTree,
     allocator: std.mem.Allocator,
 ) !?ir.BlockId {
-    const header_preds = predecessors.get(loop.header) orelse return null;
+    const active_preds: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId) =
+        if (owned_predecessors.*) |*owned| owned else predecessors;
+    const header_preds = active_preds.get(loop.header) orelse return null;
 
     var unique_non_loop_pred: ?ir.BlockId = null;
     var multiple_non_loop = false;
@@ -4691,7 +4710,12 @@ fn obtainLoopPreheader(
         }
     }
 
-    return try synthesizeLoopPreheader(func, loop, header_preds, predecessors, allocator);
+    if (owned_predecessors.* == null) {
+        owned_predecessors.* = try analysis.cloneBlockIdMap(predecessors, allocator);
+    }
+    const mutable_preds = &owned_predecessors.*.?;
+    const mutable_header_preds = mutable_preds.get(loop.header) orelse return null;
+    return try synthesizeLoopPreheader(func, loop, mutable_header_preds, mutable_preds, allocator);
 }
 
 /// True iff `bid` is an exiting block of `loop`: its terminator has
@@ -4957,18 +4981,28 @@ fn invariantAddressBase(
 pub fn inductionVariableSimplification(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
     if (func.blocks.items.len == 0) return false;
 
-    var dom = try analysis.computeDominators(func, allocator);
-    defer dom.deinit();
-    var lf = try analysis.computeLoops(func, &dom, allocator);
+    const cfg_cache = analysis.currentCfgAnalysisCache();
+    var owned_dom: ?analysis.DomTree = null;
+    defer if (owned_dom) |*dom| dom.deinit();
+    const dom: *const analysis.DomTree = if (cfg_cache) |cache|
+        try cache.getDominators(func)
+    else blk: {
+        owned_dom = try analysis.computeDominators(func, allocator);
+        break :blk &owned_dom.?;
+    };
+
+    var lf = try analysis.computeLoopsCached(func, dom, allocator, cfg_cache);
     defer lf.deinit();
     if (lf.loops.len == 0) return false;
 
-    var predecessors = try analysis.buildPredecessors(func, allocator);
-    defer {
-        var pit = predecessors.iterator();
-        while (pit.next()) |entry| allocator.free(entry.value_ptr.*);
-        predecessors.deinit();
-    }
+    var owned_predecessors: ?std.AutoHashMap(ir.BlockId, []const ir.BlockId) = null;
+    defer if (owned_predecessors) |*preds| analysis.freeBlockIdMap(preds, allocator);
+    const predecessors: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId) = if (cfg_cache) |cache|
+        try cache.getPredecessors(func)
+    else blk: {
+        owned_predecessors = try analysis.buildPredecessors(func, allocator);
+        break :blk &owned_predecessors.?;
+    };
 
     var changed = false;
     for (lf.loops) |*loop| {
@@ -4993,7 +5027,7 @@ pub fn inductionVariableSimplification(func: *ir.IrFunction, allocator: std.mem.
         var defs = try buildDefSites(func, allocator);
         defer defs.deinit();
 
-        const ph = dedicatedPreheader(func, loop, &predecessors, &dom) orelse continue;
+        const ph = dedicatedPreheader(func, loop, predecessors, dom) orelse continue;
         const ind = findPrimaryInduction(func, loop, ph, &defs) orelse continue;
 
         // The preheader initialiser below sets `p = base`, which is only
@@ -5174,25 +5208,35 @@ fn remapLoopLiveOuts(
 pub fn unrollSmallFixedLoops(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
     if (func.blocks.items.len == 0) return false;
 
-    var dom = try analysis.computeDominators(func, allocator);
-    defer dom.deinit();
-    var lf = try analysis.computeLoops(func, &dom, allocator);
+    const cfg_cache = analysis.currentCfgAnalysisCache();
+    var owned_dom: ?analysis.DomTree = null;
+    defer if (owned_dom) |*dom| dom.deinit();
+    const dom: *const analysis.DomTree = if (cfg_cache) |cache|
+        try cache.getDominators(func)
+    else blk: {
+        owned_dom = try analysis.computeDominators(func, allocator);
+        break :blk &owned_dom.?;
+    };
+
+    var lf = try analysis.computeLoopsCached(func, dom, allocator, cfg_cache);
     defer lf.deinit();
     if (lf.loops.len == 0) return false;
 
-    var predecessors = try analysis.buildPredecessors(func, allocator);
-    defer {
-        var pit = predecessors.iterator();
-        while (pit.next()) |entry| allocator.free(entry.value_ptr.*);
-        predecessors.deinit();
-    }
+    var owned_predecessors: ?std.AutoHashMap(ir.BlockId, []const ir.BlockId) = null;
+    defer if (owned_predecessors) |*preds| analysis.freeBlockIdMap(preds, allocator);
+    const predecessors: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId) = if (cfg_cache) |cache|
+        try cache.getPredecessors(func)
+    else blk: {
+        owned_predecessors = try analysis.buildPredecessors(func, allocator);
+        break :blk &owned_predecessors.?;
+    };
 
     for (lf.loops) |*loop| {
         // Flattening multiple CFG blocks into the preheader would erase their
         // internal control flow. Keep the supported class explicit.
         if (loop.blocks.len != 1) continue;
         if (loopBodySize(func, loop) > 16) continue;
-        const ph = dedicatedPreheader(func, loop, &predecessors, &dom) orelse continue;
+        const ph = dedicatedPreheader(func, loop, predecessors, dom) orelse continue;
         var defs = try buildDefSites(func, allocator);
         defer defs.deinit();
         const ind = findPrimaryInduction(func, loop, ph, &defs) orelse continue;
@@ -5275,6 +5319,7 @@ pub fn unrollSmallFixedLoops(func: *ir.IrFunction, allocator: std.mem.Allocator)
         var dead_loop_block = &func.blocks.items[loop.blocks[0]];
         dead_loop_block.instructions.clearRetainingCapacity();
         try dead_loop_block.append(.{ .op = .@"unreachable" });
+        if (cfg_cache) |cache| cache.invalidate();
         return true;
     }
     return false;
@@ -5319,8 +5364,14 @@ const SegEntry = struct { inst: *ir.Inst, max_end: u64 };
 pub fn elideRedundantBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
     if (func.blocks.items.len == 0) return false;
 
-    var dom = try analysis.computeDominators(func, allocator);
-    defer dom.deinit();
+    var owned_dom: ?analysis.DomTree = null;
+    defer if (owned_dom) |*dom| dom.deinit();
+    const dom: *const analysis.DomTree = if (analysis.currentCfgAnalysisCache()) |cache|
+        try cache.getDominators(func)
+    else blk: {
+        owned_dom = try analysis.computeDominators(func, allocator);
+        break :blk &owned_dom.?;
+    };
 
     const nblocks = func.blocks.items.len;
     var children = try allocator.alloc(std.ArrayList(ir.BlockId), nblocks);
@@ -5549,8 +5600,14 @@ fn patchSegment(seg_first: *std.AutoHashMap(ir.VReg, SegEntry)) bool {
 pub fn foldLoadStoreOffset(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
     if (func.blocks.items.len == 0) return false;
 
-    var dom = try analysis.computeDominators(func, allocator);
-    defer dom.deinit();
+    var owned_dom: ?analysis.DomTree = null;
+    defer if (owned_dom) |*dom| dom.deinit();
+    const dom: *const analysis.DomTree = if (analysis.currentCfgAnalysisCache()) |cache|
+        try cache.getDominators(func)
+    else blk: {
+        owned_dom = try analysis.computeDominators(func, allocator);
+        break :blk &owned_dom.?;
+    };
     if (dom.idom[0] == null) return false;
 
     const nblocks = func.blocks.items.len;
@@ -7369,7 +7426,9 @@ pub fn scrubUnreachableBlocks(func: *ir.IrFunction, allocator: std.mem.Allocator
         try block.instructions.append(block.allocator, .{ .op = .{ .@"unreachable" = {} } });
         changed = true;
     }
-    if (analysis.currentCfgAnalysisCache()) |cache| cache.invalidate();
+    if (changed) {
+        if (analysis.currentCfgAnalysisCache()) |cache| cache.invalidate();
+    }
     return changed;
 }
 
@@ -8767,7 +8826,7 @@ fn runFunctionPassPipeline(
             defer timing_context.deinit();
             break :blk try promoteLocalsToSSA(func, allocator);
         };
-        cfg_cache.invalidate();
+        if (promote_changed) cfg_cache.invalidate();
         if (timing_for_func) {
             maybePrintPassTiming(
                 timing,
@@ -8925,7 +8984,7 @@ fn runFunctionPassPipeline(
                 defer timing_context.deinit();
                 break :blk try pass(func, allocator);
             };
-            if (passMutatesCfg(pass)) cfg_cache.invalidate();
+            if (changed and passMutatesCfg(pass)) cfg_cache.invalidate();
             if (opts.control) |c| try c.function(func);
             if (timing_for_func) {
                 maybePrintPassTiming(
@@ -9006,7 +9065,7 @@ fn runFunctionPassPipeline(
         defer timing_context.deinit();
         break :blk try scrubUnreachableBlocks(func, allocator);
     };
-    cfg_cache.invalidate();
+    if (scrub_changed) cfg_cache.invalidate();
     if (timing_for_func) {
         maybePrintPassTiming(
             timing,
@@ -9249,7 +9308,6 @@ pub const default_passes: []const PassFn = &.{
     &hoistLoopInvariantCode,
     &unrollSmallFixedLoops,
     &@import("forward_redundant_loads.zig").forwardRedundantLoads,
-    @import("forward_redundant_loads.zig").forwardRedundantLoads,
     &@import("forward_redundant_loads_dominator.zig").forwardRedundantLoadsDominator,
     &deadStoreElimination,
     &deadCodeAndLocalSetCleanup,
@@ -9287,7 +9345,6 @@ const x86_64_default_passes: []const PassFn = &.{
     &hoistLoopInvariantCode,
     &unrollSmallFixedLoops,
     &@import("forward_redundant_loads.zig").forwardRedundantLoads,
-    @import("forward_redundant_loads.zig").forwardRedundantLoads,
     &@import("forward_redundant_loads_dominator.zig").forwardRedundantLoadsDominator,
     &deadStoreElimination,
     &foldCompoundLea,
@@ -9298,56 +9355,168 @@ const x86_64_default_passes: []const PassFn = &.{
 };
 
 const default_passes_no_iv: []const PassFn = &.{
-    &forwardLocalGet,                  &constantFold,               &algebraicSimplify,     &strengthReduceMul,
-    &strengthReduceMulShiftAdd,        &strengthReduceDivRem,       &foldConstantBranches,  &foldInverseCompareEqz,
-    &threadChainedConditionalBranches, &tailDuplicateSmallJoins,    &foldSelectOnEqz,       &foldSignExtendingLoad,
-    &foldFloatUnaryIdempotents,        &foldWrapOfExtend,           &globalValueNumbering,  &hoistLoopInvariantCode,
-    &unrollSmallFixedLoops,            &deadCodeAndLocalSetCleanup, &hoistLoopBoundsChecks, &elideRedundantBoundsChecks,
+    &forwardLocalGet,
+    &constantFold,
+    &algebraicSimplify,
+    &strengthReduceMul,
+    &strengthReduceMulShiftAdd,
+    &strengthReduceDivRem,
+    &foldConstantBranches,
+    &foldInverseCompareEqz,
+    &threadChainedConditionalBranches,
+    &tailDuplicateSmallJoins,
+    &foldSelectOnEqz,
+    &foldSignExtendingLoad,
+    &foldFloatUnaryIdempotents,
+    &foldWrapOfExtend,
+    &globalValueNumbering,
+    &hoistLoopInvariantCode,
+    &unrollSmallFixedLoops,
+    &@import("forward_redundant_loads.zig").forwardRedundantLoads,
+    &@import("forward_redundant_loads_dominator.zig").forwardRedundantLoadsDominator,
+    &deadStoreElimination,
+    &deadCodeAndLocalSetCleanup,
+    &hoistLoopBoundsChecks,
+    &elideRedundantBoundsChecks,
     &foldLoadStoreOffset,
 };
 
 const default_passes_no_unroll: []const PassFn = &.{
-    &forwardLocalGet,                  &constantFold,               &algebraicSimplify,     &strengthReduceMul,
-    &strengthReduceMulShiftAdd,        &strengthReduceDivRem,       &foldConstantBranches,  &foldInverseCompareEqz,
-    &threadChainedConditionalBranches, &tailDuplicateSmallJoins,    &foldSelectOnEqz,       &foldSignExtendingLoad,
-    &foldFloatUnaryIdempotents,        &foldWrapOfExtend,           &globalValueNumbering,  &inductionVariableSimplification,
-    &hoistLoopInvariantCode,           &deadCodeAndLocalSetCleanup, &hoistLoopBoundsChecks, &elideRedundantBoundsChecks,
+    &forwardLocalGet,
+    &constantFold,
+    &algebraicSimplify,
+    &strengthReduceMul,
+    &strengthReduceMulShiftAdd,
+    &strengthReduceDivRem,
+    &foldConstantBranches,
+    &foldInverseCompareEqz,
+    &threadChainedConditionalBranches,
+    &tailDuplicateSmallJoins,
+    &foldSelectOnEqz,
+    &foldSignExtendingLoad,
+    &foldFloatUnaryIdempotents,
+    &foldWrapOfExtend,
+    &globalValueNumbering,
+    &inductionVariableSimplification,
+    &hoistLoopInvariantCode,
+    &@import("forward_redundant_loads.zig").forwardRedundantLoads,
+    &@import("forward_redundant_loads_dominator.zig").forwardRedundantLoadsDominator,
+    &deadStoreElimination,
+    &deadCodeAndLocalSetCleanup,
+    &hoistLoopBoundsChecks,
+    &elideRedundantBoundsChecks,
     &foldLoadStoreOffset,
 };
 
 const default_passes_no_iv_no_unroll: []const PassFn = &.{
-    &forwardLocalGet,                  &constantFold,            &algebraicSimplify,          &strengthReduceMul,
-    &strengthReduceMulShiftAdd,        &strengthReduceDivRem,    &foldConstantBranches,       &foldInverseCompareEqz,
-    &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,            &foldSignExtendingLoad,
-    &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,       &hoistLoopInvariantCode,
-    &deadCodeAndLocalSetCleanup,       &hoistLoopBoundsChecks,   &elideRedundantBoundsChecks, &foldLoadStoreOffset,
+    &forwardLocalGet,
+    &constantFold,
+    &algebraicSimplify,
+    &strengthReduceMul,
+    &strengthReduceMulShiftAdd,
+    &strengthReduceDivRem,
+    &foldConstantBranches,
+    &foldInverseCompareEqz,
+    &threadChainedConditionalBranches,
+    &tailDuplicateSmallJoins,
+    &foldSelectOnEqz,
+    &foldSignExtendingLoad,
+    &foldFloatUnaryIdempotents,
+    &foldWrapOfExtend,
+    &globalValueNumbering,
+    &hoistLoopInvariantCode,
+    &@import("forward_redundant_loads.zig").forwardRedundantLoads,
+    &@import("forward_redundant_loads_dominator.zig").forwardRedundantLoadsDominator,
+    &deadStoreElimination,
+    &deadCodeAndLocalSetCleanup,
+    &hoistLoopBoundsChecks,
+    &elideRedundantBoundsChecks,
+    &foldLoadStoreOffset,
 };
 
 const x86_64_default_passes_no_iv: []const PassFn = &.{
-    &forwardLocalGet,           &constantFold,                     &algebraicSimplify,       &strengthReduceMul,
-    &strengthReduceMulShiftAdd, &strengthReduceDivRem,             &foldConstantBranches,    &foldInverseCompareEqz,
-    &foldBranchOnEqz,           &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,
-    &foldSignExtendingLoad,     &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,
-    &hoistLoopInvariantCode,    &unrollSmallFixedLoops,            &foldCompoundLea,         &deadCodeAndLocalSetCleanup,
-    &hoistLoopBoundsChecks,     &elideRedundantBoundsChecks,       &foldLoadStoreOffset,
+    &forwardLocalGet,
+    &constantFold,
+    &algebraicSimplify,
+    &strengthReduceMul,
+    &strengthReduceMulShiftAdd,
+    &strengthReduceDivRem,
+    &foldConstantBranches,
+    &foldInverseCompareEqz,
+    &foldBranchOnEqz,
+    &threadChainedConditionalBranches,
+    &tailDuplicateSmallJoins,
+    &foldSelectOnEqz,
+    &foldSignExtendingLoad,
+    &foldFloatUnaryIdempotents,
+    &foldWrapOfExtend,
+    &globalValueNumbering,
+    &hoistLoopInvariantCode,
+    &unrollSmallFixedLoops,
+    &@import("forward_redundant_loads.zig").forwardRedundantLoads,
+    &@import("forward_redundant_loads_dominator.zig").forwardRedundantLoadsDominator,
+    &deadStoreElimination,
+    &foldCompoundLea,
+    &deadCodeAndLocalSetCleanup,
+    &hoistLoopBoundsChecks,
+    &elideRedundantBoundsChecks,
+    &foldLoadStoreOffset,
 };
 
 const x86_64_default_passes_no_unroll: []const PassFn = &.{
-    &forwardLocalGet,                 &constantFold,                     &algebraicSimplify,       &strengthReduceMul,
-    &strengthReduceMulShiftAdd,       &strengthReduceDivRem,             &foldConstantBranches,    &foldInverseCompareEqz,
-    &foldBranchOnEqz,                 &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,
-    &foldSignExtendingLoad,           &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,
-    &inductionVariableSimplification, &hoistLoopInvariantCode,           &foldCompoundLea,         &deadCodeAndLocalSetCleanup,
-    &hoistLoopBoundsChecks,           &elideRedundantBoundsChecks,       &foldLoadStoreOffset,
+    &forwardLocalGet,
+    &constantFold,
+    &algebraicSimplify,
+    &strengthReduceMul,
+    &strengthReduceMulShiftAdd,
+    &strengthReduceDivRem,
+    &foldConstantBranches,
+    &foldInverseCompareEqz,
+    &foldBranchOnEqz,
+    &threadChainedConditionalBranches,
+    &tailDuplicateSmallJoins,
+    &foldSelectOnEqz,
+    &foldSignExtendingLoad,
+    &foldFloatUnaryIdempotents,
+    &foldWrapOfExtend,
+    &globalValueNumbering,
+    &hoistLoopInvariantCode,
+    &@import("forward_redundant_loads.zig").forwardRedundantLoads,
+    &@import("forward_redundant_loads_dominator.zig").forwardRedundantLoadsDominator,
+    &deadStoreElimination,
+    &foldCompoundLea,
+    &deadCodeAndLocalSetCleanup,
+    &hoistLoopBoundsChecks,
+    &elideRedundantBoundsChecks,
+    &foldLoadStoreOffset,
 };
 
 const x86_64_default_passes_no_iv_no_unroll: []const PassFn = &.{
-    &forwardLocalGet,            &constantFold,                     &algebraicSimplify,          &strengthReduceMul,
-    &strengthReduceMulShiftAdd,  &strengthReduceDivRem,             &foldConstantBranches,       &foldInverseCompareEqz,
-    &foldBranchOnEqz,            &threadChainedConditionalBranches, &tailDuplicateSmallJoins,    &foldSelectOnEqz,
-    &foldSignExtendingLoad,      &foldFloatUnaryIdempotents,        &foldWrapOfExtend,           &globalValueNumbering,
-    &hoistLoopInvariantCode,     &foldCompoundLea,                  &deadCodeAndLocalSetCleanup, &hoistLoopBoundsChecks,
-    &elideRedundantBoundsChecks, &foldLoadStoreOffset,
+    &forwardLocalGet,
+    &constantFold,
+    &algebraicSimplify,
+    &strengthReduceMul,
+    &strengthReduceMulShiftAdd,
+    &strengthReduceDivRem,
+    &foldConstantBranches,
+    &foldInverseCompareEqz,
+    &foldBranchOnEqz,
+    &threadChainedConditionalBranches,
+    &tailDuplicateSmallJoins,
+    &foldSelectOnEqz,
+    &foldSignExtendingLoad,
+    &foldFloatUnaryIdempotents,
+    &foldWrapOfExtend,
+    &globalValueNumbering,
+    &hoistLoopInvariantCode,
+    &@import("forward_redundant_loads.zig").forwardRedundantLoads,
+    &@import("forward_redundant_loads_dominator.zig").forwardRedundantLoadsDominator,
+    &deadStoreElimination,
+    &foldCompoundLea,
+    &deadCodeAndLocalSetCleanup,
+    &hoistLoopBoundsChecks,
+    &elideRedundantBoundsChecks,
+    &foldLoadStoreOffset,
 };
 
 pub fn defaultPassesForTarget(target: TargetArch) []const PassFn {
@@ -15377,6 +15546,77 @@ test "every default pipeline keeps DCE enabled (#116/#834)" {
             try std.testing.expect(pipelineContains(pipeline, &deadCodeAndLocalSetCleanup));
         }
     }
+}
+
+test "defaultPassesForTargetWithOptions: option toggles only remove intended passes and preserve load-forwarding/DSE" {
+    const fwd_loads: PassFn = &@import("forward_redundant_loads.zig").forwardRedundantLoads;
+    const fwd_loads_dom: PassFn = &@import("forward_redundant_loads_dominator.zig").forwardRedundantLoadsDominator;
+    const targets = [_]TargetArch{ .x86_64, .aarch64 };
+    const option_variants = [_]CompileOptions{
+        .{ .enable_iv_simplify = true, .enable_loop_unroll = true },
+        .{ .enable_iv_simplify = true, .enable_loop_unroll = false },
+        .{ .enable_iv_simplify = false, .enable_loop_unroll = true },
+        .{ .enable_iv_simplify = false, .enable_loop_unroll = false },
+    };
+    for (targets) |target| {
+        const base = defaultPassesForTarget(target);
+        for (option_variants) |options| {
+            const pipeline = defaultPassesForTargetWithOptions(target, options);
+            try std.testing.expect(pipelineContains(pipeline, fwd_loads));
+            try std.testing.expect(pipelineContains(pipeline, fwd_loads_dom));
+            try std.testing.expect(pipelineContains(pipeline, &deadStoreElimination));
+
+            // No duplicate pass registrations in any pipeline variant.
+            for (pipeline, 0..) |pass_a, i| {
+                for (pipeline[i + 1 ..]) |pass_b| {
+                    try std.testing.expect(pass_a != pass_b);
+                }
+            }
+
+            // Pipeline must match `defaultPassesForTarget(target)` minus
+            // disabled loop passes in exact order.
+            var expected_idx: usize = 0;
+            for (base) |base_pass| {
+                if (!options.enable_iv_simplify and base_pass == &inductionVariableSimplification) continue;
+                if (!options.enable_loop_unroll and base_pass == &unrollSmallFixedLoops) continue;
+                try std.testing.expect(expected_idx < pipeline.len);
+                try std.testing.expectEqual(base_pass, pipeline[expected_idx]);
+                expected_idx += 1;
+            }
+            try std.testing.expectEqual(expected_idx, pipeline.len);
+        }
+    }
+}
+
+test "loop passes reuse CfgAnalysisCache without dirtying on no-op" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_c = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_c, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_c, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    var cfg_cache = analysis.CfgAnalysisCache.init(allocator);
+    defer cfg_cache.deinit();
+    var scope = analysis.pushCfgAnalysisCache(&cfg_cache);
+    defer scope.deinit();
+
+    const dom_before = try cfg_cache.getDominators(&func);
+    const preds_before = try cfg_cache.getPredecessors(&func);
+    try std.testing.expect(!cfg_cache.dirty);
+
+    try std.testing.expect(!(try inductionVariableSimplification(&func, allocator)));
+    try std.testing.expect(!(try unrollSmallFixedLoops(&func, allocator)));
+    try std.testing.expect(!(try scrubUnreachableBlocks(&func, allocator)));
+    try std.testing.expect(!cfg_cache.dirty);
+    try std.testing.expectEqual(dom_before, try cfg_cache.getDominators(&func));
+    try std.testing.expectEqual(preds_before, try cfg_cache.getPredecessors(&func));
 }
 
 test "threadChainedConditionalBranches: true edge jumps to inner true target" {
