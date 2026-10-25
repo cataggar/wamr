@@ -2255,6 +2255,61 @@ Correct operation validated. See README.md for run and reporting rules.
         with self.assertRaisesRegex(ValueError, "continued"):
             native_benchmark.validate_result(result, self.manifest, run["run_id"])
 
+    def test_closed_coremark_short_crc_profile_validates_and_cannot_masquerade_as_measurement(self):
+        self.assertEqual(native_benchmark.UNIKRAFT_TINY_CORRECTNESS_PROFILE,
+                         "qcow2-derived-vhd")
+        self.assertEqual(native_benchmark.UNIKRAFT_COREMARK_CORRECTNESS_PROFILE,
+                         "coremark-qcow2-derived-vhd")
+        self.assertEqual(native_benchmark.UNIKRAFT_LOCAL_BOOT_MODES, (
+            "raw-x2apic", "raw-legacy-apic",
+            "qcow2-x2apic", "qcow2-legacy-apic",
+            "vpc-x2apic", "vpc-legacy-apic",
+        ))
+        self.assertEqual(native_benchmark.COREMARK_SHORT_CRC_ARGUMENTS,
+                         ["coremark", "0", "0", "0", "100", "0"])
+        for workload, secs, rate, time_format in (
+            ("coremark", "0.005000", "20000.000000", "float-6dp"),
+            ("coremark-nofp", "0", "0", "integer-truncated"),
+        ):
+            with self.subTest(workload=workload):
+                stdout = (
+                    "2K performance run parameters for coremark.\n"
+                    "CoreMark Size    : 666\n"
+                    "Total ticks      : 5\n"
+                    f"Total time (secs): {secs}\n"
+                    f"Iterations/Sec   : {rate}\n"
+                    "ERROR! Must execute for at least 10 secs for a valid result!\n"
+                    "Iterations       : 100\n"
+                    "Compiler version : clang\n"
+                    "Compiler flags   : -O2\n"
+                    "Memory location  : STACK\n"
+                    "seedcrc          : 0xe9f5\n"
+                    "[0]crclist       : 0xe714\n"
+                    "[0]crcmatrix     : 0x1fd7\n"
+                    "[0]crcstate      : 0x8e3a\n"
+                    "[0]crcfinal      : 0x988c\n"
+                    "Errors detected\n"
+                )
+                summary = native_benchmark.validate_coremark_short_crc_output(stdout, workload)
+                self.assertEqual(summary["qualification"], "correctness-only-not-performance")
+                self.assertEqual(summary["profile"], "coremark-qcow2-derived-vhd")
+                self.assertEqual(summary["workload"], workload)
+                self.assertEqual(summary["iterations"], 100)
+                self.assertEqual(summary["time_format"], time_format)
+                self.assertFalse(summary["minimum_timing_met"])
+                self.assertEqual(summary["crc"]["crcfinal"], "988c")
+                with self.assertRaises((ValueError, RuntimeError)):
+                    native_benchmark.coremark_correctness(stdout, 0.005, workload)
+                for bad in (
+                    stdout.replace("0x988c", "0x382f"),
+                    stdout.replace("Iterations       : 100\n", "Iterations       : 400000\n"),
+                    stdout.replace("Errors detected\n", ""),
+                    stdout + "Extra field      : 1\n",
+                    stdout[:-1],
+                ):
+                    with self.assertRaises(ValueError):
+                        native_benchmark.validate_coremark_short_crc_output(bad, workload)
+
 
 @unittest.skipUnless(os.environ.get("WAMR_NATIVE_PRODUCER"),
                      "built Linux embedding producer not supplied")
@@ -2311,11 +2366,78 @@ class NativeLinuxProducerTests(unittest.TestCase):
                     self.assertIsNone(invocation["exit_code"])
                     stdout = native_benchmark.decode_stdout(invocation["stdout_base64"]).decode("ascii")
                     self.assertIn("[0]crcfinal      : 0x988c", stdout)
+                    summary = native_benchmark.validate_coremark_short_crc_output(stdout, workload)
+                    self.assertEqual(summary["qualification"], "correctness-only-not-performance")
+                    self.assertEqual(summary["profile"],
+                                     native_benchmark.UNIKRAFT_COREMARK_CORRECTNESS_PROFILE)
+                    self.assertEqual(summary["crc"]["crcfinal"], "988c")
                     # Small-iteration correctness intentionally fails the timing
                     # qualification; neither zero nor emulated rates are evidence.
                     with self.assertRaises((ValueError, RuntimeError)):
                         native_benchmark.coremark_correctness(
                             stdout, invocation["elapsed_ns"] / 1e9, workload)
+
+    def test_closed_four_workload_fixtures_and_end_to_end_replay_report(self):
+        for workload, (rel_path, expected_wasm_sha256) in native_benchmark.FIXTURES.items():
+            with self.subTest(workload=workload):
+                tracked_wasm = REPO / rel_path
+                self.assertEqual(native_benchmark.sha256_file(tracked_wasm), expected_wasm_sha256)
+                compiled_cwasm = self.fixtures / f"{workload}.cwasm"
+                self.assertTrue(compiled_cwasm.is_file())
+                self.assertGreater(compiled_cwasm.stat().st_size, 0)
+        harness = NativeBenchmarkTests("runTest")
+        harness.setUp()
+        self.addCleanup(harness.doCleanups)
+        harness.use_snapshot_lifecycle()
+        real_records = {workload: self.check(workload) for workload in ("compute", "memory")}
+        short_coremark = {workload: self.check(workload) for workload in ("coremark", "coremark-nofp")}
+        captures = []
+        for run in harness.manifest["schedule"]:
+            workload = run["workload"]
+            out = harness.root / f"e2e-{run['run_id']}"
+            out.mkdir(parents=True, mode=0o700)
+            if workload in ("compute", "memory"):
+                envelope = self.synthetic_envelope(harness, run, real_records[workload])
+                if run["target"] == "unikraft":
+                    envelope["clock"] = {
+                        "source": "unikraft-hyperv-reference-tsc", "unit": "ns",
+                        "ticks_per_second": 1_000_000_000, "resolution_ticks": 100,
+                    }
+                    envelope["memory"]["method"] = "unikraft-ukvmem-page-frame-high-water"
+                    envelope["memory"]["covered_regions"] = ["native-code", "wasm-linear-memory"]
+                    envelope["memory"]["omitted_regions"] = ["allocator", "kernel", "page-tables", "stack"]
+            else:
+                envelope = self.synthetic_envelope(harness, run, short_coremark[workload])
+                with self.assertRaisesRegex(ValueError, "contradicts CoreMark validation"):
+                    native_benchmark.validate_result(envelope, harness.manifest, run["run_id"])
+                envelope["outcome"] = "error"
+            payload = (native_benchmark.PREFIX + json.dumps(envelope, sort_keys=True) + "\n").encode("utf-8")
+            now = datetime.now(timezone.utc).isoformat()
+            native_benchmark.persist_observation(
+                harness.manifest, run["run_id"], out, payload, b"",
+                started_at=now,
+                completed_at=now,
+                observation_seconds=2.0,
+                control_plane_seconds=0.5 if run["target"] == "unikraft" else None,
+            )
+            captures.append(out)
+        report = native_benchmark.build_report(harness.manifest, captures, allow_synthetic=True)
+        self.assertEqual(report["kind"], "wamr-native-matched-comparison")
+        self.assertEqual(report["evidence_kind"], "synthetic")
+        self.assertFalse(report["status"]["paired_measurement_complete"])
+        for target in ("linux", "unikraft"):
+            for workload in ("compute", "memory"):
+                summary = report["summary"][target][workload]
+                self.assertEqual(summary["planned_runs"], 1)
+                self.assertEqual(summary["successful_runs"], 1)
+                self.assertIsNotNone(summary["snapshot_replay_seconds"])
+                self.assertIsNone(summary["steady_state_seconds"])
+                self.assertIsNotNone(summary["reset_seconds"])
+                self.assertIsNotNone(summary["lifecycle_setup_seconds"])
+            for workload in ("coremark", "coremark-nofp"):
+                summary = report["summary"][target][workload]
+                self.assertEqual(summary["planned_runs"], 1)
+                self.assertEqual(summary["successful_runs"], 0)
 
     def test_pinned_compute_memory_real_phases_fit_protocol(self):
         harness = NativeBenchmarkTests("runTest")

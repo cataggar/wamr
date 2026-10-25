@@ -35,6 +35,40 @@ SUPPORTED_UNIKRAFT_NATIVE_SDK_COMMITS = frozenset({
     UNIKRAFT_NATIVE_SDK_COMMIT,
     HISTORICAL_UNIKRAFT_NATIVE_SDK_COMMIT,
 })
+UNIKRAFT_TINY_CORRECTNESS_PROFILE = "qcow2-derived-vhd"
+UNIKRAFT_COREMARK_CORRECTNESS_PROFILE = "coremark-qcow2-derived-vhd"
+UNIKRAFT_LOCAL_BOOT_MODES = (
+    "raw-x2apic",
+    "raw-legacy-apic",
+    "qcow2-x2apic",
+    "qcow2-legacy-apic",
+    "vpc-x2apic",
+    "vpc-legacy-apic",
+)
+COREMARK_SHORT_CRC_ITERATIONS = 100
+COREMARK_SHORT_CRC_ARGUMENTS = ["coremark", "0", "0", "0", "100", "0"]
+COREMARK_SHORT_CRC_REQUIRED_FIELDS = {
+    "Iterations": "100",
+    "seedcrc": "0xe9f5",
+    "[0]crclist": "0xe714",
+    "[0]crcmatrix": "0x1fd7",
+    "[0]crcstate": "0x8e3a",
+    "[0]crcfinal": "0x988c",
+}
+COREMARK_SHORT_CRC_METADATA_FIELDS = frozenset({
+    "CoreMark Size",
+    "Total ticks",
+    "Total time (secs)",
+    "Iterations/Sec",
+    "Compiler version",
+    "Compiler flags",
+    "Memory location",
+})
+COREMARK_SHORT_CRC_MARKERS = frozenset({
+    "2K performance run parameters for coremark.",
+    "ERROR! Must execute for at least 10 secs for a valid result!",
+    "Errors detected",
+})
 PREFIX = "WAMR_BENCH_RESULT="
 COREMARK_TICKS_PER_SECOND = 1000
 FIXTURES = {
@@ -497,6 +531,69 @@ def decode_stdout(encoded):
     require(base64.b64encode(raw).decode("ascii") == encoded,
             "stdout_base64 must use canonical padded base64")
     return raw
+
+
+def validate_coremark_short_crc_output(stdout, workload):
+    require(workload in ("coremark", "coremark-nofp"), "unknown pinned CoreMark variant")
+    require(isinstance(stdout, str) and len(stdout) > 0 and stdout.endswith("\n"),
+            "incomplete short CoreMark output")
+    seen_required = set()
+    seen_metadata = set()
+    seen_markers = set()
+    metadata_values = {}
+    for raw in stdout[:-1].split("\n"):
+        require(all((32 <= ord(ch) <= 126) or ch in ("\t", "\r") for ch in raw),
+                "invalid short CoreMark output characters")
+        without_cr = raw[:-1] if raw.endswith("\r") else raw
+        line = without_cr.strip(" \t")
+        if ":" in line:
+            key, value = (part.strip(" \t") for part in line.split(":", 1))
+            if key in COREMARK_SHORT_CRC_REQUIRED_FIELDS:
+                require(key not in seen_required and
+                        value == COREMARK_SHORT_CRC_REQUIRED_FIELDS[key],
+                        f"invalid or duplicate short CoreMark field: {key}")
+                seen_required.add(key)
+            elif key in COREMARK_SHORT_CRC_METADATA_FIELDS:
+                require(key not in seen_metadata,
+                        f"duplicate short CoreMark metadata field: {key}")
+                seen_metadata.add(key)
+                metadata_values[key] = value
+            else:
+                raise ValueError(f"unknown short CoreMark field: {key}")
+        else:
+            require(line in COREMARK_SHORT_CRC_MARKERS and line not in seen_markers,
+                    f"invalid or duplicate short CoreMark marker: {line}")
+            seen_markers.add(line)
+    require(seen_required == set(COREMARK_SHORT_CRC_REQUIRED_FIELDS) and
+            seen_markers == set(COREMARK_SHORT_CRC_MARKERS),
+            "incomplete short CoreMark fields or markers")
+    nofp = workload == "coremark-nofp"
+    formatted_number = r"\d+" if nofp else r"\d+\.\d{6}"
+    if "Total time (secs)" in metadata_values:
+        require(re.fullmatch(formatted_number, metadata_values["Total time (secs)"]) is not None,
+                "malformed short CoreMark Total time (secs)")
+    if "Iterations/Sec" in metadata_values:
+        require(re.fullmatch(formatted_number, metadata_values["Iterations/Sec"]) is not None,
+                "malformed short CoreMark Iterations/Sec")
+    if "Total ticks" in metadata_values:
+        require(re.fullmatch(r"\d+", metadata_values["Total ticks"]) is not None,
+                "malformed short CoreMark Total ticks")
+    return {
+        "qualification": "correctness-only-not-performance",
+        "profile": UNIKRAFT_COREMARK_CORRECTNESS_PROFILE,
+        "workload": workload,
+        "iterations": COREMARK_SHORT_CRC_ITERATIONS,
+        "crc": {
+            "seedcrc": "e9f5",
+            "crclist": "e714",
+            "crcmatrix": "1fd7",
+            "crcstate": "8e3a",
+            "crcfinal": "988c",
+        },
+        "time_format": "integer-truncated" if nofp else "float-6dp",
+        "minimum_timing_met": False,
+        "compliance": "not-certified",
+    }
 
 
 def coremark_correctness(stdout, invocation_seconds, workload, clock_resolution_seconds=0):
