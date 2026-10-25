@@ -133,6 +133,28 @@ diagnostic-only and has a null production budget. Validation and analysis each
 write matching Markdown beside their JSON output, including the retained file,
 cohort, and policy hashes.
 
+The `wasi-thread-duration-cross-966-v29` campaign completed all 20 workflows and
+40 reports at tagged commit `65e22797998a0b76be9b0336977ed8c9320978d0`
+(cohort `96600000000000000000000000000029`, dispatch SHA-256
+`12d40f1604c76a146b789d2b59a5464878b9d1aa92c8a9ced86496617ba429ab`, manifest
+SHA-256 `79da0abca8f6bddcfff67d52170a3c80d41e317ac57d1d632c4d6b672c913ef1`,
+cohort SHA-256
+`7ccdee70fd4537ab12d0650654a54ebd00c04d8d1c57756a2c4bf243db7e3399`, conclusion
+SHA-256 `70dbdec6db85c192e9658fde80ef3314bdd1a817d346459e3d77fb583d05bc65`) with
+zero retries or replacements on homogeneous `AMD EPYC 7763 64-Core Processor`
+and `Neoverse-N2` runners. Moving `ubuntu-22.04-x86_64` to isolated hosted VMs
+resolved 17 of the 19 implicated x86 checks on both the current and doubled
+duration arms (`already-within-ceiling`, `0.0048–0.0653`), while the remaining
+failures (`x86 runtime/hot/1 interpreter`, `x86 runtime/wait-notify/1 aot`, and
+`Arm runtime/atomic/{2,4,8}`) were classified as `non-duration-dominated`.
+Remediation addresses those three runtime mechanisms directly without changing
+measurement-plan v20 durations: `ParkingLot` unlocks `bucket.mutex` before OS
+futex wakeups and avoids empty-wake syscall spinning (`wait-notify`), the
+interpreter `dispatchLoopWithFuel` frame and hot bytecode/stack helpers are
+inlined and shrunk (`hot`), and `ThreadManager` pins generation-1 Linux worker
+slots deterministically across the process's allowed CPU set (`atomic`,
+`wait-notify`, and `hot`).
+
 ## Workloads
 
 `threaded.wasm` is a real wasi-libc pthread program. It is built with the

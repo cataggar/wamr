@@ -259,42 +259,47 @@ pub const ExecEnv = struct {
     // -- Stack operations --
 
     /// Push a value onto the operand stack.
-    pub fn push(self: *ExecEnv, val: types.Value) !void {
+    pub inline fn push(self: *ExecEnv, val: types.Value) !void {
         if (self.sp >= self.operand_stack.len) return error.StackOverflow;
         self.operand_stack[self.sp] = val;
         self.sp += 1;
     }
 
     /// Pop a value from the operand stack.
-    pub fn pop(self: *ExecEnv) !types.Value {
+    pub inline fn pop(self: *ExecEnv) !types.Value {
         if (self.sp == 0) return error.StackUnderflow;
         self.sp -= 1;
         return self.operand_stack[self.sp];
     }
 
     /// Peek at the top value without popping.
-    pub fn peek(self: *const ExecEnv) !types.Value {
+    pub inline fn peek(self: *const ExecEnv) !types.Value {
         if (self.sp == 0) return error.StackUnderflow;
         return self.operand_stack[self.sp - 1];
     }
 
     /// Push typed values
-    pub fn pushI32(self: *ExecEnv, val: i32) !void {
+    pub inline fn pushI32(self: *ExecEnv, val: i32) !void {
         try self.push(.{ .i32 = val });
     }
-    pub fn pushI64(self: *ExecEnv, val: i64) !void {
+    pub inline fn pushI64(self: *ExecEnv, val: i64) !void {
         try self.push(.{ .i64 = val });
     }
-    pub fn pushF32(self: *ExecEnv, val: f32) !void {
+    pub inline fn pushF32(self: *ExecEnv, val: f32) !void {
         try self.push(.{ .f32 = val });
     }
-    pub fn pushF64(self: *ExecEnv, val: f64) !void {
+    pub inline fn pushF64(self: *ExecEnv, val: f64) !void {
         try self.push(.{ .f64 = val });
     }
 
     /// Pop typed values
-    pub fn popI32(self: *ExecEnv) !i32 {
+    pub inline fn popI32(self: *ExecEnv) !i32 {
         const v = try self.pop();
+        if (v == .i32) return v.i32;
+        return popI32Slow(v);
+    }
+    fn popI32Slow(v: types.Value) i32 {
+        @branchHint(.cold);
         return switch (v) {
             .i32 => |i| i,
             .f32 => |f| @bitCast(f),
@@ -305,8 +310,13 @@ pub const ExecEnv = struct {
             else => 0,
         };
     }
-    pub fn popI64(self: *ExecEnv) !i64 {
+    pub inline fn popI64(self: *ExecEnv) !i64 {
         const v = try self.pop();
+        if (v == .i64) return v.i64;
+        return popI64Slow(v);
+    }
+    fn popI64Slow(v: types.Value) i64 {
+        @branchHint(.cold);
         return switch (v) {
             .i64 => |i| i,
             .f64 => |f| @bitCast(f),
@@ -315,8 +325,13 @@ pub const ExecEnv = struct {
             else => 0,
         };
     }
-    pub fn popF32(self: *ExecEnv) !f32 {
+    pub inline fn popF32(self: *ExecEnv) !f32 {
         const v = try self.pop();
+        if (v == .f32) return v.f32;
+        return popF32Slow(v);
+    }
+    fn popF32Slow(v: types.Value) f32 {
+        @branchHint(.cold);
         return switch (v) {
             .f32 => |f| f,
             .i32 => |i| @bitCast(i),
@@ -325,8 +340,13 @@ pub const ExecEnv = struct {
             else => 0.0,
         };
     }
-    pub fn popF64(self: *ExecEnv) !f64 {
+    pub inline fn popF64(self: *ExecEnv) !f64 {
         const v = try self.pop();
+        if (v == .f64) return v.f64;
+        return popF64Slow(v);
+    }
+    fn popF64Slow(v: types.Value) f64 {
+        @branchHint(.cold);
         return switch (v) {
             .f64 => |f| f,
             .i64 => |i| @bitCast(i),
@@ -354,13 +374,13 @@ pub const ExecEnv = struct {
     }
 
     /// Get the current (top) call frame.
-    pub fn currentFrame(self: *const ExecEnv) ?*const CallFrame {
+    pub inline fn currentFrame(self: *const ExecEnv) ?*const CallFrame {
         if (self.call_depth == 0) return null;
         return &self.call_stack[self.call_depth - 1];
     }
 
     /// Get a mutable reference to the current call frame.
-    pub fn currentFrameMut(self: *ExecEnv) ?*CallFrame {
+    pub inline fn currentFrameMut(self: *ExecEnv) ?*CallFrame {
         if (self.call_depth == 0) return null;
         return &self.call_stack[self.call_depth - 1];
     }
@@ -368,7 +388,7 @@ pub const ExecEnv = struct {
     // -- Local variable access --
 
     /// Get a local variable value.
-    pub fn getLocal(self: *const ExecEnv, frame: *const CallFrame, idx: u32) !types.Value {
+    pub inline fn getLocal(self: *const ExecEnv, frame: *const CallFrame, idx: u32) !types.Value {
         if (idx >= frame.local_count) return error.StackOverflow;
         const abs = frame.stack_base + idx;
         if (abs >= self.operand_stack.len) return error.StackOverflow;
@@ -376,7 +396,7 @@ pub const ExecEnv = struct {
     }
 
     /// Set a local variable value.
-    pub fn setLocal(self: *ExecEnv, frame: *const CallFrame, idx: u32, val: types.Value) !void {
+    pub inline fn setLocal(self: *ExecEnv, frame: *const CallFrame, idx: u32, val: types.Value) !void {
         if (idx >= frame.local_count) return error.StackOverflow;
         const abs = frame.stack_base + idx;
         if (abs >= self.operand_stack.len) return error.StackOverflow;
