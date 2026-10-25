@@ -3719,6 +3719,6 @@ test "LinuxCpuAffinity: workerCpuLocked maps generation-0 pool slots and restore
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expect(!affinity.parent_pinned_single);
-    try std.testing.expect(affinity.sequential_spawn_detected);
+    try std.testing.expect(affinity.sequential_lifecycle);
     try std.testing.expectEqual(@as(?u16, null), affinity.workerCpuLocked(1, 0));
 }
