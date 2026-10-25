@@ -2230,7 +2230,23 @@ pub fn buildIconstSuppress(
             // Foldable uses: per-op classifier matching the const_vals
             // checks in compileInstRA.
             switch (inst.op) {
-                .add, .sub, .mul, .@"and", .@"or", .xor => |b| {
+                .add,
+                .sub,
+                .mul,
+                .@"and",
+                .@"or",
+                .xor,
+                .eq,
+                .ne,
+                .lt_s,
+                .lt_u,
+                .gt_s,
+                .gt_u,
+                .le_s,
+                .le_u,
+                .ge_s,
+                .ge_u,
+                => |b| {
                     if (inst.type != .i32 and inst.type != .i64) continue;
                     if (const_vals.get(b.rhs)) |imm| {
                         if (imm >= std.math.minInt(i32) and imm <= std.math.maxInt(i32)) {
@@ -2266,6 +2282,220 @@ pub fn buildIconstSuppress(
         if (total > 0 and total == fold) try suppress.put(v, {});
     }
     return suppress;
+}
+
+fn intCmpCc(op: ir.Inst.Op) ?u4 {
+    return switch (op) {
+        .eqz, .eq => 0x4, // E / Z
+        .ne => 0x5, // NE / NZ
+        .lt_s => 0xC, // L
+        .lt_u => 0x2, // B
+        .gt_s => 0xF, // G
+        .gt_u => 0x7, // A
+        .le_s => 0xE, // LE
+        .le_u => 0x6, // BE
+        .ge_s => 0xD, // GE
+        .ge_u => 0x3, // AE
+        else => null,
+    };
+}
+
+/// Post-allocation 2-address move coalescing for x86_64 (#798).
+/// Retargets `ch.dest` to `ch.src`'s physical register `r_s` when `ch.src` dies
+/// at the exact instruction that defines `ch.dest` (`src_range.end == dest_range.start`)
+/// and no other interval on `r_s` touches `[dest_range.start, dest_range.end]`
+/// (preserving x86_64's 2-address `dr != rhs_reg` invariant at `dest_range.end`).
+fn coalesceX86Moves(
+    allocator: std.mem.Allocator,
+    result: *regalloc.AllocResult,
+    reg_set: regalloc.RegSet,
+    clobbers: []const regalloc.ClobberPoint,
+    ranges: []const analysis.LiveRange,
+    copy_hints: []const regalloc.CopyHint,
+) !void {
+    if (copy_hints.len == 0) return;
+
+    var range_idx = std.AutoHashMap(ir.VReg, usize).init(allocator);
+    defer range_idx.deinit();
+    try range_idx.ensureTotalCapacity(@intCast(ranges.len));
+    for (ranges, 0..) |r, i| range_idx.putAssumeCapacity(r.vreg, i);
+
+    const Interval = struct {
+        vreg: ir.VReg,
+        start: u32,
+        end: u32,
+    };
+    var per_reg = std.AutoHashMap(regalloc.PhysReg, std.ArrayList(Interval)).init(allocator);
+    defer {
+        var it = per_reg.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(allocator);
+        per_reg.deinit();
+    }
+    {
+        var it = result.assignments.iterator();
+        while (it.next()) |entry| {
+            const vreg = entry.key_ptr.*;
+            const alloc = entry.value_ptr.*;
+            switch (alloc) {
+                .reg => |r| {
+                    const ridx = range_idx.get(vreg) orelse continue;
+                    const range = ranges[ridx];
+                    const gop = try per_reg.getOrPut(r);
+                    if (!gop.found_existing) gop.value_ptr.* = .empty;
+                    try gop.value_ptr.append(allocator, .{
+                        .vreg = vreg,
+                        .start = range.start,
+                        .end = range.end,
+                    });
+                },
+                .stack => {},
+            }
+        }
+    }
+
+    for (copy_hints) |ch| {
+        const dest_alloc = result.assignments.get(ch.dest) orelse continue;
+        const src_alloc = result.assignments.get(ch.src) orelse continue;
+        if (dest_alloc != .reg or src_alloc != .reg) continue;
+        const r_d = dest_alloc.reg;
+        const r_s = src_alloc.reg;
+        if (r_d == r_s) continue;
+
+        const dest_range_idx = range_idx.get(ch.dest) orelse continue;
+        const src_range_idx = range_idx.get(ch.src) orelse continue;
+        const dest_range = ranges[dest_range_idx];
+        const src_range = ranges[src_range_idx];
+        if (src_range.end != dest_range.start) continue;
+
+        const r_s_alloc_idx: u8 = blk: {
+            for (reg_set.alloc_regs, 0..) |p, i| {
+                if (p == r_s) break :blk @intCast(i);
+            }
+            continue;
+        };
+
+        var clobbered = false;
+        for (clobbers) |cp| {
+            if (cp.pos > dest_range.start and cp.pos < dest_range.end) {
+                if ((cp.regs_clobbered & (@as(u64, 1) << @intCast(r_s_alloc_idx))) != 0) {
+                    clobbered = true;
+                    break;
+                }
+            } else if (cp.pos >= dest_range.end) break;
+        }
+        if (clobbered) continue;
+
+        const r_s_list_ptr = per_reg.getPtr(r_s) orelse continue;
+        var conflict = false;
+        for (r_s_list_ptr.items) |iv| {
+            if (iv.vreg == ch.dest) continue;
+            if (iv.vreg == ch.src) {
+                if (iv.start < dest_range.end and dest_range.start < iv.end) {
+                    conflict = true;
+                    break;
+                }
+            } else {
+                if (iv.start <= dest_range.end and dest_range.start <= iv.end) {
+                    conflict = true;
+                    break;
+                }
+            }
+        }
+        if (conflict) continue;
+
+        if (per_reg.getPtr(r_d)) |r_d_list_ptr| {
+            for (r_d_list_ptr.items, 0..) |iv, i| {
+                if (iv.vreg == ch.dest) {
+                    _ = r_d_list_ptr.swapRemove(i);
+                    break;
+                }
+            }
+        }
+        try r_s_list_ptr.append(allocator, .{
+            .vreg = ch.dest,
+            .start = dest_range.start,
+            .end = dest_range.end,
+        });
+        try result.assignments.put(ch.dest, .{ .reg = r_s });
+    }
+}
+
+/// Identify single-use integer comparisons (and `.eqz`) in a block that feed
+/// the block's `.br_if` terminator with only RFLAGS-preserving `.parallel_copy`
+/// instructions intervening. Fused condition VRegs emit only `cmp`/`test` at
+/// their definition, jump directly on `cc` at `.br_if`, and are excluded from
+/// register allocation.
+fn buildFusedCmpBrIf(
+    func: *const ir.IrFunction,
+    allocator: std.mem.Allocator,
+) !std.AutoHashMap(ir.VReg, u4) {
+    var use_counts = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer use_counts.deinit();
+    var def_counts = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer def_counts.deinit();
+
+    const UseCtx = struct {
+        map: *std.AutoHashMap(ir.VReg, u32),
+        fn visit(self: *@This(), v: ir.VReg) !void {
+            const gop = try self.map.getOrPut(v);
+            if (gop.found_existing) {
+                gop.value_ptr.* += 1;
+            } else {
+                gop.value_ptr.* = 1;
+            }
+        }
+    };
+    var uctx = UseCtx{ .map = &use_counts };
+
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            if (inst.dest) |d| {
+                const gop = try def_counts.getOrPut(d);
+                if (gop.found_existing) gop.value_ptr.* += 1 else gop.value_ptr.* = 1;
+            }
+            if (inst.op == .parallel_copy) {
+                for (inst.op.parallel_copy) |p| {
+                    const gop = try def_counts.getOrPut(p.dst);
+                    if (gop.found_existing) gop.value_ptr.* += 1 else gop.value_ptr.* = 1;
+                }
+            }
+            try range_split.forEachUseInst(inst, &uctx, UseCtx.visit);
+        }
+    }
+
+    var fused = std.AutoHashMap(ir.VReg, u4).init(allocator);
+    errdefer fused.deinit();
+
+    for (func.blocks.items) |block| {
+        const insts = block.instructions.items;
+        if (insts.len < 2) continue;
+        const term = insts[insts.len - 1];
+        const bi = switch (term.op) {
+            .br_if => |b| b,
+            else => continue,
+        };
+        if ((use_counts.get(bi.cond) orelse 0) != 1) continue;
+        if ((def_counts.get(bi.cond) orelse 0) != 1) continue;
+
+        var i: usize = insts.len - 1;
+        while (i > 0) {
+            i -= 1;
+            const cand = insts[i];
+            if (cand.dest) |d| {
+                if (d == bi.cond) {
+                    if (cand.type == .i32 or cand.type == .i64) {
+                        if (intCmpCc(cand.op)) |cc| {
+                            try fused.put(bi.cond, cc);
+                        }
+                    }
+                    break;
+                }
+            }
+            if (cand.op != .parallel_copy) break;
+        }
+    }
+
+    return fused;
 }
 
 fn functionUsesV128(func: *const ir.IrFunction) bool {
@@ -2667,6 +2897,21 @@ fn buildSpillValues(
                     }
                 }
             }
+            if (inst.op == .parallel_copy) {
+                for (inst.op.parallel_copy) |p| {
+                    if (def_infos.getPtr(p.dst)) |info| {
+                        const opcode = "parallel_copy";
+                        info.count += 1;
+                        if (info.count == 1) {
+                            info.opcode = opcode;
+                            info.source_class = stableSourceClass(opcode);
+                        } else if (!std.mem.eql(u8, info.opcode orelse "", opcode)) {
+                            info.opcode = null;
+                            info.source_class = null;
+                        }
+                    }
+                }
+            }
             try range_split.forEachUseInst(inst, &use_ctx, SpillUseCountCtx.visit);
         }
     }
@@ -2782,6 +3027,18 @@ fn resolveSpillValue(
 
     switch (kind) {
         .store => {
+            if (range.inst.op == .parallel_copy) {
+                var match: ?usize = null;
+                for (range.inst.op.parallel_copy) |p| {
+                    for (values, 0..) |value, i| {
+                        if (value.vreg == p.dst and spillValueCoversSlot(value, slot)) {
+                            if (match != null and match.? != i) return .{ .index = null, .candidate_count = candidate_count };
+                            match = i;
+                        }
+                    }
+                }
+                return .{ .index = match, .candidate_count = candidate_count };
+            }
             const dest = range.inst.dest orelse
                 return .{ .index = null, .candidate_count = candidate_count };
             var match: ?usize = null;
@@ -3162,6 +3419,9 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
     var suppress_iconst = try buildIconstSuppress(func, &const_vals, allocator);
     defer suppress_iconst.deinit();
 
+    var fused_cmp_br_if = try buildFusedCmpBrIf(func, allocator);
+    defer fused_cmp_br_if.deinit();
+
     // Collect clobber points and ABI register hints in a single walk.
     // Hints steer call-arg vregs into their target `param_regs[i+1]` so
     // emitCallRegArgMoves emits no inter-vreg movs. Hints are advisory:
@@ -3171,6 +3431,8 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
     defer clobber_points.deinit(allocator);
     var hint_points: std.ArrayList(regalloc.Hint) = .empty;
     defer hint_points.deinit(allocator);
+    var copy_hints: std.ArrayList(regalloc.CopyHint) = .empty;
+    defer copy_hints.deinit(allocator);
     {
         var pos: u32 = 0;
         for (block_order) |block_id| {
@@ -3283,6 +3545,39 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
                             }
                         }
                     },
+                    .reinterpret => |v| {
+                        if (ci.dest) |d| {
+                            if (d != v) try copy_hints.append(allocator, .{ .dest = d, .src = v });
+                        }
+                    },
+                    .wrap_i64 => |v| {
+                        if (ci.dest) |d| {
+                            if (d != v) try copy_hints.append(allocator, .{ .dest = d, .src = v });
+                        }
+                    },
+                    .add, .sub, .@"and", .@"or", .xor => |b| {
+                        if (ci.type == .i32 or ci.type == .i64) {
+                            if (ci.dest) |d| {
+                                if (d != b.lhs and b.lhs != b.rhs and const_vals.contains(b.rhs)) {
+                                    try copy_hints.append(allocator, .{ .dest = d, .src = b.lhs });
+                                }
+                            }
+                        }
+                    },
+                    .shl, .shr_s, .shr_u, .rotl, .rotr => |b| {
+                        if (ci.dest) |d| {
+                            if (d != b.lhs and b.lhs != b.rhs and const_vals.contains(b.rhs)) {
+                                try copy_hints.append(allocator, .{ .dest = d, .src = b.lhs });
+                            }
+                        }
+                    },
+                    .parallel_copy => |pairs| {
+                        for (pairs) |p| {
+                            if (p.dst != p.src) {
+                                try copy_hints.append(allocator, .{ .dest = p.dst, .src = p.src });
+                            }
+                        }
+                    },
                     else => {},
                 }
                 pos += 1;
@@ -3301,7 +3596,7 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
     defer alloc_live_ranges.deinit(allocator);
     try alloc_live_ranges.ensureTotalCapacity(allocator, live_ranges.len);
     for (live_ranges) |range| {
-        if (!suppress_iconst.contains(range.vreg)) {
+        if (!suppress_iconst.contains(range.vreg) and !fused_cmp_br_if.contains(range.vreg)) {
             alloc_live_ranges.appendAssumeCapacity(range);
         }
     }
@@ -3328,6 +3623,16 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
         remat_ptr,
     );
     defer alloc_result.deinit();
+    if (copy_hints.items.len > 0) {
+        try coalesceX86Moves(
+            allocator,
+            &alloc_result,
+            reg_set,
+            clobber_points.items,
+            alloc_live_ranges.items,
+            copy_hints.items,
+        );
+    }
     if (timer) |t| t.end(.regalloc);
 
     // The aggregate spill metric feeds both the legacy stderr diagnostic and
@@ -3572,7 +3877,7 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
         for (block.instructions.items) |inst| {
             last_was_ret = isRet(inst.op);
             const native_start = code.len();
-            try compileInstRA(&code, inst, &alloc_result, &const_vals, &suppress_iconst, &branch_patches, &call_patches, &table_patches, import_count, &used_caller_saved, &used_callee_saved, func.local_count, global_offsets, options);
+            try compileInstRA(&code, inst, &alloc_result, &const_vals, &suppress_iconst, &fused_cmp_br_if, &branch_patches, &call_patches, &table_patches, import_count, &used_caller_saved, &used_callee_saved, func.local_count, global_offsets, options);
             if (frame_attr_ctx != null) {
                 try emitted_ir_ranges.append(allocator, .{
                     .native_start = @intCast(native_start),
@@ -4040,12 +4345,211 @@ fn destReg(alloc_result: *const regalloc.AllocResult, dest: ir.VReg) emit.Reg {
     return regOf(alloc_result, dest) orelse .rax;
 }
 
+const ParallelCopyLoc = union(enum) {
+    reg: emit.Reg,
+    stack: i32,
+    remat: regalloc.RematDef,
+};
+
+fn parallelCopyLocEq(a: ParallelCopyLoc, b: ParallelCopyLoc) bool {
+    return switch (a) {
+        .reg => |ra| switch (b) {
+            .reg => |rb| ra == rb,
+            else => false,
+        },
+        .stack => |sa| switch (b) {
+            .stack => |sb| sa == sb,
+            else => false,
+        },
+        .remat => false,
+    };
+}
+
+/// Emit a rematerialized constant for `.parallel_copy` using ONLY `MOV`
+/// instructions (`movRegImm32` / `movRegImm64`) — never `xor r32, r32` —
+/// so `RFLAGS` is preserved across `.parallel_copy` when a comparison is
+/// fused with a trailing `.br_if`.
+fn emitParallelCopyConst(code: *emit.CodeBuffer, dst_reg: emit.Reg, remat: regalloc.RematDef) !void {
+    switch (remat) {
+        .iconst_32 => |v| try code.movRegImm32(dst_reg, v),
+        .iconst_64 => |v| {
+            if (v >= 0 and v <= std.math.maxInt(i32)) {
+                try code.movRegImm32(dst_reg, @intCast(v));
+            } else {
+                try code.movRegImm64(dst_reg, @bitCast(v));
+            }
+        },
+    }
+}
+
+fn emitParallelCopyLocMove(code: *emit.CodeBuffer, dst: ParallelCopyLoc, src: ParallelCopyLoc) !void {
+    switch (dst) {
+        .reg => |dr| switch (src) {
+            .reg => |sr| if (dr != sr) try code.movRegReg(dr, sr),
+            .stack => |so| try code.movRegMem(dr, .rbp, so),
+            .remat => |rem| try emitParallelCopyConst(code, dr, rem),
+        },
+        .stack => |do| switch (src) {
+            .reg => |sr| try code.movMemReg(.rbp, do, sr),
+            .stack => |so| if (do != so) {
+                try code.movRegMem(.r11, .rbp, so);
+                try code.movMemReg(.rbp, do, .r11);
+            },
+            .remat => |rem| {
+                try emitParallelCopyConst(code, .r11, rem);
+                try code.movMemReg(.rbp, do, .r11);
+            },
+        },
+        .remat => unreachable,
+    }
+}
+
+/// Cycle-safe simultaneous parallel-copy emission for x86_64 (#798 / #540).
+/// All pairs `(p.dst <- p.src)` take effect simultaneously:
+/// 1. Resolve `src` and `dst` locations, dropping self-copies (`dst == src`).
+/// 2. Peel leaf copies whose `dst` is not read by any remaining pair's `src`.
+/// 3. Break any remaining directed cycles using `.r10` as cycle-break scratch
+///    (`.r11` is reserved for stack-to-stack / remat-to-stack staging inside
+///    `emitParallelCopyLocMove`).
+/// Emits only `MOV` instructions so `RFLAGS` is never modified.
+fn emitParallelCopyRA(
+    code: *emit.CodeBuffer,
+    pairs: []const ir.Inst.ParallelCopy,
+    alloc_result: *const regalloc.AllocResult,
+    const_vals: *const std.AutoHashMap(ir.VReg, i64),
+) !void {
+    if (pairs.len == 0) return;
+
+    const ResolvedPair = struct {
+        dst: ParallelCopyLoc,
+        src: ParallelCopyLoc,
+        done: bool = false,
+    };
+
+    var stack_buf: [32]ResolvedPair = undefined;
+    const heap_buf = if (pairs.len > stack_buf.len)
+        try code.allocator.alloc(ResolvedPair, pairs.len)
+    else
+        null;
+    defer if (heap_buf) |hb| code.allocator.free(hb);
+    const resolved = if (heap_buf) |hb| hb else stack_buf[0..pairs.len];
+
+    var n: usize = 0;
+    for (pairs) |p| {
+        const dst_alloc = alloc_result.get(p.dst) orelse continue;
+        const dst_loc: ParallelCopyLoc = switch (dst_alloc) {
+            .reg => |r| .{ .reg = @fromBackingInt(@intCast(r)) },
+            .stack => |off| .{ .stack = off },
+        };
+        const src_loc: ParallelCopyLoc = if (alloc_result.getRemat(p.src)) |rem|
+            .{ .remat = rem }
+        else if (alloc_result.get(p.src)) |sa| switch (sa) {
+            .reg => |r| .{ .reg = @fromBackingInt(@intCast(r)) },
+            .stack => |off| .{ .stack = off },
+        } else if (const_vals.get(p.src)) |cv| blk: {
+            if (p.ty == .i32) {
+                break :blk .{ .remat = .{ .iconst_32 = @truncate(cv) } };
+            } else {
+                break :blk .{ .remat = .{ .iconst_64 = cv } };
+            }
+        } else continue;
+
+        if (parallelCopyLocEq(dst_loc, src_loc)) continue;
+        resolved[n] = .{ .dst = dst_loc, .src = src_loc, .done = false };
+        n += 1;
+    }
+    const active = resolved[0..n];
+
+    // Phase 1: Iteratively peel ready leaf moves (`dst` not read by any pending `src`).
+    while (true) {
+        var progress = false;
+        for (active, 0..) |*pair, i| {
+            if (pair.done) continue;
+            var blocked = false;
+            for (active, 0..) |other, j| {
+                if (i == j or other.done) continue;
+                if (parallelCopyLocEq(pair.dst, other.src)) {
+                    blocked = true;
+                    break;
+                }
+            }
+            if (!blocked) {
+                try emitParallelCopyLocMove(code, pair.dst, pair.src);
+                pair.done = true;
+                progress = true;
+            }
+        }
+        if (!progress) break;
+    }
+
+    // Phase 2: Break remaining directed cycles using `.r10`.
+    // After Phase 1, every remaining pair's `dst` is read by another remaining
+    // pair's `src`; since all `dst` locations are distinct, the remaining pairs
+    // form vertex-disjoint simple cycles. Saving `start_pair.src` into `.r10`
+    // frees `start_pair.src` to be overwritten by the unique pair whose `dst`
+    // equals `start_pair.src`, and so on around the cycle.
+    for (active, 0..) |*start_pair, start_idx| {
+        if (start_pair.done) continue;
+        const tmp_loc: ParallelCopyLoc = .{ .reg = .r10 };
+        try emitParallelCopyLocMove(code, tmp_loc, start_pair.src);
+        start_pair.done = true;
+
+        var cur_free = start_pair.src;
+        _ = start_idx;
+        while (true) {
+            var next_opt: ?usize = null;
+            for (active, 0..) |cand, k| {
+                if (cand.done) continue;
+                if (parallelCopyLocEq(cand.dst, cur_free)) {
+                    next_opt = k;
+                    break;
+                }
+            }
+            if (next_opt) |next_idx| {
+                try emitParallelCopyLocMove(code, active[next_idx].dst, active[next_idx].src);
+                active[next_idx].done = true;
+                cur_free = active[next_idx].src;
+            } else break;
+        }
+        try emitParallelCopyLocMove(code, start_pair.dst, tmp_loc);
+    }
+}
+
+fn emitIntCmpFlags(
+    code: *emit.CodeBuffer,
+    alloc_result: *const regalloc.AllocResult,
+    const_vals: *const std.AutoHashMap(ir.VReg, i64),
+    inst_type: ir.IrType,
+    bin: ir.Inst.BinOp,
+) !void {
+    const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .r11);
+    if (const_vals.get(bin.rhs)) |v| {
+        if (v >= std.math.minInt(i32) and v <= std.math.maxInt(i32)) {
+            const imm: i32 = @intCast(v);
+            if (inst_type == .i32) {
+                try code.cmpReg32Imm32(lhs_reg, imm);
+            } else {
+                try code.cmpRegImm32(lhs_reg, imm);
+            }
+            return;
+        }
+    }
+    const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rax);
+    // Use 32-bit compare for i32 to get correct signed semantics.
+    if (inst_type == .i32) {
+        try code.cmpRegReg32(lhs_reg, rhs_reg);
+    } else {
+        try code.cmpRegReg(lhs_reg, rhs_reg);
+    }
+}
+
 fn compileInstRA(
     code: *emit.CodeBuffer,
     inst: ir.Inst,
     alloc_result: *const regalloc.AllocResult,
     const_vals: *const std.AutoHashMap(ir.VReg, i64),
     suppress_iconst: *const std.AutoHashMap(ir.VReg, void),
+    fused_cmp_br_if: *const std.AutoHashMap(ir.VReg, u4),
     patches: *std.ArrayList(BranchPatch),
     call_patches: *std.ArrayList(CallPatch),
     table_patches: *std.ArrayList(TablePatch),
@@ -4267,17 +4771,9 @@ fn compileInstRA(
         // ── Comparisons ───────────────────────────────────────────────
         inline .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u => |bin, tag| {
             const dest = inst.dest orelse return;
+            try emitIntCmpFlags(code, alloc_result, const_vals, inst.type, bin);
+            if (fused_cmp_br_if.contains(dest)) return;
             const dr = destReg(alloc_result, dest);
-            // Load lhs and rhs using different spill scratches so spilled
-            // operands don't clobber each other.
-            const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .r11);
-            const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rax);
-            // Use 32-bit compare for i32 to get correct signed semantics.
-            if (inst.type == .i32) {
-                try code.cmpRegReg32(lhs_reg, rhs_reg);
-            } else {
-                try code.cmpRegReg(lhs_reg, rhs_reg);
-            }
             const cc: u4 = comptime switch (tag) {
                 .eq => 0x4,
                 .ne => 0x5,
@@ -4299,7 +4795,6 @@ fn compileInstRA(
 
         .eqz => |vreg| {
             const dest = inst.dest orelse return;
-            const dr = destReg(alloc_result, dest);
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
             // Use 32-bit TEST for i32 so upper-32-bit garbage doesn't
             // affect the zero check (same reasoning as cmpRegReg32 for
@@ -4309,6 +4804,8 @@ fn compileInstRA(
             } else {
                 try code.testRegReg(src_reg, src_reg);
             }
+            if (fused_cmp_br_if.contains(dest)) return;
+            const dr = destReg(alloc_result, dest);
             try code.setcc(0x4, dr);
             try code.movzxByte(dr, dr);
             // setcc+movzx produces clean 0/1 — skip zeroExtend32
@@ -4386,13 +4883,18 @@ fn compileInstRA(
             try patches.append(code.allocator, .{ .patch_offset = patch_off, .target_block = target });
         },
         .br_if => |br| {
-            const cond_reg = try useVReg(code, alloc_result, br.cond, .rax);
-            // Wasm br_if condition is always i32; use 32-bit TEST so that
-            // upper-32 garbage (possible after our local_get preserves full
-            // 64 bits) doesn't spuriously flip the branch.
-            try code.testRegReg32(cond_reg, cond_reg);
-            try code.emitByte(0x0F);
-            try code.emitByte(0x85);
+            if (fused_cmp_br_if.get(br.cond)) |cc| {
+                try code.emitByte(0x0F);
+                try code.emitByte(@as(u8, 0x80) | @as(u8, cc));
+            } else {
+                const cond_reg = try useVReg(code, alloc_result, br.cond, .rax);
+                // Wasm br_if condition is always i32; use 32-bit TEST so that
+                // upper-32 garbage (possible after our local_get preserves full
+                // 64 bits) doesn't spuriously flip the branch.
+                try code.testRegReg32(cond_reg, cond_reg);
+                try code.emitByte(0x0F);
+                try code.emitByte(0x85);
+            }
             const then_patch = code.len();
             try code.emitI32(0);
             try patches.append(code.allocator, .{ .patch_offset = then_patch, .target_block = br.then_block });
@@ -5471,10 +5973,16 @@ fn compileInstRA(
             if (const_vals.get(bin.rhs)) |cnt| {
                 const mask: u64 = if (is64) 0x3f else 0x1f;
                 const imm: u8 = @intCast(@as(u64, @bitCast(cnt)) & mask);
-                const val_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
-                if (val_reg != .rax) try code.movRegReg(.rax, val_reg);
-                if (imm != 0) try code.shiftRegImm8(.rax, digit, imm, is64);
-                try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+                const dr = destReg(alloc_result, dest);
+                const val_reg = try useVReg(code, alloc_result, bin.lhs, dr);
+                if (val_reg != dr) try code.movRegReg(dr, val_reg);
+                if (imm != 0) {
+                    try code.shiftRegImm8(dr, digit, imm, is64);
+                    // 32-bit shift on x86_64 already zero-extends the 64-bit register.
+                    try writeDef(code, alloc_result, dest, dr);
+                } else {
+                    try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+                }
                 return;
             }
             // Load val first to avoid clobbering if both share a register
@@ -6502,6 +7010,7 @@ fn compileInstRA(
         // ── Stubs for ops not commonly hit ────────────────────────────
         // Phi must be lowered before codegen.
         .phi => unreachable,
+        .parallel_copy => |pairs| try emitParallelCopyRA(code, pairs, alloc_result, const_vals),
 
         // #672 commit 4: AOT exception-handling ops on x86_64.
         //   try_table_begin / try_table_end emit no machine code; the
@@ -7384,12 +7893,12 @@ test "iconst suppress (#523, x86_64): mixed foldable/non-foldable use stays mate
     const sum = func.newVReg();
     const eq = func.newVReg();
     const out = func.newVReg();
-    // k=7 used as ADD-imm32 rhs (foldable) AND as cmp rhs (non-foldable
-    // — cmp has no const_vals fold path). Conjunctive rule keeps it.
+    // k=7 used as ADD-imm32 rhs (foldable) AND as cmp lhs (non-foldable
+    // — cmp only folds rhs). Conjunctive rule keeps it.
     try block.append(.{ .op = .{ .iconst_32 = 100 }, .dest = a, .type = .i32 });
     try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = k, .type = .i32 });
     try block.append(.{ .op = .{ .add = .{ .lhs = a, .rhs = k } }, .dest = sum, .type = .i32 });
-    try block.append(.{ .op = .{ .eq = .{ .lhs = sum, .rhs = k } }, .dest = eq, .type = .i32 });
+    try block.append(.{ .op = .{ .eq = .{ .lhs = k, .rhs = sum } }, .dest = eq, .type = .i32 });
     try block.append(.{ .op = .{ .add = .{ .lhs = sum, .rhs = eq } }, .dest = out, .type = .i32 });
     try block.append(.{ .op = .{ .ret = out } });
 
@@ -7908,9 +8417,10 @@ test "compileFunctionRA: shift does not emit dead r11 save" {
     // `mov r11, rax` = 49 89 C3. `mov rax, r11` = 4C 89 D8. Neither should appear.
     try std.testing.expect(!containsBytes(code, &.{ 0x49, 0x89, 0xC3 }));
     try std.testing.expect(!containsBytes(code, &.{ 0x4C, 0x89, 0xD8 }));
-    // With a constant shift count the backend now emits the imm form
-    // `C1 E0 02` (shl eax, 2) and skips the MOV-to-CL entirely.
-    try std.testing.expect(containsBytes(code, &.{ 0xC1, 0xE0, 0x02 }));
+    // With a constant shift count the backend now emits the imm form directly
+    // on the allocated destination register `rdx` (`C1 E2 02` = shl edx, 2)
+    // and skips both the MOV-to-RAX bounce and MOV-to-CL.
+    try std.testing.expect(containsBytes(code, &.{ 0xC1, 0xE2, 0x02 }));
     // The CL-based form `D3 E0` must not appear for this constant count.
     try std.testing.expect(!containsBytes(code, &.{ 0xD3, 0xE0 }));
 }
@@ -7962,8 +8472,8 @@ test "compileFunctionRA: shl i64 by constant 3 emits REX.W C1 E0 03" {
     defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
-    // REX.W + C1 /4 ib = `48 C1 E0 03` (shl rax, 3).
-    try std.testing.expect(containsBytes(code, &.{ 0x48, 0xC1, 0xE0, 0x03 }));
+    // REX.W + C1 /4 ib = `48 C1 E2 03` (shl rdx, 3).
+    try std.testing.expect(containsBytes(code, &.{ 0x48, 0xC1, 0xE2, 0x03 }));
 }
 
 test "compileFunctionRA: shl by constant 1 uses D1 form (no imm byte)" {
@@ -7987,9 +8497,9 @@ test "compileFunctionRA: shl by constant 1 uses D1 form (no imm byte)" {
     defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
-    // `D1 E0` = shl eax, 1. No C1 form, no D3/CL form.
-    try std.testing.expect(containsBytes(code, &.{ 0xD1, 0xE0 }));
-    try std.testing.expect(!containsBytes(code, &.{ 0xC1, 0xE0 }));
+    // `D1 E2` = shl edx, 1. No C1 form, no D3/CL form.
+    try std.testing.expect(containsBytes(code, &.{ 0xD1, 0xE2 }));
+    try std.testing.expect(!containsBytes(code, &.{ 0xC1, 0xE2 }));
     try std.testing.expect(!containsBytes(code, &.{ 0xD3, 0xE0 }));
 }
 
@@ -8015,10 +8525,10 @@ test "compileFunctionRA: shr_u/shr_s/rotl/rotr by constant use imm form" {
         }
     };
     const cases = [_]Case{
-        .{ .tag = "shr_u", .expected = .{ 0xC1, 0xE8, 0x02 }, .build = &B.shr_u },
-        .{ .tag = "shr_s", .expected = .{ 0xC1, 0xF8, 0x02 }, .build = &B.shr_s },
-        .{ .tag = "rotl", .expected = .{ 0xC1, 0xC0, 0x02 }, .build = &B.rotl },
-        .{ .tag = "rotr", .expected = .{ 0xC1, 0xC8, 0x02 }, .build = &B.rotr },
+        .{ .tag = "shr_u", .expected = .{ 0xC1, 0xEA, 0x02 }, .build = &B.shr_u },
+        .{ .tag = "shr_s", .expected = .{ 0xC1, 0xFA, 0x02 }, .build = &B.shr_s },
+        .{ .tag = "rotl", .expected = .{ 0xC1, 0xC2, 0x02 }, .build = &B.rotl },
+        .{ .tag = "rotr", .expected = .{ 0xC1, 0xCA, 0x02 }, .build = &B.rotr },
     };
     for (cases) |c| {
         var func = ir.IrFunction.init(allocator, 0, 1, 0);
@@ -9413,3 +9923,106 @@ test "#798 x86_64: high-pressure remat handles call reg/stack args, loop back-ed
         try std.testing.expect(!sv.rematerialization_eligible);
     }
 }
+
+test "#798 x86_64: integer comparison folds immediate rhs and fuses across parallel_copy into br_if" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 1);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const loop_hdr = try func.newBlock();
+    const exit_blk = try func.newBlock();
+
+    const b0 = func.getBlock(entry);
+    const v_init = func.newVReg();
+    const v_phi = func.newVReg();
+    try b0.append(.{ .op = .{ .local_get = 0 }, .dest = v_init, .type = .i32 });
+    const init_copies = try allocator.alloc(ir.Inst.ParallelCopy, 1);
+    init_copies[0] = .{ .dst = v_phi, .src = v_init, .ty = .i32 };
+    try b0.append(.{ .op = .{ .parallel_copy = init_copies }, .type = .void });
+    try b0.append(.{ .op = .{ .br = loop_hdr } });
+
+    const b1 = func.getBlock(loop_hdr);
+    const v_step = func.newVReg();
+    const v_next = func.newVReg();
+    const v_limit = func.newVReg();
+    const v_cond = func.newVReg();
+    try b1.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_step, .type = .i32 });
+    try b1.append(.{ .op = .{ .add = .{ .lhs = v_phi, .rhs = v_step } }, .dest = v_next, .type = .i32 });
+    try b1.append(.{ .op = .{ .iconst_32 = 42 }, .dest = v_limit, .type = .i32 });
+    try b1.append(.{ .op = .{ .lt_s = .{ .lhs = v_next, .rhs = v_limit } }, .dest = v_cond, .type = .i32 });
+    const latch_copies = try allocator.alloc(ir.Inst.ParallelCopy, 1);
+    latch_copies[0] = .{ .dst = v_phi, .src = v_next, .ty = .i32 };
+    try b1.append(.{ .op = .{ .parallel_copy = latch_copies }, .type = .void });
+    try b1.append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = loop_hdr, .else_block = exit_blk } } });
+
+    const b2 = func.getBlock(exit_blk);
+    try b2.append(.{ .op = .{ .ret = v_phi } });
+
+    var const_vals = try buildConstVals(&func, allocator);
+    defer const_vals.deinit();
+    var suppress = try buildIconstSuppress(&func, &const_vals, allocator);
+    defer suppress.deinit();
+    try std.testing.expect(suppress.contains(v_limit));
+
+    var fused = try buildFusedCmpBrIf(&func, allocator);
+    defer fused.deinit();
+    try std.testing.expectEqual(@as(?u4, 0xC), fused.get(v_cond));
+
+    const result = try compileFunctionRA(&func, 0, allocator);
+    defer allocator.free(result.code);
+    defer allocator.free(result.call_patches);
+
+    // Must contain 32-bit CMP imm8 `83 FA 2A` (`cmp edx, 42`) and fused `JL` (`0F 8C`).
+    try std.testing.expect(containsBytes(result.code, &.{ 0x83, 0xFA, 0x2A }));
+    try std.testing.expect(containsBytes(result.code, &.{ 0x0F, 0x8C }));
+    // Must NOT contain SETCC (`0F 9x`).
+    for (result.code, 0..) |byte, idx| {
+        if (byte == 0x0F and idx + 1 < result.code.len) {
+            try std.testing.expect((result.code[idx + 1] & 0xF0) != 0x90);
+        }
+    }
+}
+
+test "#798 x86_64: emitParallelCopyRA breaks 2-way and 3-way register cycles via r10 scratch" {
+    const allocator = std.testing.allocator;
+    var alloc_result = regalloc.AllocResult{
+        .assignments = std.AutoHashMap(ir.VReg, regalloc.Allocation).init(allocator),
+        .spill_count = 0,
+        .remat = std.AutoHashMap(ir.VReg, regalloc.RematDef).init(allocator),
+    };
+    defer alloc_result.deinit();
+    var const_vals = std.AutoHashMap(ir.VReg, i64).init(allocator);
+    defer const_vals.deinit();
+
+    // v0 -> rdx, v1 -> rsi, v2 -> rdi
+    try alloc_result.assignments.put(0, .{ .reg = @intFromEnum(emit.Reg.rdx) });
+    try alloc_result.assignments.put(1, .{ .reg = @intFromEnum(emit.Reg.rsi) });
+    try alloc_result.assignments.put(2, .{ .reg = @intFromEnum(emit.Reg.rdi) });
+
+    // 3-way rotation: v0 <- v1, v1 <- v2, v2 <- v0
+    const pairs = [_]ir.Inst.ParallelCopy{
+        .{ .dst = 0, .src = 1, .ty = .i64 },
+        .{ .dst = 1, .src = 2, .ty = .i64 },
+        .{ .dst = 2, .src = 0, .ty = .i64 },
+    };
+
+    var code = emit.CodeBuffer.init(allocator);
+    defer code.deinit();
+    try emitParallelCopyRA(&code, &pairs, &alloc_result, &const_vals);
+
+    // 3-cycle requires exactly 4 64-bit MOVs (3 bytes each = 12 bytes) using r10:
+    //   mov r10, rsi  (49 89 F2)
+    //   mov rsi, rdi  (48 89 FE)
+    //   mov rdi, rdx  (48 89 D7)
+    //   mov rdx, r10  (4C 89 D2)
+    try std.testing.expectEqual(@as(usize, 12), code.len());
+    try std.testing.expectEqualSlices(u8, &.{
+        0x49, 0x89, 0xF2,
+        0x48, 0x89, 0xFE,
+        0x48, 0x89, 0xD7,
+        0x4C, 0x89, 0xD2,
+    }, code.bytes.items);
+}
+
+

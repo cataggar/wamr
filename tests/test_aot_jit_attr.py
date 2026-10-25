@@ -1457,12 +1457,9 @@ class FrameAttributionCompilerSmoke(unittest.TestCase):
             metadata.reconciliation["emitted_allocator_loads"], 0
         )
         self.assertIn("allocator_spill", summary["origins"])
-        if architecture == "x86_64":
-            self.assertIn("wasm_local_or_phi", summary["origins"])
-        else:
-            self.assertIn(
-                "fixed_runtime_frame_state", summary["origins"]
-            )
+        self.assertIn(
+            "fixed_runtime_frame_state", summary["origins"]
+        )
         self.assertEqual(0, summary["coverage"]["unknown_frame_instructions"])
 
     def test_tracked_x86_64_core_wasm_sidecar_reconciles(self):
