@@ -42,6 +42,8 @@ pub const Reg = enum(u5) {
     lr = 30, // link register (x30)
     sp = 31, // stack pointer (also encodes as XZR in some contexts)
 
+    pub const xzr: Reg = .sp;
+
     pub fn encoding(self: Reg) u5 {
         return @backingInt(self);
     }
@@ -662,6 +664,71 @@ pub const CodeBuffer = struct {
     /// LDRSW Xt, [Xn, Xm] (sign-extend word → 64-bit).
     pub fn ldrswRegOffset(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
         try self.loadStoreRegOffset(0xB8A06800, rt, rn, rm);
+    }
+
+    /// LDR Xt, [Xn, Wm, UXTW] (64-bit load, zero-extended 32-bit register offset).
+    pub fn ldrRegOffsetUxtw(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0xF8604800, rt, rn, rm);
+    }
+
+    /// STR Xt, [Xn, Wm, UXTW] (64-bit store, zero-extended 32-bit register offset).
+    pub fn strRegOffsetUxtw(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0xF8204800, rt, rn, rm);
+    }
+
+    /// LDR Wt, [Xn, Wm, UXTW] (32-bit load, zero-extended 32-bit register offset).
+    pub fn ldrRegOffset32Uxtw(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0xB8604800, rt, rn, rm);
+    }
+
+    /// STR Wt, [Xn, Wm, UXTW] (32-bit store, zero-extended 32-bit register offset).
+    pub fn strRegOffset32Uxtw(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0xB8204800, rt, rn, rm);
+    }
+
+    /// LDRB Wt, [Xn, Wm, UXTW] (zero-extended byte load, UXTW register offset).
+    pub fn ldrbRegOffsetUxtw(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0x38604800, rt, rn, rm);
+    }
+
+    /// STRB Wt, [Xn, Wm, UXTW] (byte store, UXTW register offset).
+    pub fn strbRegOffsetUxtw(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0x38204800, rt, rn, rm);
+    }
+
+    /// LDRH Wt, [Xn, Wm, UXTW] (zero-extended halfword load, UXTW register offset).
+    pub fn ldrhRegOffsetUxtw(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0x78604800, rt, rn, rm);
+    }
+
+    /// STRH Wt, [Xn, Wm, UXTW] (halfword store, UXTW register offset).
+    pub fn strhRegOffsetUxtw(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0x78204800, rt, rn, rm);
+    }
+
+    /// LDRSB Xt, [Xn, Wm, UXTW] (sign-extend byte → 64-bit, UXTW register offset).
+    pub fn ldrsbRegOffset64Uxtw(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0x38A04800, rt, rn, rm);
+    }
+
+    /// LDRSB Wt, [Xn, Wm, UXTW] (sign-extend byte → 32-bit, UXTW register offset).
+    pub fn ldrsbRegOffset32Uxtw(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0x38E04800, rt, rn, rm);
+    }
+
+    /// LDRSH Xt, [Xn, Wm, UXTW] (sign-extend halfword → 64-bit, UXTW register offset).
+    pub fn ldrshRegOffset64Uxtw(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0x78A04800, rt, rn, rm);
+    }
+
+    /// LDRSH Wt, [Xn, Wm, UXTW] (sign-extend halfword → 32-bit, UXTW register offset).
+    pub fn ldrshRegOffset32Uxtw(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0x78E04800, rt, rn, rm);
+    }
+
+    /// LDRSW Xt, [Xn, Wm, UXTW] (sign-extend word → 64-bit, UXTW register offset).
+    pub fn ldrswRegOffsetUxtw(self: *CodeBuffer, rt: Reg, rn: Reg, rm: Reg) !void {
+        try self.loadStoreRegOffset(0xB8A04800, rt, rn, rm);
     }
 
     /// STP Xt1, Xt2, [Xn, #imm7*8]! (store pair, pre-index)
@@ -3433,6 +3500,27 @@ test "emit: scalar register-offset load/store encodings" {
             .ldrsw => try code.ldrswRegOffset(case.rt, case.rn, case.rm),
         }
         try expectWord(case.expected, &code);
+    }
+
+    for (cases) |case| {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        switch (case.kind) {
+            .ldrb => try code.ldrbRegOffsetUxtw(case.rt, case.rn, case.rm),
+            .strb => try code.strbRegOffsetUxtw(case.rt, case.rn, case.rm),
+            .ldrh => try code.ldrhRegOffsetUxtw(case.rt, case.rn, case.rm),
+            .strh => try code.strhRegOffsetUxtw(case.rt, case.rn, case.rm),
+            .ldr32 => try code.ldrRegOffset32Uxtw(case.rt, case.rn, case.rm),
+            .str32 => try code.strRegOffset32Uxtw(case.rt, case.rn, case.rm),
+            .ldr64 => try code.ldrRegOffsetUxtw(case.rt, case.rn, case.rm),
+            .str64 => try code.strRegOffsetUxtw(case.rt, case.rn, case.rm),
+            .ldrsb32 => try code.ldrsbRegOffset32Uxtw(case.rt, case.rn, case.rm),
+            .ldrsb64 => try code.ldrsbRegOffset64Uxtw(case.rt, case.rn, case.rm),
+            .ldrsh32 => try code.ldrshRegOffset32Uxtw(case.rt, case.rn, case.rm),
+            .ldrsh64 => try code.ldrshRegOffset64Uxtw(case.rt, case.rn, case.rm),
+            .ldrsw => try code.ldrswRegOffsetUxtw(case.rt, case.rn, case.rm),
+        }
+        try expectWord((case.expected & ~@as(u32, 0x00002000)), &code);
     }
 }
 
