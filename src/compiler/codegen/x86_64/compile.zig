@@ -2190,7 +2190,15 @@ fn smallFixedBulkMemLen(const_vals: *const std.AutoHashMap(ir.VReg, i64), len: i
 /// non-foldable; under the conjunctive rule a single non-foldable use
 /// suppresses suppression. Spilled vregs aren't a concern here: if all
 /// uses fold, no consumer reads the spill slot either.
-pub fn buildIconstSuppress(
+pub fn isSingleInsnImmX86(val: i64, ty: ir.IrType) bool {
+    return switch (ty) {
+        .i32 => @as(i32, @bitCast(@as(u32, @truncate(@as(u64, @bitCast(val)))))) >= 0,
+        .i64 => val >= std.math.minInt(i32) and val <= std.math.maxInt(i32),
+        else => false,
+    };
+}
+
+fn buildIconstSuppress(
     func: *const ir.IrFunction,
     const_vals: *const std.AutoHashMap(ir.VReg, i64),
     allocator: std.mem.Allocator,
@@ -2267,6 +2275,24 @@ pub fn buildIconstSuppress(
                         try bumpFold(&folds, mf.len);
                     }
                 },
+                .parallel_copy => |pairs| {
+                    for (pairs) |p| {
+                        if (const_vals.get(p.src)) |imm| {
+                            if (isSingleInsnImmX86(imm, p.ty)) {
+                                try bumpFold(&folds, p.src);
+                            }
+                        }
+                    }
+                },
+                .ret => |maybe_v| {
+                    if (maybe_v) |rv| {
+                        if (const_vals.get(rv)) |imm| {
+                            if (imm >= 0 and imm <= std.math.maxInt(i32)) {
+                                try bumpFold(&folds, rv);
+                            }
+                        }
+                    }
+                },
                 else => {},
             }
         }
@@ -2300,11 +2326,105 @@ fn intCmpCc(op: ir.Inst.Op) ?u4 {
     };
 }
 
+fn instReadsVRegX86(inst: ir.Inst, target: ir.VReg) bool {
+    const Ctx = struct {
+        target: ir.VReg,
+        found: bool = false,
+        fn visit(ctx: *@This(), v: ir.VReg) error{}!void {
+            if (v == ctx.target) ctx.found = true;
+        }
+    };
+    var ctx: Ctx = .{ .target = target };
+    range_split.forEachUseInst(inst, &ctx, Ctx.visit) catch unreachable;
+    return ctx.found;
+}
+
+fn vregsInterfereX86(
+    u: ir.VReg,
+    v: ir.VReg,
+    func: *const ir.IrFunction,
+    liveness: *const std.AutoHashMap(ir.BlockId, analysis.BlockLiveness),
+) bool {
+    if (u == v) return false;
+    for (func.blocks.items, 0..) |block, bid| {
+        const bl = liveness.get(@intCast(bid)) orelse continue;
+        if (bl.live_in.contains(u) and bl.live_in.contains(v)) return true;
+
+        const insts = block.instructions.items;
+        var maybe_equiv_copy_idx: ?usize = null;
+        for (insts, 0..) |inst, c_idx| {
+            if (inst.op == .parallel_copy) {
+                var has_uv_copy = false;
+                var other_clobber = false;
+                for (inst.op.parallel_copy) |pp| {
+                    if ((pp.dst == u and pp.src == v) or (pp.dst == v and pp.src == u)) {
+                        has_uv_copy = true;
+                    } else if (pp.dst == u or pp.dst == v) {
+                        other_clobber = true;
+                    }
+                }
+                if (has_uv_copy and !other_clobber) {
+                    var post_clobber = false;
+                    for (insts[c_idx + 1 ..]) |aft| {
+                        if (aft.dest == u or aft.dest == v or aft.op == .parallel_copy) {
+                            post_clobber = true;
+                            break;
+                        }
+                    }
+                    if (!post_clobber) {
+                        maybe_equiv_copy_idx = c_idx;
+                    }
+                }
+            }
+        }
+
+        var u_live = bl.live_out.contains(u);
+        var v_live = bl.live_out.contains(v);
+        if (u_live and v_live and maybe_equiv_copy_idx == null) return true;
+
+        var idx = insts.len;
+        while (idx > 0) {
+            idx -= 1;
+            const inst = insts[idx];
+            if (inst.op == .parallel_copy) {
+                const pairs = inst.op.parallel_copy;
+                for (pairs) |pp| {
+                    if (pp.dst == u and pp.src != v and v_live) return true;
+                    if (pp.dst == v and pp.src != u and u_live) return true;
+                }
+                for (pairs) |pp| {
+                    if (pp.dst == u) u_live = false;
+                    if (pp.dst == v) v_live = false;
+                }
+                for (pairs) |pp| {
+                    if (pp.src == u) u_live = true;
+                    if (pp.src == v) v_live = true;
+                }
+                if (u_live and v_live) return true;
+            } else {
+                const reads_u = instReadsVRegX86(inst, u);
+                const reads_v = instReadsVRegX86(inst, v);
+                if (inst.dest) |d| {
+                    if (d == u and (v_live or reads_v)) return true;
+                    if (d == v and (u_live or reads_u)) return true;
+                    if (d == u) u_live = false;
+                    if (d == v) v_live = false;
+                }
+                if (reads_u) u_live = true;
+                if (reads_v) v_live = true;
+                if (u_live and v_live and (maybe_equiv_copy_idx == null or idx < maybe_equiv_copy_idx.?)) return true;
+            }
+        }
+    }
+    return false;
+}
+
 /// Post-allocation 2-address move coalescing for x86_64 (#798).
 /// Retargets `ch.dest` to `ch.src`'s physical register `r_s` when `ch.src` dies
 /// at the exact instruction that defines `ch.dest` (`src_range.end == dest_range.start`)
-/// and no other interval on `r_s` touches `[dest_range.start, dest_range.end]`
-/// (preserving x86_64's 2-address `dr != rhs_reg` invariant at `dest_range.end`).
+/// or when `ch.allow_dest_overlap` is proven safe, and no other interval on the
+/// target register touches the moving range (preserving x86_64's 2-address
+/// `dr != rhs_reg` invariant).
 fn coalesceX86Moves(
     allocator: std.mem.Allocator,
     result: *regalloc.AllocResult,
@@ -2353,70 +2473,183 @@ fn coalesceX86Moves(
         }
     }
 
+    var pinned = std.AutoHashMap(ir.VReg, void).init(allocator);
+    defer pinned.deinit();
+
+    const Helper = struct {
+        fn tryMove(
+            alloc_inner: std.mem.Allocator,
+            res: *regalloc.AllocResult,
+            rset: regalloc.RegSet,
+            clobs: []const regalloc.ClobberPoint,
+            rngs: []const analysis.LiveRange,
+            ridx_map: *const std.AutoHashMap(ir.VReg, usize),
+            preg_map: *std.AutoHashMap(regalloc.PhysReg, std.ArrayList(Interval)),
+            moving_vreg: ir.VReg,
+            partner_vreg: ir.VReg,
+            from_reg: regalloc.PhysReg,
+            to_reg: regalloc.PhysReg,
+            allow_partner_overlap: bool,
+        ) !bool {
+            const moving_ridx = ridx_map.get(moving_vreg) orelse return false;
+            const moving_range = rngs[moving_ridx];
+            const to_alloc_idx: u8 = blk: {
+                for (rset.alloc_regs, 0..) |p, i| {
+                    if (p == to_reg) break :blk @intCast(i);
+                }
+                return false;
+            };
+            for (clobs) |cp| {
+                if (cp.pos > moving_range.start and cp.pos < moving_range.end) {
+                    if ((cp.regs_clobbered & (@as(u64, 1) << @intCast(to_alloc_idx))) != 0) {
+                        return false;
+                    }
+                } else if (cp.pos >= moving_range.end) break;
+            }
+            const to_list_ptr = preg_map.getPtr(to_reg) orelse return false;
+            for (to_list_ptr.items) |iv| {
+                if (iv.vreg == moving_vreg) continue;
+                if (iv.vreg == partner_vreg) {
+                    if (!allow_partner_overlap and iv.start < moving_range.end and moving_range.start < iv.end) {
+                        return false;
+                    }
+                } else {
+                    if (iv.start <= moving_range.end and moving_range.start <= iv.end) {
+                        return false;
+                    }
+                }
+            }
+            if (preg_map.getPtr(from_reg)) |from_list_ptr| {
+                for (from_list_ptr.items, 0..) |iv, i| {
+                    if (iv.vreg == moving_vreg) {
+                        _ = from_list_ptr.swapRemove(i);
+                        break;
+                    }
+                }
+            }
+            try to_list_ptr.append(alloc_inner, .{
+                .vreg = moving_vreg,
+                .start = moving_range.start,
+                .end = moving_range.end,
+            });
+            try res.assignments.put(moving_vreg, .{ .reg = to_reg });
+            return true;
+        }
+    };
+
     for (copy_hints) |ch| {
         const dest_alloc = result.assignments.get(ch.dest) orelse continue;
         const src_alloc = result.assignments.get(ch.src) orelse continue;
         if (dest_alloc != .reg or src_alloc != .reg) continue;
         const r_d = dest_alloc.reg;
         const r_s = src_alloc.reg;
-        if (r_d == r_s) continue;
+        if (r_d == r_s) {
+            try pinned.put(ch.dest, {});
+            try pinned.put(ch.src, {});
+            continue;
+        }
 
         const dest_range_idx = range_idx.get(ch.dest) orelse continue;
         const src_range_idx = range_idx.get(ch.src) orelse continue;
         const dest_range = ranges[dest_range_idx];
         const src_range = ranges[src_range_idx];
-        if (src_range.end != dest_range.start) continue;
+        if (!ch.allow_dest_overlap and src_range.end != dest_range.start) continue;
 
-        const r_s_alloc_idx: u8 = blk: {
-            for (reg_set.alloc_regs, 0..) |p, i| {
-                if (p == r_s) break :blk @intCast(i);
-            }
-            continue;
-        };
-
-        var clobbered = false;
-        for (clobbers) |cp| {
-            if (cp.pos > dest_range.start and cp.pos < dest_range.end) {
-                if ((cp.regs_clobbered & (@as(u64, 1) << @intCast(r_s_alloc_idx))) != 0) {
-                    clobbered = true;
-                    break;
+        const dest_pinned = pinned.contains(ch.dest);
+        const src_pinned = pinned.contains(ch.src);
+        var did_coalesce = false;
+        if (ch.allow_dest_overlap) {
+            const dest_span = dest_range.end -| dest_range.start;
+            const src_span = src_range.end -| src_range.start;
+            if (dest_span >= src_span) {
+                if (!src_pinned) {
+                    did_coalesce = try Helper.tryMove(
+                        allocator,
+                        result,
+                        reg_set,
+                        clobbers,
+                        ranges,
+                        &range_idx,
+                        &per_reg,
+                        ch.src,
+                        ch.dest,
+                        r_s,
+                        r_d,
+                        true,
+                    );
                 }
-            } else if (cp.pos >= dest_range.end) break;
-        }
-        if (clobbered) continue;
-
-        const r_s_list_ptr = per_reg.getPtr(r_s) orelse continue;
-        var conflict = false;
-        for (r_s_list_ptr.items) |iv| {
-            if (iv.vreg == ch.dest) continue;
-            if (iv.vreg == ch.src) {
-                if (iv.start < dest_range.end and dest_range.start < iv.end) {
-                    conflict = true;
-                    break;
+                if (!did_coalesce and !dest_pinned) {
+                    did_coalesce = try Helper.tryMove(
+                        allocator,
+                        result,
+                        reg_set,
+                        clobbers,
+                        ranges,
+                        &range_idx,
+                        &per_reg,
+                        ch.dest,
+                        ch.src,
+                        r_d,
+                        r_s,
+                        true,
+                    );
                 }
             } else {
-                if (iv.start <= dest_range.end and dest_range.start <= iv.end) {
-                    conflict = true;
-                    break;
+                if (!dest_pinned) {
+                    did_coalesce = try Helper.tryMove(
+                        allocator,
+                        result,
+                        reg_set,
+                        clobbers,
+                        ranges,
+                        &range_idx,
+                        &per_reg,
+                        ch.dest,
+                        ch.src,
+                        r_d,
+                        r_s,
+                        true,
+                    );
+                }
+                if (!did_coalesce and !src_pinned) {
+                    did_coalesce = try Helper.tryMove(
+                        allocator,
+                        result,
+                        reg_set,
+                        clobbers,
+                        ranges,
+                        &range_idx,
+                        &per_reg,
+                        ch.src,
+                        ch.dest,
+                        r_s,
+                        r_d,
+                        true,
+                    );
                 }
             }
-        }
-        if (conflict) continue;
-
-        if (per_reg.getPtr(r_d)) |r_d_list_ptr| {
-            for (r_d_list_ptr.items, 0..) |iv, i| {
-                if (iv.vreg == ch.dest) {
-                    _ = r_d_list_ptr.swapRemove(i);
-                    break;
-                }
+        } else {
+            if (!dest_pinned) {
+                did_coalesce = try Helper.tryMove(
+                    allocator,
+                    result,
+                    reg_set,
+                    clobbers,
+                    ranges,
+                    &range_idx,
+                    &per_reg,
+                    ch.dest,
+                    ch.src,
+                    r_d,
+                    r_s,
+                    false,
+                );
             }
         }
-        try r_s_list_ptr.append(allocator, .{
-            .vreg = ch.dest,
-            .start = dest_range.start,
-            .end = dest_range.end,
-        });
-        try result.assignments.put(ch.dest, .{ .reg = r_s });
+        if (did_coalesce) {
+            try pinned.put(ch.dest, {});
+            try pinned.put(ch.src, {});
+        }
     }
 }
 
@@ -3576,13 +3809,7 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
                             }
                         }
                     },
-                    .parallel_copy => |pairs| {
-                        for (pairs) |p| {
-                            if (p.dst != p.src) {
-                                try copy_hints.append(allocator, .{ .dest = p.dst, .src = p.src });
-                            }
-                        }
-                    },
+                    .parallel_copy => {},
                     else => {},
                 }
                 pos += 1;
@@ -3604,6 +3831,127 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
         if (!suppress_iconst.contains(range.vreg) and !fused_cmp_br_if.contains(range.vreg)) {
             alloc_live_ranges.appendAssumeCapacity(range);
         }
+    }
+    {
+        var liveness_opt: ?std.AutoHashMap(ir.BlockId, analysis.BlockLiveness) = null;
+        defer if (liveness_opt) |*lv| {
+            var it = lv.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.live_in.deinit();
+                entry.value_ptr.live_out.deinit();
+            }
+            lv.deinit();
+        };
+        var range_by_vreg = std.AutoHashMap(ir.VReg, analysis.LiveRange).init(allocator);
+        defer range_by_vreg.deinit();
+        try range_by_vreg.ensureTotalCapacity(@intCast(alloc_live_ranges.items.len));
+        for (alloc_live_ranges.items) |r| range_by_vreg.putAssumeCapacity(r.vreg, r);
+
+        var cross_block_hints: std.ArrayList(regalloc.CopyHint) = .empty;
+        defer cross_block_hints.deinit(allocator);
+        var normal_pc_hints: std.ArrayList(regalloc.CopyHint) = .empty;
+        defer normal_pc_hints.deinit(allocator);
+
+        for (block_order) |bo_bid| {
+            const insts = func.blocks.items[bo_bid].instructions.items;
+            for (insts, 0..) |ci, copy_idx| {
+                if (ci.op != .parallel_copy) continue;
+                const pairs = ci.op.parallel_copy;
+                for (pairs, 0..) |p, p_idx| {
+                    if (p.dst == p.src) continue;
+                    if (suppress_iconst.contains(p.src)) continue;
+                    const dest_range = range_by_vreg.get(p.dst) orelse continue;
+                    const src_range = range_by_vreg.get(p.src) orelse continue;
+
+                    var allow_overlap = false;
+                    var is_cross_block_overlap = false;
+                    if (src_range.end > dest_range.start and src_range.start < dest_range.end) {
+                        var maybe_def_idx: ?usize = null;
+                        for (insts[0..copy_idx], 0..) |prev_inst, idx| {
+                            if (prev_inst.dest) |d| {
+                                if (d == p.src and prev_inst.op != .parallel_copy) {
+                                    maybe_def_idx = idx;
+                                }
+                            }
+                        }
+                        if (maybe_def_idx) |def_idx| {
+                            const def_inst = insts[def_idx];
+                            const def_2addr_safe = if (!instReadsVRegX86(def_inst, p.dst))
+                                true
+                            else switch (def_inst.op) {
+                                .add, .sub, .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr => |b| b.lhs == p.dst and b.rhs != p.dst,
+                                else => false,
+                            };
+                            if (def_2addr_safe and src_range.end <= dest_range.end) {
+                                allow_overlap = true;
+                                for (insts[def_idx + 1 .. copy_idx]) |mid_inst| {
+                                    if (mid_inst.dest) |d| {
+                                        if (d == p.dst or d == p.src) allow_overlap = false;
+                                    }
+                                    if (instReadsVRegX86(mid_inst, p.dst)) allow_overlap = false;
+                                    if (!allow_overlap) break;
+                                }
+                                if (allow_overlap) {
+                                    for (pairs, 0..) |p2, p2_idx| {
+                                        if (p2_idx == p_idx) continue;
+                                        if (p2.src == p.dst or p2.dst == p.dst or p2.dst == p.src or p2.src == p.src) {
+                                            allow_overlap = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            var pair_conflict = false;
+                            for (pairs, 0..) |p2, p2_idx| {
+                                if (p2_idx == p_idx) continue;
+                                if (p2.src == p.dst or p2.dst == p.dst or p2.dst == p.src or p2.src == p.src) {
+                                    pair_conflict = true;
+                                    break;
+                                }
+                            }
+                            if (!pair_conflict) {
+                                if (liveness_opt == null) {
+                                    liveness_opt = try analysis.computeLiveness(func, allocator);
+                                }
+                                if (!vregsInterfereX86(p.dst, p.src, func, &liveness_opt.?)) {
+                                    allow_overlap = true;
+                                    is_cross_block_overlap = true;
+                                }
+                            }
+                        }
+                    }
+                    const hint: regalloc.CopyHint = .{
+                        .dest = p.dst,
+                        .src = p.src,
+                        .allow_dest_overlap = allow_overlap,
+                    };
+                    if (is_cross_block_overlap) {
+                        try cross_block_hints.append(allocator, hint);
+                    } else {
+                        try normal_pc_hints.append(allocator, hint);
+                    }
+                }
+            }
+        }
+        if (cross_block_hints.items.len > 0) {
+            const SortCtx = struct {
+                rmap: *const std.AutoHashMap(ir.VReg, analysis.LiveRange),
+                pub fn lessThan(ctx: @This(), a: regalloc.CopyHint, b: regalloc.CopyHint) bool {
+                    const a_d = if (ctx.rmap.get(a.dest)) |r| r.end -| r.start else 0;
+                    const a_s = if (ctx.rmap.get(a.src)) |r| r.end -| r.start else 0;
+                    const b_d = if (ctx.rmap.get(b.dest)) |r| r.end -| r.start else 0;
+                    const b_s = if (ctx.rmap.get(b.src)) |r| r.end -| r.start else 0;
+                    const a_max = @max(a_d, a_s);
+                    const b_max = @max(b_d, b_s);
+                    if (a_max != b_max) return a_max > b_max;
+                    return @min(a_d, a_s) > @min(b_d, b_s);
+                }
+            };
+            std.mem.sort(regalloc.CopyHint, cross_block_hints.items, SortCtx{ .rmap = &range_by_vreg }, SortCtx.lessThan);
+            try copy_hints.insertSlice(allocator, 0, cross_block_hints.items);
+        }
+        try copy_hints.appendSlice(allocator, normal_pc_hints.items);
     }
     if (clobber_points.items.len > 0) {
         try analysis.populateClobberLiveVregs(func, block_order, clobber_points.items, allocator);
@@ -4379,9 +4727,12 @@ fn parallelCopyLocEq(a: ParallelCopyLoc, b: ParallelCopyLoc) bool {
 /// fused with a trailing `.br_if`.
 fn emitParallelCopyConst(code: *emit.CodeBuffer, dst_reg: emit.Reg, remat: regalloc.RematDef) !void {
     switch (remat) {
-        .iconst_32 => |v| try code.movRegImm32(dst_reg, v),
+        .iconst_32 => |v| {
+            try code.movRegImm32(dst_reg, v);
+            if (v < 0) try code.zeroExtend32(dst_reg);
+        },
         .iconst_64 => |v| {
-            if (v >= 0 and v <= std.math.maxInt(i32)) {
+            if (v >= std.math.minInt(i32) and v <= std.math.maxInt(i32)) {
                 try code.movRegImm32(dst_reg, @intCast(v));
             } else {
                 try code.movRegImm64(dst_reg, @bitCast(v));
@@ -4449,18 +4800,37 @@ fn emitParallelCopyRA(
             .reg => |r| .{ .reg = @fromBackingInt(@intCast(r)) },
             .stack => |off| .{ .stack = off },
         };
-        const src_loc: ParallelCopyLoc = if (alloc_result.getRemat(p.src)) |rem|
-            .{ .remat = rem }
-        else if (alloc_result.get(p.src)) |sa| switch (sa) {
-            .reg => |r| .{ .reg = @fromBackingInt(@intCast(r)) },
-            .stack => |off| .{ .stack = off },
-        } else if (const_vals.get(p.src)) |cv| blk: {
-            if (p.ty == .i32) {
-                break :blk .{ .remat = .{ .iconst_32 = @truncate(cv) } };
-            } else {
-                break :blk .{ .remat = .{ .iconst_64 = cv } };
+        const src_loc: ParallelCopyLoc = blk: {
+            if (alloc_result.get(p.src)) |sa| {
+                if (sa == .reg and dst_loc == .reg and @as(emit.Reg, @fromBackingInt(@intCast(sa.reg))) == dst_loc.reg) {
+                    break :blk .{ .reg = dst_loc.reg };
+                }
             }
-        } else continue;
+            if (const_vals.get(p.src)) |cv| {
+                if (isSingleInsnImmX86(cv, p.ty)) {
+                    break :blk .{ .remat = if (p.ty == .i32)
+                        .{ .iconst_32 = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(cv))))) }
+                    else
+                        .{ .iconst_64 = cv } };
+                }
+            }
+            if (alloc_result.getRemat(p.src)) |rem| {
+                break :blk .{ .remat = rem };
+            }
+            if (alloc_result.get(p.src)) |sa| {
+                break :blk switch (sa) {
+                    .reg => |r| .{ .reg = @fromBackingInt(@intCast(r)) },
+                    .stack => |off| .{ .stack = off },
+                };
+            }
+            if (const_vals.get(p.src)) |cv| {
+                break :blk .{ .remat = if (p.ty == .i32)
+                    .{ .iconst_32 = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(cv))))) }
+                else
+                    .{ .iconst_64 = cv } };
+            }
+            continue;
+        };
 
         if (parallelCopyLocEq(dst_loc, src_loc)) continue;
         resolved[n] = .{ .dst = dst_loc, .src = src_loc, .done = false };
@@ -4842,8 +5212,25 @@ fn compileInstRA(
         // ── Return ────────────────────────────────────────────────────
         .ret => |maybe_val| {
             if (maybe_val) |val| {
-                const src_reg = try useVReg(code, alloc_result, val, .rax);
-                if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+                const folded_imm = blk: {
+                    if (suppress_iconst.contains(val)) {
+                        if (const_vals.get(val)) |cv| break :blk cv;
+                    } else if (alloc_result.get(val)) |loc| {
+                        if (loc == .reg and @as(emit.Reg, @fromBackingInt(@intCast(loc.reg))) == .rax) {
+                            break :blk null;
+                        }
+                        if (const_vals.get(val)) |cv| {
+                            if (cv >= std.math.minInt(i32) and cv <= std.math.maxInt(i32)) break :blk cv;
+                        }
+                    }
+                    break :blk null;
+                };
+                if (folded_imm) |cv| {
+                    try emitRematConst(code, .rax, .{ .iconst_64 = cv });
+                } else {
+                    const src_reg = try useVReg(code, alloc_result, val, .rax);
+                    if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+                }
             }
             // Restore callee-saved registers before epilogue (reverse order).
             var ci: usize = callee_saved_alloc.len;
@@ -9986,8 +10373,11 @@ test "#798 x86_64: integer comparison folds immediate rhs and fuses across paral
     defer allocator.free(result.code);
     defer allocator.free(result.call_patches);
 
-    // Must contain 32-bit CMP imm8 `83 FA 2A` (`cmp edx, 42`) and fused `JL` (`0F 8C`).
-    try std.testing.expect(containsBytes(result.code, &.{ 0x83, 0xFA, 0x2A }));
+    // Must contain 32-bit CMP imm8 `83 FA 2A` (`cmp edx, 42`) or `83 FE 2A` (`cmp esi, 42`) and fused `JL` (`0F 8C`).
+    try std.testing.expect(
+        containsBytes(result.code, &.{ 0x83, 0xFA, 0x2A }) or
+            containsBytes(result.code, &.{ 0x83, 0xFE, 0x2A }),
+    );
     try std.testing.expect(containsBytes(result.code, &.{ 0x0F, 0x8C }));
     // Must NOT contain SETCC (`0F 9x`).
     for (result.code, 0..) |byte, idx| {

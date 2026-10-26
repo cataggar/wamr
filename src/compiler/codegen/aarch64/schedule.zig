@@ -124,18 +124,20 @@ pub fn scheduleBlock(
     for (insts, 0..) |inst, idx| {
         const meta = metadata(inst);
         if (meta.barrier) {
-            try appendScheduledWindow(insts[window_start..idx], &out, allocator, options);
+            const trailing_pc: ?[]const ir.Inst.ParallelCopy = if (inst.op == .parallel_copy) inst.op.parallel_copy else null;
+            try appendScheduledWindow(insts[window_start..idx], trailing_pc, &out, allocator, options);
             out.appendAssumeCapacity(inst);
             window_start = idx + 1;
         }
     }
-    try appendScheduledWindow(insts[window_start..], &out, allocator, options);
+    try appendScheduledWindow(insts[window_start..], null, &out, allocator, options);
 
     return out.toOwnedSlice(allocator);
 }
 
 fn appendScheduledWindow(
     window: []const ir.Inst,
+    trailing_parallel_copy: ?[]const ir.Inst.ParallelCopy,
     out: *std.ArrayListUnmanaged(ir.Inst),
     allocator: std.mem.Allocator,
     options: Options,
@@ -192,6 +194,43 @@ fn appendScheduledWindow(
             nodes[idx].preds_left += 1;
         }
         last_memory = idx;
+    }
+
+    // For a window immediately preceding a `.parallel_copy`, keep any leaf
+    // producer `I` (`def_idx`) of `p.src` scheduled after earlier readers
+    // `J < I` of `p.dst` so `p.dst` and `p.src` do not overlap across `J`
+    // and can coalesce onto the same register. Because `J < I`, all edges
+    // remain strictly topological (`from < to`) and cannot introduce a cycle.
+    if (trailing_parallel_copy) |pairs| {
+        const UseCheck = struct {
+            target: ir.VReg,
+            found: bool = false,
+            fn visit(self: *@This(), v: ir.VReg) !void {
+                if (v == self.target) self.found = true;
+            }
+        };
+        for (pairs) |p| {
+            if (p.dst == p.src) continue;
+            const def_idx = defs.get(p.src) orelse continue;
+            if (nodes[def_idx].succs.items.len != 0) continue;
+            if (isOrderedMemory(window[def_idx])) continue;
+            for (0..def_idx) |j| {
+                var uc = UseCheck{ .target = p.dst };
+                try forEachUse(window[j], &uc, UseCheck.visit);
+                if (!uc.found) continue;
+                var already = false;
+                for (nodes[j].succs.items) |s| {
+                    if (s == def_idx) {
+                        already = true;
+                        break;
+                    }
+                }
+                if (!already) {
+                    try nodes[j].succs.append(allocator, def_idx);
+                    nodes[def_idx].preds_left += 1;
+                }
+            }
+        }
     }
 
     var rev_idx = nodes.len;
@@ -1120,3 +1159,25 @@ test "local scheduler preserves scalar store/load order" {
 
     try std.testing.expect(store_pos < load_pos);
 }
+
+test "local scheduler orders reader of parallel_copy dst before single-use pure producer of src" {
+    const allocator = std.testing.allocator;
+    const pairs = try allocator.alloc(ir.Inst.ParallelCopy, 1);
+    defer allocator.free(pairs);
+    pairs[0] = .{ .dst = 1, .src = 3, .ty = .i32 };
+
+    const insts = [_]ir.Inst{
+        .{ .op = .{ .load = .{ .base = 1, .offset = 0, .size = 1 } }, .dest = 2, .type = .i32 },
+        .{ .op = .{ .add = .{ .lhs = 1, .rhs = 4 } }, .dest = 3, .type = .i32 },
+        .{ .op = .{ .parallel_copy = pairs }, .type = .void },
+        .{ .op = .{ .br_if = .{ .cond = 2, .then_block = 0, .else_block = 1 } }, .type = .void },
+    };
+
+    const scheduled = try scheduleBlock(&insts, allocator, .{ .min_block_len = 2 });
+    defer allocator.free(scheduled);
+
+    const load_pos = findDest(scheduled, 2).?;
+    const add_pos = findDest(scheduled, 3).?;
+    try std.testing.expect(load_pos < add_pos);
+}
+
