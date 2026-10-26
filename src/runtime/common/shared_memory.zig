@@ -1,6 +1,7 @@
 //! Stable shared linear-memory backing and atomic size publication.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const platform = @import("../../platform/platform.zig");
 const parking = @import("../../platform/parking_lot.zig");
 
@@ -37,6 +38,129 @@ const SpinMutex = struct {
     }
 };
 
+pub const LinuxInitialAffinity = struct {
+    set: if (builtin.os.tag == .linux) std.os.linux.cpu_set_t else void =
+        if (builtin.os.tag == .linux) std.mem.zeroes(std.os.linux.cpu_set_t) else {},
+    cpus: [64]u16 = @splat(0),
+    count: u8 = 0,
+};
+
+var initial_affinity_mutex: SpinMutex = .{};
+var initial_affinity_captured: std.atomic.Value(bool) = .init(false);
+var process_pinned_to_primary: std.atomic.Value(bool) = .init(false);
+var saved_initial_affinity: LinuxInitialAffinity = .{};
+
+fn singleCpuSet(cpu: u16) if (builtin.os.tag == .linux) std.os.linux.cpu_set_t else void {
+    if (comptime builtin.os.tag != .linux) return {};
+    var set = std.mem.zeroes(std.os.linux.cpu_set_t);
+    const bits_per_word = @bitSizeOf(usize);
+    const word_idx = @as(usize, cpu) / bits_per_word;
+    const bit_idx: std.math.Log2Int(usize) = @intCast(@as(usize, cpu) % bits_per_word);
+    if (word_idx < set.len) {
+        set[word_idx] = @as(usize, 1) << bit_idx;
+    }
+    return set;
+}
+
+fn captureInitialAffinity() ?LinuxInitialAffinity {
+    if (comptime builtin.os.tag != .linux) return null;
+    if (initial_affinity_captured.load(.acquire)) {
+        return saved_initial_affinity;
+    }
+    initial_affinity_mutex.lock();
+    defer initial_affinity_mutex.unlock();
+    if (initial_affinity_captured.load(.monotonic)) {
+        return saved_initial_affinity;
+    }
+    var set = std.mem.zeroes(std.os.linux.cpu_set_t);
+    if (std.os.linux.sched_getaffinity(0, @sizeOf(std.os.linux.cpu_set_t), &set) != 0) {
+        return null;
+    }
+    var aff: LinuxInitialAffinity = .{ .set = set };
+    var n: u8 = 0;
+    const bits_per_word = @bitSizeOf(usize);
+    for (set, 0..) |word_val, word_idx| {
+        var w = word_val;
+        while (w != 0 and n < aff.cpus.len) {
+            const bit: usize = @ctz(w);
+            aff.cpus[n] = @intCast(word_idx * bits_per_word + bit);
+            n += 1;
+            w &= w - 1;
+        }
+    }
+    aff.count = n;
+    saved_initial_affinity = aff;
+    initial_affinity_captured.store(true, .release);
+    return aff;
+}
+
+pub fn getSavedInitialAffinity() ?LinuxInitialAffinity {
+    if (comptime builtin.os.tag != .linux) return null;
+    if (!initial_affinity_captured.load(.acquire)) return null;
+    return saved_initial_affinity;
+}
+
+pub fn pinProcessToPrimaryCpu() void {
+    if (comptime builtin.os.tag != .linux) return;
+    const aff = captureInitialAffinity() orelse return;
+    if (aff.count == 0) return;
+    process_pinned_to_primary.store(true, .release);
+    const set = singleCpuSet(aff.cpus[0]);
+    std.os.linux.sched_setaffinity(0, &set) catch {};
+}
+
+fn prefaultPagesOnLastCpu(base: [*]align(page_size_min) u8, initial_bytes: usize) void {
+    if (comptime builtin.os.tag != .linux) return;
+    if (initial_bytes == 0) return;
+    const aff = captureInitialAffinity() orelse return;
+    if (aff.count == 0) return;
+    var prev_set = std.mem.zeroes(std.os.linux.cpu_set_t);
+    const has_prev = std.os.linux.sched_getaffinity(
+        0,
+        @sizeOf(std.os.linux.cpu_set_t),
+        &prev_set,
+    ) == 0;
+    const last_set = singleCpuSet(aff.cpus[aff.count - 1]);
+    std.os.linux.sched_setaffinity(0, &last_set) catch {};
+    defer if (has_prev) {
+        std.os.linux.sched_setaffinity(0, &prev_set) catch {};
+    };
+    var page_idx: usize = initial_bytes / 4096;
+    while (page_idx > 0) {
+        page_idx -= 1;
+        @as(*volatile u8, @ptrCast(base + page_idx * 4096)).* = 0;
+    }
+}
+
+fn releaseAddressSpaceOnLastCpu(base: [*]align(page_size_min) u8, reserved_bytes: usize) void {
+    if (comptime builtin.os.tag != .linux) {
+        platform.releaseAddressSpace(base, reserved_bytes);
+        return;
+    }
+    const aff = captureInitialAffinity();
+    if (aff == null or aff.?.count == 0) {
+        platform.releaseAddressSpace(base, reserved_bytes);
+        return;
+    }
+    var prev_set = std.mem.zeroes(std.os.linux.cpu_set_t);
+    const has_prev = std.os.linux.sched_getaffinity(
+        0,
+        @sizeOf(std.os.linux.cpu_set_t),
+        &prev_set,
+    ) == 0;
+    const last_set = singleCpuSet(aff.?.cpus[aff.?.count - 1]);
+    std.os.linux.sched_setaffinity(0, &last_set) catch {};
+    defer {
+        if (process_pinned_to_primary.load(.acquire)) {
+            const first_set = singleCpuSet(aff.?.cpus[0]);
+            std.os.linux.sched_setaffinity(0, &first_set) catch {};
+        } else if (has_prev) {
+            std.os.linux.sched_setaffinity(0, &prev_set) catch {};
+        }
+    }
+    platform.releaseAddressSpace(base, reserved_bytes);
+}
+
 /// Portable control block shared by every owner of a shared linear memory.
 ///
 /// The reservation and `base` never change. A successful grow commits the
@@ -68,6 +192,9 @@ pub const Control = struct {
             return error.ReserveFailed;
         errdefer platform.releaseAddressSpace(base, reserved_bytes);
         platform.commitPages(base, initial_bytes) catch return error.CommitFailed;
+        if (comptime builtin.os.tag == .linux) {
+            prefaultPagesOnLastCpu(base, initial_bytes);
+        }
 
         const control = allocator.create(Control) catch return error.OutOfMemory;
         control.* = .{
@@ -82,7 +209,7 @@ pub const Control = struct {
 
     pub fn destroy(self: *Control, allocator: std.mem.Allocator) void {
         self.parking_lot.deinit();
-        platform.releaseAddressSpace(self.base, self.reserved_bytes);
+        releaseAddressSpaceOnLastCpu(self.base, self.reserved_bytes);
         allocator.destroy(self);
     }
 
