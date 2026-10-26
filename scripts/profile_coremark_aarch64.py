@@ -852,8 +852,8 @@ def analyze_wamr_frame_provenance(
     reconciliation = summary["reconciliation"]
     if (
         reconciliation["matches"] is not True
-        or reconciliation["emitted_allocator_loads"] != spill_metric.get("spill_ld")
-        or reconciliation["emitted_allocator_stores"] != spill_metric.get("spill_st")
+        or reconciliation["emitted_allocator_loads"] != spill_metric.get("spill_ld", 0)
+        or reconciliation["emitted_allocator_stores"] != spill_metric.get("spill_st", 0)
     ):
         raise ProfileError("frame origins disagree with the emitted spill metric log")
     for values in summary["origins"].values():
@@ -2269,7 +2269,10 @@ def run_profile(args: argparse.Namespace) -> dict[str, Any]:
             capture_counts=wamr_capture_counts,
             ranking_reports=ranking_reports,
             total_samples=wamr_attribution["total_samples"],
-            spill_metric=spill_metrics.get(args.frame_func, {}),
+            spill_metric=spill_metrics.get(
+                args.frame_func,
+                {"spill_ld": 0, "spill_st": 0, "spilled_vregs": 0, "slots": 0},
+            ),
             scratch_dir=out_dir,
         )
         frame_attribution.update(

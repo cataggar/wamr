@@ -288,6 +288,68 @@ class CoreMarkProfileTests(unittest.TestCase):
         with self.assertRaisesRegex(profile.ProfileError, "static component"):
             profile.validate_frame_provenance(frame, report)
 
+    def test_zero_spill_frame_func_reconciles_when_omitted_from_spill_log(self):
+        summary = {
+            "coverage": {
+                "frame_instructions": 1, "attributed_frame_instructions": 1,
+                "proven_origin_frame_instructions": 1, "unknown_frame_instructions": 0,
+                "frame_samples": 10, "attributed_frame_samples": 10,
+                "proven_origin_frame_samples": 10, "unknown_frame_samples": 0,
+            },
+            "origins": {
+                "wasm_local_or_phi_slot": {"samples": 10, "static_instructions": 1},
+            },
+            "allocator_contributors": [],
+            "reconciliation": {
+                "emitted_allocator_loads": 0, "emitted_allocator_stores": 0,
+                "spill_metric_loads": 0, "spill_metric_stores": 0, "matches": True,
+            },
+            "allocator_component_counts": {
+                "total_loads": 0, "total_stores": 0,
+                "unranked_loads": 0, "unranked_stores": 0,
+            },
+            "unknown_instructions": [],
+        }
+        metadata = SimpleNamespace(
+            inline_data_ranges=[],
+            raw={
+                "module": 0, "schema": "wamr-aot-frame-attribution",
+                "schema_version": 2, "architecture": "aarch64", "abi": "aapcs64",
+                "compiler_build_id": "dev", "module_text_sha256": "a" * 64,
+                "normalized_code_sha256": "b" * 64,
+            },
+        )
+        aot = SimpleNamespace(
+            function_bounds=mock.Mock(return_value=(8, 16)),
+            load_frame_metadata=mock.Mock(return_value=metadata),
+            disassemble_function=mock.Mock(return_value=[object()]),
+            validate_metadata_disassembly=mock.Mock(),
+            build_frame_summary=mock.Mock(return_value=summary),
+        )
+        cache = ROOT / ".cache"
+        cache.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=cache) as temp:
+            root = Path(temp)
+            path = root / "wamr-frame.mod0.func10.json"
+            path.write_text("{}")
+            frame = profile.analyze_wamr_frame_provenance(
+                aot=aot,
+                cwasm_info=SimpleNamespace(
+                    data=b"\0" * 36, text_file_offset=4, text_size=32, version=11
+                ),
+                metadata_path=path,
+                local_func=10,
+                capture_counts=[({1012: 10}, 1000)],
+                ranking_reports=[
+                    {"total_samples": 100, "top_functions": [{"local_func": 10, "samples": 10}]}
+                ],
+                total_samples=100,
+                spill_metric={},
+                scratch_dir=root,
+            )
+        self.assertEqual(0, frame["summary"]["reconciliation"]["emitted_allocator_loads"])
+        self.assertEqual(0, frame["summary"]["reconciliation"]["emitted_allocator_stores"])
+
     def test_analysis_sources_include_loaded_comparison_dependencies(self):
         aot = profile.load_aot_helper(ROOT)
         sources = {

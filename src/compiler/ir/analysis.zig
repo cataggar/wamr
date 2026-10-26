@@ -1117,6 +1117,10 @@ fn computeLiveRangesImpl(
     defer def_type.deinit();
     var last_use_pos = std.AutoHashMap(ir.VReg, u32).init(allocator);
     defer last_use_pos.deinit();
+    var max_access_depth = std.AutoHashMap(ir.VReg, u8).init(allocator);
+    defer max_access_depth.deinit();
+    var max_depth_hits = std.AutoHashMap(ir.VReg, u8).init(allocator);
+    defer max_depth_hits.deinit();
     // Earliest block-start position at which each vreg is live-in. A value
     // that is live-in to a block is live from that block's start, so its
     // range must begin no later than there — even when its only textual
@@ -1141,6 +1145,15 @@ fn computeLiveRangesImpl(
     };
     defer if (owns_order) allocator.free(effective_order);
 
+    // Per-block loop-nest depth, computed once and reused for every
+    // range. On functions without back-edges this stays all-zeros and
+    // the eviction heuristic degrades to the pre-change "longest end"
+    // rule. Failures here are propagated rather than silently masked —
+    // dominator/loop computation is bounded by CFG size and very rarely
+    // OOMs in practice.
+    const loop_depth_by_block: []u8 = try computeLoopDepthByBlockForFunc(func, allocator);
+    defer allocator.free(loop_depth_by_block);
+
     // Per-order-position flat-index span: block at order position `i`
     // covers [block_starts[i], block_starts[i+1]). Used after the main
     // pass to annotate each live range with the max loop-nest depth of
@@ -1152,6 +1165,7 @@ fn computeLiveRangesImpl(
     for (effective_order, 0..) |bid, oi| {
         block_starts[oi] = global_idx;
         const block = func.blocks.items[bid];
+        const block_depth: u8 = if (bid < loop_depth_by_block.len) loop_depth_by_block[bid] else 0;
 
         // VRegs in live_in are used before defined in this block — extend their range
         if (liveness.getPtr(bid)) |bl| {
@@ -1168,6 +1182,12 @@ fn computeLiveRangesImpl(
             }
         }
 
+        const use_recorder = LastUseRecorder{
+            .last_use_pos = &last_use_pos,
+            .max_access_depth = &max_access_depth,
+            .max_depth_hits = &max_depth_hits,
+            .block_depth = block_depth,
+        };
         for (block.instructions.items) |inst| {
             // Record definition position
             if (inst.dest) |dest| {
@@ -1175,6 +1195,7 @@ fn computeLiveRangesImpl(
                     try def_pos.put(dest, global_idx);
                     try def_type.put(dest, inst.type);
                 }
+                try recordAccessDepth(&max_access_depth, &max_depth_hits, dest, block_depth);
             }
             if (inst.op == .parallel_copy) {
                 for (inst.op.parallel_copy) |p| {
@@ -1182,12 +1203,13 @@ fn computeLiveRangesImpl(
                         try def_pos.put(p.dst, global_idx);
                         try def_type.put(p.dst, p.ty);
                     }
+                    try recordAccessDepth(&max_access_depth, &max_depth_hits, p.dst, block_depth);
                 }
             }
             // Record last use position. In SSA mode a phi contributes no
             // in-block use; each arm's last use is the terminator of its
             // predecessor, applied via the live_out extension below.
-            if (!(ssa and inst.op == .phi)) updateLastUse(&last_use_pos, inst, global_idx);
+            if (!(ssa and inst.op == .phi)) updateLastUse(use_recorder, inst, global_idx);
             global_idx += 1;
         }
 
@@ -1203,15 +1225,6 @@ fn computeLiveRangesImpl(
     }
     block_starts[effective_order.len] = global_idx;
 
-    // Per-block loop-nest depth, computed once and reused for every
-    // range. On functions without back-edges this stays all-zeros and
-    // the eviction heuristic degrades to the pre-change "longest end"
-    // rule. Failures here are propagated rather than silently masked —
-    // dominator/loop computation is bounded by CFG size and very rarely
-    // OOMs in practice.
-    const loop_depth_by_block: []u8 = try computeLoopDepthByBlockForFunc(func, allocator);
-    defer allocator.free(loop_depth_by_block);
-
     // Build sorted live ranges
     var ranges: std.ArrayList(LiveRange) = .empty;
     var dit = def_pos.iterator();
@@ -1226,13 +1239,19 @@ fn computeLiveRangesImpl(
         const start = if (first_live_in_pos.get(vreg)) |li| @min(def_p, li) else def_p;
         const end = last_use_pos.get(vreg) orelse start;
         const final_end = @max(start, end);
-        const depth = maxLoopDepthOverSpan(
+        const span_depth = maxLoopDepthOverSpan(
             start,
             final_end,
             effective_order,
             block_starts,
             loop_depth_by_block,
         );
+        const access_depth = max_access_depth.get(vreg) orelse 0;
+        const hits = max_depth_hits.get(vreg) orelse 0;
+        const depth: u8 = if (span_depth >= 2)
+            @intCast(@min(@as(u16, 255), @as(u16, 2) + (@as(u16, access_depth) * 32) + @as(u16, @min(hits, 31))))
+        else
+            span_depth;
         try ranges.append(allocator, .{
             .vreg = vreg,
             .start = start,
@@ -1314,7 +1333,141 @@ pub fn maxLoopDepthOverSpan(
     return max_depth;
 }
 
-fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u32) void {
+fn recordAccessDepth(
+    max_access_depth: *std.AutoHashMap(ir.VReg, u8),
+    max_depth_hits: *std.AutoHashMap(ir.VReg, u8),
+    v: ir.VReg,
+    block_depth: u8,
+) !void {
+    const prev_d = max_access_depth.get(v) orelse 0;
+    if (block_depth > prev_d) {
+        try max_access_depth.put(v, block_depth);
+        try max_depth_hits.put(v, 1);
+    } else if (block_depth == prev_d) {
+        const prev_h = max_depth_hits.get(v) orelse 0;
+        try max_depth_hits.put(v, @min(@as(u8, 31), prev_h +| 1));
+    }
+}
+
+const LastUseRecorder = struct {
+    last_use_pos: *std.AutoHashMap(ir.VReg, u32),
+    max_access_depth: *std.AutoHashMap(ir.VReg, u8),
+    max_depth_hits: *std.AutoHashMap(ir.VReg, u8),
+    block_depth: u8,
+
+    pub fn put(self: LastUseRecorder, v: ir.VReg, pos: u32) !void {
+        try self.last_use_pos.put(v, pos);
+        try recordAccessDepth(self.max_access_depth, self.max_depth_hits, v, self.block_depth);
+    }
+};
+
+const BitSetUseRecorder = struct {
+    bs: *std.DynamicBitSetUnmanaged,
+
+    pub fn put(self: BitSetUseRecorder, v: ir.VReg, _: u32) !void {
+        if (v < self.bs.bit_length) self.bs.set(v);
+    }
+};
+
+/// Populate exact per-clobber live-VReg bitsets (`cp.live_vregs`) by
+/// walking backward from `live_out[bid]` in `block_order` so linear-scan
+/// `regSafeForRange` only disqualifies caller-saved registers when a VReg
+/// is genuinely live across the clobber instruction (not inside a linear
+/// RPO hole).
+pub fn populateClobberLiveVregs(
+    func: *const ir.IrFunction,
+    block_order: []const ir.BlockId,
+    clobbers: anytype,
+    allocator: std.mem.Allocator,
+) !void {
+    if (clobbers.len == 0 or block_order.len == 0) return;
+
+    var max_vreg: ir.VReg = func.next_vreg;
+    for (func.blocks.items) |*block| {
+        for (block.instructions.items) |inst| {
+            if (inst.dest) |d| {
+                if (d >= max_vreg) max_vreg = d + 1;
+            }
+            if (inst.op == .parallel_copy) {
+                for (inst.op.parallel_copy) |p| {
+                    if (p.dst >= max_vreg) max_vreg = p.dst + 1;
+                    if (p.src >= max_vreg) max_vreg = p.src + 1;
+                }
+            }
+        }
+    }
+    if (max_vreg == 0) return;
+
+    const liveness = try computeLiveness(func, allocator);
+    defer {
+        var it = @constCast(&liveness).iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.live_in.deinit();
+            entry.value_ptr.live_out.deinit();
+        }
+        @constCast(&liveness).deinit();
+    }
+
+    const block_starts = try allocator.alloc(u32, block_order.len + 1);
+    defer allocator.free(block_starts);
+    var global_idx: u32 = 0;
+    for (block_order, 0..) |bid, oi| {
+        block_starts[oi] = global_idx;
+        global_idx += @intCast(func.blocks.items[bid].instructions.items.len);
+    }
+    block_starts[block_order.len] = global_idx;
+
+    var live_bs = try std.DynamicBitSetUnmanaged.initEmpty(allocator, max_vreg);
+    defer live_bs.deinit(allocator);
+    const bit_recorder = BitSetUseRecorder{ .bs = &live_bs };
+
+    var cp_idx: usize = 0;
+    for (block_order, 0..) |bid, oi| {
+        const b_start = block_starts[oi];
+        const b_end = block_starts[oi + 1];
+        while (cp_idx < clobbers.len and clobbers[cp_idx].pos < b_start) : (cp_idx += 1) {}
+        if (cp_idx >= clobbers.len or clobbers[cp_idx].pos >= b_end) continue;
+
+        var block_cp_end = cp_idx;
+        while (block_cp_end < clobbers.len and clobbers[block_cp_end].pos < b_end) : (block_cp_end += 1) {}
+
+        live_bs.unsetAll();
+        if (liveness.getPtr(bid)) |bl| {
+            var lit = bl.live_out.iterator();
+            while (lit.next()) |entry| {
+                const v = entry.key_ptr.*;
+                if (v < live_bs.bit_length) live_bs.set(v);
+            }
+        }
+
+        const insts = func.blocks.items[bid].instructions.items;
+        var cur_cp: usize = block_cp_end;
+        var i: usize = insts.len;
+        while (i > 0) {
+            i -= 1;
+            const inst = insts[i];
+            const pos: u32 = b_start + @as(u32, @intCast(i));
+            if (inst.dest) |d| {
+                if (d < live_bs.bit_length) live_bs.unset(d);
+            }
+            if (inst.op == .parallel_copy) {
+                for (inst.op.parallel_copy) |p| {
+                    if (p.dst < live_bs.bit_length) live_bs.unset(p.dst);
+                }
+            }
+            while (cur_cp > cp_idx and clobbers[cur_cp - 1].pos == pos) {
+                cur_cp -= 1;
+                clobbers[cur_cp].live_vregs = try live_bs.clone(allocator);
+            }
+            if (inst.op != .phi) {
+                updateLastUse(bit_recorder, inst, pos);
+            }
+        }
+        cp_idx = block_cp_end;
+    }
+}
+
+fn updateLastUse(last_use: anytype, inst: ir.Inst, pos: u32) void {
     switch (inst.op) {
         .iconst_32, .iconst_64, .fconst_32, .fconst_64, .v128_const => {},
         .local_get, .global_get => {},
@@ -3857,3 +4010,103 @@ test "computeBlockFrequencies: unreachable block stays at 0" {
     try std.testing.expectEqual(@as(f32, 1.0), freq[1]);
     try std.testing.expectEqual(@as(f32, 0.0), freq[2]);
 }
+
+test "computeLiveRanges: nested loop max_loop_depth weights access depth and hit count" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const h_o = try func.newBlock();
+    const h_i = try func.newBlock();
+    const exit_o = try func.newBlock();
+
+    const v_outer_only = func.newVReg();
+    const v_inner_hot = func.newVReg();
+    const v_inner_tmp = func.newVReg();
+    const v_cond_i = func.newVReg();
+    const v_cond_o = func.newVReg();
+
+    // v_outer_only is defined in b0 and used in exit_o (spans nested loop, accessed at depth 0).
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 10 }, .dest = v_outer_only });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 20 }, .dest = v_inner_hot });
+    try func.getBlock(b0).append(.{ .op = .{ .br = h_o } });
+
+    try func.getBlock(h_o).append(.{ .op = .{ .br = h_i } });
+
+    // Inside inner loop (depth 2), v_inner_hot is used twice.
+    try func.getBlock(h_i).append(.{ .op = .{ .add = .{ .lhs = v_inner_hot, .rhs = v_inner_hot } }, .dest = v_inner_tmp });
+    try func.getBlock(h_i).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_cond_i });
+    try func.getBlock(h_i).append(.{ .op = .{ .br_if = .{ .cond = v_cond_i, .then_block = h_i, .else_block = exit_o } } });
+
+    try func.getBlock(exit_o).append(.{ .op = .{ .add = .{ .lhs = v_outer_only, .rhs = v_inner_tmp } }, .dest = v_cond_o });
+    try func.getBlock(exit_o).append(.{ .op = .{ .br_if = .{ .cond = v_cond_o, .then_block = h_o, .else_block = b0 } } });
+
+    const ranges = try computeLiveRanges(&func, allocator);
+    defer allocator.free(ranges);
+
+    var depth_outer: ?u8 = null;
+    var depth_inner_hot: ?u8 = null;
+    var depth_inner_tmp: ?u8 = null;
+    for (ranges) |r| {
+        if (r.vreg == v_outer_only) depth_outer = r.max_loop_depth;
+        if (r.vreg == v_inner_hot) depth_inner_hot = r.max_loop_depth;
+        if (r.vreg == v_inner_tmp) depth_inner_tmp = r.max_loop_depth;
+    }
+
+    try std.testing.expect(depth_outer != null and depth_inner_hot != null and depth_inner_tmp != null);
+    // v_inner_hot is accessed at depth 2 with 2 uses -> higher priority than v_inner_tmp (1 def at depth 2)
+    // and much higher than v_outer_only (accessed only at depth 0/1).
+    try std.testing.expect(depth_inner_hot.? > depth_inner_tmp.?);
+    try std.testing.expect(depth_inner_tmp.? > depth_outer.?);
+}
+
+test "populateClobberLiveVregs: marks only vregs live across clobber and excludes RPO hole vregs" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    // Diamond CFG: b0 -> {b1, b2}, b1 -> b3, b2 -> b3.
+    // v_hole is defined in b0 and used ONLY in b2 (not live in b1).
+    // v_live is defined in b0 and used in b3 (live across the call in b1).
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+
+    const v_cond = func.newVReg();
+    const v_hole = func.newVReg();
+    const v_live = func.newVReg();
+    const v_call = func.newVReg();
+    const v_use2 = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_cond });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 11 }, .dest = v_hole });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 22 }, .dest = v_live });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b1, .else_block = b2 } } });
+
+    // b1 has a call at global pos 4 (b0 has 4 insts: 0..3).
+    try func.getBlock(b1).append(.{ .op = .{ .call = .{ .func_idx = 0, .args = &.{} } }, .dest = v_call });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+
+    try func.getBlock(b2).append(.{ .op = .{ .add = .{ .lhs = v_hole, .rhs = v_hole } }, .dest = v_use2 });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+
+    try func.getBlock(b3).append(.{ .op = .{ .ret = v_live } });
+
+    const order = [_]ir.BlockId{ b0, b1, b2, b3 };
+    const MockClobber = struct {
+        pos: u32,
+        live_vregs: ?std.DynamicBitSetUnmanaged = null,
+    };
+    var clobbers = [_]MockClobber{.{ .pos = 4 }};
+    defer for (&clobbers) |*cp| if (cp.live_vregs) |*bs| bs.deinit(allocator);
+
+    try populateClobberLiveVregs(&func, &order, &clobbers, allocator);
+
+    try std.testing.expect(clobbers[0].live_vregs != null);
+    const bs = clobbers[0].live_vregs.?;
+    try std.testing.expect(bs.isSet(v_live));
+    try std.testing.expect(!bs.isSet(v_hole));
+}
+

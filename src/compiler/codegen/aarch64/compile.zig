@@ -716,6 +716,7 @@ const FuncCompileCtx = struct {
     block_rep: []const ir.BlockId = &.{},
     block_pos: []const usize = &.{},
     fallthrough_rep: ?ir.BlockId = null,
+    cached_mem_index_vreg: ?ir.VReg = null,
     func_idx: u32 = 0,
     allocator: std.mem.Allocator,
 
@@ -3003,6 +3004,7 @@ pub fn compileFunctionImpl(
             }
         }
         fctx.fallthrough_rep = if (order_idx + 1 < block_order.len) rep[order_idx + 1] else null;
+        fctx.cached_mem_index_vreg = null;
         const block_insts = scheduled.instructions(bi);
         for (block_insts, 0..) |inst, ii| {
             last_was_ret = isRet(inst.op);
@@ -3035,6 +3037,9 @@ pub fn compileFunctionImpl(
             ir_position += 1;
             // Release physregs of vregs whose last static use is this inst.
             for (kill_lists[flat_idx].items) |v| {
+                if (fctx.cached_mem_index_vreg == v) {
+                    fctx.cached_mem_index_vreg = null;
+                }
                 reg_map.freeVReg(v);
                 v128_cache.release(v);
             }
@@ -4497,7 +4502,18 @@ fn compileInst(
 ) !void {
     if (instRequiresV128Flush(inst)) {
         try v128_cache.flushAll(code, v128_map);
+        fctx.cached_mem_index_vreg = null;
     }
+
+    switch (inst.op) {
+        .load, .store, .iconst_32, .iconst_64, .fconst_32, .fconst_64, .try_table_begin, .try_table_end => {},
+        else => fctx.cached_mem_index_vreg = null,
+    }
+    defer if (inst.dest) |d| {
+        if (fctx.cached_mem_index_vreg == d) {
+            fctx.cached_mem_index_vreg = null;
+        }
+    };
 
     switch (inst.op) {
         // ── Constants ────────────────────────────────────────────────
@@ -8457,7 +8473,7 @@ fn emitMemAddr(
     offset: u32,
     end_offset: u64,
 ) !void {
-    try emitMemAddrImpl(code, reg_map, base_vreg, offset, end_offset, false);
+    try emitMemAddrImpl(code, reg_map, base_vreg, offset, end_offset, false, null);
 }
 
 fn emitAtomicAlignmentCheck(
@@ -8482,7 +8498,7 @@ fn emitAtomicMemAddr(
     offset: u32,
     size: u8,
 ) !void {
-    try emitMemIndex(code, reg_map, base_vreg);
+    try emitMemIndex(code, reg_map, base_vreg, null);
     if (offset != 0) {
         if (offset <= 0xFFF) {
             try code.addImm(RegMap.tmp2, RegMap.tmp2, @intCast(offset));
@@ -8502,7 +8518,7 @@ fn emitMemAddrSkipBounds(
     base_vreg: ir.VReg,
     offset: u32,
 ) !void {
-    try emitMemAddrImpl(code, reg_map, base_vreg, offset, 0, true);
+    try emitMemAddrImpl(code, reg_map, base_vreg, offset, 0, true, null);
 }
 
 fn emitMemAddrImpl(
@@ -8512,8 +8528,9 @@ fn emitMemAddrImpl(
     offset: u32,
     end_offset: u64,
     skip_bounds: bool,
+    fctx: ?*FuncCompileCtx,
 ) !void {
-    try emitMemIndexImpl(code, reg_map, base_vreg, end_offset, skip_bounds);
+    try emitMemIndexImpl(code, reg_map, base_vreg, end_offset, skip_bounds, fctx);
 
     // ea = mem_base (pinned x20, issue #466) + zext(wasm_addr).
     try code.addRegReg(RegMap.tmp0, .x20, RegMap.tmp2);
@@ -8539,7 +8556,7 @@ fn emitCheckedMemIndex(
     base_vreg: ir.VReg,
     end_offset: u64,
 ) !void {
-    try emitMemIndexImpl(code, reg_map, base_vreg, end_offset, false);
+    try emitMemIndexImpl(code, reg_map, base_vreg, end_offset, false, null);
 }
 
 fn emitMemIndexImpl(
@@ -8548,8 +8565,9 @@ fn emitMemIndexImpl(
     base_vreg: ir.VReg,
     end_offset: u64,
     skip_bounds: bool,
+    fctx: ?*FuncCompileCtx,
 ) !void {
-    try emitMemIndex(code, reg_map, base_vreg);
+    try emitMemIndex(code, reg_map, base_vreg, fctx);
     if (!skip_bounds)
         try emitMemIndexBoundsCheck(code, RegMap.tmp2, end_offset);
 }
@@ -8558,9 +8576,18 @@ fn emitMemIndex(
     code: *emit.CodeBuffer,
     reg_map: *RegMap,
     base_vreg: ir.VReg,
+    fctx: ?*FuncCompileCtx,
 ) !void {
+    if (fctx) |ctx| {
+        if (!ctx.has_memory64 and ctx.cached_mem_index_vreg == base_vreg) {
+            return;
+        }
+    }
     const src = try useInto(code, reg_map, base_vreg, RegMap.tmp1);
     try code.movRegReg32(RegMap.tmp2, src);
+    if (fctx) |ctx| {
+        ctx.cached_mem_index_vreg = if (!ctx.has_memory64) base_vreg else null;
+    }
 }
 
 fn emitMemIndexBoundsCheck(
@@ -9956,7 +9983,7 @@ fn emitLoad(
     inst: ir.Inst,
     ld: @TypeOf(@as(ir.Inst.Op, undefined).load),
     reg_map: *RegMap,
-    fctx: *const FuncCompileCtx,
+    fctx: *FuncCompileCtx,
 ) !void {
     const dest = inst.dest orelse return;
     const is64 = inst.type == .i64;
@@ -9977,17 +10004,14 @@ fn emitLoad(
     const folded = scaledOffset(ld.offset, scale);
     const end_offset: u64 = if (ld.checked_end > 0) ld.checked_end else @as(u64, ld.offset) + @as(u64, ld.size);
     const folded_offset: u32 = if (folded == null) ld.offset else 0;
-    const use_reg_offset = !ld.bounds_known and
-        fctx.options.enable_mem_reg_offset and
+    const use_reg_offset = fctx.options.enable_mem_reg_offset and
         ld.offset == 0 and
         !fctx.has_memory64 and
         !fctx.has_shared_memory;
     if (use_reg_offset) {
-        try emitCheckedMemIndex(code, reg_map, ld.base, end_offset);
-    } else if (ld.bounds_known) {
-        try emitMemAddrSkipBounds(code, reg_map, ld.base, folded_offset);
+        try emitMemIndexImpl(code, reg_map, ld.base, end_offset, ld.bounds_known, fctx);
     } else {
-        try emitMemAddr(code, reg_map, ld.base, folded_offset, end_offset);
+        try emitMemAddrImpl(code, reg_map, ld.base, folded_offset, end_offset, ld.bounds_known, fctx);
     }
     const disp: u12 = if (folded) |d| d else 0;
 
@@ -10030,7 +10054,7 @@ fn emitStore(
     code: *emit.CodeBuffer,
     st: @TypeOf(@as(ir.Inst.Op, undefined).store),
     reg_map: *RegMap,
-    fctx: *const FuncCompileCtx,
+    fctx: *FuncCompileCtx,
 ) !void {
     const scale: u32 = switch (st.size) {
         1 => 1,
@@ -10043,17 +10067,14 @@ fn emitStore(
     const folded = scaledOffset(st.offset, scale);
     const end_offset: u64 = if (st.checked_end > 0) st.checked_end else @as(u64, st.offset) + @as(u64, st.size);
     const folded_offset: u32 = if (folded == null) st.offset else 0;
-    const use_reg_offset = !st.bounds_known and
-        fctx.options.enable_mem_reg_offset and
+    const use_reg_offset = fctx.options.enable_mem_reg_offset and
         st.offset == 0 and
         !fctx.has_memory64 and
         !fctx.has_shared_memory;
     if (use_reg_offset) {
-        try emitCheckedMemIndex(code, reg_map, st.base, end_offset);
-    } else if (st.bounds_known) {
-        try emitMemAddrSkipBounds(code, reg_map, st.base, folded_offset);
+        try emitMemIndexImpl(code, reg_map, st.base, end_offset, st.bounds_known, fctx);
     } else {
-        try emitMemAddr(code, reg_map, st.base, folded_offset, end_offset);
+        try emitMemAddrImpl(code, reg_map, st.base, folded_offset, end_offset, st.bounds_known, fctx);
     }
     const disp: u12 = if (folded) |d| d else 0;
 
@@ -15938,7 +15959,7 @@ test "store: spilled value reload preserves the checked register-offset index" {
     const val: ir.VReg = 1;
     try reg_map.entries.put(base, .{ .reg = .x0 });
     try reg_map.entries.put(val, .{ .stack = 0 });
-    const fctx = FuncCompileCtx{ .allocator = allocator };
+    var fctx = FuncCompileCtx{ .allocator = allocator };
 
     try emitStore(&code, .{ .base = base, .offset = 0, .size = 4, .val = val }, &reg_map, &fctx);
 
@@ -16025,7 +16046,6 @@ test "load: register-offset eligibility preserves offset and memory64-shaped fal
         .{ .offset = std.math.maxInt(u32), .size = 1 },
         .{ .base_type = .i64, .has_memory64 = true, .size = 4, .result_type = .i64 },
         .{ .has_shared_memory = true, .size = 4 },
-        .{ .size = 4, .bounds_known = true },
     };
     const index_bits = (@as(u32, @backingInt(RegMap.tmp2)) << 16) |
         (@as(u32, @backingInt(emit.Reg.x20)) << 5);
@@ -16041,6 +16061,16 @@ test "load: register-offset eligibility preserves offset and memory64-shaped fal
         try std.testing.expect(!testCodeContainsMasked(code, 0x3B200C00, 0x38200800));
         try std.testing.expect(testCodeContainsWord(code, native_add));
     }
+
+    const bounds_known_code = try compileAddressingLoadTest(allocator, .{ .size = 4, .bounds_known = true }, .{
+        .enable_scheduler = false,
+        .enable_peephole = false,
+        .enable_post_emit_coalesce = false,
+    });
+    defer allocator.free(bounds_known_code);
+    try std.testing.expect(testCodeContainsMasked(bounds_known_code, 0x3B200C00, 0x38200800));
+    try std.testing.expect(!testCodeContainsWord(bounds_known_code, native_add));
+    try std.testing.expect(!testCodeContainsMasked(bounds_known_code, 0xFF00001F, 0x54000009));
 }
 
 test "store: register-offset eligibility preserves offset and memory64-shaped fallbacks" {
@@ -16050,7 +16080,6 @@ test "store: register-offset eligibility preserves offset and memory64-shaped fa
         .{ .offset = std.math.maxInt(u32), .size = 1 },
         .{ .base_type = .i64, .has_memory64 = true, .size = 8, .value_type = .i64 },
         .{ .has_shared_memory = true, .size = 4 },
-        .{ .size = 4, .bounds_known = true },
     };
     const index_bits = (@as(u32, @backingInt(RegMap.tmp2)) << 16) |
         (@as(u32, @backingInt(emit.Reg.x20)) << 5);
@@ -16066,6 +16095,52 @@ test "store: register-offset eligibility preserves offset and memory64-shaped fa
         try std.testing.expect(!testCodeContainsMasked(code, 0x3B200C00, 0x38200800));
         try std.testing.expect(testCodeContainsWord(code, native_add));
     }
+
+    const bounds_known_code = try compileAddressingStoreTest(allocator, .{ .size = 4, .bounds_known = true }, .{
+        .enable_scheduler = false,
+        .enable_peephole = false,
+        .enable_post_emit_coalesce = false,
+    });
+    defer allocator.free(bounds_known_code);
+    try std.testing.expect(testCodeContainsMasked(bounds_known_code, 0x3B200C00, 0x38200800));
+    try std.testing.expect(!testCodeContainsWord(bounds_known_code, native_add));
+    try std.testing.expect(!testCodeContainsMasked(bounds_known_code, 0xFF00001F, 0x54000009));
+}
+
+test "load+store: consecutive accesses with same base vreg reuse cached zext index in x15" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 1, 2);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const addr = func.newVReg();
+    const val = func.newVReg();
+    const loaded = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .local_get = 0 }, .dest = addr, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .local_get = 1 }, .dest = val, .type = .i32 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .load = .{ .base = addr, .offset = 0, .size = 4 } },
+        .dest = loaded,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .store = .{ .base = addr, .val = val, .offset = 0, .size = 4, .bounds_known = true } },
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = loaded } });
+
+    const code = try compileFunctionWithOptions(&func, allocator, .{
+        .enable_scheduler = false,
+        .enable_peephole = false,
+        .enable_post_emit_coalesce = false,
+    });
+    defer allocator.free(code);
+
+    var mov_zext_count: usize = 0;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const word = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((word & 0xFFE0FFFF) == 0x2A0003EF) mov_zext_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), mov_zext_count);
 }
 
 test "atomic load: shared-memory path keeps materialized address fallback" {
