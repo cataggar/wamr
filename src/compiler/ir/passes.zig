@@ -8371,6 +8371,39 @@ pub fn coalescePhiLocalsToParallelCopy(func: *ir.IrFunction, allocator: std.mem.
             const loop_depths = try analysis.loopDepthByBlockForFunc(func, allocator);
             defer allocator.free(loop_depths);
             const orig_nblocks = func.blocks.items.len;
+            const valid_split_target = try allocator.alloc(bool, orig_nblocks);
+            defer allocator.free(valid_split_target);
+            for (0..orig_nblocks) |t_us| {
+                const t_bid: ir.BlockId = @intCast(t_us);
+                const t_preds = preds.get(t_bid) orelse {
+                    valid_split_target[t_us] = false;
+                    continue;
+                };
+                if (t_preds.len == 0) {
+                    valid_split_target[t_us] = false;
+                    continue;
+                }
+                var ok = true;
+                for (info, 0..) |slot_t, kt| {
+                    if (!slot_t.eligible or slot_t.join_block != t_bid) continue;
+                    const synth_t: u32 = synth_start + @as(u32, @intCast(kt));
+                    for (t_preds) |tp| {
+                        var found_set = false;
+                        for (func.blocks.items[tp].instructions.items) |tinst| {
+                            if (tinst.op == .local_set and tinst.op.local_set.idx == synth_t) {
+                                found_set = true;
+                                break;
+                            }
+                        }
+                        if (!found_set) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (!ok) break;
+                }
+                valid_split_target[t_us] = ok;
+            }
             for (0..orig_nblocks) |pred_bid_us| {
                 const pred_bid: ir.BlockId = @intCast(pred_bid_us);
                 const term_idx = findTerminatorIndex(&func.blocks.items[pred_bid]);
@@ -8408,7 +8441,8 @@ pub fn coalescePhiLocalsToParallelCopy(func: *ir.IrFunction, allocator: std.mem.
                 const other_bid = if (target_bid == bi.then_block) bi.else_block else bi.then_block;
                 if (target_bid >= orig_nblocks or other_bid >= orig_nblocks) continue;
 
-                if (loop_depths[pred_bid] > loop_depths[target_bid] and
+                if (valid_split_target[target_bid] and
+                    loop_depths[pred_bid] > loop_depths[target_bid] and
                     !dom.dominates(target_bid, pred_bid) and
                     loop_depths[other_bid] >= loop_depths[pred_bid])
                 {
