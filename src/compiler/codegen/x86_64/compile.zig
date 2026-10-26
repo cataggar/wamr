@@ -2339,6 +2339,32 @@ fn instReadsVRegX86(inst: ir.Inst, target: ir.VReg) bool {
     return ctx.found;
 }
 
+fn instAllowsDestOperandOverlapX86(inst: ir.Inst, src_vreg: ir.VReg) bool {
+    return switch (inst.op) {
+        .add,
+        .sub,
+        .mul,
+        .@"and",
+        .@"or",
+        .xor,
+        .shl,
+        .shr_s,
+        .shr_u,
+        .rotl,
+        .rotr,
+        => |b| (b.lhs == src_vreg and b.rhs != src_vreg),
+        .wrap_i64,
+        .reinterpret,
+        .extend8_s,
+        .extend16_s,
+        .extend32_s,
+        .extend_i32_s,
+        .extend_i32_u,
+        => |un| un == src_vreg,
+        else => false,
+    };
+}
+
 fn vregsInterfereX86(
     u: ir.VReg,
     v: ir.VReg,
@@ -2405,8 +2431,8 @@ fn vregsInterfereX86(
                 const reads_u = instReadsVRegX86(inst, u);
                 const reads_v = instReadsVRegX86(inst, v);
                 if (inst.dest) |d| {
-                    if (d == u and (v_live or reads_v)) return true;
-                    if (d == v and (u_live or reads_u)) return true;
+                    if (d == u and (v_live or (reads_v and !instAllowsDestOperandOverlapX86(inst, v)))) return true;
+                    if (d == v and (u_live or (reads_u and !instAllowsDestOperandOverlapX86(inst, u)))) return true;
                     if (d == u) u_live = false;
                     if (d == v) v_live = false;
                 }
@@ -2432,6 +2458,8 @@ fn coalesceX86Moves(
     clobbers: []const regalloc.ClobberPoint,
     ranges: []const analysis.LiveRange,
     copy_hints: []const regalloc.CopyHint,
+    func_opt: ?*const ir.IrFunction,
+    liveness_opt_ptr: ?*?std.AutoHashMap(ir.BlockId, analysis.BlockLiveness),
 ) !void {
     if (copy_hints.len == 0) return;
 
@@ -2490,6 +2518,8 @@ fn coalesceX86Moves(
             from_reg: regalloc.PhysReg,
             to_reg: regalloc.PhysReg,
             allow_partner_overlap: bool,
+            f_opt: ?*const ir.IrFunction,
+            lv_opt_ptr: ?*?std.AutoHashMap(ir.BlockId, analysis.BlockLiveness),
         ) !bool {
             const moving_ridx = ridx_map.get(moving_vreg) orelse return false;
             const moving_range = rngs[moving_ridx];
@@ -2515,6 +2545,25 @@ fn coalesceX86Moves(
                     }
                 } else {
                     if (iv.start <= moving_range.end and moving_range.start <= iv.end) {
+                        if (allow_partner_overlap and f_opt != null and lv_opt_ptr != null) {
+                            if (lv_opt_ptr.?.* == null) {
+                                lv_opt_ptr.?.* = try analysis.computeLiveness(f_opt.?, alloc_inner);
+                            }
+                            if (!vregsInterfereX86(moving_vreg, iv.vreg, f_opt.?, &lv_opt_ptr.?.*.?)) {
+                                const span_start = @min(moving_range.start, iv.start);
+                                const span_end = @max(moving_range.end, iv.end);
+                                var clobbered = false;
+                                for (clobs) |cp| {
+                                    if (cp.pos > span_start and cp.pos < span_end) {
+                                        if ((cp.regs_clobbered & (@as(u64, 1) << @intCast(to_alloc_idx))) != 0) {
+                                            clobbered = true;
+                                            break;
+                                        }
+                                    } else if (cp.pos >= span_end) break;
+                                }
+                                if (!clobbered) continue;
+                            }
+                        }
                         return false;
                     }
                 }
@@ -2576,6 +2625,8 @@ fn coalesceX86Moves(
                         r_s,
                         r_d,
                         true,
+                        func_opt,
+                        liveness_opt_ptr,
                     );
                 }
                 if (!did_coalesce and !dest_pinned) {
@@ -2592,6 +2643,8 @@ fn coalesceX86Moves(
                         r_d,
                         r_s,
                         true,
+                        func_opt,
+                        liveness_opt_ptr,
                     );
                 }
             } else {
@@ -2609,6 +2662,8 @@ fn coalesceX86Moves(
                         r_d,
                         r_s,
                         true,
+                        func_opt,
+                        liveness_opt_ptr,
                     );
                 }
                 if (!did_coalesce and !src_pinned) {
@@ -2625,6 +2680,8 @@ fn coalesceX86Moves(
                         r_s,
                         r_d,
                         true,
+                        func_opt,
+                        liveness_opt_ptr,
                     );
                 }
             }
@@ -2643,6 +2700,8 @@ fn coalesceX86Moves(
                     r_d,
                     r_s,
                     false,
+                    func_opt,
+                    liveness_opt_ptr,
                 );
             }
         }
@@ -3832,16 +3891,16 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
             alloc_live_ranges.appendAssumeCapacity(range);
         }
     }
+    var liveness_opt: ?std.AutoHashMap(ir.BlockId, analysis.BlockLiveness) = null;
+    defer if (liveness_opt) |*lv| {
+        var it = lv.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.live_in.deinit();
+            entry.value_ptr.live_out.deinit();
+        }
+        lv.deinit();
+    };
     {
-        var liveness_opt: ?std.AutoHashMap(ir.BlockId, analysis.BlockLiveness) = null;
-        defer if (liveness_opt) |*lv| {
-            var it = lv.iterator();
-            while (it.next()) |entry| {
-                entry.value_ptr.live_in.deinit();
-                entry.value_ptr.live_out.deinit();
-            }
-            lv.deinit();
-        };
         var range_by_vreg = std.AutoHashMap(ir.VReg, analysis.LiveRange).init(allocator);
         defer range_by_vreg.deinit();
         try range_by_vreg.ensureTotalCapacity(@intCast(alloc_live_ranges.items.len));
@@ -3901,7 +3960,8 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
                                     }
                                 }
                             }
-                        } else {
+                        }
+                        if (!allow_overlap) {
                             var pair_conflict = false;
                             for (pairs, 0..) |p2, p2_idx| {
                                 if (p2_idx == p_idx) continue;
@@ -3987,6 +4047,8 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
             clobber_points.items,
             alloc_live_ranges.items,
             copy_hints.items,
+            func,
+            &liveness_opt,
         );
     }
     if (timer) |t| t.end(.regalloc);

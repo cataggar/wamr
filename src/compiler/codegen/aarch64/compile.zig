@@ -2513,10 +2513,10 @@ pub fn compileFunctionImpl(
                         try cls_ctx.bumpTotal(s.if_false);
                         if (inst.type == .i32 or inst.type == .i64) {
                             if (cls_ctx.cv.get(s.if_true)) |v| {
-                                if (v == 0) try cls_ctx.bumpFold(s.if_true);
+                                if (isSingleInsnImm(v, inst.type)) try cls_ctx.bumpFold(s.if_true);
                             }
                             if (cls_ctx.cv.get(s.if_false)) |v| {
-                                if (v == 0) try cls_ctx.bumpFold(s.if_false);
+                                if (isSingleInsnImm(v, inst.type)) try cls_ctx.bumpFold(s.if_false);
                             }
                         }
                     },
@@ -2547,43 +2547,73 @@ pub fn compileFunctionImpl(
     fctx.suppress_iconst_emit = &suppress_iconst;
 
     // Identify single-use integer comparisons in the same block whose result
-    // feeds the block-terminating `br_if` across only flag-preserving ops
-    // (`.parallel_copy` or suppressed `.iconst_*`). When fused, `emitCmp`
-    // emits `CMP` without `CSET` and `emitBrIf` branches on NZCV directly.
+    // feeds a `.select` or the block-terminating `br_if` across only
+    // flag-preserving ops (`.parallel_copy` or suppressed `.iconst_*`). When
+    // fused, `emitCmp` emits `CMP` without `CSET` and `emitSelect` / `emitBrIf`
+    // consumes NZCV directly.
     var fused_cmp_cond = std.AutoHashMap(ir.VReg, emit.Cond).init(allocator);
     defer fused_cmp_cond.deinit();
     for (block_order) |bo_bid| {
         const insts = scheduled.instructions(bo_bid);
-        if (insts.len < 2) continue;
-        const term = insts[insts.len - 1];
-        const br_op = switch (term.op) {
-            .br_if => |b| b,
-            else => continue,
-        };
-        if ((use_counts.get(br_op.cond) orelse 0) != 1) continue;
-        var j: usize = insts.len - 1;
-        while (j > 0) {
-            j -= 1;
-            const prev = insts[j];
-            if (prev.dest) |d| {
-                if (d == br_op.cond) {
-                    if (prev.type == .i32 or prev.type == .i64) {
-                        if (cmpOpToCond(prev.op)) |cc| {
-                            try fused_cmp_cond.put(br_op.cond, cc);
+        for (insts, 0..) |inst, idx| {
+            switch (inst.op) {
+                .select => |sel| {
+                    if ((use_counts.get(sel.cond) orelse 0) != 1) continue;
+                    var j: usize = idx;
+                    while (j > 0) {
+                        j -= 1;
+                        const prev = insts[j];
+                        if (prev.dest) |d| {
+                            if (d == sel.cond) {
+                                if (prev.type == .i32 or prev.type == .i64) {
+                                    if (cmpOpToCond(prev.op)) |cc| {
+                                        try fused_cmp_cond.put(sel.cond, cc);
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                        switch (prev.op) {
+                            .iconst_32, .iconst_64 => {
+                                if (prev.dest) |d| {
+                                    if (suppress_iconst.contains(d)) continue;
+                                }
+                                break;
+                            },
+                            else => break,
                         }
                     }
-                    break;
-                }
-            }
-            switch (prev.op) {
-                .parallel_copy => continue,
-                .iconst_32, .iconst_64 => {
-                    if (prev.dest) |d| {
-                        if (suppress_iconst.contains(d)) continue;
-                    }
-                    break;
                 },
-                else => break,
+                .br_if => |br_op| {
+                    if (idx != insts.len - 1) continue;
+                    if ((use_counts.get(br_op.cond) orelse 0) != 1) continue;
+                    var j: usize = idx;
+                    while (j > 0) {
+                        j -= 1;
+                        const prev = insts[j];
+                        if (prev.dest) |d| {
+                            if (d == br_op.cond) {
+                                if (prev.type == .i32 or prev.type == .i64) {
+                                    if (cmpOpToCond(prev.op)) |cc| {
+                                        try fused_cmp_cond.put(br_op.cond, cc);
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                        switch (prev.op) {
+                            .parallel_copy => continue,
+                            .iconst_32, .iconst_64 => {
+                                if (prev.dest) |d| {
+                                    if (suppress_iconst.contains(d)) continue;
+                                }
+                                break;
+                            },
+                            else => break,
+                        }
+                    }
+                },
+                else => {},
             }
         }
     }
@@ -2723,6 +2753,15 @@ pub fn compileFunctionImpl(
         // through `RegMap.assign` unchanged.
         if (ctx.options.enable_move_coalesce) {
             if (tmr) |t| t.begin();
+            var liveness_opt: ?std.AutoHashMap(ir.BlockId, analysis.BlockLiveness) = null;
+            defer if (liveness_opt) |*lv| {
+                var it = lv.iterator();
+                while (it.next()) |entry| {
+                    entry.value_ptr.live_in.deinit();
+                    entry.value_ptr.live_out.deinit();
+                }
+                lv.deinit();
+            };
             var copy_hints = try collectCopyHints(
                 func,
                 block_order,
@@ -2733,16 +2772,56 @@ pub fn compileFunctionImpl(
                 fctx.mul_fused,
                 fctx.simd_mul_fused,
                 &suppress_iconst,
+                &liveness_opt,
                 allocator,
             );
             defer copy_hints.deinit(allocator);
-            _ = try regalloc.coalesceMoves(
+            const InterfereCtx = struct {
+                func: *const ir.IrFunction,
+                scheduled: *const schedule.FunctionSchedule,
+                liveness_opt: *?std.AutoHashMap(ir.BlockId, analysis.BlockLiveness),
+                mul_fused_opt: ?*const std.AutoHashMap(ir.VReg, void),
+                simd_mul_fused_opt: ?*const std.AutoHashMap(ir.VReg, void),
+                fma_info_opt: ?*const std.AutoHashMap(ir.VReg, FmaInfo),
+                simd_fma_info_opt: ?*const std.AutoHashMap(ir.VReg, FmaInfo),
+                allocator: std.mem.Allocator,
+
+                fn check(raw_ctx: *const anyopaque, u: ir.VReg, v: ir.VReg) anyerror!bool {
+                    const self: *const @This() = @ptrCast(@alignCast(raw_ctx));
+                    if (self.liveness_opt.* == null) {
+                        self.liveness_opt.* = try analysis.computeLiveness(self.func, self.allocator);
+                    }
+                    return vregsInterfere(
+                        u,
+                        v,
+                        self.func,
+                        self.scheduled,
+                        &self.liveness_opt.*.?,
+                        self.mul_fused_opt,
+                        self.simd_mul_fused_opt,
+                        self.fma_info_opt,
+                        self.simd_fma_info_opt,
+                    );
+                }
+            };
+            const ictx = InterfereCtx{
+                .func = func,
+                .scheduled = &scheduled,
+                .liveness_opt = &liveness_opt,
+                .mul_fused_opt = fctx.mul_fused,
+                .simd_mul_fused_opt = fctx.simd_mul_fused,
+                .fma_info_opt = &fma_info,
+                .simd_fma_info_opt = &simd_fma_info,
+                .allocator = allocator,
+            };
+            _ = try regalloc.coalesceMovesWithInterfere(
                 allocator,
                 &alloc_result_storage.?,
                 aarch64RegSetForSpillBase(spill_base),
                 clobbers.items,
                 scalar_live_ranges.items,
                 copy_hints.items,
+                .{ .ctx = &ictx, .checkFn = InterfereCtx.check },
             );
             if (tmr) |t| t.end(.coalesce);
         }
@@ -4656,7 +4735,49 @@ fn compileInst(
     }
 
     switch (inst.op) {
-        .load, .store, .iconst_32, .iconst_64, .fconst_32, .fconst_64, .try_table_begin, .try_table_end => {},
+        .load,
+        .store,
+        .iconst_32,
+        .iconst_64,
+        .fconst_32,
+        .fconst_64,
+        .try_table_begin,
+        .try_table_end,
+        .shl,
+        .shr_s,
+        .shr_u,
+        .rotr,
+        .eq,
+        .ne,
+        .lt_s,
+        .lt_u,
+        .gt_s,
+        .gt_u,
+        .le_s,
+        .le_u,
+        .ge_s,
+        .ge_u,
+        .eqz,
+        .clz,
+        .ctz,
+        .extend8_s,
+        .extend16_s,
+        .extend32_s,
+        .extend_i32_s,
+        .extend_i32_u,
+        .wrap_i64,
+        .reinterpret,
+        .select,
+        => {},
+        .add, .sub, .mul, .@"and", .@"or", .xor => {
+            if (inst.type == .f32 or inst.type == .f64) {
+                fctx.cached_mem_index_vreg = null;
+            } else if (fctx.fma_info) |fma_map| {
+                if (inst.dest) |d| {
+                    if (fma_map.contains(d)) fctx.cached_mem_index_vreg = null;
+                }
+            }
+        },
         else => fctx.cached_mem_index_vreg = null,
     }
     defer if (inst.dest) |d| {
@@ -7202,7 +7323,7 @@ fn emitCmp(
                     code.peepholeBarrier();
                     return;
                 }
-                const info = try destBegin(reg_map, dest, RegMap.tmp2);
+                const info = try destBegin(reg_map, dest, RegMap.tmp0);
                 if (inst.type == .i32) {
                     try code.cmpImm32(lhs, imm12);
                     try code.cset32(info.reg, cond);
@@ -7226,7 +7347,7 @@ fn emitCmp(
         code.peepholeBarrier();
         return;
     }
-    const info = try destBegin(reg_map, dest, RegMap.tmp2);
+    const info = try destBegin(reg_map, dest, RegMap.tmp0);
     if (inst.type == .i32) {
         try code.cmpRegReg32(lhs, rhs);
         try code.cset32(info.reg, cond);
@@ -8207,7 +8328,7 @@ fn emitSelect(
     inst: ir.Inst,
     sel: @TypeOf(@as(ir.Inst.Op, undefined).select),
     reg_map: *RegMap,
-    fctx: *const FuncCompileCtx,
+    fctx: *FuncCompileCtx,
 ) !void {
     const dest = inst.dest orelse return;
     if (trace_select) {
@@ -8216,30 +8337,92 @@ fn emitSelect(
             .{ dest, @tagName(inst.type), sel.if_true, sel.if_false, sel.cond },
         );
     }
-    // Load cond first; after CMP we don't need the cond register anymore,
-    // so we can reuse tmp0 for subsequent uses if desired. We keep t/f in
-    // distinct scratches (tmp1/tmp2) so CSEL can read them simultaneously.
-    const cond_r = try useInto(code, reg_map, sel.cond, RegMap.tmp0);
-    try code.cmpImm32(cond_r, 0);
+    const fused_cc: ?emit.Cond = if (fctx.fused_cmp_cond) |m| m.get(sel.cond) else null;
+    if (fused_cc == null) {
+        // Load cond first; after CMP we don't need the cond register anymore,
+        // so we can reuse tmp0 for subsequent uses if desired.
+        const cond_r = try useInto(code, reg_map, sel.cond, RegMap.tmp0);
+        try code.cmpImm32(cond_r, 0);
+    }
+    const effective_cc: emit.Cond = fused_cc orelse .ne;
     const is_int = (inst.type == .i32 or inst.type == .i64);
-    const t_is_zero = is_int and (if (fctx.const_vals) |cv| cv.get(sel.if_true) == @as(?i64, 0) else false);
-    const f_is_zero = is_int and (if (fctx.const_vals) |cv| cv.get(sel.if_false) == @as(?i64, 0) else false);
-    const t_r: emit.Reg = if (t_is_zero) .xzr else try useInto(code, reg_map, sel.if_true, RegMap.tmp1);
-    const f_r: emit.Reg = if (f_is_zero) .xzr else try useInto(code, reg_map, sel.if_false, RegMap.tmp2);
+    const true_const: ?i64 = if (is_int and fctx.const_vals != null)
+        if (fctx.const_vals.?.get(sel.if_true)) |v|
+            (if (isSingleInsnImm(v, inst.type)) v else null)
+        else
+            null
+    else
+        null;
+    const false_const: ?i64 = if (is_int and fctx.const_vals != null)
+        if (fctx.const_vals.?.get(sel.if_false)) |v|
+            (if (isSingleInsnImm(v, inst.type)) v else null)
+        else
+            null
+    else
+        null;
+
     const info = try destBegin(reg_map, dest, RegMap.tmp0);
-    // wasm: select picks if_true when cond != 0.
-    //
-    // #754: `inst.type` MUST reflect the actual 64-bit type when
-    // selecting f64/i64 values — `csel32` clobbers the upper 32 bits
-    // of the destination register. The frontend's untyped `select`
-    // initially records `.i32` and a fix-up pass propagates the
-    // correct type from the `if_true` producer; flip `trace_select`
-    // on a debug build if a chained-select pattern is suspected of
-    // returning only the low 32 bits.
-    if (inst.type == .i32) {
-        try code.csel32(info.reg, t_r, f_r, .ne);
+    if (false_const != null and false_const.? == 1) {
+        const true_reg: emit.Reg = if (true_const) |tv| blk: {
+            if (tv == 0) break :blk .xzr;
+            if (inst.type == .i32) {
+                try code.movImm32(info.reg, @bitCast(@as(u32, @truncate(@as(u64, @bitCast(tv))))));
+            } else {
+                try code.movImm64(info.reg, @bitCast(tv));
+            }
+            break :blk info.reg;
+        } else try useInto(code, reg_map, sel.if_true, RegMap.tmp1);
+        if (inst.type == .i32) {
+            try code.csinc32(info.reg, true_reg, .xzr, effective_cc);
+        } else {
+            try code.csinc(info.reg, true_reg, .xzr, effective_cc);
+        }
+    } else if (true_const != null and true_const.? == 1) {
+        const false_reg: emit.Reg = if (false_const) |fv| blk: {
+            if (fv == 0) break :blk .xzr;
+            if (inst.type == .i32) {
+                try code.movImm32(info.reg, @bitCast(@as(u32, @truncate(@as(u64, @bitCast(fv))))));
+            } else {
+                try code.movImm64(info.reg, @bitCast(fv));
+            }
+            break :blk info.reg;
+        } else try useInto(code, reg_map, sel.if_false, RegMap.tmp2);
+        if (false_reg == RegMap.tmp2) fctx.cached_mem_index_vreg = null;
+        if (inst.type == .i32) {
+            try code.csinc32(info.reg, false_reg, .xzr, effective_cc.invert());
+        } else {
+            try code.csinc(info.reg, false_reg, .xzr, effective_cc.invert());
+        }
     } else {
-        try code.csel(info.reg, t_r, f_r, .ne);
+        const t_r: emit.Reg = if (true_const) |tv| blk: {
+            if (tv == 0) break :blk .xzr;
+            if (inst.type == .i32) {
+                try code.movImm32(RegMap.tmp1, @bitCast(@as(u32, @truncate(@as(u64, @bitCast(tv))))));
+            } else {
+                try code.movImm64(RegMap.tmp1, @bitCast(tv));
+            }
+            break :blk RegMap.tmp1;
+        } else try useInto(code, reg_map, sel.if_true, RegMap.tmp1);
+        const f_r: emit.Reg = if (false_const) |fv| blk: {
+            if (fv == 0) break :blk .xzr;
+            if (inst.type == .i32) {
+                try code.movImm32(RegMap.tmp2, @bitCast(@as(u32, @truncate(@as(u64, @bitCast(fv))))));
+            } else {
+                try code.movImm64(RegMap.tmp2, @bitCast(fv));
+            }
+            break :blk RegMap.tmp2;
+        } else try useInto(code, reg_map, sel.if_false, RegMap.tmp2);
+        if (f_r == RegMap.tmp2) fctx.cached_mem_index_vreg = null;
+        // wasm: select picks if_true when cond != 0.
+        //
+        // #754: `inst.type` MUST reflect the actual 64-bit type when
+        // selecting f64/i64 values — `csel32` clobbers the upper 32 bits
+        // of the destination register.
+        if (inst.type == .i32) {
+            try code.csel32(info.reg, t_r, f_r, effective_cc);
+        } else {
+            try code.csel(info.reg, t_r, f_r, effective_cc);
+        }
     }
     try destCommit(code, reg_map, info);
 }
@@ -8256,7 +8439,7 @@ fn emitShift(
     if ((inst.type == .i32 or inst.type == .i64) and fctx.const_vals != null) {
         if (fctx.const_vals.?.get(bin.rhs)) |v| {
             const lhs = try useInto(code, reg_map, bin.lhs, RegMap.tmp0);
-            const info = try destBegin(reg_map, dest, RegMap.tmp2);
+            const info = try destBegin(reg_map, dest, RegMap.tmp0);
             if (inst.type == .i32) {
                 const shift: u5 = @truncate(@as(u64, @bitCast(v)));
                 switch (op) {
@@ -8280,7 +8463,7 @@ fn emitShift(
     }
     const lhs = try useInto(code, reg_map, bin.lhs, RegMap.tmp0);
     const rhs = try useInto(code, reg_map, bin.rhs, RegMap.tmp1);
-    const info = try destBegin(reg_map, dest, RegMap.tmp2);
+    const info = try destBegin(reg_map, dest, RegMap.tmp0);
     if (inst.type == .i32) {
         try code.shiftRegReg32(info.reg, lhs, rhs, op);
     } else {
@@ -11674,6 +11857,49 @@ fn collectHintPoints(
 /// sub-word extends (`extend8/16/32_s`) are NOT in scope: their
 /// upper-bit-write semantics are part of the IR contract for the i64
 /// dest and cannot be skipped just because src and dest co-located.
+fn instAllowsDestSrcOverlapAArch64(op: ir.Inst.Op) bool {
+    return switch (op) {
+        .add,
+        .sub,
+        .mul,
+        .@"and",
+        .@"or",
+        .xor,
+        .shl,
+        .shr_s,
+        .shr_u,
+        .rotl,
+        .rotr,
+        .load,
+        .select,
+        .eq,
+        .ne,
+        .lt_s,
+        .lt_u,
+        .gt_s,
+        .gt_u,
+        .le_s,
+        .le_u,
+        .ge_s,
+        .ge_u,
+        .eqz,
+        .clz,
+        .ctz,
+        .popcnt,
+        .extend8_s,
+        .extend16_s,
+        .extend32_s,
+        .extend_i32_s,
+        .extend_i32_u,
+        .wrap_i64,
+        .reinterpret,
+        .iconst_32,
+        .iconst_64,
+        => true,
+        else => false,
+    };
+}
+
 fn vregsInterfere(
     u: ir.VReg,
     v: ir.VReg,
@@ -11790,8 +12016,9 @@ fn vregsInterfere(
             }
 
             if (inst.dest) |d| {
-                if (d == u and (v_live or rc.reads_v)) return true;
-                if (d == v and (u_live or rc.reads_u)) return true;
+                const allow_self = instAllowsDestSrcOverlapAArch64(inst.op);
+                if (d == u and (v_live or (!allow_self and rc.reads_v))) return true;
+                if (d == v and (u_live or (!allow_self and rc.reads_u))) return true;
                 if (d == u) u_live = false;
                 if (d == v) v_live = false;
             }
@@ -11814,6 +12041,7 @@ fn collectCopyHints(
     mul_fused_opt: ?*const std.AutoHashMap(ir.VReg, void),
     simd_mul_fused_opt: ?*const std.AutoHashMap(ir.VReg, void),
     suppress_iconst_opt: ?*const std.AutoHashMap(ir.VReg, void),
+    liveness_out_opt: ?*?std.AutoHashMap(ir.BlockId, analysis.BlockLiveness),
     allocator: std.mem.Allocator,
 ) !std.ArrayList(regalloc.CopyHint) {
     var hints: std.ArrayList(regalloc.CopyHint) = .empty;
@@ -11821,8 +12049,8 @@ fn collectCopyHints(
     var cross_block_hints: std.ArrayList(regalloc.CopyHint) = .empty;
     defer cross_block_hints.deinit(allocator);
 
-    var liveness_opt: ?std.AutoHashMap(ir.BlockId, analysis.BlockLiveness) = null;
-    defer if (liveness_opt) |*lv| {
+    var local_liveness_opt: ?std.AutoHashMap(ir.BlockId, analysis.BlockLiveness) = null;
+    defer if (local_liveness_opt) |*lv| {
         var it = lv.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.live_in.deinit();
@@ -11830,6 +12058,8 @@ fn collectCopyHints(
         }
         lv.deinit();
     };
+    const liveness_opt_ptr: *?std.AutoHashMap(ir.BlockId, analysis.BlockLiveness) =
+        liveness_out_opt orelse &local_liveness_opt;
 
     var range_map: std.AutoHashMap(ir.VReg, analysis.LiveRange) = .init(allocator);
     defer range_map.deinit();
@@ -11900,7 +12130,96 @@ fn collectCopyHints(
                                     }
                                 }
                             }
-                            if (maybe_def_idx == null) {
+                            if (maybe_def_idx) |def_idx| intra_blk: {
+                                const def_inst = insts[def_idx];
+                                switch (def_inst.op) {
+                                    .add,
+                                    .sub,
+                                    .mul,
+                                    .@"and",
+                                    .@"or",
+                                    .xor,
+                                    .shl,
+                                    .shr_s,
+                                    .shr_u,
+                                    .rotl,
+                                    .rotr,
+                                    .load,
+                                    .select,
+                                    .extend_i32_s,
+                                    .extend_i32_u,
+                                    .extend8_s,
+                                    .extend16_s,
+                                    .extend32_s,
+                                    .wrap_i64,
+                                    .reinterpret,
+                                    .iconst_32,
+                                    .iconst_64,
+                                    => {},
+                                    else => break :intra_blk,
+                                }
+
+                                if (src_range.start != b_start + @as(u32, @intCast(def_idx))) break :intra_blk;
+                                if (dest_range.start > b_start) break :intra_blk;
+                                if (@min(src_range.end, dest_range.end) >= b_end) break :intra_blk;
+
+                                var hole_ok = true;
+                                var k: usize = def_idx + 1;
+                                while (k < copy_idx) : (k += 1) {
+                                    const mid = insts[k];
+                                    if (mid.dest == p.dst or mid.dest == p.src or mid.op == .parallel_copy) {
+                                        hole_ok = false;
+                                        break;
+                                    }
+                                    var read_ctx: CheckReadCtx = .{ .target = p.dst };
+                                    schedule.forEachUse(mid, &read_ctx, CheckReadCtx.visit) catch unreachable;
+                                    if (read_ctx.found) {
+                                        hole_ok = false;
+                                        break;
+                                    }
+                                    if (mid.dest) |md| {
+                                        if (fma_info_opt) |fma_map| {
+                                            if (fma_map.get(md)) |fi| {
+                                                if (fi.mul_lhs == p.dst or fi.mul_rhs == p.dst or fi.addend == p.dst) {
+                                                    hole_ok = false;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if (simd_fma_info_opt) |sfma_map| {
+                                            if (sfma_map.get(md)) |fi| {
+                                                if (fi.mul_lhs == p.dst or fi.mul_rhs == p.dst or fi.addend == p.dst) {
+                                                    hole_ok = false;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if (!hole_ok) break :intra_blk;
+
+                                for (pairs, 0..) |p2, p2_idx| {
+                                    if (p2_idx == p_idx) continue;
+                                    if (p2.src == p.dst or p2.dst == p.dst or p2.dst == p.src or p2.src == p.src) {
+                                        hole_ok = false;
+                                        break;
+                                    }
+                                }
+                                if (!hole_ok) break :intra_blk;
+
+                                var after_k: usize = copy_idx + 1;
+                                while (after_k < insts.len) : (after_k += 1) {
+                                    const aft = insts[after_k];
+                                    if (aft.dest == p.dst or aft.dest == p.src or aft.op == .parallel_copy) {
+                                        hole_ok = false;
+                                        break;
+                                    }
+                                }
+                                if (!hole_ok) break :intra_blk;
+
+                                allow_overlap = true;
+                            }
+                            if (!allow_overlap) {
                                 var pairs_ok = true;
                                 for (pairs, 0..) |p2, p2_idx| {
                                     if (p2_idx == p_idx) continue;
@@ -11910,15 +12229,15 @@ fn collectCopyHints(
                                     }
                                 }
                                 if (pairs_ok) {
-                                    if (liveness_opt == null) {
-                                        liveness_opt = try analysis.computeLiveness(func, allocator);
+                                    if (liveness_opt_ptr.* == null) {
+                                        liveness_opt_ptr.* = try analysis.computeLiveness(func, allocator);
                                     }
                                     if (!vregsInterfere(
                                         p.dst,
                                         p.src,
                                         func,
                                         scheduled,
-                                        &liveness_opt.?,
+                                        &liveness_opt_ptr.*.?,
                                         mul_fused_opt,
                                         simd_mul_fused_opt,
                                         fma_info_opt,
@@ -11928,95 +12247,7 @@ fn collectCopyHints(
                                         is_cross_block_overlap = true;
                                     }
                                 }
-                                break :blk;
                             }
-                            const def_idx = maybe_def_idx.?;
-                            const def_inst = insts[def_idx];
-                            switch (def_inst.op) {
-                                .add,
-                                .sub,
-                                .mul,
-                                .@"and",
-                                .@"or",
-                                .xor,
-                                .shl,
-                                .shr_s,
-                                .shr_u,
-                                .rotl,
-                                .rotr,
-                                .load,
-                                .extend_i32_s,
-                                .extend_i32_u,
-                                .extend8_s,
-                                .extend16_s,
-                                .extend32_s,
-                                .wrap_i64,
-                                .reinterpret,
-                                .iconst_32,
-                                .iconst_64,
-                                => {},
-                                else => break :blk,
-                            }
-
-                            if (src_range.start != b_start + @as(u32, @intCast(def_idx))) break :blk;
-                            if (dest_range.start > b_start) break :blk;
-                            if (@min(src_range.end, dest_range.end) >= b_end) break :blk;
-
-                            var hole_ok = true;
-                            var k: usize = def_idx + 1;
-                            while (k < copy_idx) : (k += 1) {
-                                const mid = insts[k];
-                                if (mid.dest == p.dst or mid.dest == p.src or mid.op == .parallel_copy) {
-                                    hole_ok = false;
-                                    break;
-                                }
-                                var read_ctx: CheckReadCtx = .{ .target = p.dst };
-                                schedule.forEachUse(mid, &read_ctx, CheckReadCtx.visit) catch unreachable;
-                                if (read_ctx.found) {
-                                    hole_ok = false;
-                                    break;
-                                }
-                                if (mid.dest) |md| {
-                                    if (fma_info_opt) |fma_map| {
-                                        if (fma_map.get(md)) |fi| {
-                                            if (fi.mul_lhs == p.dst or fi.mul_rhs == p.dst or fi.addend == p.dst) {
-                                                hole_ok = false;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if (simd_fma_info_opt) |sfma_map| {
-                                        if (sfma_map.get(md)) |fi| {
-                                            if (fi.mul_lhs == p.dst or fi.mul_rhs == p.dst or fi.addend == p.dst) {
-                                                hole_ok = false;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            if (!hole_ok) break :blk;
-
-                            for (pairs, 0..) |p2, p2_idx| {
-                                if (p2_idx == p_idx) continue;
-                                if (p2.src == p.dst or p2.dst == p.dst or p2.dst == p.src or p2.src == p.src) {
-                                    hole_ok = false;
-                                    break;
-                                }
-                            }
-                            if (!hole_ok) break :blk;
-
-                            var after_k: usize = copy_idx + 1;
-                            while (after_k < insts.len) : (after_k += 1) {
-                                const aft = insts[after_k];
-                                if (aft.dest == p.dst or aft.dest == p.src or aft.op == .parallel_copy) {
-                                    hole_ok = false;
-                                    break;
-                                }
-                            }
-                            if (!hole_ok) break :blk;
-
-                            allow_overlap = true;
                         }
                         const hint_item = regalloc.CopyHint{
                             .dest = p.dst,
@@ -19379,4 +19610,107 @@ test "suppress_iconst (#949): folds zero in select to xzr and single-insn imm in
     // c_zero is folded into CSEL via XZR (0 MOVZ) and c_five is emitted directly at ret (1 MOVZ).
     try std.testing.expectEqual(@as(u32, 1), countMovzImm(code));
 }
+
+test "coalesce (#949): self-derived loop accumulator coalesces without MOV in latch" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 1);
+    defer func.deinit();
+    const lt = try allocator.alloc(ir.IrType, 1);
+    lt[0] = .i32;
+    func.local_types = lt;
+
+    const b_entry = try func.newBlock();
+    const b_loop = try func.newBlock();
+    const b_exit = try func.newBlock();
+
+    const p0 = func.newVReg();
+    const v_zero = func.newVReg();
+    const v_acc = func.newVReg();
+    const v_step = func.newVReg();
+    const v_next = func.newVReg();
+    const v_cond = func.newVReg();
+
+    try func.getBlock(b_entry).append(.{ .op = .{ .local_get = 0 }, .dest = p0, .type = .i32 });
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_zero, .type = .i32 });
+    const entry_copy = try allocator.alloc(ir.Inst.ParallelCopy, 1);
+    entry_copy[0] = .{ .dst = v_acc, .src = v_zero, .ty = .i32 };
+    try func.getBlock(b_entry).append(.{ .op = .{ .parallel_copy = entry_copy } });
+    try func.getBlock(b_entry).append(.{ .op = .{ .br = b_loop } });
+
+    try func.getBlock(b_loop).append(.{ .op = .{ .iconst_32 = 3 }, .dest = v_step, .type = .i32 });
+    try func.getBlock(b_loop).append(.{ .op = .{ .add = .{ .lhs = v_acc, .rhs = v_step } }, .dest = v_next, .type = .i32 });
+    try func.getBlock(b_loop).append(.{ .op = .{ .lt_s = .{ .lhs = v_next, .rhs = p0 } }, .dest = v_cond, .type = .i32 });
+    const latch_copy = try allocator.alloc(ir.Inst.ParallelCopy, 1);
+    latch_copy[0] = .{ .dst = v_acc, .src = v_next, .ty = .i32 };
+    try func.getBlock(b_loop).append(.{ .op = .{ .parallel_copy = latch_copy } });
+    try func.getBlock(b_loop).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b_loop, .else_block = b_exit } } });
+
+    try func.getBlock(b_exit).append(.{ .op = .{ .ret = v_acc } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // Verify `ADD Xn/Wn, Xn/Wn, #3` is emitted in-place (Rn == Rd) for the self-derived accumulator.
+    var found_inplace_add = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0x7FFF_FC00) == (0x1100_0000 | (3 << 10))) {
+            const rd = w & 0x1F;
+            const rn = (w >> 5) & 0x1F;
+            if (rd == rn) found_inplace_add = true;
+        }
+    }
+    try std.testing.expect(found_inplace_add);
+}
+
+test "select (#949): fuses single-use icmp condition and emits CSINC for constant 1 arm" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 1, 2);
+    defer func.deinit();
+    const lt = try allocator.alloc(ir.IrType, 2);
+    lt[0] = .i32;
+    lt[1] = .i32;
+    func.local_types = lt;
+
+    const bid = try func.newBlock();
+    const block = func.getBlock(bid);
+
+    const p0 = func.newVReg();
+    const p1 = func.newVReg();
+    const c_cmp = func.newVReg();
+    const cond = func.newVReg();
+    const c_one = func.newVReg();
+    const sel = func.newVReg();
+
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = p0, .type = .i32 });
+    try block.append(.{ .op = .{ .local_get = 1 }, .dest = p1, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 42 }, .dest = c_cmp, .type = .i32 });
+    try block.append(.{ .op = .{ .eq = .{ .lhs = p0, .rhs = c_cmp } }, .dest = cond, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = c_one, .type = .i32 });
+    try block.append(.{ .op = .{ .select = .{ .cond = cond, .if_true = p1, .if_false = c_one } }, .dest = sel, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = sel } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // Neither 42 (cmp imm12) nor 1 (csinc) should emit MOVZ.
+    try std.testing.expectEqual(@as(u32, 0), countMovzImm(code));
+    // Expect CSINC Wd, Wn, WZR, EQ (mask 0xFFE0FC00 == 0x1A800400, Rm=31, Rn!=31, cond=0).
+    var found_csinc = false;
+    var found_cset = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0x7FE0_0C00) == 0x1A80_0400) {
+            const rm = (w >> 16) & 0x1F;
+            const rn = (w >> 5) & 0x1F;
+            if (rm == 31 and rn == 31) found_cset = true;
+            if (rm == 31 and rn != 31) found_csinc = true;
+        }
+    }
+    try std.testing.expect(found_csinc);
+    try std.testing.expect(!found_cset);
+}
+
 

@@ -120,24 +120,59 @@ pub fn scheduleBlock(
     errdefer out.deinit(allocator);
     try out.ensureTotalCapacity(allocator, insts.len);
 
+    const br_cond: ?ir.VReg = if (insts.len > 0 and insts[insts.len - 1].op == .br_if)
+        insts[insts.len - 1].op.br_if.cond
+    else
+        null;
+
     var window_start: usize = 0;
     for (insts, 0..) |inst, idx| {
         const meta = metadata(inst);
         if (meta.barrier) {
             const trailing_pc: ?[]const ir.Inst.ParallelCopy = if (inst.op == .parallel_copy) inst.op.parallel_copy else null;
-            try appendScheduledWindow(insts[window_start..idx], trailing_pc, &out, allocator, options);
+            const window_br_cond: ?ir.VReg = if (idx == insts.len - 1 or
+                (inst.op == .parallel_copy and idx + 1 == insts.len - 1))
+                br_cond
+            else
+                null;
+            try appendScheduledWindow(insts[window_start..idx], trailing_pc, window_br_cond, &out, allocator, options);
             out.appendAssumeCapacity(inst);
             window_start = idx + 1;
         }
     }
-    try appendScheduledWindow(insts[window_start..], null, &out, allocator, options);
+    try appendScheduledWindow(insts[window_start..], null, null, &out, allocator, options);
 
     return out.toOwnedSlice(allocator);
+}
+
+fn isSchedulableBrIfCmp(op: ir.Inst.Op) bool {
+    return switch (op) {
+        .eq,
+        .ne,
+        .lt_s,
+        .lt_u,
+        .gt_s,
+        .gt_u,
+        .le_s,
+        .le_u,
+        .ge_s,
+        .ge_u,
+        .eqz,
+        .f_eq,
+        .f_ne,
+        .f_lt,
+        .f_gt,
+        .f_le,
+        .f_ge,
+        => true,
+        else => false,
+    };
 }
 
 fn appendScheduledWindow(
     window: []const ir.Inst,
     trailing_parallel_copy: ?[]const ir.Inst.ParallelCopy,
+    trailing_br_cond: ?ir.VReg,
     out: *std.ArrayListUnmanaged(ir.Inst),
     allocator: std.mem.Allocator,
     options: Options,
@@ -241,6 +276,27 @@ fn appendScheduledWindow(
             best_succ_height = @max(best_succ_height, nodes[succ].height);
         }
         nodes[rev_idx].height = @as(u32, nodes[rev_idx].latency) + best_succ_height;
+    }
+
+    if (trailing_br_cond) |cond| {
+        if (defs.get(cond)) |cmp_idx| {
+            if (nodes[cmp_idx].succs.items.len == 0 and isSchedulableBrIfCmp(window[cmp_idx].op)) {
+                for (0..nodes.len) |u| {
+                    if (u == cmp_idx) continue;
+                    var already = false;
+                    for (nodes[u].succs.items) |s| {
+                        if (s == cmp_idx) {
+                            already = true;
+                            break;
+                        }
+                    }
+                    if (!already) {
+                        try nodes[u].succs.append(allocator, cmp_idx);
+                        nodes[cmp_idx].preds_left += 1;
+                    }
+                }
+            }
+        }
     }
 
     var ready: std.ArrayListUnmanaged(usize) = .empty;
