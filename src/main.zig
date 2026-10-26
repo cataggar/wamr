@@ -435,6 +435,8 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
         return 2;
     };
 
+    wamr.shared_memory.pinProcessToPrimaryCpu();
+
     const io = init.io;
     const cwd = std.Io.Dir.cwd();
     const wasm_data = cwd.readFileAlloc(io, path, allocator, @fromBackingInt(@intCast(256 * 1024 * 1024))) catch |err| {
@@ -1535,6 +1537,7 @@ fn runInterpreterCore(
     stack_size: u32,
     benchmark_wasi_thread_manager_enabled: bool,
 ) u8 {
+    wamr.shared_memory.pinProcessToPrimaryCpu();
     var module_arena = std.heap.ArenaAllocator.init(allocator);
     defer module_arena.deinit();
 
@@ -1735,6 +1738,7 @@ fn runAot(
     map_dirs: []const MapDir,
     benchmark_wasi_thread_manager_enabled: bool,
 ) u8 {
+    wamr.shared_memory.pinProcessToPrimaryCpu();
     if (comptime aot_supported) {
         return runAotReal(
             io,

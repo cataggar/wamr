@@ -56,13 +56,27 @@ const Outcome = enum(u32) {
     closed,
 };
 
+var next_park_slot: std.atomic.Value(u32) = .init(0);
+threadlocal var tls_park_slot: u32 = 0;
+
+fn currentParkSlot() usize {
+    var slot = tls_park_slot;
+    if (slot == 0) {
+        slot = next_park_slot.fetchAdd(1, .monotonic) +% 1;
+        if (slot == 0) slot = 1;
+        tls_park_slot = slot;
+    }
+    return (slot - 1) & (ParkingLot.park_word_count - 1);
+}
+
 const Waiter = struct {
     next: ?*Waiter = null,
     key: usize,
     cancellation: if (config.lib_wasi_threads) ?CancellationEpoch.Ticket else void =
         if (config.lib_wasi_threads) null else {},
     outcome: std.atomic.Value(u32) = .init(@backingInt(Outcome.waiting)),
-    parked: std.atomic.Value(u32) = .init(0),
+    park_word: *std.atomic.Value(u32) = undefined,
+    park_seq: u32 = 0,
 };
 
 const Bucket = struct {
@@ -137,10 +151,12 @@ pub const CancellationEpoch = struct {
 /// because nothing sweeps a second time once every sibling has stopped.
 pub const ParkingLot = struct {
     const bucket_count = 64;
+    const park_word_count = 256;
     const closing_bit: u32 = 1 << 31;
     const active_mask: u32 = closing_bit - 1;
 
     buckets: [bucket_count]Bucket = @splat(.{}),
+    park_words: [park_word_count]std.atomic.Value(u32) = @splat(.init(0)),
     lifecycle: std.atomic.Value(u32) = .init(0),
     /// Latched by `cancelAll`. Kept out of `lifecycle` so the active-count
     /// and closing protocol `enter`/`leave`/`deinit` rely on is untouched.
@@ -252,12 +268,22 @@ pub const ParkingLot = struct {
                 return .cancelled;
             }
         }
+        const pw = &self.park_words[currentParkSlot()];
+        const seq = pw.fetchAdd(1, .acq_rel) +% 1;
+        waiter.park_word = pw;
+        waiter.park_seq = seq;
         waiter.next = bucket.head;
         bucket.head = &waiter;
         bucket.mutex.unlock();
 
         var deadline_ns: ?u64 = null;
         while (true) {
+            const cur_seq = pw.load(.acquire);
+            const pre_outcome: Outcome = @fromBackingInt(@intCast(waiter.outcome.load(.acquire)));
+            if (pre_outcome != .waiting) {
+                return outcomeToResult(pre_outcome);
+            }
+
             const remaining_ns: ?u64 = if (timeout_ns < 0)
                 null
             else if (deadline_ns) |deadline| remaining: {
@@ -269,15 +295,14 @@ pub const ParkingLot = struct {
             } else @intCast(timeout_ns);
 
             const os_result = osWait(
-                &waiter.parked.raw,
-                0,
+                &pw.raw,
+                cur_seq,
                 remaining_ns,
             ) catch |err| {
                 bucket.mutex.lock();
                 const final_outcome: Outcome = @fromBackingInt(@intCast(waiter.outcome.load(.acquire)));
                 if (final_outcome != .waiting) {
                     bucket.mutex.unlock();
-                    finishWokenWaiter(&waiter);
                     return outcomeToResult(final_outcome);
                 }
                 self.removeLocked(bucket, &waiter);
@@ -287,7 +312,6 @@ pub const ParkingLot = struct {
             };
             const outcome: Outcome = @fromBackingInt(@intCast(waiter.outcome.load(.acquire)));
             if (outcome != .waiting) {
-                finishWokenWaiter(&waiter);
                 return outcomeToResult(outcome);
             }
             switch (os_result) {
@@ -313,7 +337,6 @@ pub const ParkingLot = struct {
         const outcome: Outcome = @fromBackingInt(@intCast(waiter.outcome.load(.acquire)));
         if (outcome != .waiting) {
             bucket.mutex.unlock();
-            finishWokenWaiter(waiter);
             return outcomeToResult(outcome);
         }
 
@@ -370,16 +393,27 @@ pub const ParkingLot = struct {
         var total: u32 = 0;
         for (0..bucket_count) |i| {
             const bucket = &self.buckets[i];
-            bucket.mutex.lock();
-            const wake_head = bucket.head;
-            bucket.head = null;
-            var cursor = wake_head;
-            while (cursor) |w| : (cursor = w.next) {
-                w.outcome.store(@backingInt(Outcome.cancelled), .release);
-                total +|= 1;
+            while (true) {
+                var wake_words: [64]*std.atomic.Value(u32) = undefined;
+                var batch_len: usize = 0;
+                bucket.mutex.lock();
+                while (bucket.head) |w| {
+                    if (batch_len == wake_words.len) break;
+                    const next_w = w.next;
+                    const pw = w.park_word;
+                    bucket.head = next_w;
+                    w.next = null;
+                    w.outcome.store(@backingInt(Outcome.cancelled), .release);
+                    _ = pw.fetchAdd(1, .acq_rel);
+                    wake_words[batch_len] = pw;
+                    batch_len += 1;
+                    total +|= 1;
+                }
+                const more = bucket.head != null;
+                bucket.mutex.unlock();
+                try wakeParkWords(wake_words[0..batch_len]);
+                if (!more) break;
             }
-            bucket.mutex.unlock();
-            try wakeWaiterList(wake_head);
         }
         return total;
     }
@@ -401,32 +435,36 @@ pub const ParkingLot = struct {
             var total: u32 = 0;
             for (0..bucket_count) |i| {
                 const bucket = &self.buckets[i];
-                var wake_head: ?*Waiter = null;
-                var wake_tail: ?*Waiter = null;
-                bucket.mutex.lock();
-                var link = &bucket.head;
-                while (link.*) |waiter| {
-                    const matches = if (waiter.cancellation) |candidate|
-                        CancellationEpoch.Ticket.eql(candidate, ticket)
-                    else
-                        false;
-                    if (!matches) {
-                        link = &waiter.next;
-                        continue;
+                while (true) {
+                    var wake_words: [64]*std.atomic.Value(u32) = undefined;
+                    var batch_len: usize = 0;
+                    bucket.mutex.lock();
+                    var link = &bucket.head;
+                    while (link.*) |waiter| {
+                        if (batch_len == wake_words.len) break;
+                        const matches = if (waiter.cancellation) |candidate|
+                            CancellationEpoch.Ticket.eql(candidate, ticket)
+                        else
+                            false;
+                        if (!matches) {
+                            link = &waiter.next;
+                            continue;
+                        }
+                        const next_w = waiter.next;
+                        const pw = waiter.park_word;
+                        link.* = next_w;
+                        waiter.next = null;
+                        waiter.outcome.store(@backingInt(Outcome.cancelled), .release);
+                        _ = pw.fetchAdd(1, .acq_rel);
+                        wake_words[batch_len] = pw;
+                        batch_len += 1;
+                        total +|= 1;
                     }
-                    link.* = waiter.next;
-                    waiter.next = null;
-                    waiter.outcome.store(@backingInt(Outcome.cancelled), .release);
-                    if (wake_tail) |tail| {
-                        tail.next = waiter;
-                    } else {
-                        wake_head = waiter;
-                    }
-                    wake_tail = waiter;
-                    total +|= 1;
+                    const more = batch_len == wake_words.len;
+                    bucket.mutex.unlock();
+                    try wakeParkWords(wake_words[0..batch_len]);
+                    if (!more) break;
                 }
-                bucket.mutex.unlock();
-                try wakeWaiterList(wake_head);
             }
             return total;
         }
@@ -435,30 +473,34 @@ pub const ParkingLot = struct {
     fn wakeKey(self: *ParkingLot, key: usize, count: u32, outcome: Outcome) BackendError!u32 {
         const bucket = self.bucketFor(key);
         var woken: u32 = 0;
-        var wake_head: ?*Waiter = null;
-        var wake_tail: ?*Waiter = null;
 
-        bucket.mutex.lock();
-        var link = &bucket.head;
-        while (link.*) |waiter| {
-            if (waiter.key != key or woken >= count) {
-                link = &waiter.next;
-                continue;
+        while (woken < count) {
+            var wake_words: [64]*std.atomic.Value(u32) = undefined;
+            var batch_len: usize = 0;
+            bucket.mutex.lock();
+            var link = &bucket.head;
+            while (link.*) |waiter| {
+                if (woken >= count or batch_len == wake_words.len) break;
+                if (waiter.key != key) {
+                    link = &waiter.next;
+                    continue;
+                }
+                const next_w = waiter.next;
+                const pw = waiter.park_word;
+                link.* = next_w;
+                waiter.next = null;
+                waiter.outcome.store(@backingInt(outcome), .release);
+                _ = pw.fetchAdd(1, .acq_rel);
+                wake_words[batch_len] = pw;
+                batch_len += 1;
+                woken += 1;
             }
-            link.* = waiter.next;
-            waiter.next = null;
-            waiter.outcome.store(@backingInt(outcome), .release);
-            if (wake_tail) |tail| {
-                tail.next = waiter;
-            } else {
-                wake_head = waiter;
-            }
-            wake_tail = waiter;
-            woken += 1;
+            const more = woken < count and batch_len == wake_words.len;
+            bucket.mutex.unlock();
+
+            try wakeParkWords(wake_words[0..batch_len]);
+            if (!more) break;
         }
-        bucket.mutex.unlock();
-
-        try wakeWaiterList(wake_head);
         return woken;
     }
 
@@ -510,21 +552,32 @@ pub const ParkingLot = struct {
     fn closeAll(self: *ParkingLot) void {
         for (0..bucket_count) |i| {
             const bucket = &self.buckets[i];
-            bucket.mutex.lock();
-            const wake_head = bucket.head;
-            bucket.head = null;
-            var cursor = wake_head;
-            while (cursor) |w| : (cursor = w.next) {
-                w.outcome.store(@backingInt(Outcome.closed), .release);
+            while (true) {
+                var wake_words: [64]*std.atomic.Value(u32) = undefined;
+                var batch_len: usize = 0;
+                bucket.mutex.lock();
+                while (bucket.head) |w| {
+                    if (batch_len == wake_words.len) break;
+                    const next_w = w.next;
+                    const pw = w.park_word;
+                    bucket.head = next_w;
+                    w.next = null;
+                    w.outcome.store(@backingInt(Outcome.closed), .release);
+                    _ = pw.fetchAdd(1, .acq_rel);
+                    wake_words[batch_len] = pw;
+                    batch_len += 1;
+                }
+                const more = bucket.head != null;
+                bucket.mutex.unlock();
+                wakeParkWords(wake_words[0..batch_len]) catch |err| switch (err) {
+                    error.InvalidAddress,
+                    error.InvalidArgument,
+                    error.Unsupported,
+                    error.SystemFailure,
+                    => {},
+                };
+                if (!more) break;
             }
-            bucket.mutex.unlock();
-            wakeWaiterList(wake_head) catch |err| switch (err) {
-                error.InvalidAddress,
-                error.InvalidArgument,
-                error.Unsupported,
-                error.SystemFailure,
-                => {},
-            };
         }
     }
 
@@ -578,34 +631,16 @@ fn monotonicNowNs() u64 {
         std.math.maxInt(u64);
 }
 
-fn wakeWaiterList(head: ?*Waiter) BackendError!void {
+fn wakeParkWords(words: []const *std.atomic.Value(u32)) BackendError!void {
     var first_err: ?BackendError = null;
-    var current = head;
-    while (current) |waiter| {
-        const next = waiter.next;
-        wakeWaiterAfterOutcome(waiter) catch |err| {
+    const wake_all = next_park_slot.load(.monotonic) > ParkingLot.park_word_count;
+    for (words) |pw| {
+        const res = if (wake_all) osWakeAll(&pw.raw) else osWake(&pw.raw);
+        res catch |err| {
             if (first_err == null) first_err = err;
         };
-        current = next;
     }
     if (first_err) |err| return err;
-}
-
-fn wakeWaiterAfterOutcome(waiter: *Waiter) BackendError!void {
-    waiter.parked.store(1, .release);
-    defer waiter.parked.store(2, .release);
-    return osWake(&waiter.parked.raw);
-}
-
-fn finishWokenWaiter(waiter: *Waiter) void {
-    var spins: u32 = 0;
-    while (waiter.parked.load(.acquire) != 2) : (spins += 1) {
-        if (spins < 64) {
-            std.atomic.spinLoopHint();
-        } else {
-            std.Thread.yield() catch std.atomic.spinLoopHint();
-        }
-    }
 }
 
 fn osWait(word: *const u32, expected: u32, timeout_ns: ?u64) BackendError!OsWaitResult {
