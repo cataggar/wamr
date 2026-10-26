@@ -619,8 +619,7 @@ const LinuxCpuAffinity = struct {
         }
         if (slot_index == 0 and !self.parent_pinned_single) {
             self.parent_pinned_single = true;
-            const target_cpu = if (self.count == 2) self.cpus[0] else self.cpus[self.count - 1];
-            return .{ .pin_single = target_cpu };
+            return .{ .pin_single = self.cpus[self.count - 1] };
         }
         return .none;
     }
@@ -3703,21 +3702,6 @@ test "LinuxCpuAffinity: workerCpuLocked maps generation-0 pool slots and restore
     try std.testing.expectEqual(@as(?u16, 8), affinity.workerCpuLocked(3, 0));
     try std.testing.expectEqual(@as(?u16, 2), affinity.workerCpuLocked(4, 0));
     try std.testing.expectEqual(@as(?u16, null), affinity.workerCpuLocked(0, 1));
-
-    var affinity2: LinuxCpuAffinity = .{
-        .initialized = true,
-        .count = 2,
-    };
-    affinity2.cpus[0] = 2;
-    affinity2.cpus[1] = 3;
-    switch (affinity2.planParentSpawnLocked(0, 0, true)) {
-        .pin_single => |cpu| try std.testing.expectEqual(@as(u16, 2), cpu),
-        else => return error.TestUnexpectedResult,
-    }
-    switch (affinity2.planParentSpawnLocked(1, 0, true)) {
-        .restore_initial => {},
-        else => return error.TestUnexpectedResult,
-    }
 
     switch (affinity.planParentSpawnLocked(0, 0, true)) {
         .pin_single => |cpu| try std.testing.expectEqual(@as(u16, 8), cpu),
