@@ -109,6 +109,10 @@ pub const Cond = enum(u4) {
     gt = 0b1100, // signed greater than (Z=0 & N=V)
     le = 0b1101, // signed less or equal (Z=1 | N≠V)
     al = 0b1110, // always
+
+    pub fn invert(self: Cond) Cond {
+        return @enumFromInt(@backingInt(self) ^ 1);
+    }
 };
 
 /// Machine code buffer with AArch64 instruction encoding helpers.
@@ -785,6 +789,20 @@ pub const CodeBuffer = struct {
     /// CSEL Wd, Wn, Wm, cond — 32-bit variant.
     pub fn csel32(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg, cond: Cond) !void {
         try self.emit32(0x1A800000 | (@as(u32, rm.encoding()) << 16) |
+            (@as(u32, @backingInt(cond)) << 12) |
+            (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// CSINC Xd, Xn, Xm, cond — Xd = (cond) ? Xn : (Xm + 1)
+    pub fn csinc(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg, cond: Cond) !void {
+        try self.emit32(0x9A800400 | (@as(u32, rm.encoding()) << 16) |
+            (@as(u32, @backingInt(cond)) << 12) |
+            (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// CSINC Wd, Wn, Wm, cond — 32-bit variant.
+    pub fn csinc32(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg, cond: Cond) !void {
+        try self.emit32(0x1A800400 | (@as(u32, rm.encoding()) << 16) |
             (@as(u32, @backingInt(cond)) << 12) |
             (@as(u32, rn.encoding()) << 5) | rd.encoding());
     }

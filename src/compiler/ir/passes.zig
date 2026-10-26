@@ -5603,7 +5603,7 @@ pub fn elideRedundantBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Alloc
         for (block.instructions.items) |*inst| {
             switch (inst.op) {
                 .load => |*ld| {
-                    const end: u64 = @as(u64, ld.offset) + @as(u64, ld.size);
+                    const end: u64 = @max(if (ld.checked_end > 0) ld.checked_end else 0, @as(u64, ld.offset) + @as(u64, ld.size));
                     const dom_max = domMaxEnd(table.items, valid_start, ld.base);
 
                     if (end <= dom_max) {
@@ -5624,7 +5624,7 @@ pub fn elideRedundantBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Alloc
                     }
                 },
                 .v128_load_extend => |*ld| {
-                    const end: u64 = @as(u64, ld.offset) + ld.accessSize();
+                    const end: u64 = @max(if (ld.checked_end > 0) ld.checked_end else 0, @as(u64, ld.offset) + ld.accessSize());
                     const dom_max = domMaxEnd(table.items, valid_start, ld.base);
 
                     if (end <= dom_max) {
@@ -5643,7 +5643,7 @@ pub fn elideRedundantBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Alloc
                     }
                 },
                 .store => |*st| {
-                    const end: u64 = @as(u64, st.offset) + @as(u64, st.size);
+                    const end: u64 = @max(if (st.checked_end > 0) st.checked_end else 0, @as(u64, st.offset) + @as(u64, st.size));
                     const dom_max = domMaxEnd(table.items, valid_start, st.base);
 
                     if (end <= dom_max) {
@@ -9058,10 +9058,15 @@ fn sinkSingleUseAluToParallelCopy(func: *ir.IrFunction, allocator: std.mem.Alloc
             }
             if (same_def_opt) |def_idx| {
                 const def_inst = func.blocks.items[b_idx].instructions.items[def_idx];
-                if (isSinkablePureAlu(def_inst.op) and def_idx + 1 < copy_idx) {
+                const insert_idx = findSinkInsertIdxBeforeParallelCopy(
+                    func.blocks.items[b_idx].instructions.items,
+                    copy_idx,
+                    def_inst,
+                );
+                if (isSinkablePureAlu(def_inst.op) and def_idx + 1 < insert_idx) {
                     const ops = getUsedVRegs(def_inst);
                     var operand_redefined = false;
-                    for (func.blocks.items[b_idx].instructions.items[(def_idx + 1)..copy_idx]) |later_inst| {
+                    for (func.blocks.items[b_idx].instructions.items[(def_idx + 1)..insert_idx]) |later_inst| {
                         for (ops.slice()) |op_v| {
                             if (instDefinesVReg(later_inst, op_v)) {
                                 operand_redefined = true;
@@ -9072,9 +9077,7 @@ fn sinkSingleUseAluToParallelCopy(func: *ir.IrFunction, allocator: std.mem.Alloc
                     }
                     if (!operand_redefined) {
                         const moved = func.blocks.items[b_idx].instructions.orderedRemove(def_idx);
-                        copy_idx -= 1;
-                        try func.blocks.items[b_idx].instructions.insert(func.allocator, copy_idx, moved);
-                        copy_idx += 1;
+                        try func.blocks.items[b_idx].instructions.insert(func.allocator, insert_idx - 1, moved);
                     }
                 }
                 continue;
@@ -9096,6 +9099,11 @@ fn sinkSingleUseAluToParallelCopy(func: *ir.IrFunction, allocator: std.mem.Alloc
             const def_inst = func.blocks.items[a_idx].instructions.items[def_idx];
             if (!isSinkablePureAlu(def_inst.op)) continue;
 
+            const insert_idx = findSinkInsertIdxBeforeParallelCopy(
+                func.blocks.items[b_idx].instructions.items,
+                copy_idx,
+                def_inst,
+            );
             const ops = getUsedVRegs(def_inst);
             var operand_redefined = false;
             for (func.blocks.items[a_idx].instructions.items[(def_idx + 1)..]) |later_a| {
@@ -9108,7 +9116,7 @@ fn sinkSingleUseAluToParallelCopy(func: *ir.IrFunction, allocator: std.mem.Alloc
                 if (operand_redefined) break;
             }
             if (!operand_redefined) {
-                for (func.blocks.items[b_idx].instructions.items[0..copy_idx]) |early_b| {
+                for (func.blocks.items[b_idx].instructions.items[0..insert_idx]) |early_b| {
                     for (ops.slice()) |op_v| {
                         if (instDefinesVReg(early_b, op_v)) {
                             operand_redefined = true;
@@ -9120,11 +9128,100 @@ fn sinkSingleUseAluToParallelCopy(func: *ir.IrFunction, allocator: std.mem.Alloc
             }
             if (!operand_redefined) {
                 const moved = func.blocks.items[a_idx].instructions.orderedRemove(def_idx);
-                try func.blocks.items[b_idx].instructions.insert(func.allocator, copy_idx, moved);
+                try func.blocks.items[b_idx].instructions.insert(func.allocator, insert_idx, moved);
                 copy_idx += 1;
             }
         }
     }
+}
+
+fn isBrIfFusableCmpOp(op: ir.Inst.Op) bool {
+    return switch (op) {
+        .eq,
+        .ne,
+        .lt_s,
+        .lt_u,
+        .gt_s,
+        .gt_u,
+        .le_s,
+        .le_u,
+        .ge_s,
+        .ge_u,
+        .eqz,
+        .f_eq,
+        .f_ne,
+        .f_lt,
+        .f_gt,
+        .f_le,
+        .f_ge,
+        .@"and",
+        => true,
+        else => false,
+    };
+}
+
+fn findSinkInsertIdxBeforeParallelCopy(b_insts: []const ir.Inst, copy_idx: usize, moved: ir.Inst) usize {
+    if (b_insts.len == 0 or copy_idx == 0) return copy_idx;
+    const term = b_insts[b_insts.len - 1];
+    const br_cond = switch (term.op) {
+        .br_if => |bi| bi.cond,
+        else => return copy_idx,
+    };
+
+    var k: usize = copy_idx;
+    var cmp_idx_opt: ?usize = null;
+    while (k > 0) {
+        k -= 1;
+        const cand = b_insts[k];
+        if (cand.dest == br_cond) {
+            if (isBrIfFusableCmpOp(cand.op)) {
+                cmp_idx_opt = k;
+            }
+            break;
+        }
+        switch (cand.op) {
+            .iconst_32, .iconst_64 => continue,
+            else => break,
+        }
+    }
+    var insert_idx = cmp_idx_opt orelse return copy_idx;
+
+    const cmp_ops = getUsedVRegs(b_insts[insert_idx]);
+    while (insert_idx > 0) {
+        const prev = b_insts[insert_idx - 1];
+        switch (prev.op) {
+            .iconst_32, .iconst_64 => {
+                const pd = prev.dest orelse break;
+                var feeds_cmp = false;
+                for (cmp_ops.slice()) |v| {
+                    if (v == pd) {
+                        feeds_cmp = true;
+                        break;
+                    }
+                }
+                if (feeds_cmp) {
+                    insert_idx -= 1;
+                } else {
+                    break;
+                }
+            },
+            else => break,
+        }
+    }
+
+    const moved_ops = getUsedVRegs(moved);
+    for (b_insts[insert_idx..copy_idx]) |tail_inst| {
+        for (moved_ops.slice()) |mv| {
+            if (instDefinesVReg(tail_inst, mv)) return copy_idx;
+        }
+        if (moved.dest) |md| {
+            const tail_ops = getUsedVRegs(tail_inst);
+            for (tail_ops.slice()) |tv| {
+                if (tv == md) return copy_idx;
+            }
+        }
+    }
+    return insert_idx;
 }
 
 // ── Tail Duplication of Small Joins ────────────────────────────────────────
@@ -13820,6 +13917,71 @@ test "inductionVariableSimplification: aliased base pointers share synthetic loc
     try std.testing.expect(try inductionVariableSimplification(&func, allocator));
     try std.testing.expectEqual(@as(u32, 2), func.local_count);
 }
+
+test "sinkSingleUseAluToParallelCopy: preserves icmp + br_if adjacency across parallel_copy" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+
+    const v_acc = func.newVReg();
+    const v_step = func.newVReg();
+    const v_next = func.newVReg();
+    const v_limit = func.newVReg();
+    const v_cond = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_acc, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 2 }, .dest = v_step, .type = .i32 });
+    // Single-use ALU early in the block that feeds parallel_copy
+    try func.getBlock(b0).append(.{ .op = .{ .add = .{ .lhs = v_acc, .rhs = v_step } }, .dest = v_next, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 10 }, .dest = v_limit, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .ne = .{ .lhs = v_acc, .rhs = v_limit } }, .dest = v_cond, .type = .i32 });
+    const pairs = try allocator.alloc(ir.Inst.ParallelCopy, 1);
+    pairs[0] = .{ .dst = v_acc, .src = v_next, .ty = .i32 };
+    try func.getBlock(b0).append(.{ .op = .{ .parallel_copy = pairs } });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b0, .else_block = b1 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = v_acc } });
+
+    try sinkSingleUseAluToParallelCopy(&func, allocator);
+
+    const insts = func.getBlock(b0).instructions.items;
+    // Expected order at tail of b0: add (v_next), iconst_32 (v_limit), ne (v_cond), parallel_copy, br_if
+    try std.testing.expect(insts[insts.len - 1].op == .br_if);
+    try std.testing.expect(insts[insts.len - 2].op == .parallel_copy);
+    try std.testing.expect(insts[insts.len - 3].op == .ne);
+}
+
+test "elideRedundantBoundsChecks: preserves widened checked_end on dominating guard load" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 1);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const v_guard = func.newVReg();
+    const v_ld = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .local_get = 0 }, .dest = v_base, .type = .i32 });
+    // Preheader-style guard load with size=1 but widened checked_end=16
+    try func.getBlock(b0).append(.{
+        .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 1, .checked_end = 16 } },
+        .dest = v_guard,
+        .type = .i32,
+    });
+    // Subsequent load within [0..16] should be elided because checked_end=16 is preserved
+    try func.getBlock(b0).append(.{
+        .op = .{ .load = .{ .base = v_base, .offset = 8, .size = 4 } },
+        .dest = v_ld,
+        .type = .i32,
+    });
+    try func.getBlock(b0).append(.{ .op = .{ .ret = v_ld } });
+
+    try std.testing.expect(try elideRedundantBoundsChecks(&func, allocator));
+    const insts = func.getBlock(b0).instructions.items;
+    try std.testing.expectEqual(@as(u64, 16), insts[1].op.load.checked_end);
+    try std.testing.expect(insts[2].op.load.bounds_known);
+}
+
 
 test "inductionVariableSimplification: nested loops only transform innermost" {
     const allocator = std.testing.allocator;

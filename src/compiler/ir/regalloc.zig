@@ -1088,6 +1088,11 @@ fn snapshotTrace(
 /// Returns the number of moves coalesced (rewrites applied). The
 /// AllocResult is mutated in place. Safe to call with empty
 /// `copy_hints` — does nothing and returns 0.
+pub const InterfereHook = struct {
+    ctx: *const anyopaque,
+    checkFn: *const fn (ctx: *const anyopaque, u: ir.VReg, v: ir.VReg) anyerror!bool,
+};
+
 pub fn coalesceMoves(
     allocator: std.mem.Allocator,
     result: *AllocResult,
@@ -1095,6 +1100,18 @@ pub fn coalesceMoves(
     clobbers: []const ClobberPoint,
     ranges: []const analysis.LiveRange,
     copy_hints: []const CopyHint,
+) !u32 {
+    return coalesceMovesWithInterfere(allocator, result, reg_set, clobbers, ranges, copy_hints, null);
+}
+
+pub fn coalesceMovesWithInterfere(
+    allocator: std.mem.Allocator,
+    result: *AllocResult,
+    reg_set: RegSet,
+    clobbers: []const ClobberPoint,
+    ranges: []const analysis.LiveRange,
+    copy_hints: []const CopyHint,
+    interfere_hook: ?InterfereHook,
 ) !u32 {
     if (copy_hints.len == 0) return 0;
 
@@ -1156,6 +1173,7 @@ pub fn coalesceMoves(
             from_reg: PhysReg,
             to_reg: PhysReg,
             allow_partner_overlap: bool,
+            hook_opt: ?InterfereHook,
         ) !bool {
             const moving_ridx = ridx_map.get(moving_vreg) orelse return false;
             const moving_range = rngs[moving_ridx];
@@ -1175,6 +1193,11 @@ pub fn coalesceMoves(
                 if (iv.vreg == moving_vreg) continue;
                 if (allow_partner_overlap and iv.vreg == partner_vreg) continue;
                 if (iv.start < moving_range.end and moving_range.start < iv.end) {
+                    if (allow_partner_overlap) {
+                        if (hook_opt) |hook| {
+                            if (!try hook.checkFn(hook.ctx, moving_vreg, iv.vreg)) continue;
+                        }
+                    }
                     return false;
                 }
             }
@@ -1233,6 +1256,7 @@ pub fn coalesceMoves(
                         r_s,
                         r_d,
                         true,
+                        interfere_hook,
                     );
                 }
                 if (!did_coalesce and !dest_pinned) {
@@ -1249,6 +1273,7 @@ pub fn coalesceMoves(
                         r_d,
                         r_s,
                         true,
+                        interfere_hook,
                     );
                 }
             } else {
@@ -1266,6 +1291,7 @@ pub fn coalesceMoves(
                         r_d,
                         r_s,
                         true,
+                        interfere_hook,
                     );
                 }
                 if (!did_coalesce and !src_pinned) {
@@ -1282,6 +1308,7 @@ pub fn coalesceMoves(
                         r_s,
                         r_d,
                         true,
+                        interfere_hook,
                     );
                 }
             }
@@ -1300,6 +1327,7 @@ pub fn coalesceMoves(
                     r_d,
                     r_s,
                     false,
+                    null,
                 );
             }
             if (!did_coalesce and !src_pinned) {
@@ -1316,6 +1344,7 @@ pub fn coalesceMoves(
                     r_s,
                     r_d,
                     false,
+                    null,
                 );
             }
         }
@@ -2692,3 +2721,49 @@ test "remat: remat incoming never evicts non-remat active (#985)" {
     try std.testing.expect(result.isRemat(9));
     try std.testing.expectEqual(@as(u32, 0), result.spill_count);
 }
+
+test "coalesceMovesWithInterfere: multi-hop web coalesces non-interfering overlapping linear ranges" {
+    const allocator = std.testing.allocator;
+    // vreg 0 [0..20] and vreg 1 [4..18] have already been coalesced onto physreg 2.
+    // vreg 2 [10..15] has hint partner vreg 1 with allow_dest_overlap=true, and its
+    // linear bounding box overlaps vreg 0 [0..20], but CFG liveness says vreg 2 and
+    // vreg 0 do not interfere.
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 0, .end = 20, .type = .i32 },
+        .{ .vreg = 1, .start = 4, .end = 18, .type = .i32 },
+        .{ .vreg = 2, .start = 10, .end = 15, .type = .i32 },
+    };
+    var result: AllocResult = .{
+        .assignments = std.AutoHashMap(ir.VReg, Allocation).init(allocator),
+        .spill_count = 0,
+        .remat = std.AutoHashMap(ir.VReg, RematDef).init(allocator),
+    };
+    defer result.deinit();
+    try result.assignments.put(0, .{ .reg = 2 });
+    try result.assignments.put(1, .{ .reg = 2 });
+    try result.assignments.put(2, .{ .reg = 3 });
+
+    const copy_hints = [_]CopyHint{
+        .{ .dest = 1, .src = 0, .allow_dest_overlap = true },
+        .{ .dest = 1, .src = 2, .allow_dest_overlap = true },
+    };
+
+    const NoInterfere = struct {
+        fn check(_: *const anyopaque, _: ir.VReg, _: ir.VReg) anyerror!bool {
+            return false;
+        }
+    };
+    const dummy: u8 = 0;
+    const n = try coalesceMovesWithInterfere(
+        allocator,
+        &result,
+        test_reg_set,
+        &.{},
+        &ranges,
+        &copy_hints,
+        .{ .ctx = &dummy, .checkFn = NoInterfere.check },
+    );
+    try std.testing.expectEqual(@as(u32, 1), n);
+    try std.testing.expectEqual(Allocation{ .reg = 2 }, result.get(2).?);
+}
+
