@@ -2475,6 +2475,13 @@ pub fn compileFunctionImpl(
                             }
                         }
                     },
+                    .store => |st| {
+                        try cls_ctx.bumpTotal(st.base);
+                        try cls_ctx.bumpTotal(st.val);
+                        if (cls_ctx.cv.get(st.val)) |v| {
+                            if (v == 0) try cls_ctx.bumpFold(st.val);
+                        }
+                    },
                     else => {
                         try schedule.forEachUse(inst, &cls_ctx, Ctx.visitDefault);
                     },
@@ -2678,7 +2685,15 @@ pub fn compileFunctionImpl(
         // through `RegMap.assign` unchanged.
         if (ctx.options.enable_move_coalesce) {
             if (tmr) |t| t.begin();
-            var copy_hints = try collectCopyHints(func, block_order, &scheduled, allocator);
+            var copy_hints = try collectCopyHints(
+                func,
+                block_order,
+                &scheduled,
+                scalar_live_ranges.items,
+                &fma_info,
+                &simd_fma_info,
+                allocator,
+            );
             defer copy_hints.deinit(allocator);
             _ = try regalloc.coalesceMoves(
                 allocator,
@@ -10008,7 +10023,12 @@ fn emitLoad(
         ld.offset == 0 and
         !fctx.has_memory64 and
         !fctx.has_shared_memory;
-    if (use_reg_offset) {
+    const use_uxtw = use_reg_offset and ld.bounds_known and fctx.cached_mem_index_vreg != ld.base;
+    var uxtw_idx_reg: emit.Reg = RegMap.tmp2;
+    if (use_uxtw) {
+        uxtw_idx_reg = try useInto(code, reg_map, ld.base, RegMap.tmp2);
+        if (uxtw_idx_reg == RegMap.tmp2) fctx.cached_mem_index_vreg = null;
+    } else if (use_reg_offset) {
         try emitMemIndexImpl(code, reg_map, ld.base, end_offset, ld.bounds_known, fctx);
     } else {
         try emitMemAddrImpl(code, reg_map, ld.base, folded_offset, end_offset, ld.bounds_known, fctx);
@@ -10016,7 +10036,22 @@ fn emitLoad(
     const disp: u12 = if (folded) |d| d else 0;
 
     const info = try destBegin(reg_map, dest, RegMap.tmp1);
-    if (use_reg_offset and ld.sign_extend) {
+    if (use_uxtw and ld.sign_extend) {
+        switch (ld.size) {
+            1 => if (is64) try code.ldrsbRegOffset64Uxtw(info.reg, .x20, uxtw_idx_reg) else try code.ldrsbRegOffset32Uxtw(info.reg, .x20, uxtw_idx_reg),
+            2 => if (is64) try code.ldrshRegOffset64Uxtw(info.reg, .x20, uxtw_idx_reg) else try code.ldrshRegOffset32Uxtw(info.reg, .x20, uxtw_idx_reg),
+            4 => try code.ldrswRegOffsetUxtw(info.reg, .x20, uxtw_idx_reg),
+            else => unreachable,
+        }
+    } else if (use_uxtw) {
+        switch (ld.size) {
+            1 => try code.ldrbRegOffsetUxtw(info.reg, .x20, uxtw_idx_reg),
+            2 => try code.ldrhRegOffsetUxtw(info.reg, .x20, uxtw_idx_reg),
+            4 => try code.ldrRegOffset32Uxtw(info.reg, .x20, uxtw_idx_reg),
+            8 => try code.ldrRegOffsetUxtw(info.reg, .x20, uxtw_idx_reg),
+            else => unreachable,
+        }
+    } else if (use_reg_offset and ld.sign_extend) {
         switch (ld.size) {
             1 => if (is64) try code.ldrsbRegOffset64(info.reg, .x20, RegMap.tmp2) else try code.ldrsbRegOffset32(info.reg, .x20, RegMap.tmp2),
             2 => if (is64) try code.ldrshRegOffset64(info.reg, .x20, RegMap.tmp2) else try code.ldrshRegOffset32(info.reg, .x20, RegMap.tmp2),
@@ -10071,18 +10106,37 @@ fn emitStore(
         st.offset == 0 and
         !fctx.has_memory64 and
         !fctx.has_shared_memory;
-    if (use_reg_offset) {
+    const use_uxtw = use_reg_offset and st.bounds_known and fctx.cached_mem_index_vreg != st.base;
+    var uxtw_idx_reg: emit.Reg = RegMap.tmp2;
+    if (use_uxtw) {
+        uxtw_idx_reg = try useInto(code, reg_map, st.base, RegMap.tmp2);
+        if (uxtw_idx_reg == RegMap.tmp2) fctx.cached_mem_index_vreg = null;
+    } else if (use_reg_offset) {
         try emitMemIndexImpl(code, reg_map, st.base, end_offset, st.bounds_known, fctx);
     } else {
         try emitMemAddrImpl(code, reg_map, st.base, folded_offset, end_offset, st.bounds_known, fctx);
     }
     const disp: u12 = if (folded) |d| d else 0;
 
-    // Materialize the value into tmp1 (or use its home reg). Address
-    // preparation is done with tmp1 by now, while tmp2 keeps the index live
-    // for the register-offset form.
-    const val_reg = try useInto(code, reg_map, st.val, RegMap.tmp1);
-    if (use_reg_offset) {
+    // Materialize the value into tmp1 (or use its home reg, or xzr/wzr when
+    // storing a known zero constant). Address preparation is done with tmp1
+    // by now, while tmp2/uxtw_idx_reg keeps the index live for the
+    // register-offset form.
+    const is_zero_const = (if (fctx.const_vals) |cv| cv.get(st.val) == @as(?i64, 0) else false) or
+        (if (reg_map.alloc_result) |ar| if (ar.getRemat(st.val)) |rd| switch (rd) {
+            .iconst_32 => |v| v == 0,
+            .iconst_64 => |v| v == 0,
+        } else false else false);
+    const val_reg: emit.Reg = if (is_zero_const) .xzr else try useInto(code, reg_map, st.val, RegMap.tmp1);
+    if (use_uxtw) {
+        switch (st.size) {
+            1 => try code.strbRegOffsetUxtw(val_reg, .x20, uxtw_idx_reg),
+            2 => try code.strhRegOffsetUxtw(val_reg, .x20, uxtw_idx_reg),
+            4 => try code.strRegOffset32Uxtw(val_reg, .x20, uxtw_idx_reg),
+            8 => try code.strRegOffsetUxtw(val_reg, .x20, uxtw_idx_reg),
+            else => unreachable,
+        }
+    } else if (use_reg_offset) {
         switch (st.size) {
             1 => try code.strbRegOffset(val_reg, .x20, RegMap.tmp2),
             2 => try code.strhRegOffset(val_reg, .x20, RegMap.tmp2),
@@ -11403,10 +11457,20 @@ fn collectCopyHints(
     func: *const ir.IrFunction,
     block_order_opt: ?[]const ir.BlockId,
     scheduled: ?*const schedule.FunctionSchedule,
+    live_ranges_opt: ?[]const analysis.LiveRange,
+    fma_info_opt: ?*const std.AutoHashMap(ir.VReg, FmaInfo),
+    simd_fma_info_opt: ?*const std.AutoHashMap(ir.VReg, FmaInfo),
     allocator: std.mem.Allocator,
 ) !std.ArrayList(regalloc.CopyHint) {
     var hints: std.ArrayList(regalloc.CopyHint) = .empty;
     errdefer hints.deinit(allocator);
+
+    var range_map: std.AutoHashMap(ir.VReg, analysis.LiveRange) = .init(allocator);
+    defer range_map.deinit();
+    if (live_ranges_opt) |lrs| {
+        try range_map.ensureTotalCapacity(@intCast(lrs.len));
+        for (lrs) |r| range_map.putAssumeCapacity(r.vreg, r);
+    }
 
     var owns_order = false;
     const block_order: []const ir.BlockId = if (block_order_opt) |bo| bo else blk: {
@@ -11417,31 +11481,149 @@ fn collectCopyHints(
     };
     defer if (owns_order) allocator.free(block_order);
 
+    const CheckReadCtx = struct {
+        target: ir.VReg,
+        found: bool = false,
+        fn visit(self: *@This(), v: ir.VReg) error{}!void {
+            if (v == self.target) self.found = true;
+        }
+    };
+
+    var global_idx: u32 = 0;
     for (block_order) |bo_bid| {
         const insts = if (scheduled) |s|
             s.instructions(bo_bid)
         else
             func.blocks.items[bo_bid].instructions.items;
-        for (insts) |ci| {
+        const b_start: u32 = global_idx;
+        const b_end: u32 = b_start + @as(u32, @intCast(insts.len));
+        defer global_idx = b_end;
+
+        for (insts, 0..) |ci, copy_idx| {
             switch (ci.op) {
                 .reinterpret, .wrap_i64 => |src_vreg| {
                     const dest = ci.dest orelse continue;
                     try hints.append(allocator, .{ .dest = dest, .src = src_vreg });
                 },
                 .parallel_copy => |pairs| {
-                    // Each pair is an honest register-move candidate at
-                    // the predecessor's terminator. Hinting `dst <- src`
-                    // lets the linear-scan allocator + post-allocation
-                    // coalescer collapse same-physreg pairs to no-ops
-                    // before `emitParallelCopy` ever runs.
-                    //
-                    // Disabled while investigating: copy hints for the
-                    // back-edge phi (src = vreg defined inside the
-                    // loop body, dst = phi value live across the
-                    // body) may make the coalescer believe two
-                    // overlapping live ranges can share a physreg —
-                    // misaligning loop semantics.
-                    _ = pairs;
+                    for (pairs, 0..) |p, p_idx| {
+                        var allow_overlap = false;
+                        if (live_ranges_opt != null and p.dst != p.src) blk: {
+                            const src_range = range_map.get(p.src) orelse break :blk;
+                            const dest_range = range_map.get(p.dst) orelse break :blk;
+
+                            var maybe_def_idx: ?usize = null;
+                            for (insts[0..copy_idx], 0..) |prev, idx| {
+                                if (prev.dest == p.src) {
+                                    if (maybe_def_idx != null) {
+                                        maybe_def_idx = null;
+                                        break;
+                                    }
+                                    maybe_def_idx = idx;
+                                }
+                                if (prev.op == .parallel_copy) {
+                                    for (prev.op.parallel_copy) |pp| {
+                                        if (pp.dst == p.src) {
+                                            maybe_def_idx = null;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            const def_idx = maybe_def_idx orelse break :blk;
+                            const def_inst = insts[def_idx];
+                            switch (def_inst.op) {
+                                .add,
+                                .sub,
+                                .mul,
+                                .@"and",
+                                .@"or",
+                                .xor,
+                                .shl,
+                                .shr_s,
+                                .shr_u,
+                                .rotl,
+                                .rotr,
+                                .load,
+                                .extend_i32_s,
+                                .extend_i32_u,
+                                .extend8_s,
+                                .extend16_s,
+                                .extend32_s,
+                                .wrap_i64,
+                                .reinterpret,
+                                .iconst_32,
+                                .iconst_64,
+                                => {},
+                                else => break :blk,
+                            }
+
+                            if (src_range.start != b_start + @as(u32, @intCast(def_idx))) break :blk;
+                            if (dest_range.start > b_start) break :blk;
+                            if (@min(src_range.end, dest_range.end) >= b_end) break :blk;
+
+                            var hole_ok = true;
+                            var k: usize = def_idx + 1;
+                            while (k < copy_idx) : (k += 1) {
+                                const mid = insts[k];
+                                if (mid.dest == p.dst or mid.dest == p.src or mid.op == .parallel_copy) {
+                                    hole_ok = false;
+                                    break;
+                                }
+                                var read_ctx: CheckReadCtx = .{ .target = p.dst };
+                                schedule.forEachUse(mid, &read_ctx, CheckReadCtx.visit) catch unreachable;
+                                if (read_ctx.found) {
+                                    hole_ok = false;
+                                    break;
+                                }
+                                if (mid.dest) |md| {
+                                    if (fma_info_opt) |fma_map| {
+                                        if (fma_map.get(md)) |fi| {
+                                            if (fi.mul_lhs == p.dst or fi.mul_rhs == p.dst or fi.addend == p.dst) {
+                                                hole_ok = false;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if (simd_fma_info_opt) |sfma_map| {
+                                        if (sfma_map.get(md)) |fi| {
+                                            if (fi.mul_lhs == p.dst or fi.mul_rhs == p.dst or fi.addend == p.dst) {
+                                                hole_ok = false;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if (!hole_ok) break :blk;
+
+                            for (pairs, 0..) |p2, p2_idx| {
+                                if (p2_idx == p_idx) continue;
+                                if (p2.src == p.dst or p2.dst == p.dst or p2.dst == p.src or p2.src == p.src) {
+                                    hole_ok = false;
+                                    break;
+                                }
+                            }
+                            if (!hole_ok) break :blk;
+
+                            var after_k: usize = copy_idx + 1;
+                            while (after_k < insts.len) : (after_k += 1) {
+                                const aft = insts[after_k];
+                                if (aft.dest == p.dst or aft.dest == p.src or aft.op == .parallel_copy) {
+                                    hole_ok = false;
+                                    break;
+                                }
+                            }
+                            if (!hole_ok) break :blk;
+
+                            allow_overlap = true;
+                        }
+                        try hints.append(allocator, .{
+                            .dest = p.dst,
+                            .src = p.src,
+                            .allow_dest_overlap = allow_overlap,
+                        });
+                    }
                 },
                 else => {},
             }

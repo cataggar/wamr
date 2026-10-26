@@ -234,6 +234,7 @@ pub const AllocationTrace = struct {
 pub const CopyHint = struct {
     dest: ir.VReg,
     src: ir.VReg,
+    allow_dest_overlap: bool = false,
 };
 
 /// Run linear scan register allocation on a function.
@@ -1138,6 +1139,65 @@ pub fn coalesceMoves(
         }
     }
 
+    var pinned = std.AutoHashMap(ir.VReg, void).init(allocator);
+    defer pinned.deinit();
+
+    const tryRetarget = struct {
+        fn call(
+            alloc: std.mem.Allocator,
+            res: *AllocResult,
+            rset: RegSet,
+            clobs: []const ClobberPoint,
+            rngs: []const analysis.LiveRange,
+            ridx_map: *const std.AutoHashMap(ir.VReg, usize),
+            preg: *std.AutoHashMap(PhysReg, std.ArrayList(Interval)),
+            moving_vreg: ir.VReg,
+            partner_vreg: ir.VReg,
+            from_reg: PhysReg,
+            to_reg: PhysReg,
+            allow_partner_overlap: bool,
+        ) !bool {
+            const moving_ridx = ridx_map.get(moving_vreg) orelse return false;
+            const moving_range = rngs[moving_ridx];
+
+            const to_alloc_idx_opt: ?u8 = blk: {
+                for (rset.alloc_regs, 0..) |p, i| {
+                    if (p == to_reg) break :blk @intCast(i);
+                }
+                break :blk null;
+            };
+            const to_alloc_idx = to_alloc_idx_opt orelse return false;
+
+            if (!regSafeForRange(to_alloc_idx, moving_vreg, moving_range.start, moving_range.end, clobs)) return false;
+
+            const to_list_ptr = preg.getPtr(to_reg) orelse return false;
+            for (to_list_ptr.items) |iv| {
+                if (iv.vreg == moving_vreg) continue;
+                if (allow_partner_overlap and iv.vreg == partner_vreg) continue;
+                if (iv.start < moving_range.end and moving_range.start < iv.end) {
+                    return false;
+                }
+            }
+
+            try res.assignments.put(moving_vreg, .{ .reg = to_reg });
+            if (preg.getPtr(from_reg)) |old_list| {
+                var i: usize = 0;
+                while (i < old_list.items.len) : (i += 1) {
+                    if (old_list.items[i].vreg == moving_vreg) {
+                        _ = old_list.swapRemove(i);
+                        break;
+                    }
+                }
+            }
+            try to_list_ptr.append(alloc, .{
+                .vreg = moving_vreg,
+                .start = moving_range.start,
+                .end = moving_range.end,
+            });
+            return true;
+        }
+    }.call;
+
     var coalesced: u32 = 0;
     for (copy_hints) |ch| {
         const dest_alloc = result.assignments.get(ch.dest) orelse continue;
@@ -1145,59 +1205,53 @@ pub fn coalesceMoves(
         if (dest_alloc != .reg or src_alloc != .reg) continue;
         const r_d = dest_alloc.reg;
         const r_s = src_alloc.reg;
-        if (r_d == r_s) continue; // already coalesced — no-op
-
-        const dest_range_idx = range_idx.get(ch.dest) orelse continue;
-        const dest_range = ranges[dest_range_idx];
-
-        // Find r_s's index in reg_set.alloc_regs (for clobber bitmask).
-        const r_s_alloc_idx_opt: ?u8 = blk: {
-            for (reg_set.alloc_regs, 0..) |p, i| {
-                if (p == r_s) break :blk @intCast(i);
-            }
-            break :blk null;
-        };
-        const r_s_alloc_idx = r_s_alloc_idx_opt orelse continue;
-
-        // Clobber safety: same predicate as the allocator. Note we use
-        // the strict-inside check (start < pos < end) consistent with
-        // `regSafeForRange`.
-        if (!regSafeForRange(r_s_alloc_idx, ch.dest, dest_range.start, dest_range.end, clobbers)) continue;
-
-        // Interference check: any *other* interval already on r_s
-        // whose range overlaps dest's range blocks the retarget.
-        // (Two intervals overlap iff max(start) < min(end). Equal
-        // endpoints don't overlap under our live-range convention —
-        // a vreg defined at pos N ends a different vreg that died at
-        // N.)
-        const r_s_list_ptr = per_reg.getPtr(r_s) orelse continue;
-        var conflict = false;
-        for (r_s_list_ptr.items) |iv| {
-            if (iv.vreg == ch.dest) continue;
-            if (iv.start < dest_range.end and dest_range.start < iv.end) {
-                conflict = true;
-                break;
-            }
+        if (r_d == r_s) {
+            try pinned.put(ch.dest, {});
+            try pinned.put(ch.src, {});
+            continue; // already coalesced — no-op
         }
-        if (conflict) continue;
 
-        // Safe to retarget. Move `dest`'s interval from r_d → r_s.
-        try result.assignments.put(ch.dest, .{ .reg = r_s });
-        if (per_reg.getPtr(r_d)) |old_list| {
-            var i: usize = 0;
-            while (i < old_list.items.len) : (i += 1) {
-                if (old_list.items[i].vreg == ch.dest) {
-                    _ = old_list.swapRemove(i);
-                    break;
-                }
-            }
+        const dest_pinned = pinned.contains(ch.dest);
+        const src_pinned = pinned.contains(ch.src);
+
+        var did_coalesce = false;
+        if (!dest_pinned) {
+            did_coalesce = try tryRetarget(
+                allocator,
+                result,
+                reg_set,
+                clobbers,
+                ranges,
+                &range_idx,
+                &per_reg,
+                ch.dest,
+                ch.src,
+                r_d,
+                r_s,
+                ch.allow_dest_overlap,
+            );
         }
-        try r_s_list_ptr.append(allocator, .{
-            .vreg = ch.dest,
-            .start = dest_range.start,
-            .end = dest_range.end,
-        });
-        coalesced += 1;
+        if (!did_coalesce and !src_pinned) {
+            did_coalesce = try tryRetarget(
+                allocator,
+                result,
+                reg_set,
+                clobbers,
+                ranges,
+                &range_idx,
+                &per_reg,
+                ch.src,
+                ch.dest,
+                r_s,
+                r_d,
+                ch.allow_dest_overlap,
+            );
+        }
+        if (did_coalesce) {
+            try pinned.put(ch.dest, {});
+            try pinned.put(ch.src, {});
+            coalesced += 1;
+        }
     }
 
     return coalesced;
@@ -2308,8 +2362,8 @@ test "coalesceMoves: refuses when src's reg is clobbered inside dest's range" {
     // hint (dest=1, src=0) would put vreg 1 on physreg 2 — but the
     // clobber would corrupt it mid-range, so coalesce must refuse.
     const ranges = [_]analysis.LiveRange{
-        .{ .vreg = 0, .start = 0, .end = 1, .type = .i64 },
-        .{ .vreg = 1, .start = 1, .end = 4, .type = .i64 },
+        .{ .vreg = 0, .start = 0, .end = 2, .type = .i64 },
+        .{ .vreg = 1, .start = 2, .end = 5, .type = .i64 },
     };
     // Hand-build assignments to control placement deterministically.
     var result: AllocResult = .{
@@ -2322,11 +2376,37 @@ test "coalesceMoves: refuses when src's reg is clobbered inside dest's range" {
     try result.assignments.put(1, .{ .reg = 3 });
 
     const clobbers = [_]ClobberPoint{
-        .{ .pos = 2, .regs_clobbered = 0b1 }, // clobbers idx 0 = physreg 2
+        .{ .pos = 1, .regs_clobbered = 0b10 }, // clobbers idx 1 = physreg 3 inside src's range [0..2]
+        .{ .pos = 3, .regs_clobbered = 0b1 }, // clobbers idx 0 = physreg 2 inside dest's range [2..5]
     };
     const copy_hints = [_]CopyHint{.{ .dest = 1, .src = 0 }};
     const n = try coalesceMoves(allocator, &result, test_reg_set, &clobbers, &ranges, &copy_hints);
     try std.testing.expectEqual(@as(u32, 0), n);
+    try std.testing.expectEqual(Allocation{ .reg = 3 }, result.get(1).?);
+}
+
+test "coalesceMoves: bidirectional fallback retargets src to dest's reg and supports allow_dest_overlap" {
+    const allocator = std.testing.allocator;
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 2, .end = 3, .type = .i64 },
+        .{ .vreg = 1, .start = 0, .end = 4, .type = .i64 },
+    };
+    var result: AllocResult = .{
+        .assignments = std.AutoHashMap(ir.VReg, Allocation).init(allocator),
+        .spill_count = 0,
+        .remat = std.AutoHashMap(ir.VReg, RematDef).init(allocator),
+    };
+    defer result.deinit();
+    try result.assignments.put(0, .{ .reg = 2 });
+    try result.assignments.put(1, .{ .reg = 3 });
+
+    const clobbers = [_]ClobberPoint{
+        .{ .pos = 1, .regs_clobbered = 0b1 }, // clobbers physreg 2 inside dest's range [0..4], outside src's [2..3]
+    };
+    const copy_hints = [_]CopyHint{.{ .dest = 1, .src = 0, .allow_dest_overlap = true }};
+    const n = try coalesceMoves(allocator, &result, test_reg_set, &clobbers, &ranges, &copy_hints);
+    try std.testing.expectEqual(@as(u32, 1), n);
+    try std.testing.expectEqual(Allocation{ .reg = 3 }, result.get(0).?);
     try std.testing.expectEqual(Allocation{ .reg = 3 }, result.get(1).?);
 }
 

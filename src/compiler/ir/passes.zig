@@ -2793,8 +2793,148 @@ pub fn deadCodeElimination(func: *ir.IrFunction, allocator: std.mem.Allocator) !
 ///   leave an `iconst_32 = 0` placeholder for `deadCodeElimination` to
 ///   sweep, matching the convention used by `constantFold`.
 pub fn algebraicSimplify(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
-    _ = allocator;
     var changed = false;
+
+    const n_vregs: usize = @intCast(func.next_vreg);
+    const n_locals: usize = @max(func.param_count, func.local_count);
+
+    const possible_ones = try allocator.alloc(u64, n_vregs);
+    defer allocator.free(possible_ones);
+    @memset(possible_ones, 0);
+
+    const def_counts = try allocator.alloc(u8, n_vregs);
+    defer allocator.free(def_counts);
+    @memset(def_counts, 0);
+
+    const known_const = try allocator.alloc(?i64, n_vregs);
+    defer allocator.free(known_const);
+    @memset(known_const, null);
+
+    const local_possible_ones = try allocator.alloc(u64, n_locals);
+    defer allocator.free(local_possible_ones);
+
+    const local_has_set = try allocator.alloc(bool, n_locals);
+    defer allocator.free(local_has_set);
+    @memset(local_has_set, false);
+
+    for (func.blocks.items) |*block| {
+        for (block.instructions.items) |inst| {
+            if (inst.dest) |d| {
+                if (d < n_vregs) {
+                    def_counts[d] +|= 1;
+                    switch (inst.op) {
+                        .iconst_32 => |c| known_const[d] = c,
+                        .iconst_64 => |c| known_const[d] = c,
+                        else => {},
+                    }
+                }
+            }
+            switch (inst.op) {
+                .parallel_copy => |pairs| {
+                    for (pairs) |pair| {
+                        if (pair.dst < n_vregs) def_counts[pair.dst] = 2;
+                    }
+                },
+                .local_set => |ls| {
+                    if (ls.idx < n_locals) local_has_set[ls.idx] = true;
+                },
+                else => {},
+            }
+        }
+    }
+
+    for (0..n_vregs) |v| {
+        if (def_counts[v] != 1) {
+            possible_ones[v] = ~@as(u64, 0);
+            known_const[v] = null;
+        }
+    }
+    for (0..n_locals) |i| {
+        local_possible_ones[i] = if (i < func.param_count or !local_has_set[i]) ~@as(u64, 0) else 0;
+    }
+
+    var reached_fixpoint = false;
+    var iter: u32 = 0;
+    while (iter < 6) : (iter += 1) {
+        var iter_changed = false;
+        for (func.blocks.items) |*block| {
+            for (block.instructions.items) |inst| {
+                if (inst.op == .local_set) {
+                    const ls = inst.op.local_set;
+                    if (ls.idx >= func.param_count and ls.idx < local_possible_ones.len) {
+                        const val_ones = if (ls.val < n_vregs) possible_ones[ls.val] else ~@as(u64, 0);
+                        if ((local_possible_ones[ls.idx] | val_ones) != local_possible_ones[ls.idx]) {
+                            local_possible_ones[ls.idx] |= val_ones;
+                            iter_changed = true;
+                        }
+                    }
+                    continue;
+                }
+                const d = inst.dest orelse continue;
+                if (d >= n_vregs or def_counts[d] != 1) continue;
+                const type_mask: u64 = if (inst.type == .i32) 0xFFFF_FFFF else ~@as(u64, 0);
+                const raw_mask: u64 = switch (inst.op) {
+                    .iconst_32 => |c| @as(u32, @bitCast(c)),
+                    .iconst_64 => |c| @as(u64, @bitCast(c)),
+                    .load => |ld| if (!ld.sign_extend) switch (ld.size) {
+                        1 => 0xFF,
+                        2 => 0xFFFF,
+                        4 => 0xFFFF_FFFF,
+                        else => type_mask,
+                    } else type_mask,
+                    .@"and" => |bin| (if (bin.lhs < n_vregs) possible_ones[bin.lhs] else ~@as(u64, 0)) &
+                        (if (bin.rhs < n_vregs) possible_ones[bin.rhs] else ~@as(u64, 0)),
+                    .@"or", .xor => |bin| (if (bin.lhs < n_vregs) possible_ones[bin.lhs] else ~@as(u64, 0)) |
+                        (if (bin.rhs < n_vregs) possible_ones[bin.rhs] else ~@as(u64, 0)),
+                    .shr_u => |bin| blk: {
+                        const lhs_ones = (if (bin.lhs < n_vregs) possible_ones[bin.lhs] else ~@as(u64, 0)) & type_mask;
+                        if (bin.rhs < n_vregs) {
+                            if (known_const[bin.rhs]) |c| {
+                                if (inst.type == .i32) {
+                                    const sh: u5 = @truncate(@as(u32, @bitCast(@as(i32, @truncate(c)))));
+                                    break :blk lhs_ones >> sh;
+                                } else if (inst.type == .i64) {
+                                    const sh: u6 = @truncate(@as(u64, @bitCast(c)));
+                                    break :blk lhs_ones >> sh;
+                                }
+                            }
+                        }
+                        break :blk type_mask;
+                    },
+                    .shl => |bin| blk: {
+                        const lhs_ones = if (bin.lhs < n_vregs) possible_ones[bin.lhs] else ~@as(u64, 0);
+                        if (bin.rhs < n_vregs) {
+                            if (known_const[bin.rhs]) |c| {
+                                if (inst.type == .i32) {
+                                    const sh: u5 = @truncate(@as(u32, @bitCast(@as(i32, @truncate(c)))));
+                                    break :blk (lhs_ones << sh) & type_mask;
+                                } else if (inst.type == .i64) {
+                                    const sh: u6 = @truncate(@as(u64, @bitCast(c)));
+                                    break :blk (lhs_ones << sh) & type_mask;
+                                }
+                            }
+                        }
+                        break :blk type_mask;
+                    },
+                    .extend_i32_u, .wrap_i64 => |src| (if (src < n_vregs) possible_ones[src] else ~@as(u64, 0)) & 0xFFFF_FFFF,
+                    .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u, .eqz, .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge => 1,
+                    .select => |sel| (if (sel.if_true < n_vregs) possible_ones[sel.if_true] else ~@as(u64, 0)) |
+                        (if (sel.if_false < n_vregs) possible_ones[sel.if_false] else ~@as(u64, 0)),
+                    .local_get => |idx| if (idx < local_possible_ones.len) local_possible_ones[idx] else type_mask,
+                    else => type_mask,
+                };
+                const new_mask = raw_mask & type_mask;
+                if ((possible_ones[d] | new_mask) != possible_ones[d]) {
+                    possible_ones[d] |= new_mask;
+                    iter_changed = true;
+                }
+            }
+        }
+        if (!iter_changed) {
+            reached_fixpoint = true;
+            break;
+        }
+    }
 
     for (func.blocks.items) |*block| {
         for (block.instructions.items) |*inst| {
@@ -2812,7 +2952,37 @@ pub fn algebraicSimplify(func: *ir.IrFunction, allocator: std.mem.Allocator) !bo
                     }
                     changed = true;
                 },
-                .@"and", .@"or" => |bin| {
+                .@"and" => |bin| {
+                    if (bin.lhs == bin.rhs) {
+                        const keep = bin.lhs;
+                        replaceVReg(func, dest, keep);
+                        inst.op = if (inst.type == .i64) .{ .iconst_64 = 0 } else .{ .iconst_32 = 0 };
+                        changed = true;
+                        continue;
+                    }
+                    if (reached_fixpoint and bin.lhs < n_vregs and bin.rhs < n_vregs) {
+                        const type_mask: u64 = if (inst.type == .i32) 0xFFFF_FFFF else ~@as(u64, 0);
+                        if (known_const[bin.rhs]) |c| {
+                            const mask: u64 = @as(u64, @bitCast(c)) & type_mask;
+                            if ((possible_ones[bin.lhs] & ~mask) == 0) {
+                                replaceVReg(func, dest, bin.lhs);
+                                inst.op = if (inst.type == .i64) .{ .iconst_64 = 0 } else .{ .iconst_32 = 0 };
+                                changed = true;
+                                continue;
+                            }
+                        }
+                        if (known_const[bin.lhs]) |c| {
+                            const mask: u64 = @as(u64, @bitCast(c)) & type_mask;
+                            if ((possible_ones[bin.rhs] & ~mask) == 0) {
+                                replaceVReg(func, dest, bin.rhs);
+                                inst.op = if (inst.type == .i64) .{ .iconst_64 = 0 } else .{ .iconst_32 = 0 };
+                                changed = true;
+                                continue;
+                            }
+                        }
+                    }
+                },
+                .@"or" => |bin| {
                     if (bin.lhs != bin.rhs) continue;
                     const keep = bin.lhs;
                     replaceVReg(func, dest, keep);
@@ -6030,25 +6200,34 @@ pub fn foldBranchOnEqz(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool
     var use_counts = try buildVRegUseCounts(func, allocator);
     defer use_counts.deinit();
 
-    for (func.blocks.items) |*block| {
+    for (func.blocks.items, 0..) |*block, block_idx| {
         if (block.instructions.items.len == 0) continue;
         const term = &block.instructions.items[block.instructions.items.len - 1];
         switch (term.op) {
             .br_if => |bi| {
                 const producer_block = def_block.get(bi.cond) orelse continue;
                 const producer_ii = def_idx.get(bi.cond) orelse continue;
-                const producer = &func.blocks.items[producer_block].instructions.items[producer_ii];
-                const inner = switch (producer.op) {
-                    .eqz => |v| v,
-                    else => continue,
-                };
                 if ((use_counts.get(bi.cond) orelse 0) != 1) continue;
-                term.op = .{ .br_if = .{
-                    .cond = inner,
-                    .then_block = bi.else_block,
-                    .else_block = bi.then_block,
-                } };
-                changed = true;
+                const producer = &func.blocks.items[producer_block].instructions.items[producer_ii];
+                switch (producer.op) {
+                    .eqz => |inner| {
+                        term.op = .{ .br_if = .{
+                            .cond = inner,
+                            .then_block = bi.else_block,
+                            .else_block = bi.then_block,
+                        } };
+                        changed = true;
+                    },
+                    .xor => |b| {
+                        if ((producer.type == .i32 or producer.type == .i64) and
+                            producer_block == @as(ir.BlockId, @intCast(block_idx)))
+                        {
+                            producer.op = .{ .ne = b };
+                            changed = true;
+                        }
+                    },
+                    else => continue,
+                }
             },
             else => {},
         }
@@ -6499,6 +6678,7 @@ pub fn foldInverseCompareEqz(func: *ir.IrFunction, allocator: std.mem.Allocator)
             const new_op: ?ir.Inst.Op = switch (producer.op) {
                 .eq => |b| .{ .ne = b },
                 .ne => |b| .{ .eq = b },
+                .xor => |b| if (producer.type == .i32 or producer.type == .i64) .{ .eq = b } else null,
                 .lt_s => |b| .{ .ge_s = b },
                 .ge_s => |b| .{ .lt_s = b },
                 .le_s => |b| .{ .gt_s = b },
@@ -7972,11 +8152,12 @@ fn synthCoalesceLostCopyUnsafe(
         fn call(
             target: ir.BlockId,
             join: ir.BlockId,
+            dom_tree: *const analysis.DomTree,
             vis: []bool,
             wl: *std.ArrayListUnmanaged(ir.BlockId),
             alloc: std.mem.Allocator,
         ) !void {
-            if (target == join or target >= vis.len) return;
+            if (target == join or target >= vis.len or !dom_tree.dominates(join, target)) return;
             if (!vis[target]) {
                 vis[target] = true;
                 try wl.append(alloc, target);
@@ -7992,14 +8173,14 @@ fn synthCoalesceLostCopyUnsafe(
         if (term_idx >= func.blocks.items[p].instructions.items.len) continue;
         const term = func.blocks.items[p].instructions.items[term_idx];
         switch (term.op) {
-            .br => |target| try enqueueIfNotJoin(target, join_block, visited, &worklist, allocator),
+            .br => |target| try enqueueIfNotJoin(target, join_block, dom, visited, &worklist, allocator),
             .br_if => |bi| {
-                try enqueueIfNotJoin(bi.then_block, join_block, visited, &worklist, allocator);
-                try enqueueIfNotJoin(bi.else_block, join_block, visited, &worklist, allocator);
+                try enqueueIfNotJoin(bi.then_block, join_block, dom, visited, &worklist, allocator);
+                try enqueueIfNotJoin(bi.else_block, join_block, dom, visited, &worklist, allocator);
             },
             .br_table => |bt| {
-                for (bt.targets) |t| try enqueueIfNotJoin(t, join_block, visited, &worklist, allocator);
-                try enqueueIfNotJoin(bt.default, join_block, visited, &worklist, allocator);
+                for (bt.targets) |t| try enqueueIfNotJoin(t, join_block, dom, visited, &worklist, allocator);
+                try enqueueIfNotJoin(bt.default, join_block, dom, visited, &worklist, allocator);
             },
             else => {},
         }
@@ -8014,14 +8195,14 @@ fn synthCoalesceLostCopyUnsafe(
         if (term_idx >= func.blocks.items[b].instructions.items.len) continue;
         const term = func.blocks.items[b].instructions.items[term_idx];
         switch (term.op) {
-            .br => |target| try enqueueIfNotJoin(target, join_block, visited, &worklist, allocator),
+            .br => |target| try enqueueIfNotJoin(target, join_block, dom, visited, &worklist, allocator),
             .br_if => |bi| {
-                try enqueueIfNotJoin(bi.then_block, join_block, visited, &worklist, allocator);
-                try enqueueIfNotJoin(bi.else_block, join_block, visited, &worklist, allocator);
+                try enqueueIfNotJoin(bi.then_block, join_block, dom, visited, &worklist, allocator);
+                try enqueueIfNotJoin(bi.else_block, join_block, dom, visited, &worklist, allocator);
             },
             .br_table => |bt| {
-                for (bt.targets) |t| try enqueueIfNotJoin(t, join_block, visited, &worklist, allocator);
-                try enqueueIfNotJoin(bt.default, join_block, visited, &worklist, allocator);
+                for (bt.targets) |t| try enqueueIfNotJoin(t, join_block, dom, visited, &worklist, allocator);
+                try enqueueIfNotJoin(bt.default, join_block, dom, visited, &worklist, allocator);
             },
             else => {},
         }
@@ -8140,11 +8321,12 @@ fn tryRescueLostCopyViaSibling(
         fn call(
             target: ir.BlockId,
             join: ir.BlockId,
+            dom_tree: *const analysis.DomTree,
             vis: []bool,
             wl: *std.ArrayListUnmanaged(ir.BlockId),
             alloc: std.mem.Allocator,
         ) !void {
-            if (target == join or target >= vis.len) return;
+            if (target == join or target >= vis.len or !dom_tree.dominates(join, target)) return;
             if (!vis[target]) {
                 vis[target] = true;
                 try wl.append(alloc, target);
@@ -8156,14 +8338,14 @@ fn tryRescueLostCopyViaSibling(
     if (back_term_idx >= func.blocks.items[back_p].instructions.items.len) return false;
     const back_term = func.blocks.items[back_p].instructions.items[back_term_idx];
     switch (back_term.op) {
-        .br => |target| try enqueueIfNotJoin(target, join_block, visited, &worklist, allocator),
+        .br => |target| try enqueueIfNotJoin(target, join_block, dom, visited, &worklist, allocator),
         .br_if => |bi| {
-            try enqueueIfNotJoin(bi.then_block, join_block, visited, &worklist, allocator);
-            try enqueueIfNotJoin(bi.else_block, join_block, visited, &worklist, allocator);
+            try enqueueIfNotJoin(bi.then_block, join_block, dom, visited, &worklist, allocator);
+            try enqueueIfNotJoin(bi.else_block, join_block, dom, visited, &worklist, allocator);
         },
         .br_table => |bt| {
-            for (bt.targets) |t| try enqueueIfNotJoin(t, join_block, visited, &worklist, allocator);
-            try enqueueIfNotJoin(bt.default, join_block, visited, &worklist, allocator);
+            for (bt.targets) |t| try enqueueIfNotJoin(t, join_block, dom, visited, &worklist, allocator);
+            try enqueueIfNotJoin(bt.default, join_block, dom, visited, &worklist, allocator);
         },
         else => {},
     }
@@ -8174,14 +8356,14 @@ fn tryRescueLostCopyViaSibling(
         if (term_idx >= func.blocks.items[b].instructions.items.len) continue;
         const term = func.blocks.items[b].instructions.items[term_idx];
         switch (term.op) {
-            .br => |target| try enqueueIfNotJoin(target, join_block, visited, &worklist, allocator),
+            .br => |target| try enqueueIfNotJoin(target, join_block, dom, visited, &worklist, allocator),
             .br_if => |bi| {
-                try enqueueIfNotJoin(bi.then_block, join_block, visited, &worklist, allocator);
-                try enqueueIfNotJoin(bi.else_block, join_block, visited, &worklist, allocator);
+                try enqueueIfNotJoin(bi.then_block, join_block, dom, visited, &worklist, allocator);
+                try enqueueIfNotJoin(bi.else_block, join_block, dom, visited, &worklist, allocator);
             },
             .br_table => |bt| {
-                for (bt.targets) |t| try enqueueIfNotJoin(t, join_block, visited, &worklist, allocator);
-                try enqueueIfNotJoin(bt.default, join_block, visited, &worklist, allocator);
+                for (bt.targets) |t| try enqueueIfNotJoin(t, join_block, dom, visited, &worklist, allocator);
+                try enqueueIfNotJoin(bt.default, join_block, dom, visited, &worklist, allocator);
             },
             else => {},
         }
@@ -18485,3 +18667,130 @@ test "coalescePhiLocalsToParallelCopy: splits loop-exit critical edge for exit p
     try std.testing.expect(func.getBlock(tramp_bid).instructions.items[0].op == .parallel_copy);
     try std.testing.expectEqual(ir.Inst.Op{ .br = b_exit }, func.getBlock(tramp_bid).instructions.items[1].op);
 }
+
+test "coalescePhiLocalsToParallelCopy: rescues nested inner-loop lost-copy hazard via dominance bound" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 2);
+    defer func.deinit();
+    func.phi_synth_local_start = 0;
+    func.phi_synth_local_end = 2;
+
+    const b_entry = try func.newBlock();
+    const b_outer_hdr = try func.newBlock();
+    const b_pre_inner = try func.newBlock();
+    const b_inner_loop = try func.newBlock();
+    const b_after_inner = try func.newBlock();
+    const b_inner_exit = try func.newBlock();
+    const b_ret = try func.newBlock();
+
+    const v_init = func.newVReg();
+    const v_zero = func.newVReg();
+    const v_list = func.newVReg();
+    const v_prev = func.newVReg();
+    const v_next = func.newVReg();
+
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 16 }, .dest = v_init, .type = .i32 });
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_zero, .type = .i32 });
+    try func.getBlock(b_entry).append(.{ .op = .{ .br = b_outer_hdr } });
+
+    try func.getBlock(b_outer_hdr).append(.{ .op = .{ .br_if = .{ .cond = v_init, .then_block = b_pre_inner, .else_block = b_after_inner } } });
+
+    try func.getBlock(b_pre_inner).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_init } } });
+    try func.getBlock(b_pre_inner).append(.{ .op = .{ .local_set = .{ .idx = 1, .val = v_zero } } });
+    try func.getBlock(b_pre_inner).append(.{ .op = .{ .br = b_inner_loop } });
+
+    try func.getBlock(b_inner_loop).append(.{ .op = .{ .local_get = 0 }, .dest = v_list, .type = .i32 });
+    try func.getBlock(b_inner_loop).append(.{ .op = .{ .local_get = 1 }, .dest = v_prev, .type = .i32 });
+    try func.getBlock(b_inner_loop).append(.{ .op = .{ .load = .{ .base = v_list, .offset = 0, .size = 4 } }, .dest = v_next, .type = .i32 });
+    try func.getBlock(b_inner_loop).append(.{ .op = .{ .store = .{ .base = v_list, .val = v_prev, .offset = 0, .size = 4 } } });
+    try func.getBlock(b_inner_loop).append(.{ .op = .{ .local_set = .{ .idx = 1, .val = v_list } } });
+    try func.getBlock(b_inner_loop).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_next } } });
+    try func.getBlock(b_inner_loop).append(.{ .op = .{ .br_if = .{ .cond = v_next, .then_block = b_inner_loop, .else_block = b_inner_exit } } });
+
+    try func.getBlock(b_inner_exit).append(.{ .op = .{ .store = .{ .base = v_zero, .val = v_list, .offset = 0, .size = 4 } } });
+    try func.getBlock(b_inner_exit).append(.{ .op = .{ .br = b_after_inner } });
+
+    try func.getBlock(b_after_inner).append(.{ .op = .{ .br_if = .{ .cond = v_zero, .then_block = b_outer_hdr, .else_block = b_ret } } });
+
+    try func.getBlock(b_ret).append(.{ .op = .{ .ret = v_zero } });
+
+    try std.testing.expect(try coalescePhiLocalsToParallelCopy(&func, allocator));
+    try std.testing.expectEqual(v_prev, func.getBlock(b_inner_exit).instructions.items[0].op.store.val);
+
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            try std.testing.expect(inst.op != .local_get);
+            try std.testing.expect(inst.op != .local_set);
+        }
+    }
+}
+
+test "algebraicSimplify: eliminates redundant bitwise-and over phi local of load8_u" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 1);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+
+    const v_addr = func.newVReg();
+    const v_ld = func.newVReg();
+    const v_get = func.newVReg();
+    const v_mask = func.newVReg();
+    const v_and = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_addr, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .load = .{ .base = v_addr, .offset = 0, .size = 1, .sign_extend = false } }, .dest = v_ld, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_ld } } });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_get, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 0xFF }, .dest = v_mask, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .@"and" = .{ .lhs = v_get, .rhs = v_mask } }, .dest = v_and, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = v_and } });
+
+    try std.testing.expect(try algebraicSimplify(&func, allocator));
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_get }, func.getBlock(b1).instructions.items[3].op);
+}
+
+test "foldInverseCompareEqz and foldBranchOnEqz: xor folds to eq/ne" {
+    const allocator = std.testing.allocator;
+    {
+        var func = ir.IrFunction.init(allocator, 0, 1, 0);
+        defer func.deinit();
+        const b0 = try func.newBlock();
+        const v0 = func.newVReg();
+        const v1 = func.newVReg();
+        const v_xor = func.newVReg();
+        const v_eqz = func.newVReg();
+        try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0, .type = .i32 });
+        try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 2 }, .dest = v1, .type = .i32 });
+        try func.getBlock(b0).append(.{ .op = .{ .xor = .{ .lhs = v0, .rhs = v1 } }, .dest = v_xor, .type = .i32 });
+        try func.getBlock(b0).append(.{ .op = .{ .eqz = v_eqz }, .dest = v_eqz, .type = .i32 });
+        func.getBlock(b0).instructions.items[3].op = .{ .eqz = v_xor };
+        try func.getBlock(b0).append(.{ .op = .{ .ret = v_eqz } });
+
+        try std.testing.expect(try foldInverseCompareEqz(&func, allocator));
+        try std.testing.expect(func.getBlock(b0).instructions.items[3].op == .eq);
+    }
+    {
+        var func = ir.IrFunction.init(allocator, 0, 0, 0);
+        defer func.deinit();
+        const b0 = try func.newBlock();
+        const b1 = try func.newBlock();
+        const b2 = try func.newBlock();
+        const v0 = func.newVReg();
+        const v1 = func.newVReg();
+        const v_xor = func.newVReg();
+        try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0, .type = .i32 });
+        try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 2 }, .dest = v1, .type = .i32 });
+        try func.getBlock(b0).append(.{ .op = .{ .xor = .{ .lhs = v0, .rhs = v1 } }, .dest = v_xor, .type = .i32 });
+        try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_xor, .then_block = b1, .else_block = b2 } } });
+        try func.getBlock(b1).append(.{ .op = .{ .ret = null } });
+        try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+        try std.testing.expect(try foldBranchOnEqz(&func, allocator));
+        try std.testing.expect(func.getBlock(b0).instructions.items[2].op == .ne);
+    }
+}
+
