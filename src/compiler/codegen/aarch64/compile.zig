@@ -2981,7 +2981,7 @@ pub fn compileFunctionImpl(
     if (tmr) |t| t.end(.prepass);
     defer allocator.free(needs_init);
 
-    if (ctx.options.enable_peephole and !ctx.options.cancel_points and alloc_result_storage != null and func.param_count > 0 and func.blocks.items.len > 0) {
+    if (ctx.options.enable_peephole and alloc_result_storage != null and func.param_count > 0 and func.blocks.items.len > 0) {
         var entry_abi = try buildEntryAbiPlan(allocator, func.*, fctx.local_types);
         defer entry_abi.deinit();
 
