@@ -1215,37 +1215,109 @@ pub fn coalesceMoves(
         const src_pinned = pinned.contains(ch.src);
 
         var did_coalesce = false;
-        if (!dest_pinned) {
-            did_coalesce = try tryRetarget(
-                allocator,
-                result,
-                reg_set,
-                clobbers,
-                ranges,
-                &range_idx,
-                &per_reg,
-                ch.dest,
-                ch.src,
-                r_d,
-                r_s,
-                ch.allow_dest_overlap,
-            );
-        }
-        if (!did_coalesce and !src_pinned) {
-            did_coalesce = try tryRetarget(
-                allocator,
-                result,
-                reg_set,
-                clobbers,
-                ranges,
-                &range_idx,
-                &per_reg,
-                ch.src,
-                ch.dest,
-                r_s,
-                r_d,
-                ch.allow_dest_overlap,
-            );
+        if (ch.allow_dest_overlap) {
+            const dest_span = if (range_idx.get(ch.dest)) |di| ranges[di].end -| ranges[di].start else 0;
+            const src_span = if (range_idx.get(ch.src)) |si| ranges[si].end -| ranges[si].start else 0;
+            if (dest_span >= src_span) {
+                if (!src_pinned) {
+                    did_coalesce = try tryRetarget(
+                        allocator,
+                        result,
+                        reg_set,
+                        clobbers,
+                        ranges,
+                        &range_idx,
+                        &per_reg,
+                        ch.src,
+                        ch.dest,
+                        r_s,
+                        r_d,
+                        true,
+                    );
+                }
+                if (!did_coalesce and !dest_pinned) {
+                    did_coalesce = try tryRetarget(
+                        allocator,
+                        result,
+                        reg_set,
+                        clobbers,
+                        ranges,
+                        &range_idx,
+                        &per_reg,
+                        ch.dest,
+                        ch.src,
+                        r_d,
+                        r_s,
+                        true,
+                    );
+                }
+            } else {
+                if (!dest_pinned) {
+                    did_coalesce = try tryRetarget(
+                        allocator,
+                        result,
+                        reg_set,
+                        clobbers,
+                        ranges,
+                        &range_idx,
+                        &per_reg,
+                        ch.dest,
+                        ch.src,
+                        r_d,
+                        r_s,
+                        true,
+                    );
+                }
+                if (!did_coalesce and !src_pinned) {
+                    did_coalesce = try tryRetarget(
+                        allocator,
+                        result,
+                        reg_set,
+                        clobbers,
+                        ranges,
+                        &range_idx,
+                        &per_reg,
+                        ch.src,
+                        ch.dest,
+                        r_s,
+                        r_d,
+                        true,
+                    );
+                }
+            }
+        } else {
+            if (!dest_pinned) {
+                did_coalesce = try tryRetarget(
+                    allocator,
+                    result,
+                    reg_set,
+                    clobbers,
+                    ranges,
+                    &range_idx,
+                    &per_reg,
+                    ch.dest,
+                    ch.src,
+                    r_d,
+                    r_s,
+                    false,
+                );
+            }
+            if (!did_coalesce and !src_pinned) {
+                did_coalesce = try tryRetarget(
+                    allocator,
+                    result,
+                    reg_set,
+                    clobbers,
+                    ranges,
+                    &range_idx,
+                    &per_reg,
+                    ch.src,
+                    ch.dest,
+                    r_s,
+                    r_d,
+                    false,
+                );
+            }
         }
         if (did_coalesce) {
             try pinned.put(ch.dest, {});

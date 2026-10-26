@@ -7784,7 +7784,7 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
             else
                 ir.IrType.i32;
             const param_vreg = func.newVReg();
-            try func.getBlock(0).instructions.insert(func.allocator, 0, .{
+            try func.getBlock(0).instructions.insert(func.allocator, idx, .{
                 .op = .{ .local_get = @intCast(idx) },
                 .dest = param_vreg,
                 .type = local_type,
@@ -7806,7 +7806,7 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
                 .void => .{ .iconst_32 = 0 },
             };
             // Insert at start of entry block (block 0) before phis.
-            try func.getBlock(0).instructions.insert(func.allocator, 0, .{
+            try func.getBlock(0).instructions.insert(func.allocator, idx, .{
                 .op = zero_op,
                 .dest = zero_vreg,
                 .type = local_type,
@@ -8725,7 +8725,406 @@ pub fn coalescePhiLocalsToParallelCopy(func: *ir.IrFunction, allocator: std.mem.
         }
     }
 
+    if (changed) {
+        try sinkSingleUseAluToParallelCopy(func, allocator);
+    }
+
     return changed;
+}
+
+fn isSinkablePureAlu(op: ir.Inst.Op) bool {
+    return switch (op) {
+        .add,
+        .sub,
+        .@"and",
+        .@"or",
+        .xor,
+        .shl,
+        .shr_s,
+        .shr_u,
+        .rotl,
+        .rotr,
+        .eq,
+        .ne,
+        .lt_s,
+        .lt_u,
+        .gt_s,
+        .gt_u,
+        .le_s,
+        .le_u,
+        .ge_s,
+        .ge_u,
+        .eqz,
+        => true,
+        else => false,
+    };
+}
+
+fn instDefinesVReg(inst: ir.Inst, v: ir.VReg) bool {
+    if (inst.dest) |d| {
+        if (d == v) return true;
+    }
+    if (inst.op == .parallel_copy) {
+        for (inst.op.parallel_copy) |p| {
+            if (p.dst == v) return true;
+        }
+    }
+    return false;
+}
+
+/// Sink single-use pure scalar ALU instructions whose sole consumer in the
+/// function is a `.parallel_copy` pair `p.dst <- p.src` to immediately precede
+/// that `.parallel_copy` (both intra-block and from a single CFG predecessor
+/// block `A` into `B`). Placing `p.src`'s definition after earlier reads of
+/// `p.dst` in `B` allows `p.dst` and `p.src` to coalesce without overlapping.
+fn sinkSingleUseAluToParallelCopy(func: *ir.IrFunction, allocator: std.mem.Allocator) !void {
+    const nb = func.blocks.items.len;
+    if (nb == 0) return;
+
+    var use_counts = try buildVRegUseCounts(func, allocator);
+    defer use_counts.deinit();
+
+    const pred_count = try allocator.alloc(u32, nb);
+    defer allocator.free(pred_count);
+    @memset(pred_count, 0);
+    const single_pred = try allocator.alloc(ir.BlockId, nb);
+    defer allocator.free(single_pred);
+    @memset(single_pred, 0);
+
+    const noteEdge = struct {
+        fn f(pc: []u32, sp: []ir.BlockId, from: ir.BlockId, to: ir.BlockId) void {
+            if (to >= pc.len) return;
+            if (pc[to] == 0) {
+                pc[to] = 1;
+                sp[to] = from;
+            } else if (sp[to] != from) {
+                pc[to] += 1;
+            }
+        }
+    }.f;
+
+    for (func.blocks.items, 0..) |blk, bi| {
+        const from: ir.BlockId = @intCast(bi);
+        for (blk.instructions.items) |inst| {
+            switch (inst.op) {
+                .br => |t| noteEdge(pred_count, single_pred, from, t),
+                .br_if => |br| {
+                    noteEdge(pred_count, single_pred, from, br.then_block);
+                    noteEdge(pred_count, single_pred, from, br.else_block);
+                },
+                .br_table => |bt| {
+                    for (bt.targets) |t| noteEdge(pred_count, single_pred, from, t);
+                    noteEdge(pred_count, single_pred, from, bt.default);
+                },
+                .try_table_begin => |tt| {
+                    for (tt.clauses) |c| noteEdge(pred_count, single_pred, from, c.handler);
+                },
+                else => {},
+            }
+        }
+    }
+
+    var const_vals = std.AutoHashMap(ir.VReg, i64).init(allocator);
+    defer const_vals.deinit();
+    for (func.blocks.items) |blk| {
+        for (blk.instructions.items) |inst| {
+            if (inst.dest) |d| {
+                switch (inst.op) {
+                    .iconst_32 => |v| try const_vals.put(d, v),
+                    .iconst_64 => |v| try const_vals.put(d, v),
+                    else => {},
+                }
+            }
+        }
+    }
+
+    var liveness_opt: ?std.AutoHashMap(ir.BlockId, analysis.BlockLiveness) = null;
+    defer if (liveness_opt) |*lv| {
+        var it = lv.iterator();
+        while (it.next()) |e| {
+            e.value_ptr.live_in.deinit();
+            e.value_ptr.live_out.deinit();
+        }
+        lv.deinit();
+    };
+
+    for (0..nb) |b_idx| {
+        var copy_idx_opt: ?usize = null;
+        for (func.blocks.items[b_idx].instructions.items, 0..) |inst, ii| {
+            if (inst.op == .parallel_copy) {
+                copy_idx_opt = ii;
+                break;
+            }
+        }
+        var copy_idx = copy_idx_opt orelse continue;
+        const pairs = func.blocks.items[b_idx].instructions.items[copy_idx].op.parallel_copy;
+
+        for (pairs) |p| {
+            if (p.dst == p.src) continue;
+            var p_src_uses = use_counts.get(p.src) orelse 0;
+            if (p_src_uses == 2 and b_idx != 0 and pred_count[b_idx] == 1) blk_comp: {
+                const a_idx: usize = @intCast(single_pred[b_idx]);
+                if (a_idx == b_idx) break :blk_comp;
+                const a_insts = func.blocks.items[a_idx].instructions.items;
+                if (a_insts.len == 0) break :blk_comp;
+                const a_term = a_insts[a_insts.len - 1];
+                const a_bi = switch (a_term.op) {
+                    .br_if => |bi| bi,
+                    else => break :blk_comp,
+                };
+                const j_bid: ir.BlockId = if (a_bi.then_block == @as(ir.BlockId, @intCast(b_idx)))
+                    a_bi.else_block
+                else if (a_bi.else_block == @as(ir.BlockId, @intCast(b_idx)))
+                    a_bi.then_block
+                else
+                    break :blk_comp;
+
+                const b_insts = func.blocks.items[b_idx].instructions.items;
+                if (b_insts.len == 0) break :blk_comp;
+                const b_term = b_insts[b_insts.len - 1];
+                const b_bi = switch (b_term.op) {
+                    .br_if => |bi| bi,
+                    else => break :blk_comp,
+                };
+                var maybe_s_bid: ?ir.BlockId = null;
+                for ([_]ir.BlockId{ b_bi.then_block, b_bi.else_block }) |cand_s| {
+                    if (cand_s < nb and pred_count[cand_s] == 1 and single_pred[cand_s] == @as(ir.BlockId, @intCast(b_idx))) {
+                        const s_insts = func.blocks.items[cand_s].instructions.items;
+                        if (s_insts.len == 1 and s_insts[0].op == .br and s_insts[0].op.br == j_bid) {
+                            maybe_s_bid = cand_s;
+                            break;
+                        }
+                    }
+                }
+                const s_bid = maybe_s_bid orelse break :blk_comp;
+                if (pred_count[j_bid] != 2) break :blk_comp;
+                const j_insts = func.blocks.items[j_bid].instructions.items;
+                const e_bid: ir.BlockId = if (j_insts.len == 1 and j_insts[0].op == .br and pred_count[j_insts[0].op.br] == 1 and single_pred[j_insts[0].op.br] == j_bid)
+                    j_insts[0].op.br
+                else
+                    j_bid;
+
+                var pred_def_opt: ?usize = null;
+                for (a_insts, 0..) |inst, ii| {
+                    if (inst.dest == p.src) {
+                        pred_def_opt = ii;
+                        break;
+                    }
+                }
+                const def_idx = pred_def_opt orelse break :blk_comp;
+                const def_inst = a_insts[def_idx];
+                if (def_inst.type != .i32 and def_inst.type != .i64) break :blk_comp;
+                const delta1: i64 = switch (def_inst.op) {
+                    .add => |bin| if (bin.lhs == p.dst) (const_vals.get(bin.rhs) orelse break :blk_comp) else break :blk_comp,
+                    .sub => |bin| if (bin.lhs == p.dst) (0 -% (const_vals.get(bin.rhs) orelse break :blk_comp)) else break :blk_comp,
+                    else => break :blk_comp,
+                };
+
+                const e_insts = func.blocks.items[e_bid].instructions.items;
+                var u_idx_opt: ?usize = null;
+                var e_copy_idx_opt: ?usize = null;
+                for (e_insts, 0..) |inst, ii| {
+                    if (inst.op == .parallel_copy) e_copy_idx_opt = ii;
+                    switch (inst.op) {
+                        .add => |bin| if (bin.lhs == p.src) {
+                            u_idx_opt = ii;
+                        },
+                        .sub => |bin| if (bin.lhs == p.src) {
+                            u_idx_opt = ii;
+                        },
+                        else => {},
+                    }
+                }
+                const u_idx = u_idx_opt orelse break :blk_comp;
+                const e_copy_idx = e_copy_idx_opt orelse break :blk_comp;
+                if (u_idx >= e_copy_idx) break :blk_comp;
+                const u_inst = e_insts[u_idx];
+                const u_dest = u_inst.dest orelse break :blk_comp;
+                if (u_inst.type != def_inst.type or (use_counts.get(u_dest) orelse 0) != 1) break :blk_comp;
+                const u_rhs = switch (u_inst.op) {
+                    .add => |bin| bin.rhs,
+                    .sub => |bin| bin.rhs,
+                    else => unreachable,
+                };
+                const c2 = const_vals.get(u_rhs) orelse break :blk_comp;
+                const delta2: i64 = if (u_inst.op == .add) c2 else 0 -% c2;
+                const type_mask: u64 = if (def_inst.type == .i32) 0xFFFF_FFFF else ~@as(u64, 0);
+                if (((@as(u64, @bitCast(delta1)) +% @as(u64, @bitCast(delta2))) & type_mask) != 0) break :blk_comp;
+
+                var u_in_e_copy = false;
+                for (e_insts[e_copy_idx].op.parallel_copy) |ep| {
+                    if (ep.src == u_dest) u_in_e_copy = true;
+                    if (ep.dst == p.dst or ep.src == p.dst) {
+                        u_in_e_copy = false;
+                        break;
+                    }
+                }
+                if (!u_in_e_copy) break :blk_comp;
+
+                if (liveness_opt == null) {
+                    liveness_opt = try analysis.computeLiveness(func, allocator);
+                }
+                const lv = &liveness_opt.?;
+                if (lv.get(s_bid).?.live_in.contains(p.dst) or
+                    lv.get(j_bid).?.live_in.contains(p.dst) or
+                    lv.get(e_bid).?.live_in.contains(p.dst) or
+                    lv.get(e_bid).?.live_out.contains(p.dst))
+                {
+                    break :blk_comp;
+                }
+
+                const def_ops = getUsedVRegs(def_inst);
+                for (a_insts[(def_idx + 1)..]) |later_a| {
+                    for (def_ops.slice()) |op_v| {
+                        if (instDefinesVReg(later_a, op_v)) break :blk_comp;
+                    }
+                }
+                for (b_insts[0..copy_idx]) |early_b| {
+                    if (early_b.dest == p.src) break :blk_comp;
+                    for (def_ops.slice()) |op_v| {
+                        if (instDefinesVReg(early_b, op_v)) break :blk_comp;
+                    }
+                }
+                var src_count_in_b_copy: usize = 0;
+                for (pairs) |bp| {
+                    if (bp.dst == p.src) break :blk_comp;
+                    if (bp.src == p.src) src_count_in_b_copy += 1;
+                }
+                if (src_count_in_b_copy != 1) break :blk_comp;
+
+                var const_in_e_opt: ?usize = null;
+                for (e_insts[0..u_idx], 0..) |inst, ii| {
+                    if (inst.dest == u_rhs) {
+                        const_in_e_opt = ii;
+                        break;
+                    }
+                }
+                if (const_in_e_opt) |ci| {
+                    if ((use_counts.get(u_rhs) orelse 0) != 1) break :blk_comp;
+                    const c_inst = func.blocks.items[e_bid].instructions.orderedRemove(ci);
+                    try func.blocks.items[s_bid].instructions.insert(
+                        func.allocator,
+                        func.blocks.items[s_bid].instructions.items.len - 1,
+                        c_inst,
+                    );
+                } else {
+                    break :blk_comp;
+                }
+
+                // Re-locate `u_idx` and `e_copy_idx` after removing `const_in_e_opt`.
+                const adj_u_idx = u_idx - 1;
+                const adj_e_copy_idx = e_copy_idx - 1;
+                var moved_u = func.blocks.items[e_bid].instructions.orderedRemove(adj_u_idx);
+                switch (moved_u.op) {
+                    .add => |*bin| bin.lhs = p.dst,
+                    .sub => |*bin| bin.lhs = p.dst,
+                    else => unreachable,
+                }
+                const s_term_pos = func.blocks.items[s_bid].instructions.items.len - 1;
+                try func.blocks.items[s_bid].instructions.insert(func.allocator, s_term_pos, moved_u);
+                const s_pc = try func.allocator.alloc(ir.Inst.ParallelCopy, 1);
+                s_pc[0] = .{ .dst = p.dst, .src = u_dest, .ty = p.ty };
+                try func.blocks.items[s_bid].instructions.insert(func.allocator, s_term_pos + 1, .{
+                    .op = .{ .parallel_copy = s_pc },
+                });
+
+                const old_e_pc = func.blocks.items[e_bid].instructions.items[adj_e_copy_idx - 1].op.parallel_copy;
+                const new_e_pc = try func.allocator.dupe(ir.Inst.ParallelCopy, old_e_pc);
+                for (new_e_pc) |*ep| {
+                    if (ep.src == u_dest) ep.src = p.dst;
+                }
+                func.blocks.items[e_bid].instructions.items[adj_e_copy_idx - 1].op = .{ .parallel_copy = new_e_pc };
+                try use_counts.put(p.src, 1);
+                p_src_uses = 1;
+                if (liveness_opt) |*lmap| {
+                    var it = lmap.iterator();
+                    while (it.next()) |e| {
+                        e.value_ptr.live_in.deinit();
+                        e.value_ptr.live_out.deinit();
+                    }
+                    lmap.deinit();
+                    liveness_opt = null;
+                }
+            }
+            if (p_src_uses != 1) continue;
+
+            // 1. Check intra-block definition of `p.src` in `b_idx` before `copy_idx`.
+            var same_def_opt: ?usize = null;
+            for (func.blocks.items[b_idx].instructions.items[0..copy_idx], 0..) |inst, ii| {
+                if (inst.dest == p.src) {
+                    same_def_opt = ii;
+                    break;
+                }
+            }
+            if (same_def_opt) |def_idx| {
+                const def_inst = func.blocks.items[b_idx].instructions.items[def_idx];
+                if (isSinkablePureAlu(def_inst.op) and def_idx + 1 < copy_idx) {
+                    const ops = getUsedVRegs(def_inst);
+                    var operand_redefined = false;
+                    for (func.blocks.items[b_idx].instructions.items[(def_idx + 1)..copy_idx]) |later_inst| {
+                        for (ops.slice()) |op_v| {
+                            if (instDefinesVReg(later_inst, op_v)) {
+                                operand_redefined = true;
+                                break;
+                            }
+                        }
+                        if (operand_redefined) break;
+                    }
+                    if (!operand_redefined) {
+                        const moved = func.blocks.items[b_idx].instructions.orderedRemove(def_idx);
+                        copy_idx -= 1;
+                        try func.blocks.items[b_idx].instructions.insert(func.allocator, copy_idx, moved);
+                        copy_idx += 1;
+                    }
+                }
+                continue;
+            }
+
+            // 2. Check cross-block definition of `p.src` in single predecessor `a_idx`.
+            if (b_idx == 0 or pred_count[b_idx] != 1) continue;
+            const a_idx: usize = @intCast(single_pred[b_idx]);
+            if (a_idx == b_idx) continue;
+
+            var pred_def_opt: ?usize = null;
+            for (func.blocks.items[a_idx].instructions.items, 0..) |inst, ii| {
+                if (inst.dest == p.src) {
+                    pred_def_opt = ii;
+                    break;
+                }
+            }
+            const def_idx = pred_def_opt orelse continue;
+            const def_inst = func.blocks.items[a_idx].instructions.items[def_idx];
+            if (!isSinkablePureAlu(def_inst.op)) continue;
+
+            const ops = getUsedVRegs(def_inst);
+            var operand_redefined = false;
+            for (func.blocks.items[a_idx].instructions.items[(def_idx + 1)..]) |later_a| {
+                for (ops.slice()) |op_v| {
+                    if (instDefinesVReg(later_a, op_v)) {
+                        operand_redefined = true;
+                        break;
+                    }
+                }
+                if (operand_redefined) break;
+            }
+            if (!operand_redefined) {
+                for (func.blocks.items[b_idx].instructions.items[0..copy_idx]) |early_b| {
+                    for (ops.slice()) |op_v| {
+                        if (instDefinesVReg(early_b, op_v)) {
+                            operand_redefined = true;
+                            break;
+                        }
+                    }
+                    if (operand_redefined) break;
+                }
+            }
+            if (!operand_redefined) {
+                const moved = func.blocks.items[a_idx].instructions.orderedRemove(def_idx);
+                try func.blocks.items[b_idx].instructions.insert(func.allocator, copy_idx, moved);
+                copy_idx += 1;
+            }
+        }
+    }
 }
 
 // ── Tail Duplication of Small Joins ────────────────────────────────────────
@@ -18793,4 +19192,71 @@ test "foldInverseCompareEqz and foldBranchOnEqz: xor folds to eq/ne" {
         try std.testing.expect(func.getBlock(b0).instructions.items[2].op == .ne);
     }
 }
+
+test "promoteLocalsToSSA: inserts entry local_get in ascending local index order" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 1, 2);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const v_p0 = func.newVReg();
+    const v_p1 = func.newVReg();
+    const v_sum = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .local_get = 0 }, .dest = v_p0, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_p0, .then_block = b1, .else_block = b2 } } });
+
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 1 }, .dest = v_p1, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_p1 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b2 } });
+
+    try func.getBlock(b2).append(.{ .op = .{ .local_get = 0 }, .dest = v_sum, .type = .i32 });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_sum } });
+
+    try std.testing.expect(try promoteLocalsToSSA(&func, allocator));
+    try std.testing.expectEqual(ir.Inst.Op{ .local_get = 0 }, func.getBlock(b0).instructions.items[0].op);
+    try std.testing.expectEqual(ir.Inst.Op{ .local_get = 1 }, func.getBlock(b0).instructions.items[1].op);
+}
+
+test "sinkSingleUseAluToParallelCopy: sinks single-use pure ALU producer into single-pred block" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const b_entry = try func.newBlock();
+    const b_pred = try func.newBlock();
+    const b_latch = try func.newBlock();
+    const b_exit = try func.newBlock();
+
+    const v_ptr = func.newVReg();
+    const v_one = func.newVReg();
+    const v_next = func.newVReg();
+    const v_val = func.newVReg();
+
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 100 }, .dest = v_ptr, .type = .i32 });
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_one, .type = .i32 });
+    try func.getBlock(b_entry).append(.{ .op = .{ .br = b_pred } });
+
+    try func.getBlock(b_pred).append(.{ .op = .{ .add = .{ .lhs = v_ptr, .rhs = v_one } }, .dest = v_next, .type = .i32 });
+    try func.getBlock(b_pred).append(.{ .op = .{ .br_if = .{ .cond = v_ptr, .then_block = b_latch, .else_block = b_exit } } });
+
+    const pairs = try allocator.alloc(ir.Inst.ParallelCopy, 1);
+    pairs[0] = .{ .dst = v_ptr, .src = v_next, .ty = .i32 };
+    try func.getBlock(b_latch).append(.{ .op = .{ .load = .{ .base = v_ptr, .offset = 0, .size = 1 } }, .dest = v_val, .type = .i32 });
+    try func.getBlock(b_latch).append(.{ .op = .{ .parallel_copy = pairs } });
+    try func.getBlock(b_latch).append(.{ .op = .{ .br = b_pred } });
+
+    try func.getBlock(b_exit).append(.{ .op = .{ .ret = v_ptr } });
+
+    try sinkSingleUseAluToParallelCopy(&func, allocator);
+    // v_next = add(v_ptr, v_one) should be removed from b_pred and sunk into b_latch right before parallel_copy (after load).
+    try std.testing.expectEqual(@as(usize, 1), func.getBlock(b_pred).instructions.items.len);
+    try std.testing.expect(func.getBlock(b_latch).instructions.items[0].op == .load);
+    try std.testing.expect(func.getBlock(b_latch).instructions.items[1].op == .add);
+    try std.testing.expectEqual(@as(?ir.VReg, v_next), func.getBlock(b_latch).instructions.items[1].dest);
+    try std.testing.expect(func.getBlock(b_latch).instructions.items[2].op == .parallel_copy);
+}
+
 

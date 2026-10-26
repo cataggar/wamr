@@ -670,6 +670,10 @@ const FuncCompileCtx = struct {
     /// issue #523. The IR-level def stays in place; only the asm emit is
     /// elided.
     suppress_iconst_emit: ?*const std.AutoHashMap(ir.VReg, void) = null,
+    /// Entry scalar parameters (`0..7`) that are read only at the top of
+    /// `block 0` and never overwritten by `local_set`, allowing `emitEntrySpill`
+    /// and `.local_get` to bypass the stack frame slot directly from `x1..x7`.
+    param_direct_reg: [8]?emit.Reg = @splat(null),
     /// Set of mul dest vregs whose computation should be skipped because
     /// the single consumer is an add/sub that will be emitted as a fused
     /// MADD/MSUB (Phase 4 FMA fusion). When the mul handler sees a dest
@@ -2482,6 +2486,40 @@ pub fn compileFunctionImpl(
                             if (v == 0) try cls_ctx.bumpFold(st.val);
                         }
                     },
+                    .parallel_copy => |pairs| {
+                        for (pairs) |p| {
+                            try cls_ctx.bumpTotal(p.src);
+                            if (p.ty == .i32 or p.ty == .i64) {
+                                if (cls_ctx.cv.get(p.src)) |v| {
+                                    if (isSingleInsnImm(v, p.ty)) try cls_ctx.bumpFold(p.src);
+                                }
+                            }
+                        }
+                    },
+                    .ret => |maybe_v| {
+                        if (maybe_v) |rv| {
+                            try cls_ctx.bumpTotal(rv);
+                            const rty = vregType(&fctx, rv);
+                            if (rty == .i32 or rty == .i64) {
+                                if (cls_ctx.cv.get(rv)) |v| {
+                                    if (isSingleInsnImm(v, rty)) try cls_ctx.bumpFold(rv);
+                                }
+                            }
+                        }
+                    },
+                    .select => |s| {
+                        try cls_ctx.bumpTotal(s.cond);
+                        try cls_ctx.bumpTotal(s.if_true);
+                        try cls_ctx.bumpTotal(s.if_false);
+                        if (inst.type == .i32 or inst.type == .i64) {
+                            if (cls_ctx.cv.get(s.if_true)) |v| {
+                                if (v == 0) try cls_ctx.bumpFold(s.if_true);
+                            }
+                            if (cls_ctx.cv.get(s.if_false)) |v| {
+                                if (v == 0) try cls_ctx.bumpFold(s.if_false);
+                            }
+                        }
+                    },
                     else => {
                         try schedule.forEachUse(inst, &cls_ctx, Ctx.visitDefault);
                     },
@@ -2692,6 +2730,9 @@ pub fn compileFunctionImpl(
                 scalar_live_ranges.items,
                 &fma_info,
                 &simd_fma_info,
+                fctx.mul_fused,
+                fctx.simd_mul_fused,
+                &suppress_iconst,
                 allocator,
             );
             defer copy_hints.deinit(allocator);
@@ -2939,7 +2980,99 @@ pub fn compileFunctionImpl(
     const needs_init = try local_init.computeNeedsInit(allocator, func);
     if (tmr) |t| t.end(.prepass);
     defer allocator.free(needs_init);
-    try emitEntrySpill(&code, func.*, local_layout.offsets, fctx.local_types, needs_init, hrp_save_off, frame_size, allocator);
+
+    if (ctx.options.enable_peephole and alloc_result_storage != null and func.param_count > 0 and func.blocks.items.len > 0) {
+        var entry_abi = try buildEntryAbiPlan(allocator, func.*, fctx.local_types);
+        defer entry_abi.deinit();
+
+        var block0_has_preds = false;
+        for (func.blocks.items) |blk| {
+            for (blk.instructions.items) |b_inst| {
+                switch (b_inst.op) {
+                    .br => |t| if (t == 0) {
+                        block0_has_preds = true;
+                    },
+                    .br_if => |br| if (br.then_block == 0 or br.else_block == 0) {
+                        block0_has_preds = true;
+                    },
+                    .br_table => |bt| {
+                        if (bt.default == 0) block0_has_preds = true;
+                        for (bt.targets) |t| if (t == 0) {
+                            block0_has_preds = true;
+                        };
+                    },
+                    .try_table_begin => |tt| {
+                        for (tt.clauses) |c| if (c.handler == 0) {
+                            block0_has_preds = true;
+                        };
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        if (!block0_has_preds) {
+            const b0_insts = scheduled.instructions(0);
+            const max_p: u32 = @min(func.param_count, 8);
+            var p_idx: u32 = 0;
+            while (p_idx < max_p) : (p_idx += 1) {
+                const param_reg: emit.Reg = switch (entry_abi.locs[@intCast(p_idx)]) {
+                    .scalar_reg => |r| r,
+                    else => continue,
+                };
+                var can_bypass = true;
+                var last_get_pos: ?usize = null;
+                for (0..func.blocks.items.len) |bid| {
+                    for (scheduled.instructions(@intCast(bid)), 0..) |s_inst, s_pos| {
+                        switch (s_inst.op) {
+                            .local_set => |ls| if (ls.idx == p_idx) {
+                                can_bypass = false;
+                                break;
+                            },
+                            .local_get => |lg_idx| if (lg_idx == p_idx) {
+                                if (bid != 0) {
+                                    can_bypass = false;
+                                    break;
+                                }
+                                last_get_pos = s_pos;
+                            },
+                            else => {},
+                        }
+                    }
+                    if (!can_bypass) break;
+                }
+                if (!can_bypass) continue;
+                const lg_pos = last_get_pos orelse continue;
+
+                for (b0_insts[0..lg_pos]) |early_inst| {
+                    switch (early_inst.op) {
+                        .local_get, .iconst_32, .iconst_64 => {},
+                        else => {
+                            can_bypass = false;
+                            break;
+                        },
+                    }
+                    if (early_inst.op == .local_get and early_inst.op.local_get == p_idx) continue;
+                    if (early_inst.dest) |d| {
+                        if (alloc_result_storage.?.get(d)) |loc| {
+                            if (loc == .reg) {
+                                const assigned_reg: emit.Reg = @enumFromInt(@as(u5, @intCast(loc.reg)));
+                                if (assigned_reg == param_reg) {
+                                    can_bypass = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (can_bypass) {
+                    fctx.param_direct_reg[@intCast(p_idx)] = param_reg;
+                }
+            }
+        }
+    }
+
+    try emitEntrySpill(&code, func.*, local_layout.offsets, fctx.local_types, needs_init, hrp_save_off, frame_size, fctx.param_direct_reg, allocator);
 
     var block_offsets = try allocator.alloc(usize, func.blocks.items.len);
     defer allocator.free(block_offsets);
@@ -4046,6 +4179,7 @@ fn emitEntrySpill(
     needs_init: []const bool,
     hrp_save_off: u32,
     frame_size: u32,
+    param_direct_reg: [8]?emit.Reg,
     allocator: std.mem.Allocator,
 ) !void {
     // VMContext (x0) is pinned in x19 by `compileFunctionImpl`'s
@@ -4060,6 +4194,7 @@ fn emitEntrySpill(
     // Wasm params → their typed local slots.
     var i: u32 = 0;
     while (i < func.param_count) : (i += 1) {
+        if (i < 8 and param_direct_reg[@intCast(i)] != null) continue;
         const offset = local_offsets[@intCast(i)];
         switch (abi.locs[@intCast(i)]) {
             .scalar_reg => |reg| try frameStore(code, reg, offset),
@@ -4706,7 +4841,7 @@ fn compileInst(
         .wrap_i64 => |vreg| try emitWrap(code, inst, vreg, reg_map),
 
         // ── Select (CSEL) ────────────────────────────────────────────
-        .select => |sel| try emitSelect(code, inst, sel, reg_map),
+        .select => |sel| try emitSelect(code, inst, sel, reg_map, fctx),
 
         // ── Branches ─────────────────────────────────────────────────
         .br => |target| try emitBr(code, patches, target, fctx.allocator),
@@ -4728,6 +4863,16 @@ fn compileInst(
         // ── Locals (FP-relative frame slots) ─────────────────────────
         .local_get => |idx| {
             const dest = inst.dest orelse return;
+            if (idx < 8) {
+                if (fctx.param_direct_reg[@intCast(idx)]) |param_reg| {
+                    const info = try destBegin(reg_map, dest, RegMap.tmp0);
+                    if (info.reg != param_reg) {
+                        try code.movRegReg(info.reg, param_reg);
+                    }
+                    try destCommit(code, reg_map, info);
+                    return;
+                }
+            }
             const offset = try localFrameOffset(fctx, idx);
             if (inst.type == .v128) {
                 const vt = try v128_cache.defineFresh(code, v128_map, dest, null);
@@ -4864,7 +5009,7 @@ fn compileInst(
         .elem_drop => |seg_idx| try emitElemDrop(code, seg_idx, reg_map, fctx),
         // Phi must be lowered before codegen.
         .phi => unreachable,
-        .parallel_copy => |pairs| try emitParallelCopy(code, pairs, reg_map, fctx.allocator),
+        .parallel_copy => |pairs| try emitParallelCopy(code, pairs, reg_map, fctx, fctx.allocator),
         // #672 EH ops — commit 3:
         //   * try_table_begin / try_table_end: no-op. In-function catch
         //     dispatch is deferred to a later commit; for now the catch
@@ -5046,6 +5191,14 @@ fn storeV128ToBaseOffset(
     try code.strQ(vt, addr_tmp);
 }
 
+fn isSingleInsnImm(val: i64, ty: ir.IrType) bool {
+    return switch (ty) {
+        .i32 => (@as(u32, @truncate(@as(u64, @bitCast(val)))) >> 16) == 0,
+        .i64 => (@as(u64, @bitCast(val)) >> 16) == 0,
+        else => false,
+    };
+}
+
 fn emitPrimaryReturnValue(
     code: *emit.CodeBuffer,
     val: ir.VReg,
@@ -5054,10 +5207,31 @@ fn emitPrimaryReturnValue(
     v128_cache: *V128RegCache,
     fctx: *const FuncCompileCtx,
 ) !void {
-    if (vregType(fctx, val) == .v128) {
+    const rty = vregType(fctx, val);
+    if (rty == .v128) {
         const vt = try v128_cache.ensure(code, v128_map, val, null);
         if (vt != v128_return_reg) try code.bitwise16b(.orr, v128_return_reg, vt, vt);
     } else {
+        const is_suppressed = if (fctx.suppress_iconst_emit) |s| s.contains(val) else false;
+        if (!is_suppressed) {
+            if (reg_map.get(val)) |loc| {
+                if (loc == .reg and loc.reg == .x0) return;
+            }
+        }
+        if (rty == .i32 or rty == .i64) {
+            if (fctx.const_vals) |cv| {
+                if (cv.get(val)) |v| {
+                    if (isSingleInsnImm(v, rty)) {
+                        if (rty == .i32) {
+                            try code.movImm32(.x0, @bitCast(@as(u32, @truncate(@as(u64, @bitCast(v))))));
+                        } else {
+                            try code.movImm64(.x0, @bitCast(v));
+                        }
+                        return;
+                    }
+                }
+            }
+        }
         const r = try useInto(code, reg_map, val, .x0);
         if (r != .x0) try code.movRegReg(.x0, r);
     }
@@ -7228,6 +7402,7 @@ fn emitParallelCopy(
     code: *emit.CodeBuffer,
     pairs: []const ir.Inst.ParallelCopy,
     reg_map: *RegMap,
+    fctx: *const FuncCompileCtx,
     allocator: std.mem.Allocator,
 ) !void {
     if (pairs.len == 0) return;
@@ -7235,7 +7410,7 @@ fn emitParallelCopy(
     // lowering pass only emits scalar pairs; surface a clear error if
     // a v128 sneaks in.
     for (pairs) |p| if (p.ty == .v128) return error.UnimplementedOp;
-    try emitParallelCopyFull(code, pairs, reg_map, allocator);
+    try emitParallelCopyFull(code, pairs, reg_map, fctx, allocator);
 }
 
 const ParallelCopyLoc = union(enum) {
@@ -7286,11 +7461,19 @@ fn emitLocMove(
                 .iconst_64 => |v| try code.movImm64(dst_reg, @bitCast(v)),
             },
             .stack => |dst_off| {
-                switch (rd) {
-                    .iconst_32 => |v| try code.movImm32(RegMap.tmp0, v),
-                    .iconst_64 => |v| try code.movImm64(RegMap.tmp0, @bitCast(v)),
+                const is_zero = switch (rd) {
+                    .iconst_32 => |v| v == 0,
+                    .iconst_64 => |v| v == 0,
+                };
+                if (is_zero) {
+                    try frameStore(code, .xzr, reg_map.spillOffsetBytes(dst_off));
+                } else {
+                    switch (rd) {
+                        .iconst_32 => |v| try code.movImm32(RegMap.tmp0, v),
+                        .iconst_64 => |v| try code.movImm64(RegMap.tmp0, @bitCast(v)),
+                    }
+                    try frameStore(code, RegMap.tmp0, reg_map.spillOffsetBytes(dst_off));
                 }
-                try frameStore(code, RegMap.tmp0, reg_map.spillOffsetBytes(dst_off));
             },
             .remat => unreachable,
         },
@@ -7301,6 +7484,7 @@ fn emitParallelCopyFull(
     code: *emit.CodeBuffer,
     pairs: []const ir.Inst.ParallelCopy,
     reg_map: *RegMap,
+    fctx: ?*const FuncCompileCtx,
     allocator: std.mem.Allocator,
 ) !void {
     const Loc = ParallelCopyLoc;
@@ -7317,6 +7501,26 @@ fn emitParallelCopyFull(
         const src_loc: Loc = blk: {
             if (reg_map.alloc_result) |ar| {
                 if (ar.getRemat(p.src)) |rd| break :blk .{ .remat = rd };
+            }
+            const is_suppressed = if (fctx) |fc| (if (fc.suppress_iconst_emit) |s| s.contains(p.src) else false) else false;
+            if (!is_suppressed) {
+                if (reg_map.get(p.src)) |loc| {
+                    if (loc == .reg) break :blk .{ .reg = loc.reg };
+                }
+            }
+            if (p.ty == .i32 or p.ty == .i64) {
+                if (fctx) |fc| {
+                    if (fc.const_vals) |cv| {
+                        if (cv.get(p.src)) |v| {
+                            if (isSingleInsnImm(v, p.ty)) {
+                                break :blk .{ .remat = if (p.ty == .i32)
+                                    .{ .iconst_32 = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(v))))) }
+                                else
+                                    .{ .iconst_64 = v } };
+                            }
+                        }
+                    }
+                }
             }
             const loc = reg_map.get(p.src) orelse return error.UnboundVReg;
             break :blk switch (loc) {
@@ -8003,6 +8207,7 @@ fn emitSelect(
     inst: ir.Inst,
     sel: @TypeOf(@as(ir.Inst.Op, undefined).select),
     reg_map: *RegMap,
+    fctx: *const FuncCompileCtx,
 ) !void {
     const dest = inst.dest orelse return;
     if (trace_select) {
@@ -8016,8 +8221,11 @@ fn emitSelect(
     // distinct scratches (tmp1/tmp2) so CSEL can read them simultaneously.
     const cond_r = try useInto(code, reg_map, sel.cond, RegMap.tmp0);
     try code.cmpImm32(cond_r, 0);
-    const t_r = try useInto(code, reg_map, sel.if_true, RegMap.tmp1);
-    const f_r = try useInto(code, reg_map, sel.if_false, RegMap.tmp2);
+    const is_int = (inst.type == .i32 or inst.type == .i64);
+    const t_is_zero = is_int and (if (fctx.const_vals) |cv| cv.get(sel.if_true) == @as(?i64, 0) else false);
+    const f_is_zero = is_int and (if (fctx.const_vals) |cv| cv.get(sel.if_false) == @as(?i64, 0) else false);
+    const t_r: emit.Reg = if (t_is_zero) .xzr else try useInto(code, reg_map, sel.if_true, RegMap.tmp1);
+    const f_r: emit.Reg = if (f_is_zero) .xzr else try useInto(code, reg_map, sel.if_false, RegMap.tmp2);
     const info = try destBegin(reg_map, dest, RegMap.tmp0);
     // wasm: select picks if_true when cond != 0.
     //
@@ -11370,6 +11578,9 @@ fn collectHintPoints(
     };
     defer if (owns_order) allocator.free(block_order);
 
+    var entry_abi = try buildEntryAbiPlan(allocator, func.*, fctx.local_types);
+    defer entry_abi.deinit();
+
     for (block_order) |bo_bid| {
         const insts = if (scheduled) |s|
             s.instructions(bo_bid)
@@ -11377,6 +11588,16 @@ fn collectHintPoints(
             func.blocks.items[bo_bid].instructions.items;
         for (insts) |ci| {
             switch (ci.op) {
+                .local_get => |local_idx| {
+                    if (bo_bid == 0 and local_idx < func.param_count) {
+                        if (ci.dest) |d| {
+                            switch (entry_abi.locs[@intCast(local_idx)]) {
+                                .scalar_reg => |reg| try appendArgRegHint(&hints, allocator, d, reg),
+                                .v128_reg, .stack => {},
+                            }
+                        }
+                    }
+                },
                 .call => |cl| try addCallArgScalarHints(
                     &hints,
                     allocator,
@@ -11453,6 +11674,136 @@ fn collectHintPoints(
 /// sub-word extends (`extend8/16/32_s`) are NOT in scope: their
 /// upper-bit-write semantics are part of the IR contract for the i64
 /// dest and cannot be skipped just because src and dest co-located.
+fn vregsInterfere(
+    u: ir.VReg,
+    v: ir.VReg,
+    func: *const ir.IrFunction,
+    scheduled: ?*const schedule.FunctionSchedule,
+    liveness: *const std.AutoHashMap(ir.BlockId, analysis.BlockLiveness),
+    mul_fused_opt: ?*const std.AutoHashMap(ir.VReg, void),
+    simd_mul_fused_opt: ?*const std.AutoHashMap(ir.VReg, void),
+    fma_info_opt: ?*const std.AutoHashMap(ir.VReg, FmaInfo),
+    simd_fma_info_opt: ?*const std.AutoHashMap(ir.VReg, FmaInfo),
+) bool {
+    if (u == v) return false;
+    const ReadCheck = struct {
+        target_u: ir.VReg,
+        target_v: ir.VReg,
+        reads_u: bool = false,
+        reads_v: bool = false,
+        fn visit(self: *@This(), operand: ir.VReg) error{}!void {
+            if (operand == self.target_u) self.reads_u = true;
+            if (operand == self.target_v) self.reads_v = true;
+        }
+    };
+    for (0..func.blocks.items.len) |bid| {
+        const bl = liveness.get(@intCast(bid)) orelse continue;
+        if (bl.live_in.contains(u) and bl.live_in.contains(v)) return true;
+
+        const insts = if (scheduled) |s|
+            s.instructions(@intCast(bid))
+        else
+            func.blocks.items[bid].instructions.items;
+
+        var maybe_equiv_copy_idx: ?usize = null;
+        for (insts, 0..) |inst, c_idx| {
+            if (inst.op == .parallel_copy) {
+                var has_uv_copy = false;
+                var other_clobber = false;
+                for (inst.op.parallel_copy) |pp| {
+                    if ((pp.dst == u and pp.src == v) or (pp.dst == v and pp.src == u)) {
+                        has_uv_copy = true;
+                    } else if (pp.dst == u or pp.dst == v) {
+                        other_clobber = true;
+                    }
+                }
+                if (has_uv_copy and !other_clobber) {
+                    var post_clobber = false;
+                    for (insts[c_idx + 1 ..]) |aft| {
+                        if (aft.dest == u or aft.dest == v or aft.op == .parallel_copy) {
+                            post_clobber = true;
+                            break;
+                        }
+                    }
+                    if (!post_clobber) {
+                        maybe_equiv_copy_idx = c_idx;
+                    }
+                }
+            }
+        }
+
+        var u_live = bl.live_out.contains(u);
+        var v_live = bl.live_out.contains(v);
+        if (u_live and v_live and maybe_equiv_copy_idx == null) return true;
+
+        var idx: usize = insts.len;
+        while (idx > 0) {
+            idx -= 1;
+            const inst = insts[idx];
+            if (inst.op == .parallel_copy) {
+                const pairs = inst.op.parallel_copy;
+                for (pairs) |pp| {
+                    if (pp.dst == u and pp.src != v and v_live) return true;
+                    if (pp.dst == v and pp.src != u and u_live) return true;
+                }
+                for (pairs) |pp| {
+                    if (pp.dst == u) u_live = false;
+                    if (pp.dst == v) v_live = false;
+                }
+                for (pairs) |pp| {
+                    if (pp.src == u) u_live = true;
+                    if (pp.src == v) v_live = true;
+                }
+                if (u_live and v_live) return true;
+                continue;
+            }
+
+            if (inst.dest) |d| {
+                if (mul_fused_opt) |mf| if (mf.contains(d)) continue;
+                if (simd_mul_fused_opt) |smf| if (smf.contains(d)) continue;
+            }
+
+            var rc = ReadCheck{ .target_u = u, .target_v = v };
+            var used_fma = false;
+            if (inst.dest) |d| {
+                if (fma_info_opt) |fma_map| {
+                    if (fma_map.get(d)) |fi| {
+                        rc.visit(fi.mul_lhs) catch unreachable;
+                        rc.visit(fi.mul_rhs) catch unreachable;
+                        rc.visit(fi.addend) catch unreachable;
+                        used_fma = true;
+                    }
+                }
+                if (!used_fma) {
+                    if (simd_fma_info_opt) |sfma_map| {
+                        if (sfma_map.get(d)) |fi| {
+                            rc.visit(fi.mul_lhs) catch unreachable;
+                            rc.visit(fi.mul_rhs) catch unreachable;
+                            rc.visit(fi.addend) catch unreachable;
+                            used_fma = true;
+                        }
+                    }
+                }
+            }
+            if (!used_fma) {
+                schedule.forEachUse(inst, &rc, ReadCheck.visit) catch unreachable;
+            }
+
+            if (inst.dest) |d| {
+                if (d == u and (v_live or rc.reads_v)) return true;
+                if (d == v and (u_live or rc.reads_u)) return true;
+                if (d == u) u_live = false;
+                if (d == v) v_live = false;
+            }
+
+            if (rc.reads_u) u_live = true;
+            if (rc.reads_v) v_live = true;
+            if (u_live and v_live and (maybe_equiv_copy_idx == null or idx < maybe_equiv_copy_idx.?)) return true;
+        }
+    }
+    return false;
+}
+
 fn collectCopyHints(
     func: *const ir.IrFunction,
     block_order_opt: ?[]const ir.BlockId,
@@ -11460,10 +11811,25 @@ fn collectCopyHints(
     live_ranges_opt: ?[]const analysis.LiveRange,
     fma_info_opt: ?*const std.AutoHashMap(ir.VReg, FmaInfo),
     simd_fma_info_opt: ?*const std.AutoHashMap(ir.VReg, FmaInfo),
+    mul_fused_opt: ?*const std.AutoHashMap(ir.VReg, void),
+    simd_mul_fused_opt: ?*const std.AutoHashMap(ir.VReg, void),
+    suppress_iconst_opt: ?*const std.AutoHashMap(ir.VReg, void),
     allocator: std.mem.Allocator,
 ) !std.ArrayList(regalloc.CopyHint) {
     var hints: std.ArrayList(regalloc.CopyHint) = .empty;
     errdefer hints.deinit(allocator);
+    var cross_block_hints: std.ArrayList(regalloc.CopyHint) = .empty;
+    defer cross_block_hints.deinit(allocator);
+
+    var liveness_opt: ?std.AutoHashMap(ir.BlockId, analysis.BlockLiveness) = null;
+    defer if (liveness_opt) |*lv| {
+        var it = lv.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.live_in.deinit();
+            entry.value_ptr.live_out.deinit();
+        }
+        lv.deinit();
+    };
 
     var range_map: std.AutoHashMap(ir.VReg, analysis.LiveRange) = .init(allocator);
     defer range_map.deinit();
@@ -11507,7 +11873,11 @@ fn collectCopyHints(
                 },
                 .parallel_copy => |pairs| {
                     for (pairs, 0..) |p, p_idx| {
+                        if (suppress_iconst_opt) |si| {
+                            if (si.contains(p.src)) continue;
+                        }
                         var allow_overlap = false;
+                        var is_cross_block_overlap = false;
                         if (live_ranges_opt != null and p.dst != p.src) blk: {
                             const src_range = range_map.get(p.src) orelse break :blk;
                             const dest_range = range_map.get(p.dst) orelse break :blk;
@@ -11530,7 +11900,37 @@ fn collectCopyHints(
                                     }
                                 }
                             }
-                            const def_idx = maybe_def_idx orelse break :blk;
+                            if (maybe_def_idx == null) {
+                                var pairs_ok = true;
+                                for (pairs, 0..) |p2, p2_idx| {
+                                    if (p2_idx == p_idx) continue;
+                                    if (p2.src == p.dst or p2.dst == p.dst or p2.dst == p.src or p2.src == p.src) {
+                                        pairs_ok = false;
+                                        break;
+                                    }
+                                }
+                                if (pairs_ok) {
+                                    if (liveness_opt == null) {
+                                        liveness_opt = try analysis.computeLiveness(func, allocator);
+                                    }
+                                    if (!vregsInterfere(
+                                        p.dst,
+                                        p.src,
+                                        func,
+                                        scheduled,
+                                        &liveness_opt.?,
+                                        mul_fused_opt,
+                                        simd_mul_fused_opt,
+                                        fma_info_opt,
+                                        simd_fma_info_opt,
+                                    )) {
+                                        allow_overlap = true;
+                                        is_cross_block_overlap = true;
+                                    }
+                                }
+                                break :blk;
+                            }
+                            const def_idx = maybe_def_idx.?;
                             const def_inst = insts[def_idx];
                             switch (def_inst.op) {
                                 .add,
@@ -11618,16 +12018,38 @@ fn collectCopyHints(
 
                             allow_overlap = true;
                         }
-                        try hints.append(allocator, .{
+                        const hint_item = regalloc.CopyHint{
                             .dest = p.dst,
                             .src = p.src,
                             .allow_dest_overlap = allow_overlap,
-                        });
+                        };
+                        if (is_cross_block_overlap) {
+                            try cross_block_hints.append(allocator, hint_item);
+                        } else {
+                            try hints.append(allocator, hint_item);
+                        }
                     }
                 },
                 else => {},
             }
         }
+    }
+    if (cross_block_hints.items.len > 0) {
+        const SortCtx = struct {
+            rmap: *const std.AutoHashMap(ir.VReg, analysis.LiveRange),
+            pub fn lessThan(ctx: @This(), a: regalloc.CopyHint, b: regalloc.CopyHint) bool {
+                const a_d = if (ctx.rmap.get(a.dest)) |r| r.end -| r.start else 0;
+                const a_s = if (ctx.rmap.get(a.src)) |r| r.end -| r.start else 0;
+                const b_d = if (ctx.rmap.get(b.dest)) |r| r.end -| r.start else 0;
+                const b_s = if (ctx.rmap.get(b.src)) |r| r.end -| r.start else 0;
+                const a_max = @max(a_d, a_s);
+                const b_max = @max(b_d, b_s);
+                if (a_max != b_max) return a_max > b_max;
+                return @min(a_d, a_s) > @min(b_d, b_s);
+            }
+        };
+        std.mem.sort(regalloc.CopyHint, cross_block_hints.items, SortCtx{ .rmap = &range_map }, SortCtx.lessThan);
+        try hints.insertSlice(allocator, 0, cross_block_hints.items);
     }
     return hints;
 }
@@ -11987,7 +12409,7 @@ fn simulateParallelCopy(
 
     var code = emit.CodeBuffer.init(allocator);
     defer code.deinit();
-    try emitParallelCopyFull(&code, pairs, &reg_map, allocator);
+    try emitParallelCopyFull(&code, pairs, &reg_map, null, allocator);
 
     // Model: 32 GPRs + a stack keyed by the scaled (÷8) FP offset that the
     // emitted LDR/STR immediates use.
@@ -12079,7 +12501,7 @@ test "emitParallelCopyFull: identity move (coalesced) emits nothing" {
     var code = emit.CodeBuffer.init(allocator);
     defer code.deinit();
     const pairs = [_]ir.Inst.ParallelCopy{.{ .dst = 0, .src = 1, .ty = .i32 }};
-    try emitParallelCopyFull(&code, &pairs, &reg_map, allocator);
+    try emitParallelCopyFull(&code, &pairs, &reg_map, null, allocator);
     try std.testing.expectEqual(@as(usize, 0), code.bytes.items.len);
 }
 
@@ -18932,3 +19354,29 @@ test "suppress_iconst (#949): self-use (b.lhs == b.rhs) preserves register mater
     // Both self-used constants must retain their MOVZ materializations (2 MOVZ instructions).
     try std.testing.expectEqual(@as(u32, 2), countMovzImm(code));
 }
+
+test "suppress_iconst (#949): folds zero in select to xzr and single-insn imm in ret" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 1);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const block = func.getBlock(bid);
+
+    const p0 = func.newVReg();
+    const c_zero = func.newVReg();
+    const c_five = func.newVReg();
+    const r_sel = func.newVReg();
+
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = p0, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = c_zero, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = c_five, .type = .i32 });
+    try block.append(.{ .op = .{ .select = .{ .cond = p0, .if_true = p0, .if_false = c_zero } }, .dest = r_sel, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = c_five } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // c_zero is folded into CSEL via XZR (0 MOVZ) and c_five is emitted directly at ret (1 MOVZ).
+    try std.testing.expectEqual(@as(u32, 1), countMovzImm(code));
+}
+
