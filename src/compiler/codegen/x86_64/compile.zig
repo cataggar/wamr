@@ -3428,7 +3428,12 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
     // unsafe / unavailable hints are silently ignored by the allocator.
     // Uses block_order so numbering matches live-range computation.
     var clobber_points: std.ArrayList(regalloc.ClobberPoint) = .empty;
-    defer clobber_points.deinit(allocator);
+    defer {
+        for (clobber_points.items) |*cp| {
+            if (cp.live_vregs) |*bs| bs.deinit(allocator);
+        }
+        clobber_points.deinit(allocator);
+    }
     var hint_points: std.ArrayList(regalloc.Hint) = .empty;
     defer hint_points.deinit(allocator);
     var copy_hints: std.ArrayList(regalloc.CopyHint) = .empty;
@@ -3599,6 +3604,9 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
         if (!suppress_iconst.contains(range.vreg) and !fused_cmp_br_if.contains(range.vreg)) {
             alloc_live_ranges.appendAssumeCapacity(range);
         }
+    }
+    if (clobber_points.items.len > 0) {
+        try analysis.populateClobberLiveVregs(func, block_order, clobber_points.items, allocator);
     }
     if (timer) |t| t.end(.liveness);
     if (timer) |t| t.begin();

@@ -8084,6 +8084,193 @@ pub fn applyPostOptCodegenLowering(
 ///
 /// Idempotent: a second call observes no `local_get` for synth locals and
 /// returns false.
+const SynthPhiSlotInfo = struct {
+    join_block: ir.BlockId,
+    get_inst_idx: usize,
+    dest: ir.VReg,
+    ty: ir.IrType,
+    seen_count: u8,
+    eligible: bool,
+};
+
+fn tryRescueLostCopyViaSibling(
+    func: *ir.IrFunction,
+    dom: *const analysis.DomTree,
+    preds: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId),
+    info: []const SynthPhiSlotInfo,
+    synth_start: u32,
+    k_a: usize,
+    allocator: std.mem.Allocator,
+) !bool {
+    const slot_a = info[k_a];
+    const join_block = slot_a.join_block;
+    const d_a = slot_a.dest;
+    const join_preds = preds.get(join_block) orelse return false;
+
+    var maybe_back_p: ?ir.BlockId = null;
+    for (join_preds) |p| {
+        if (dom.dominates(join_block, p)) {
+            if (maybe_back_p != null) return false;
+            maybe_back_p = p;
+        }
+    }
+    const back_p = maybe_back_p orelse return false;
+
+    for (func.blocks.items, 0..) |*b, bid| {
+        for (b.instructions.items, 0..) |inst, idx| {
+            if (bid == join_block and idx == slot_a.get_inst_idx) continue;
+            if (inst.dest == d_a) return false;
+            if (inst.op == .parallel_copy) {
+                for (inst.op.parallel_copy) |pair| {
+                    if (pair.dst == d_a) return false;
+                }
+            }
+        }
+    }
+
+    const nblocks = func.blocks.items.len;
+    const visited = try allocator.alloc(bool, nblocks);
+    defer allocator.free(visited);
+    @memset(visited, false);
+
+    var worklist: std.ArrayListUnmanaged(ir.BlockId) = .empty;
+    defer worklist.deinit(allocator);
+
+    const enqueueIfNotJoin = struct {
+        fn call(
+            target: ir.BlockId,
+            join: ir.BlockId,
+            vis: []bool,
+            wl: *std.ArrayListUnmanaged(ir.BlockId),
+            alloc: std.mem.Allocator,
+        ) !void {
+            if (target == join or target >= vis.len) return;
+            if (!vis[target]) {
+                vis[target] = true;
+                try wl.append(alloc, target);
+            }
+        }
+    }.call;
+
+    const back_term_idx = findTerminatorIndex(&func.blocks.items[back_p]);
+    if (back_term_idx >= func.blocks.items[back_p].instructions.items.len) return false;
+    const back_term = func.blocks.items[back_p].instructions.items[back_term_idx];
+    switch (back_term.op) {
+        .br => |target| try enqueueIfNotJoin(target, join_block, visited, &worklist, allocator),
+        .br_if => |bi| {
+            try enqueueIfNotJoin(bi.then_block, join_block, visited, &worklist, allocator);
+            try enqueueIfNotJoin(bi.else_block, join_block, visited, &worklist, allocator);
+        },
+        .br_table => |bt| {
+            for (bt.targets) |t| try enqueueIfNotJoin(t, join_block, visited, &worklist, allocator);
+            try enqueueIfNotJoin(bt.default, join_block, visited, &worklist, allocator);
+        },
+        else => {},
+    }
+    if (worklist.items.len == 0) return false;
+
+    while (worklist.pop()) |b| {
+        const term_idx = findTerminatorIndex(&func.blocks.items[b]);
+        if (term_idx >= func.blocks.items[b].instructions.items.len) continue;
+        const term = func.blocks.items[b].instructions.items[term_idx];
+        switch (term.op) {
+            .br => |target| try enqueueIfNotJoin(target, join_block, visited, &worklist, allocator),
+            .br_if => |bi| {
+                try enqueueIfNotJoin(bi.then_block, join_block, visited, &worklist, allocator);
+                try enqueueIfNotJoin(bi.else_block, join_block, visited, &worklist, allocator);
+            },
+            .br_table => |bt| {
+                for (bt.targets) |t| try enqueueIfNotJoin(t, join_block, visited, &worklist, allocator);
+                try enqueueIfNotJoin(bt.default, join_block, visited, &worklist, allocator);
+            },
+            else => {},
+        }
+    }
+
+    if (visited[back_p]) return false;
+
+    const Probe = struct {
+        target: ir.VReg,
+        found: *bool,
+        fn check(self: @This(), v: ir.VReg) void {
+            if (v == self.target) self.found.* = true;
+        }
+    };
+
+    var any_visited_use = false;
+    for (func.blocks.items, 0..) |*block, bid| {
+        if (!visited[bid]) continue;
+        var block_uses = false;
+        for (block.instructions.items) |inst| {
+            verifier.forEachOperand(inst, Probe{ .target = d_a, .found = &block_uses }, Probe.check);
+            if (block_uses) break;
+        }
+        if (block_uses) {
+            any_visited_use = true;
+            if (!dom.dominates(back_p, @intCast(bid))) return false;
+        }
+    }
+    if (!any_visited_use) return false;
+
+    const back_insts = func.blocks.items[back_p].instructions.items;
+    outer: for (info, 0..) |slot_b, k_b| {
+        if (k_b == k_a or !slot_b.eligible) continue;
+        if (slot_b.join_block != join_block or slot_b.ty != slot_a.ty) continue;
+
+        const synth_b: u32 = synth_start + @as(u32, @intCast(k_b));
+        const d_b = slot_b.dest;
+
+        for (join_preds) |p| {
+            var has_set = false;
+            for (func.blocks.items[p].instructions.items) |inst| {
+                if (inst.op == .local_set and inst.op.local_set.idx == synth_b) {
+                    has_set = true;
+                    break;
+                }
+            }
+            if (!has_set) continue :outer;
+        }
+
+        var last_set_val: ?ir.VReg = null;
+        for (back_insts) |inst| {
+            if (inst.op == .local_set and inst.op.local_set.idx == synth_b) {
+                last_set_val = inst.op.local_set.val;
+            }
+        }
+        if (last_set_val == null or last_set_val.? != d_a) continue;
+
+        for (func.blocks.items, 0..) |*block, bid| {
+            if (!visited[bid]) continue;
+            for (block.instructions.items) |inst| {
+                var used_b = false;
+                verifier.forEachOperand(inst, Probe{ .target = d_b, .found = &used_b }, Probe.check);
+                if (used_b) continue :outer;
+                if (inst.dest == d_b) continue :outer;
+                switch (inst.op) {
+                    .local_get => |lg| if (lg == synth_b) continue :outer,
+                    .local_set => |ls| if (ls.idx == synth_b) continue :outer,
+                    .parallel_copy => |pairs| {
+                        for (pairs) |pair| {
+                            if (pair.dst == d_b) continue :outer;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        for (func.blocks.items, 0..) |*block, bid| {
+            if (!visited[bid]) continue;
+            for (block.instructions.items) |*inst| {
+                replaceInInst(inst, d_a, d_b);
+            }
+        }
+        return true;
+    }
+
+    return false;
+}
+
 pub fn coalescePhiLocalsToParallelCopy(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
     const synth_start = func.phi_synth_local_start orelse return false;
     const synth_end = func.phi_synth_local_end orelse return false;
@@ -8096,15 +8283,7 @@ pub fn coalescePhiLocalsToParallelCopy(func: *ir.IrFunction, allocator: std.mem.
     // `lowerPhisToLocals` these are unique per synth; we conservatively
     // bail on synths that no longer match the canonical fingerprint
     // (e.g. a downstream pass duplicated or eliminated the local_get).
-    const Info = struct {
-        join_block: ir.BlockId,
-        get_inst_idx: usize,
-        dest: ir.VReg,
-        ty: ir.IrType,
-        seen_count: u8,
-        eligible: bool,
-    };
-    var info = try allocator.alloc(Info, synth_count);
+    var info = try allocator.alloc(SynthPhiSlotInfo, synth_count);
     defer allocator.free(info);
     for (info) |*it| it.* = .{
         .join_block = 0,
@@ -8151,6 +8330,8 @@ pub fn coalescePhiLocalsToParallelCopy(func: *ir.IrFunction, allocator: std.mem.
             break;
         }
     }
+    var changed = false;
+
     if (have_eligible) {
         var dom = try analysis.computeDominators(func, allocator);
         defer dom.deinit();
@@ -8160,10 +8341,105 @@ pub fn coalescePhiLocalsToParallelCopy(func: *ir.IrFunction, allocator: std.mem.
             while (pit.next()) |entry| allocator.free(entry.value_ptr.*);
             preds.deinit();
         }
-        for (info) |*it| {
+        const lost_copy_failed = try allocator.alloc(bool, synth_count);
+        defer allocator.free(lost_copy_failed);
+        @memset(lost_copy_failed, false);
+
+        for (info, 0..) |*it, k| {
             if (!it.eligible) continue;
             if (try synthCoalesceLostCopyUnsafe(func, &dom, &preds, it.join_block, it.dest, allocator)) {
                 it.eligible = false;
+                lost_copy_failed[k] = true;
+            }
+        }
+        for (info, 0..) |*it, k| {
+            if (!lost_copy_failed[k]) continue;
+            if (try tryRescueLostCopyViaSibling(func, &dom, &preds, info, synth_start, k, allocator)) {
+                it.eligible = true;
+                changed = true;
+            }
+        }
+
+        var still_eligible = false;
+        for (info) |it| {
+            if (it.eligible) {
+                still_eligible = true;
+                break;
+            }
+        }
+        if (still_eligible) {
+            const loop_depths = try analysis.loopDepthByBlockForFunc(func, allocator);
+            defer allocator.free(loop_depths);
+            const orig_nblocks = func.blocks.items.len;
+            for (0..orig_nblocks) |pred_bid_us| {
+                const pred_bid: ir.BlockId = @intCast(pred_bid_us);
+                const term_idx = findTerminatorIndex(&func.blocks.items[pred_bid]);
+                if (term_idx >= func.blocks.items[pred_bid].instructions.items.len) continue;
+                const term = func.blocks.items[pred_bid].instructions.items[term_idx];
+                const bi = switch (term.op) {
+                    .br_if => |b| b,
+                    else => continue,
+                };
+                if (bi.then_block == bi.else_block) continue;
+
+                var maybe_target_bid: ?ir.BlockId = null;
+                var all_same_target = true;
+                for (func.blocks.items[pred_bid].instructions.items[0..term_idx]) |inst| {
+                    if (inst.op == .local_set) {
+                        const ls = inst.op.local_set;
+                        if (ls.idx >= synth_start and ls.idx < synth_end) {
+                            const slot = info[ls.idx - synth_start];
+                            if (slot.eligible) {
+                                if (maybe_target_bid) |t| {
+                                    if (t != slot.join_block) {
+                                        all_same_target = false;
+                                        break;
+                                    }
+                                } else {
+                                    maybe_target_bid = slot.join_block;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!all_same_target) continue;
+                const target_bid = maybe_target_bid orelse continue;
+                if (target_bid != bi.then_block and target_bid != bi.else_block) continue;
+                const other_bid = if (target_bid == bi.then_block) bi.else_block else bi.then_block;
+                if (target_bid >= orig_nblocks or other_bid >= orig_nblocks) continue;
+
+                if (loop_depths[pred_bid] > loop_depths[target_bid] and
+                    !dom.dominates(target_bid, pred_bid) and
+                    loop_depths[other_bid] >= loop_depths[pred_bid])
+                {
+                    const tramp_bid = try func.newBlock();
+                    var k: usize = 0;
+                    while (k < func.blocks.items[pred_bid].instructions.items.len) {
+                        const inst = func.blocks.items[pred_bid].instructions.items[k];
+                        if (inst.op == .local_set) {
+                            const ls = inst.op.local_set;
+                            if (ls.idx >= synth_start and ls.idx < synth_end and info[ls.idx - synth_start].eligible) {
+                                try func.blocks.items[tramp_bid].append(inst);
+                                _ = func.blocks.items[pred_bid].instructions.orderedRemove(k);
+                                continue;
+                            }
+                        }
+                        k += 1;
+                    }
+                    try func.blocks.items[tramp_bid].append(.{ .op = .{ .br = target_bid } });
+                    const new_term_idx = findTerminatorIndex(&func.blocks.items[pred_bid]);
+                    switch (func.blocks.items[pred_bid].instructions.items[new_term_idx].op) {
+                        .br_if => |*br_if_ptr| {
+                            if (target_bid == bi.then_block) {
+                                br_if_ptr.then_block = tramp_bid;
+                            } else {
+                                br_if_ptr.else_block = tramp_bid;
+                            }
+                        },
+                        else => unreachable,
+                    }
+                    changed = true;
+                }
             }
         }
     }
@@ -8173,7 +8449,6 @@ pub fn coalescePhiLocalsToParallelCopy(func: *ir.IrFunction, allocator: std.mem.
     // Remove those local_sets and insert one `parallel_copy` before the
     // terminator. Also clear the join-side local_get for eligible synths.
 
-    var changed = false;
     var pair_buf: std.ArrayListUnmanaged(ir.Inst.ParallelCopy) = .empty;
     defer pair_buf.deinit(allocator);
 
@@ -9686,7 +9961,12 @@ pub fn reorderBlocks(func: *const ir.IrFunction, allocator: std.mem.Allocator) !
         return order;
     }
 
-    // Build CFG
+    // Build CFG + loop forest so natural-loop bodies stay contiguous in RPO
+    var dom = try analysis.computeDominators(func, allocator);
+    defer dom.deinit();
+    var forest = try analysis.computeLoops(func, &dom, allocator);
+    defer forest.deinit();
+
     var successors = try analysis.buildSuccessors(func, allocator);
     defer {
         var it = successors.valueIterator();
@@ -9705,6 +9985,11 @@ pub fn reorderBlocks(func: *const ir.IrFunction, allocator: std.mem.Allocator) !
     // Build a writable per-block visit-order array indexed by BlockId.
     // Each entry is the block's successor list sorted ascending by
     // estimated frequency, with original index as the stable tie-breaker.
+    // If `bid` is a natural-loop header, out-of-loop exit targets of loops
+    // headed by `bid` are prepended first so the iterative DFS explores
+    // post-loop subgraphs before the loop body (giving post-loop blocks
+    // smaller post-order numbers → later RPO positions after the entire
+    // loop body).
     //
     // The iterative DFS visits successors in order: the *first* child
     // is fully explored and popped before the next sibling, so it gets
@@ -9718,28 +10003,67 @@ pub fn reorderBlocks(func: *const ir.IrFunction, allocator: std.mem.Allocator) !
         allocator.free(visit_succs);
     }
     for (visit_succs, 0..) |*slot, idx| {
-        const src = successors.get(@intCast(idx)) orelse &[_]ir.BlockId{};
-        slot.* = try allocator.dupe(ir.BlockId, src);
-        if (slot.len < 2) continue;
-        // Stable insertion sort by ascending frequency. `succs.len` is
-        // tiny in practice (≤2 for br_if; br_table arity is bounded by
-        // the source wasm module). Stability preserves the original
-        // br_if then/else order for equal-frequency siblings, keeping
-        // `reorderBlocks` deterministic.
-        const succs = slot.*;
-        var i: usize = 1;
-        while (i < succs.len) : (i += 1) {
-            var j: usize = i;
-            while (j > 0) : (j -= 1) {
-                const a = succs[j - 1];
-                const b = succs[j];
-                const fa: f32 = if (a < n) freq[a] else 0.0;
-                const fb: f32 = if (b < n) freq[b] else 0.0;
-                if (fa <= fb) break; // already ascending; stable for equals
-                succs[j - 1] = b;
-                succs[j] = a;
+        const bid: ir.BlockId = @intCast(idx);
+        var exit_list: std.ArrayList(ir.BlockId) = .empty;
+        defer exit_list.deinit(allocator);
+        for (forest.loops) |*loop| {
+            if (loop.header != bid) continue;
+            for (loop.blocks) |ub| {
+                const usuccs = successors.get(ub) orelse &[_]ir.BlockId{};
+                for (usuccs) |v| {
+                    if (!loop.containsBlock(v)) {
+                        if (std.mem.indexOfScalar(ir.BlockId, exit_list.items, v) == null) {
+                            try exit_list.append(allocator, v);
+                        }
+                    }
+                }
             }
         }
+        if (exit_list.items.len >= 2) {
+            const ex = exit_list.items;
+            var i: usize = 1;
+            while (i < ex.len) : (i += 1) {
+                var j: usize = i;
+                while (j > 0) : (j -= 1) {
+                    const a = ex[j - 1];
+                    const b = ex[j];
+                    const fa: f32 = if (a < n) freq[a] else 0.0;
+                    const fb: f32 = if (b < n) freq[b] else 0.0;
+                    if (fa <= fb) break;
+                    ex[j - 1] = b;
+                    ex[j] = a;
+                }
+            }
+        }
+
+        const src = successors.get(bid) orelse &[_]ir.BlockId{};
+        const sorted_src = try allocator.dupe(ir.BlockId, src);
+        defer allocator.free(sorted_src);
+        if (sorted_src.len >= 2) {
+            var i: usize = 1;
+            while (i < sorted_src.len) : (i += 1) {
+                var j: usize = i;
+                while (j > 0) : (j -= 1) {
+                    const a = sorted_src[j - 1];
+                    const b = sorted_src[j];
+                    const fa: f32 = if (a < n) freq[a] else 0.0;
+                    const fb: f32 = if (b < n) freq[b] else 0.0;
+                    if (fa <= fb) break; // already ascending; stable for equals
+                    sorted_src[j - 1] = b;
+                    sorted_src[j] = a;
+                }
+            }
+        }
+
+        var combined: std.ArrayList(ir.BlockId) = .empty;
+        errdefer combined.deinit(allocator);
+        try combined.appendSlice(allocator, exit_list.items);
+        for (sorted_src) |v| {
+            if (std.mem.indexOfScalar(ir.BlockId, combined.items, v) == null) {
+                try combined.append(allocator, v);
+            }
+        }
+        slot.* = try combined.toOwnedSlice(allocator);
     }
 
     // Iterative DFS → post-order
@@ -11192,6 +11516,50 @@ test "reorderBlocks: hot loop laid out before cold throw (issue #388)" {
     try std.testing.expect(pos[b5] > pos[b4]);
     // b5 (containing .@"unreachable") is the very last block.
     try std.testing.expectEqual(@as(ir.BlockId, b5), order[order.len - 1]);
+}
+
+test "reorderBlocks: loop body stays contiguous when inner branch exits loop" {
+    // CFG:
+    //   b0 (entry) -> b1 (loop header)
+    //   b1 -> b2 (in-loop check) | b3 (in-loop alt)
+    //   b2 -> b5 (loop exit) | b4 (loop latch)
+    //   b3 -> b4 (loop latch)
+    //   b4 -> b1 (backedge)
+    //   b5 -> ret
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const b4 = try func.newBlock();
+    const b5 = try func.newBlock();
+
+    const c1 = func.newVReg();
+    const c2 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = c1 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = c1, .then_block = b2, .else_block = b3 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .iconst_32 = 0 }, .dest = c2 });
+    try func.getBlock(b2).append(.{ .op = .{ .br_if = .{ .cond = c2, .then_block = b5, .else_block = b4 } } });
+    try func.getBlock(b3).append(.{ .op = .{ .br = b4 } });
+    try func.getBlock(b4).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b5).append(.{ .op = .{ .ret = null } });
+
+    const order = try reorderBlocks(&func, allocator);
+    defer allocator.free(order);
+    try std.testing.expectEqual(@as(usize, 6), order.len);
+
+    var pos: [6]usize = undefined;
+    for (order, 0..) |bid, i| pos[bid] = i;
+
+    // Loop exit b5 must come strictly after ALL loop blocks {b1, b2, b3, b4}.
+    try std.testing.expect(pos[b5] > pos[b1]);
+    try std.testing.expect(pos[b5] > pos[b2]);
+    try std.testing.expect(pos[b5] > pos[b3]);
+    try std.testing.expect(pos[b5] > pos[b4]);
 }
 
 test "strengthReduceMul: mul(x, 8) → shl(x, 3)" {
@@ -17985,4 +18353,101 @@ test "CSE load (cell H): barrier in then and store in else leave merge load unfu
     try std.testing.expectEqual(@as(usize, 2), func.getBlock(merge).instructions.items.len);
     try std.testing.expect(func.getBlock(merge).instructions.items[0].op == .load);
     try std.testing.expectEqual(ir.Inst.Op{ .ret = v_merge }, func.getBlock(merge).instructions.items[1].op);
+}
+
+test "coalescePhiLocalsToParallelCopy: rescues lost-copy hazard via sibling phi forwarding" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 2);
+    defer func.deinit();
+    func.phi_synth_local_start = 0;
+    func.phi_synth_local_end = 2;
+
+    const b_entry = try func.newBlock();
+    const b_loop = try func.newBlock();
+    const b_exit = try func.newBlock();
+
+    const v_init = func.newVReg();
+    const v_zero = func.newVReg();
+    const v_list = func.newVReg();
+    const v_prev = func.newVReg();
+    const v_next = func.newVReg();
+
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 16 }, .dest = v_init, .type = .i32 });
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_zero, .type = .i32 });
+    try func.getBlock(b_entry).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_init } } });
+    try func.getBlock(b_entry).append(.{ .op = .{ .local_set = .{ .idx = 1, .val = v_zero } } });
+    try func.getBlock(b_entry).append(.{ .op = .{ .br = b_loop } });
+
+    try func.getBlock(b_loop).append(.{ .op = .{ .local_get = 0 }, .dest = v_list, .type = .i32 });
+    try func.getBlock(b_loop).append(.{ .op = .{ .local_get = 1 }, .dest = v_prev, .type = .i32 });
+    try func.getBlock(b_loop).append(.{ .op = .{ .load = .{ .base = v_list, .offset = 0, .size = 4 } }, .dest = v_next, .type = .i32 });
+    try func.getBlock(b_loop).append(.{ .op = .{ .store = .{ .base = v_list, .val = v_prev, .offset = 0, .size = 4 } } });
+    try func.getBlock(b_loop).append(.{ .op = .{ .local_set = .{ .idx = 1, .val = v_list } } });
+    try func.getBlock(b_loop).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_next } } });
+    try func.getBlock(b_loop).append(.{ .op = .{ .br_if = .{ .cond = v_next, .then_block = b_loop, .else_block = b_exit } } });
+
+    try func.getBlock(b_exit).append(.{ .op = .{ .ret = v_list } });
+
+    try std.testing.expect(try coalescePhiLocalsToParallelCopy(&func, allocator));
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_prev }, func.getBlock(b_exit).instructions.items[0].op);
+
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            try std.testing.expect(inst.op != .local_get);
+            try std.testing.expect(inst.op != .local_set);
+        }
+    }
+}
+
+test "coalescePhiLocalsToParallelCopy: splits loop-exit critical edge for exit parallel_copy" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 2);
+    defer func.deinit();
+    func.phi_synth_local_start = 0;
+    func.phi_synth_local_end = 2;
+
+    const b_entry = try func.newBlock();
+    const b_header = try func.newBlock();
+    const b_latch = try func.newBlock();
+    const b_exit = try func.newBlock();
+
+    const v_head = func.newVReg();
+    const v_target = func.newVReg();
+    const v_zero = func.newVReg();
+    const v_curr = func.newVReg();
+    const v_found = func.newVReg();
+    const v_next = func.newVReg();
+    const v_res = func.newVReg();
+
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 32 }, .dest = v_head, .type = .i32 });
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 64 }, .dest = v_target, .type = .i32 });
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_zero, .type = .i32 });
+    try func.getBlock(b_entry).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_head } } });
+    try func.getBlock(b_entry).append(.{ .op = .{ .br = b_header } });
+
+    try func.getBlock(b_header).append(.{ .op = .{ .local_get = 0 }, .dest = v_curr, .type = .i32 });
+    try func.getBlock(b_header).append(.{ .op = .{ .eq = .{ .lhs = v_curr, .rhs = v_target } }, .dest = v_found, .type = .i32 });
+    try func.getBlock(b_header).append(.{ .op = .{ .local_set = .{ .idx = 1, .val = v_curr } } });
+    try func.getBlock(b_header).append(.{ .op = .{ .br_if = .{ .cond = v_found, .then_block = b_exit, .else_block = b_latch } } });
+
+    try func.getBlock(b_latch).append(.{ .op = .{ .load = .{ .base = v_curr, .offset = 0, .size = 4 } }, .dest = v_next, .type = .i32 });
+    try func.getBlock(b_latch).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_next } } });
+    try func.getBlock(b_latch).append(.{ .op = .{ .local_set = .{ .idx = 1, .val = v_zero } } });
+    try func.getBlock(b_latch).append(.{ .op = .{ .br_if = .{ .cond = v_next, .then_block = b_header, .else_block = b_exit } } });
+
+    try func.getBlock(b_exit).append(.{ .op = .{ .local_get = 1 }, .dest = v_res, .type = .i32 });
+    try func.getBlock(b_exit).append(.{ .op = .{ .ret = v_res } });
+
+    try std.testing.expect(try coalescePhiLocalsToParallelCopy(&func, allocator));
+
+    for (func.getBlock(b_header).instructions.items) |inst| {
+        try std.testing.expect(inst.op != .parallel_copy);
+    }
+    const header_term = func.getBlock(b_header).instructions.items[func.getBlock(b_header).instructions.items.len - 1];
+    try std.testing.expect(header_term.op == .br_if);
+    const tramp_bid = header_term.op.br_if.then_block;
+    try std.testing.expect(tramp_bid != b_exit);
+    try std.testing.expectEqual(@as(usize, 2), func.getBlock(tramp_bid).instructions.items.len);
+    try std.testing.expect(func.getBlock(tramp_bid).instructions.items[0].op == .parallel_copy);
+    try std.testing.expectEqual(ir.Inst.Op{ .br = b_exit }, func.getBlock(tramp_bid).instructions.items[1].op);
 }
