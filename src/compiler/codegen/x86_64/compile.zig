@@ -10373,10 +10373,12 @@ test "#798 x86_64: integer comparison folds immediate rhs and fuses across paral
     defer allocator.free(result.code);
     defer allocator.free(result.call_patches);
 
-    // Must contain 32-bit CMP imm8 `83 FA 2A` (`cmp edx, 42`) or `83 FE 2A` (`cmp esi, 42`) and fused `JL` (`0F 8C`).
+    // Must contain 32-bit CMP imm8 `83 FA 2A` (`cmp edx, 42`), `83 FE 2A` (`cmp esi, 42` on SysV),
+    // or `41 83 F8 2A` (`cmp r8d, 42` on Win64) and fused `JL` (`0F 8C`).
     try std.testing.expect(
         containsBytes(result.code, &.{ 0x83, 0xFA, 0x2A }) or
-            containsBytes(result.code, &.{ 0x83, 0xFE, 0x2A }),
+            containsBytes(result.code, &.{ 0x83, 0xFE, 0x2A }) or
+            containsBytes(result.code, &.{ 0x41, 0x83, 0xF8, 0x2A }),
     );
     try std.testing.expect(containsBytes(result.code, &.{ 0x0F, 0x8C }));
     // Must NOT contain SETCC (`0F 9x`).
