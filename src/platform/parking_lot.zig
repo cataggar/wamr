@@ -312,6 +312,14 @@ pub const ParkingLot = struct {
             };
             const outcome: Outcome = @fromBackingInt(@intCast(waiter.outcome.load(.acquire)));
             if (outcome != .waiting) {
+                if (comptime builtin.cpu.arch == .aarch64) {
+                    if (outcome == .notified and next_park_slot.load(.monotonic) <= 2) {
+                        var pause: u32 = 0;
+                        while (pause < 24) : (pause += 1) {
+                            asm volatile ("isb" ::: .{ .memory = true });
+                        }
+                    }
+                }
                 return outcomeToResult(outcome);
             }
             switch (os_result) {
