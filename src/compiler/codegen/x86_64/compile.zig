@@ -2712,13 +2712,41 @@ fn coalesceX86Moves(
     }
 }
 
+fn instPreservesRflags(
+    inst: ir.Inst,
+    suppress_iconst: *const std.AutoHashMap(ir.VReg, void),
+) bool {
+    return switch (inst.op) {
+        .parallel_copy,
+        .local_get,
+        .local_set,
+        .global_get,
+        .global_set,
+        .reinterpret,
+        .wrap_i64,
+        .extend_i32_s,
+        .extend_i32_u,
+        .extend8_s,
+        .extend16_s,
+        .extend32_s,
+        .lea,
+        .fconst_32,
+        .fconst_64,
+        => true,
+        .iconst_32 => |v| v != 0 or (inst.dest != null and suppress_iconst.contains(inst.dest.?)),
+        .iconst_64 => |v| v != 0 or (inst.dest != null and suppress_iconst.contains(inst.dest.?)),
+        else => false,
+    };
+}
+
 /// Identify single-use integer comparisons (and `.eqz`) in a block that feed
-/// the block's `.br_if` terminator with only RFLAGS-preserving `.parallel_copy`
-/// instructions intervening. Fused condition VRegs emit only `cmp`/`test` at
-/// their definition, jump directly on `cc` at `.br_if`, and are excluded from
-/// register allocation.
+/// a `.br_if` terminator or `.select` with only RFLAGS-preserving instructions
+/// intervening. Fused condition VRegs emit only `cmp`/`test` at their
+/// definition, jump or conditionally move directly on `cc` at `.br_if`/`.select`,
+/// and are excluded from register allocation.
 fn buildFusedCmpBrIf(
     func: *const ir.IrFunction,
+    suppress_iconst: *const std.AutoHashMap(ir.VReg, void),
     allocator: std.mem.Allocator,
 ) !std.AutoHashMap(ir.VReg, u4) {
     var use_counts = std.AutoHashMap(ir.VReg, u32).init(allocator);
@@ -2761,29 +2789,31 @@ fn buildFusedCmpBrIf(
     for (func.blocks.items) |block| {
         const insts = block.instructions.items;
         if (insts.len < 2) continue;
-        const term = insts[insts.len - 1];
-        const bi = switch (term.op) {
-            .br_if => |b| b,
-            else => continue,
-        };
-        if ((use_counts.get(bi.cond) orelse 0) != 1) continue;
-        if ((def_counts.get(bi.cond) orelse 0) != 1) continue;
+        for (insts, 0..) |cons, cons_idx| {
+            const cond_vreg: ir.VReg = switch (cons.op) {
+                .br_if => |b| b.cond,
+                .select => |s| s.cond,
+                else => continue,
+            };
+            if ((use_counts.get(cond_vreg) orelse 0) != 1) continue;
+            if ((def_counts.get(cond_vreg) orelse 0) != 1) continue;
 
-        var i: usize = insts.len - 1;
-        while (i > 0) {
-            i -= 1;
-            const cand = insts[i];
-            if (cand.dest) |d| {
-                if (d == bi.cond) {
-                    if (cand.type == .i32 or cand.type == .i64) {
-                        if (intCmpCc(cand.op)) |cc| {
-                            try fused.put(bi.cond, cc);
+            var i: usize = cons_idx;
+            while (i > 0) {
+                i -= 1;
+                const cand = insts[i];
+                if (cand.dest) |d| {
+                    if (d == cond_vreg) {
+                        if (cand.type == .i32 or cand.type == .i64) {
+                            if (intCmpCc(cand.op)) |cc| {
+                                try fused.put(cond_vreg, cc);
+                            }
                         }
+                        break;
                     }
-                    break;
                 }
+                if (!instPreservesRflags(cand, suppress_iconst)) break;
             }
-            if (cand.op != .parallel_copy) break;
         }
     }
 
@@ -3711,7 +3741,7 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
     var suppress_iconst = try buildIconstSuppress(func, &const_vals, allocator);
     defer suppress_iconst.deinit();
 
-    var fused_cmp_br_if = try buildFusedCmpBrIf(func, allocator);
+    var fused_cmp_br_if = try buildFusedCmpBrIf(func, &suppress_iconst, allocator);
     defer fused_cmp_br_if.deinit();
 
     // Collect clobber points and ABI register hints in a single walk.
@@ -3868,6 +3898,12 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
                             }
                         }
                     },
+                    .select => |sel| {
+                        if (ci.dest) |d| {
+                            if (d != sel.if_false) try copy_hints.append(allocator, .{ .dest = d, .src = sel.if_false });
+                            if (d != sel.if_true and sel.if_true != sel.if_false) try copy_hints.append(allocator, .{ .dest = d, .src = sel.if_true });
+                        }
+                    },
                     .parallel_copy => {},
                     else => {},
                 }
@@ -3939,6 +3975,7 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
                                 true
                             else switch (def_inst.op) {
                                 .add, .sub, .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr => |b| b.lhs == p.dst and b.rhs != p.dst,
+                                .select => true,
                                 else => false,
                             };
                             if (def_2addr_safe and src_range.end <= dest_range.end) {
@@ -4437,6 +4474,28 @@ fn useVReg(
     // `useVReg` call after the clobber re-emits again — no reload.
     if (alloc_result.getRemat(vreg)) |rd| {
         try emitRematConst(code, scratch, rd);
+        return scratch;
+    }
+    const alloc = alloc_result.get(vreg) orelse return scratch;
+    switch (alloc) {
+        .reg => |preg| return @as(emit.Reg, @fromBackingInt(@intCast(preg))),
+        .stack => |offset| {
+            try code.movRegMem(scratch, .rbp, offset);
+            return scratch;
+        },
+    }
+}
+
+/// Same as `useVReg`, but rematerialises constants via `emitParallelCopyConst`
+/// (`MOV` only, never `xor r32, r32`) so `RFLAGS` is preserved.
+fn useVRegPreserveFlags(
+    code: *emit.CodeBuffer,
+    alloc_result: *const regalloc.AllocResult,
+    vreg: ir.VReg,
+    scratch: emit.Reg,
+) !emit.Reg {
+    if (alloc_result.getRemat(vreg)) |rd| {
+        try emitParallelCopyConst(code, scratch, rd);
         return scratch;
     }
     const alloc = alloc_result.get(vreg) orelse return scratch;
@@ -5188,8 +5247,8 @@ fn compileInstRA(
         .lea => |l| {
             const dest = inst.dest orelse return;
             const dr = destReg(alloc_result, dest);
-            const base_reg = try useVReg(code, alloc_result, l.base, .r11);
-            const index_reg = try useVReg(code, alloc_result, l.index, .r10);
+            const base_reg = try useVRegPreserveFlags(code, alloc_result, l.base, .r11);
+            const index_reg = try useVRegPreserveFlags(code, alloc_result, l.index, .r10);
             const scale_log2: u2 = switch (l.scale) {
                 1 => 0,
                 2 => 1,
@@ -5267,7 +5326,7 @@ fn compileInstRA(
             }
         },
         .local_set => |ls| {
-            const src_reg = try useVReg(code, alloc_result, ls.val, .rax);
+            const src_reg = try useVRegPreserveFlags(code, alloc_result, ls.val, .rax);
             try code.movMemReg(.rbp, -@as(i32, @intCast((ls.idx + 2) * 8)), src_reg);
         },
 
@@ -6523,33 +6582,26 @@ fn compileInstRA(
                     .{ dest, @tagName(inst.type), sel.if_true, sel.if_false, sel.cond },
                 );
             }
-            // Stage operands through non-allocatable scratch registers
-            // (.r10, .r11) so no allocated VReg can collide with our
-            // intermediate storage. The previous implementation loaded
-            // cond into .rax then operands into .rcx/.rdx, which
-            // clobbered the if_true/if_false values whenever the
-            // allocator had placed them in .rax/.rcx/.rdx (seen as
-            // the float-select LSB-ORed-with-cond pattern in
-            // float_exprs.wast).
-            const true_reg = try useVReg(code, alloc_result, sel.if_true, .r10);
-            if (true_reg != .r10) try code.movRegReg(.r10, true_reg);
-            const false_reg = try useVReg(code, alloc_result, sel.if_false, .r11);
-            if (false_reg != .r11) try code.movRegReg(.r11, false_reg);
-            const cond_reg = try useVReg(code, alloc_result, sel.cond, .rax);
-            // Condition is always i32 in wasm; use 32-bit test so
-            // upper-bit garbage doesn't affect the branch.
-            try code.testRegReg32(cond_reg, cond_reg);
-            try code.cmovnz(.r11, .r10); // if cond != 0, r11 = r10 (if_true)
-            // #754: `inst.type` here MUST be `.i64`/`.f64` when the
-            // selected values are 64-bit. The frontend sets it to
-            // `.i32` initially and a fix-up pass corrects it from
-            // the if_true producer's type — see frontend.zig's
-            // "Fix-up pass" near the end of `lowerFunction`. If you
-            // see a select returning the low 32 bits of an f64
-            // (e.g. zero for whole-number doubles), enable
-            // `trace_select` + `trace_write_def_typed` to confirm
-            // the type fix-up reached this instruction.
-            try writeDefTyped(code, alloc_result, dest, .r11, inst.type);
+            const cc: u4 = if (fused_cmp_br_if.get(sel.cond)) |fused_cc|
+                fused_cc
+            else blk: {
+                const cond_reg = try useVReg(code, alloc_result, sel.cond, .rax);
+                // Condition is always i32 in wasm; use 32-bit test so
+                // upper-bit garbage doesn't affect the branch.
+                try code.testRegReg32(cond_reg, cond_reg);
+                break :blk 0x5; // NZ / NE
+            };
+            const true_reg = try useVRegPreserveFlags(code, alloc_result, sel.if_true, .r10);
+            const false_reg = try useVRegPreserveFlags(code, alloc_result, sel.if_false, .r11);
+            const dr = destReg(alloc_result, dest);
+            if (dr != true_reg) {
+                if (false_reg != dr) try code.movRegReg(dr, false_reg);
+                try code.cmovcc(cc, dr, true_reg);
+                try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+            } else {
+                if (false_reg != dr) try code.cmovcc(cc ^ 1, dr, false_reg);
+                try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+            }
         },
 
         .global_get => |idx| {
@@ -6561,7 +6613,7 @@ fn compileInstRA(
             try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
         .global_set => |gs| {
-            const val_reg = try useVReg(code, alloc_result, gs.val, .rax);
+            const val_reg = try useVRegPreserveFlags(code, alloc_result, gs.val, .rax);
             try code.movRegMem(.r10, .rbx, vmctx_globals_field); // globals_base
             try code.movMemReg(.r10, try globalByteOffset(global_offsets, gs.idx), val_reg); // global[idx] = val
         },
@@ -6574,7 +6626,7 @@ fn compileInstRA(
         .wrap_i64 => |vreg| {
             const dest = inst.dest orelse return;
             const dr = destReg(alloc_result, dest);
-            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            const src_reg = try useVRegPreserveFlags(code, alloc_result, vreg, .rax);
             // 32-bit reg-reg move truncates to 32 bits and zero-extends.
             try code.movRegReg32(dr, src_reg);
             try writeDef(code, alloc_result, dest, dr);
@@ -6582,14 +6634,14 @@ fn compileInstRA(
         .extend_i32_s => |vreg| {
             const dest = inst.dest orelse return;
             const dr = destReg(alloc_result, dest);
-            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            const src_reg = try useVRegPreserveFlags(code, alloc_result, vreg, .rax);
             try code.movsxd(dr, src_reg);
             try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
         .extend_i32_u => |vreg| {
             const dest = inst.dest orelse return;
             const dr = destReg(alloc_result, dest);
-            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            const src_reg = try useVRegPreserveFlags(code, alloc_result, vreg, .rax);
             // 32-bit mov zero-extends to 64.
             try code.movRegReg32(dr, src_reg);
             try writeDefTyped(code, alloc_result, dest, dr, inst.type);
@@ -6597,27 +6649,27 @@ fn compileInstRA(
         .extend8_s => |vreg| {
             const dest = inst.dest orelse return;
             const dr = destReg(alloc_result, dest);
-            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            const src_reg = try useVRegPreserveFlags(code, alloc_result, vreg, .rax);
             try code.movsxByteToReg(dr, src_reg);
             try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
         .extend16_s => |vreg| {
             const dest = inst.dest orelse return;
             const dr = destReg(alloc_result, dest);
-            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            const src_reg = try useVRegPreserveFlags(code, alloc_result, vreg, .rax);
             try code.movsxWordToReg(dr, src_reg);
             try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
         .extend32_s => |vreg| {
             const dest = inst.dest orelse return;
             const dr = destReg(alloc_result, dest);
-            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            const src_reg = try useVRegPreserveFlags(code, alloc_result, vreg, .rax);
             try code.movsxd(dr, src_reg);
             try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
         .reinterpret => |vreg| {
             const dest = inst.dest orelse return;
-            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            const src_reg = try useVRegPreserveFlags(code, alloc_result, vreg, .rax);
             try writeDefTyped(code, alloc_result, dest, src_reg, inst.type);
         },
 
@@ -10427,7 +10479,7 @@ test "#798 x86_64: integer comparison folds immediate rhs and fuses across paral
     defer suppress.deinit();
     try std.testing.expect(suppress.contains(v_limit));
 
-    var fused = try buildFusedCmpBrIf(&func, allocator);
+    var fused = try buildFusedCmpBrIf(&func, &suppress, allocator);
     defer fused.deinit();
     try std.testing.expectEqual(@as(?u4, 0xC), fused.get(v_cond));
 
@@ -10491,5 +10543,57 @@ test "#798 x86_64: emitParallelCopyRA breaks 2-way and 3-way register cycles via
         0x4C, 0x89, 0xD2,
     }, code.bytes.items);
 }
+
+test "#798 x86_64: fuses single-use comparison into select via CMOVcc across RFLAGS-preserving ops" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 3, 1, 3);
+    defer func.deinit();
+    const lt = try allocator.alloc(ir.IrType, 3);
+    lt[0] = .i32;
+    lt[1] = .i32;
+    lt[2] = .i32;
+    func.local_types = lt;
+
+    const entry = try func.newBlock();
+    const b0 = func.getBlock(entry);
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    const v_c = func.newVReg();
+    const v_cond = func.newVReg();
+    const v_sel = func.newVReg();
+
+    try b0.append(.{ .op = .{ .local_get = 0 }, .dest = v_a, .type = .i32 });
+    try b0.append(.{ .op = .{ .local_get = 1 }, .dest = v_b, .type = .i32 });
+    try b0.append(.{ .op = .{ .local_get = 2 }, .dest = v_c, .type = .i32 });
+    try b0.append(.{ .op = .{ .lt_s = .{ .lhs = v_a, .rhs = v_b } }, .dest = v_cond, .type = .i32 });
+    // Intervening local_set preserves RFLAGS
+    try b0.append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_c } } });
+    try b0.append(.{ .op = .{ .select = .{ .cond = v_cond, .if_true = v_a, .if_false = v_b } }, .dest = v_sel, .type = .i32 });
+    try b0.append(.{ .op = .{ .ret = v_sel } });
+
+    var const_vals = try buildConstVals(&func, allocator);
+    defer const_vals.deinit();
+    var suppress = try buildIconstSuppress(&func, &const_vals, allocator);
+    defer suppress.deinit();
+    var fused = try buildFusedCmpBrIf(&func, &suppress, allocator);
+    defer fused.deinit();
+    try std.testing.expectEqual(@as(?u4, 0xC), fused.get(v_cond));
+
+    const result = try compileFunctionRA(&func, 0, allocator);
+    defer allocator.free(result.code);
+    defer allocator.free(result.call_patches);
+
+    // Must contain CMOVL (`0F 4C`) or CMOVGE (`0F 4D`) and NO SETCC (`0F 9x`).
+    var found_cmov = false;
+    for (result.code, 0..) |byte, idx| {
+        if (byte == 0x0F and idx + 1 < result.code.len) {
+            const next = result.code[idx + 1];
+            if (next == 0x4C or next == 0x4D) found_cmov = true;
+            try std.testing.expect((next & 0xF0) != 0x90);
+        }
+    }
+    try std.testing.expect(found_cmov);
+}
+
 
 

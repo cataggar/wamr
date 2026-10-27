@@ -124,6 +124,18 @@ fn tryFuseMemPair(a_word: u32, b_word: u32, options: Options) ?u32 {
     const a = decodeMemUnsigned(a_word) orelse return null;
     const b = decodeMemUnsigned(b_word) orelse return null;
     if (a.kind != b.kind or a.width != b.width or a.rn != b.rn) return null;
+
+    if (a.kind == .ldr and a.rn == 16 and @as(u32, b.offset) + 1 == a.offset and b.offset <= 63) {
+        if (!options.enable_load_pair) return null;
+        if (a.rt == b.rt) return null;
+        if (a.rt == a.rn or b.rt == a.rn) return null;
+        const imm7: u32 = b.offset;
+        return switch (a.width) {
+            .x64 => 0xA9400000 | (imm7 << 15) | (@as(u32, a.rt) << 10) | (@as(u32, a.rn) << 5) | b.rt,
+            .w32 => 0x29400000 | (imm7 << 15) | (@as(u32, a.rt) << 10) | (@as(u32, a.rn) << 5) | b.rt,
+        };
+    }
+
     if (@as(u32, a.offset) + 1 != b.offset) return null;
     if (a.offset > 63) return null;
 
@@ -485,4 +497,18 @@ test "peephole: leaves cmp+csel untouched without adjacent transform" {
         0x9A820041, // csel x1, x2, x2, eq
     };
     try expectOptimized(&input, &input);
+}
+
+test "peephole: fuses reverse-offset 32-bit and 64-bit loads on x16 into ldp" {
+    const input = [_]u32{
+        0xB9400601, // ldr w1, [x16, #4]
+        0xB9400202, // ldr w2, [x16, #0]
+        0xF9400603, // ldr x3, [x16, #8]
+        0xF9400204, // ldr x4, [x16, #0]
+    };
+    const expected = [_]u32{
+        0x29400602, // ldp w2, w1, [x16, #0]
+        0xA9400E04, // ldp x4, x3, [x16, #0]
+    };
+    try expectOptimized(&input, &expected);
 }
