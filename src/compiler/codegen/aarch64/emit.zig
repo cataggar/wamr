@@ -307,6 +307,118 @@ pub const CodeBuffer = struct {
         try self.emit32(0x52000000 | imm.bits() | (@as(u32, rn.encoding()) << 5) | rd.encoding());
     }
 
+    /// ANDS Xd, Xn, #imm (64-bit logical immediate; rd == .xzr encodes TST Xn, #imm)
+    pub fn andsImm64(self: *CodeBuffer, rd: Reg, rn: Reg, imm: LogicalImm) !void {
+        std.debug.assert(rn != .sp);
+        try self.emit32(0xF2000000 | imm.bits() | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// ANDS Wd, Wn, #imm (32-bit logical immediate; rd == .xzr encodes TST Wn, #imm)
+    pub fn andsImm32(self: *CodeBuffer, rd: Reg, rn: Reg, imm: LogicalImm) !void {
+        std.debug.assert(rn != .sp and imm.n == 0);
+        try self.emit32(0x72000000 | imm.bits() | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// ANDS Xd, Xn, Xm (64-bit; rd == .xzr encodes TST Xn, Xm)
+    pub fn andsRegReg(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg) !void {
+        try self.emit32(0xEA000000 | (@as(u32, rm.encoding()) << 16) |
+            (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// ANDS Wd, Wn, Wm (32-bit; rd == .xzr encodes TST Wn, Wm)
+    pub fn andsRegReg32(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg) !void {
+        try self.emit32(0x6A000000 | (@as(u32, rm.encoding()) << 16) |
+            (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// UBFM Xd, Xn, #immr, #imms (64-bit unsigned bitfield move / UBFX)
+    pub fn ubfm64(self: *CodeBuffer, rd: Reg, rn: Reg, immr: u6, imms: u6) !void {
+        try self.emit32(0xD3400000 | (@as(u32, immr) << 16) |
+            (@as(u32, imms) << 10) | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// UBFM Wd, Wn, #immr, #imms (32-bit unsigned bitfield move / UBFX)
+    pub fn ubfm32(self: *CodeBuffer, rd: Reg, rn: Reg, immr: u5, imms: u5) !void {
+        try self.emit32(0x53000000 | (@as(u32, immr) << 16) |
+            (@as(u32, imms) << 10) | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    fn shiftOpBits(shift: ShiftOp) u32 {
+        return switch (shift) {
+            .lsl => 0,
+            .lsr => 1,
+            .asr => 2,
+            .ror => 3,
+        };
+    }
+
+    /// ADD Xd, Xn, Xm, <shift> #amount
+    pub fn addRegShifted64(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg, shift: ShiftOp, amount: u6) !void {
+        std.debug.assert(shift != .ror);
+        try self.emit32(0x8B000000 | (shiftOpBits(shift) << 22) | (@as(u32, rm.encoding()) << 16) |
+            (@as(u32, amount) << 10) | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// ADD Wd, Wn, Wm, <shift> #amount
+    pub fn addRegShifted32(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg, shift: ShiftOp, amount: u6) !void {
+        std.debug.assert(shift != .ror and amount < 32);
+        try self.emit32(0x0B000000 | (shiftOpBits(shift) << 22) | (@as(u32, rm.encoding()) << 16) |
+            (@as(u32, amount) << 10) | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// SUB Xd, Xn, Xm, <shift> #amount
+    pub fn subRegShifted64(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg, shift: ShiftOp, amount: u6) !void {
+        std.debug.assert(shift != .ror);
+        try self.emit32(0xCB000000 | (shiftOpBits(shift) << 22) | (@as(u32, rm.encoding()) << 16) |
+            (@as(u32, amount) << 10) | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// SUB Wd, Wn, Wm, <shift> #amount
+    pub fn subRegShifted32(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg, shift: ShiftOp, amount: u6) !void {
+        std.debug.assert(shift != .ror and amount < 32);
+        try self.emit32(0x4B000000 | (shiftOpBits(shift) << 22) | (@as(u32, rm.encoding()) << 16) |
+            (@as(u32, amount) << 10) | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// AND Xd, Xn, Xm, <shift> #amount
+    pub fn andRegShifted64(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg, shift: ShiftOp, amount: u6) !void {
+        try self.emit32(0x8A000000 | (shiftOpBits(shift) << 22) | (@as(u32, rm.encoding()) << 16) |
+            (@as(u32, amount) << 10) | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// AND Wd, Wn, Wm, <shift> #amount
+    pub fn andRegShifted32(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg, shift: ShiftOp, amount: u6) !void {
+        std.debug.assert(amount < 32);
+        try self.emit32(0x0A000000 | (shiftOpBits(shift) << 22) | (@as(u32, rm.encoding()) << 16) |
+            (@as(u32, amount) << 10) | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// ORR Xd, Xn, Xm, <shift> #amount
+    pub fn orrRegShifted64(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg, shift: ShiftOp, amount: u6) !void {
+        try self.emit32(0xAA000000 | (shiftOpBits(shift) << 22) | (@as(u32, rm.encoding()) << 16) |
+            (@as(u32, amount) << 10) | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// ORR Wd, Wn, Wm, <shift> #amount
+    pub fn orrRegShifted32(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg, shift: ShiftOp, amount: u6) !void {
+        std.debug.assert(amount < 32);
+        try self.emit32(0x2A000000 | (shiftOpBits(shift) << 22) | (@as(u32, rm.encoding()) << 16) |
+            (@as(u32, amount) << 10) | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// EOR Xd, Xn, Xm, <shift> #amount
+    pub fn eorRegShifted64(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg, shift: ShiftOp, amount: u6) !void {
+        try self.emit32(0xCA000000 | (shiftOpBits(shift) << 22) | (@as(u32, rm.encoding()) << 16) |
+            (@as(u32, amount) << 10) | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// EOR Wd, Wn, Wm, <shift> #amount
+    pub fn eorRegShifted32(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg, shift: ShiftOp, amount: u6) !void {
+        std.debug.assert(amount < 32);
+        try self.emit32(0x4A000000 | (shiftOpBits(shift) << 22) | (@as(u32, rm.encoding()) << 16) |
+            (@as(u32, amount) << 10) | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
     /// AND Xd, Xn, Xm
     pub fn andRegReg(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg) !void {
         // 1|00|01010|00|0|Rm|000000|Rn|Rd

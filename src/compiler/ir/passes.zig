@@ -8696,7 +8696,7 @@ pub fn coalescePhiLocalsToParallelCopy(func: *ir.IrFunction, allocator: std.mem.
 
         if (pair_buf.items.len > 0) {
             const term_idx = findTerminatorIndex(block);
-            const owned = try allocator.dupe(ir.Inst.ParallelCopy, pair_buf.items);
+            const owned = try func.allocator.dupe(ir.Inst.ParallelCopy, pair_buf.items);
             try block.instructions.insert(func.allocator, term_idx, .{
                 .op = .{ .parallel_copy = owned },
             });
@@ -9033,6 +9033,7 @@ fn sinkSingleUseAluToParallelCopy(func: *ir.IrFunction, allocator: std.mem.Alloc
                 for (new_e_pc) |*ep| {
                     if (ep.src == u_dest) ep.src = p.dst;
                 }
+                func.allocator.free(old_e_pc);
                 func.blocks.items[e_bid].instructions.items[adj_e_copy_idx - 1].op = .{ .parallel_copy = new_e_pc };
                 try use_counts.put(p.src, 1);
                 p_src_uses = 1;

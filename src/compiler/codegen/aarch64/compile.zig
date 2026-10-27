@@ -687,6 +687,12 @@ const FuncCompileCtx = struct {
     simd_mul_fused: ?*const std.AutoHashMap(ir.VReg, void) = null,
     /// SIMD add/sub dest vreg → fused FMLA/FMLS source triple.
     simd_fma_info: ?*const std.AutoHashMap(ir.VReg, FmaInfo) = null,
+    /// Set of scalar shift dest vregs absorbed into a later UBFX or shifted-register ALU op.
+    shift_fused: ?*const std.AutoHashMap(ir.VReg, void) = null,
+    /// Map from `.@"and"` dest vreg → UBFX (shr_u + contiguous low mask) parameters.
+    ubfx_info: ?*const std.AutoHashMap(ir.VReg, UbfxInfo) = null,
+    /// Map from ALU dest vreg → shifted-register ALU parameters.
+    shift_alu_info: ?*const std.AutoHashMap(ir.VReg, ShiftAluInfo) = null,
     /// Single-use integer comparison dest vreg → condition code consumed
     /// directly by the same block's terminating `br_if` (skipping `cset`).
     fused_cmp_cond: ?*const std.AutoHashMap(ir.VReg, emit.Cond) = null,
@@ -746,6 +752,21 @@ const FmaInfo = struct {
     mul_rhs: ir.VReg,
     addend: ir.VReg,
     is_sub: bool,
+};
+
+/// Pre-computed info for a fused UBFX (`UBFM`): `dest = (src >> lsb) & ((1 << width) - 1)`.
+const UbfxInfo = struct {
+    src: ir.VReg,
+    lsb: u6,
+    width: u6,
+};
+
+/// Pre-computed info for a fused shifted-register ALU op: `dest = unshifted <op> (shifted_src <shift_op> shift_amt)`.
+const ShiftAluInfo = struct {
+    unshifted: ir.VReg,
+    shifted_src: ir.VReg,
+    shift_op: emit.CodeBuffer.ShiftOp,
+    shift_amt: u6,
 };
 
 const SimdFmaBin = union(enum) {
@@ -2361,6 +2382,184 @@ pub fn compileFunctionImpl(
     fctx.simd_mul_fused = &simd_mul_fused;
     fctx.simd_fma_info = &simd_fma_info;
 
+    var shift_fused = std.AutoHashMap(ir.VReg, void).init(allocator);
+    defer shift_fused.deinit();
+    var ubfx_info = std.AutoHashMap(ir.VReg, UbfxInfo).init(allocator);
+    defer ubfx_info.deinit();
+    var ubfx_pos = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer ubfx_pos.deinit();
+    var shift_alu_info = std.AutoHashMap(ir.VReg, ShiftAluInfo).init(allocator);
+    defer shift_alu_info.deinit();
+    var shift_alu_pos = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer shift_alu_pos.deinit();
+    {
+        var global_idx: u32 = 0;
+        for (block_order) |bo_bid| {
+            const insts = scheduled.instructions(bo_bid);
+            var i: usize = 0;
+            while (i < insts.len) : (i += 1) {
+                defer global_idx += 1;
+                const inst = insts[i];
+                if (inst.type != .i32 and inst.type != .i64) continue;
+                const dest = inst.dest orelse continue;
+                if (fma_info.contains(dest)) continue;
+
+                // 1. Check UBFX: `and(shr_u(src, s), (1 << width) - 1)` with `s >= 1`.
+                if (inst.op == .@"and") {
+                    const bin = inst.op.@"and";
+                    const bit_w: u7 = if (inst.type == .i32) 32 else 64;
+                    const mask_pick: ?struct { width: u6, shr_vreg: ir.VReg } = blk: {
+                        if (const_vals.get(bin.rhs)) |v| {
+                            if (!const_vals.contains(bin.lhs) and encodeLogicalImmForType(v, inst.type) != null) {
+                                const uval: u64 = if (inst.type == .i32)
+                                    @as(u32, @truncate(@as(u64, @bitCast(v))))
+                                else
+                                    @as(u64, @bitCast(v));
+                                if (uval != 0 and (uval & (uval +% 1)) == 0) {
+                                    const w: u6 = @intCast(@popCount(uval));
+                                    if (w >= 1 and @as(u7, w) < bit_w) {
+                                        break :blk .{ .width = w, .shr_vreg = bin.lhs };
+                                    }
+                                }
+                            }
+                        }
+                        if (const_vals.get(bin.lhs)) |v| {
+                            if (!const_vals.contains(bin.rhs) and encodeLogicalImmForType(v, inst.type) != null) {
+                                const uval: u64 = if (inst.type == .i32)
+                                    @as(u32, @truncate(@as(u64, @bitCast(v))))
+                                else
+                                    @as(u64, @bitCast(v));
+                                if (uval != 0 and (uval & (uval +% 1)) == 0) {
+                                    const w: u6 = @intCast(@popCount(uval));
+                                    if (w >= 1 and @as(u7, w) < bit_w) {
+                                        break :blk .{ .width = w, .shr_vreg = bin.rhs };
+                                    }
+                                }
+                            }
+                        }
+                        break :blk null;
+                    };
+                    if (mask_pick) |mp| {
+                        if ((use_counts.get(mp.shr_vreg) orelse 0) == 1 and !shift_fused.contains(mp.shr_vreg)) {
+                            var j: usize = i;
+                            while (j > 0) : (j -= 1) {
+                                const prev = insts[j - 1];
+                                if (prev.op == .parallel_copy) break;
+                                if (prev.dest) |d| {
+                                    if (d != mp.shr_vreg) continue;
+                                    if (prev.op == .shr_u and prev.type == inst.type) {
+                                        const shr_bin = prev.op.shr_u;
+                                        if (!const_vals.contains(shr_bin.lhs)) {
+                                            if (const_vals.get(shr_bin.rhs)) |shr_c| {
+                                                const s: u6 = if (inst.type == .i32)
+                                                    @as(u5, @truncate(@as(u64, @bitCast(shr_c))))
+                                                else
+                                                    @as(u6, @truncate(@as(u64, @bitCast(shr_c))));
+                                                if (s >= 1) {
+                                                    var clobbered = false;
+                                                    for (insts[j..i]) |mid| {
+                                                        if (mid.dest == shr_bin.lhs) {
+                                                            clobbered = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                    if (!clobbered) {
+                                                        const eff_width: u6 = @intCast(@min(@as(u7, mp.width), bit_w - @as(u7, s)));
+                                                        try shift_fused.put(mp.shr_vreg, {});
+                                                        try ubfx_info.put(dest, .{
+                                                            .src = shr_bin.lhs,
+                                                            .lsb = s,
+                                                            .width = eff_width,
+                                                        });
+                                                        try ubfx_pos.put(dest, global_idx);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (ubfx_info.contains(dest)) continue;
+                }
+
+                // 2. Check shifted-register ALU: `add/sub/and/or/xor` with a single-use constant shift.
+                const bin: ir.Inst.BinOp = switch (inst.op) {
+                    .add => |b| b,
+                    .sub => |b| b,
+                    .@"and" => |b| b,
+                    .@"or" => |b| b,
+                    .xor => |b| b,
+                    else => continue,
+                };
+                if (const_vals.contains(bin.lhs) or const_vals.contains(bin.rhs)) continue;
+                const candidates: [2]?ir.VReg = if (inst.op == .sub)
+                    .{ bin.rhs, null }
+                else
+                    .{ bin.rhs, bin.lhs };
+                for (candidates) |maybe_shift_dest| {
+                    const shift_dest = maybe_shift_dest orelse continue;
+                    if ((use_counts.get(shift_dest) orelse 0) != 1 or shift_fused.contains(shift_dest)) continue;
+                    var j: usize = i;
+                    var fused_this = false;
+                    while (j > 0) : (j -= 1) {
+                        const prev = insts[j - 1];
+                        if (prev.op == .parallel_copy) break;
+                        if (prev.dest) |d| {
+                            if (d != shift_dest) continue;
+                            if (prev.type == inst.type) {
+                                const maybe_shift: ?struct { b: ir.Inst.BinOp, op: emit.CodeBuffer.ShiftOp } = switch (prev.op) {
+                                    .shl => |sb| .{ .b = sb, .op = .lsl },
+                                    .shr_u => |sb| .{ .b = sb, .op = .lsr },
+                                    .shr_s => |sb| .{ .b = sb, .op = .asr },
+                                    else => null,
+                                };
+                                if (maybe_shift) |ms| {
+                                    if (!const_vals.contains(ms.b.lhs)) {
+                                        if (const_vals.get(ms.b.rhs)) |sc| {
+                                            const s: u6 = if (inst.type == .i32)
+                                                @as(u5, @truncate(@as(u64, @bitCast(sc))))
+                                            else
+                                                @as(u6, @truncate(@as(u64, @bitCast(sc))));
+                                            if (s >= 1) {
+                                                var clobbered = false;
+                                                for (insts[j..i]) |mid| {
+                                                    if (mid.dest == ms.b.lhs) {
+                                                        clobbered = true;
+                                                        break;
+                                                    }
+                                                }
+                                                if (!clobbered) {
+                                                    const unshifted = if (shift_dest == bin.lhs) bin.rhs else bin.lhs;
+                                                    try shift_fused.put(shift_dest, {});
+                                                    try shift_alu_info.put(dest, .{
+                                                        .unshifted = unshifted,
+                                                        .shifted_src = ms.b.lhs,
+                                                        .shift_op = ms.op,
+                                                        .shift_amt = s,
+                                                    });
+                                                    try shift_alu_pos.put(dest, global_idx);
+                                                    fused_this = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    if (fused_this) break;
+                }
+            }
+        }
+    }
+    fctx.shift_fused = &shift_fused;
+    fctx.ubfx_info = &ubfx_info;
+    fctx.shift_alu_info = &shift_alu_info;
+
     // Build iconst-mov suppression set. An `iconst_*` def whose every use
     // folds as an immediate operand (currently: the imm12 path of ADD/SUB
     // in `emitBinOp`) doesn't need its `mov xN, #K` materialization at
@@ -2572,6 +2771,8 @@ pub fn compileFunctionImpl(
                                 if (prev.type == .i32 or prev.type == .i64) {
                                     if (cmpOpToCond(prev.op)) |cc| {
                                         try fused_cmp_cond.put(sel.cond, cc);
+                                    } else if (prev.op == .@"and" and !ubfx_info.contains(d) and !shift_alu_info.contains(d)) {
+                                        try fused_cmp_cond.put(sel.cond, .ne);
                                     }
                                 }
                                 break;
@@ -2600,6 +2801,8 @@ pub fn compileFunctionImpl(
                                 if (prev.type == .i32 or prev.type == .i64) {
                                     if (cmpOpToCond(prev.op)) |cc| {
                                         try fused_cmp_cond.put(br_op.cond, cc);
+                                    } else if (prev.op == .@"and" and !ubfx_info.contains(d) and !shift_alu_info.contains(d)) {
+                                        try fused_cmp_cond.put(br_op.cond, .ne);
                                     }
                                 }
                                 break;
@@ -2633,10 +2836,12 @@ pub fn compileFunctionImpl(
         clobbers.items,
         &fma_info,
         &simd_fma_info,
+        &ubfx_info,
+        &shift_alu_info,
         allocator,
     );
     defer allocator.free(live_ranges);
-    if (fma_info.count() > 0) {
+    if (fma_info.count() > 0 or simd_fma_info.count() > 0 or ubfx_info.count() > 0 or shift_alu_info.count() > 0) {
         // Build a vreg→range-index lookup for the patch loop.
         var range_idx = std.AutoHashMap(ir.VReg, usize).init(allocator);
         defer range_idx.deinit();
@@ -2657,16 +2862,8 @@ pub fn compileFunctionImpl(
                 }
             }
         }
-    }
-    if (simd_fma_info.count() > 0) {
-        var range_idx = std.AutoHashMap(ir.VReg, usize).init(allocator);
-        defer range_idx.deinit();
-        try range_idx.ensureTotalCapacity(@intCast(live_ranges.len));
-        for (live_ranges, 0..) |r, idx| {
-            range_idx.putAssumeCapacity(r.vreg, idx);
-        }
-        var it = simd_fma_info.iterator();
-        while (it.next()) |entry| {
+        var sit = simd_fma_info.iterator();
+        while (sit.next()) |entry| {
             const add_dest = entry.key_ptr.*;
             const fi = entry.value_ptr.*;
             const add_pos = simd_fma_add_pos.get(add_dest) orelse continue;
@@ -2674,6 +2871,30 @@ pub fn compileFunctionImpl(
                 if (range_idx.get(src)) |idx| {
                     if (live_ranges[idx].end < add_pos) {
                         live_ranges[idx].end = add_pos;
+                    }
+                }
+            }
+        }
+        var uit = ubfx_info.iterator();
+        while (uit.next()) |entry| {
+            const ubfx_dest = entry.key_ptr.*;
+            const ui = entry.value_ptr.*;
+            const upos = ubfx_pos.get(ubfx_dest) orelse continue;
+            if (range_idx.get(ui.src)) |idx| {
+                if (live_ranges[idx].end < upos) {
+                    live_ranges[idx].end = upos;
+                }
+            }
+        }
+        var sait = shift_alu_info.iterator();
+        while (sait.next()) |entry| {
+            const sai_dest = entry.key_ptr.*;
+            const sai = entry.value_ptr.*;
+            const spos = shift_alu_pos.get(sai_dest) orelse continue;
+            inline for (.{ sai.unshifted, sai.shifted_src }) |src| {
+                if (range_idx.get(src)) |idx| {
+                    if (live_ranges[idx].end < spos) {
+                        live_ranges[idx].end = spos;
                     }
                 }
             }
@@ -2689,7 +2910,7 @@ pub fn compileFunctionImpl(
         if (range.type == .v128) {
             legacy_v128_spill_slots += 1;
             try v128_live_ranges.append(allocator, range);
-        } else if (!fused_cmp_cond.contains(range.vreg) and (!ctx.options.enable_xreg_alloc or !suppress_iconst.contains(range.vreg))) {
+        } else if (!fused_cmp_cond.contains(range.vreg) and !mul_fused.contains(range.vreg) and !shift_fused.contains(range.vreg) and (!ctx.options.enable_xreg_alloc or !suppress_iconst.contains(range.vreg))) {
             try scalar_live_ranges.append(allocator, range);
         }
     }
@@ -2775,6 +2996,9 @@ pub fn compileFunctionImpl(
                 &simd_fma_info,
                 fctx.mul_fused,
                 fctx.simd_mul_fused,
+                fctx.shift_fused,
+                &ubfx_info,
+                &shift_alu_info,
                 &suppress_iconst,
                 &liveness_opt,
                 allocator,
@@ -2786,8 +3010,11 @@ pub fn compileFunctionImpl(
                 liveness_opt: *?std.AutoHashMap(ir.BlockId, analysis.BlockLiveness),
                 mul_fused_opt: ?*const std.AutoHashMap(ir.VReg, void),
                 simd_mul_fused_opt: ?*const std.AutoHashMap(ir.VReg, void),
+                shift_fused_opt: ?*const std.AutoHashMap(ir.VReg, void),
                 fma_info_opt: ?*const std.AutoHashMap(ir.VReg, FmaInfo),
                 simd_fma_info_opt: ?*const std.AutoHashMap(ir.VReg, FmaInfo),
+                ubfx_info_opt: ?*const std.AutoHashMap(ir.VReg, UbfxInfo),
+                shift_alu_info_opt: ?*const std.AutoHashMap(ir.VReg, ShiftAluInfo),
                 allocator: std.mem.Allocator,
 
                 fn check(raw_ctx: *const anyopaque, u: ir.VReg, v: ir.VReg) anyerror!bool {
@@ -2803,8 +3030,11 @@ pub fn compileFunctionImpl(
                         &self.liveness_opt.*.?,
                         self.mul_fused_opt,
                         self.simd_mul_fused_opt,
+                        self.shift_fused_opt,
                         self.fma_info_opt,
                         self.simd_fma_info_opt,
+                        self.ubfx_info_opt,
+                        self.shift_alu_info_opt,
                     );
                 }
             };
@@ -2814,8 +3044,11 @@ pub fn compileFunctionImpl(
                 .liveness_opt = &liveness_opt,
                 .mul_fused_opt = fctx.mul_fused,
                 .simd_mul_fused_opt = fctx.simd_mul_fused,
+                .shift_fused_opt = fctx.shift_fused,
                 .fma_info_opt = &fma_info,
                 .simd_fma_info_opt = &simd_fma_info,
+                .ubfx_info_opt = &ubfx_info,
+                .shift_alu_info_opt = &shift_alu_info,
                 .allocator = allocator,
             };
             _ = try regalloc.coalesceMovesWithInterfere(
@@ -3022,16 +3255,17 @@ pub fn compileFunctionImpl(
                 const inst = insts[ii_rev];
                 const flat_idx = block_flat_base[bi_rev] + ii_rev;
 
-                // FMA fusion awareness: a fused mul has no effective reads
-                // (it doesn't emit); a fused add reads mul's sources + addend.
-                const is_fused_mul = if (inst.dest) |d|
+                // FMA / shift fusion awareness: a fused mul/shift has no effective reads
+                // (it doesn't emit); a fused consumer reads the underlying sources.
+                const is_fused_producer = if (inst.dest) |d|
                     (inst.op == .mul and mul_fused.contains(d)) or
+                        ((inst.op == .shl or inst.op == .shr_u or inst.op == .shr_s) and shift_fused.contains(d)) or
                         ((inst.op == .f32x4_binop and inst.op.f32x4_binop.op == .mul) or
                             (inst.op == .f64x2_binop and inst.op.f64x2_binop.op == .mul)) and
                             simd_mul_fused.contains(d)
                 else
                     false;
-                if (is_fused_mul) continue;
+                if (is_fused_producer) continue;
 
                 if (inst.dest) |d| {
                     if (fma_info.get(d)) |fi| {
@@ -3044,6 +3278,15 @@ pub fn compileFunctionImpl(
                         try recordKill(&seen, kill_lists, allocator, fi.mul_lhs, flat_idx);
                         try recordKill(&seen, kill_lists, allocator, fi.mul_rhs, flat_idx);
                         try recordKill(&seen, kill_lists, allocator, fi.addend, flat_idx);
+                        continue;
+                    }
+                    if (ubfx_info.get(d)) |ui| {
+                        try recordKill(&seen, kill_lists, allocator, ui.src, flat_idx);
+                        continue;
+                    }
+                    if (shift_alu_info.get(d)) |sai| {
+                        try recordKill(&seen, kill_lists, allocator, sai.unshifted, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, sai.shifted_src, flat_idx);
                         continue;
                     }
                 }
@@ -3715,6 +3958,8 @@ fn computeLiveRangesScheduled(
     clobbers: []regalloc.ClobberPoint,
     fma_info: *const std.AutoHashMap(ir.VReg, FmaInfo),
     simd_fma_info: *const std.AutoHashMap(ir.VReg, FmaInfo),
+    ubfx_info: *const std.AutoHashMap(ir.VReg, UbfxInfo),
+    shift_alu_info: *const std.AutoHashMap(ir.VReg, ShiftAluInfo),
     allocator: std.mem.Allocator,
 ) ![]analysis.LiveRange {
     const liveness = try analysis.computeLiveness(func, allocator);
@@ -3873,6 +4118,13 @@ fn computeLiveRangesScheduled(
                         try setBitUse(&live_bs, fi.mul_lhs);
                         try setBitUse(&live_bs, fi.mul_rhs);
                         try setBitUse(&live_bs, fi.addend);
+                    }
+                    if (ubfx_info.get(d)) |ui| {
+                        try setBitUse(&live_bs, ui.src);
+                    }
+                    if (shift_alu_info.get(d)) |sai| {
+                        try setBitUse(&live_bs, sai.unshifted);
+                        try setBitUse(&live_bs, sai.shifted_src);
                     }
                 }
             }
@@ -8569,6 +8821,7 @@ fn emitShift(
     op: emit.CodeBuffer.ShiftOp,
 ) !void {
     const dest = inst.dest orelse return;
+    if (fctx.shift_fused != null and fctx.shift_fused.?.contains(dest)) return;
     if ((inst.type == .i32 or inst.type == .i64) and fctx.const_vals != null) {
         if (fctx.const_vals.?.get(bin.rhs)) |v| {
             const lhs = try useInto(code, reg_map, bin.lhs, RegMap.tmp0);
@@ -11126,6 +11379,95 @@ fn emitBinOp(
         return;
     }
 
+    // UBFX fusion: shr_u + contiguous low-bit mask -> UBFM.
+    if (kind == .@"and" and fctx.ubfx_info != null) {
+        if (fctx.ubfx_info.?.get(dest)) |ui| {
+            const dst_info = try destBegin(reg_map, dest, RegMap.tmp0);
+            const src_scratch: emit.Reg = if (dst_info.spill_slot == null) RegMap.tmp0 else dst_info.reg;
+            const src_reg = try useInto(code, reg_map, ui.src, src_scratch);
+            if (inst.type == .i32) {
+                try code.ubfm32(dst_info.reg, src_reg, @intCast(ui.lsb), @intCast(ui.lsb + ui.width - 1));
+            } else {
+                try code.ubfm64(dst_info.reg, src_reg, ui.lsb, ui.lsb + ui.width - 1);
+            }
+            try destCommit(code, reg_map, dst_info);
+            return;
+        }
+    }
+
+    // Shifted-register ALU fusion: constant shift + add/sub/and/or/xor.
+    if (fctx.shift_alu_info != null) {
+        if (fctx.shift_alu_info.?.get(dest)) |sai| {
+            const dst_info = try destBegin(reg_map, dest, RegMap.tmp0);
+            const lhs_scratch: emit.Reg = if (dst_info.spill_slot == null) RegMap.tmp0 else dst_info.reg;
+            const unshifted_reg = try useInto(code, reg_map, sai.unshifted, lhs_scratch);
+            const shifted_reg = try useInto(code, reg_map, sai.shifted_src, RegMap.tmp1);
+            if (inst.type == .i32) {
+                switch (kind) {
+                    .add => try code.addRegShifted32(dst_info.reg, unshifted_reg, shifted_reg, sai.shift_op, sai.shift_amt),
+                    .sub => try code.subRegShifted32(dst_info.reg, unshifted_reg, shifted_reg, sai.shift_op, sai.shift_amt),
+                    .@"and" => try code.andRegShifted32(dst_info.reg, unshifted_reg, shifted_reg, sai.shift_op, sai.shift_amt),
+                    .@"or" => try code.orrRegShifted32(dst_info.reg, unshifted_reg, shifted_reg, sai.shift_op, sai.shift_amt),
+                    .xor => try code.eorRegShifted32(dst_info.reg, unshifted_reg, shifted_reg, sai.shift_op, sai.shift_amt),
+                    else => unreachable,
+                }
+            } else {
+                switch (kind) {
+                    .add => try code.addRegShifted64(dst_info.reg, unshifted_reg, shifted_reg, sai.shift_op, sai.shift_amt),
+                    .sub => try code.subRegShifted64(dst_info.reg, unshifted_reg, shifted_reg, sai.shift_op, sai.shift_amt),
+                    .@"and" => try code.andRegShifted64(dst_info.reg, unshifted_reg, shifted_reg, sai.shift_op, sai.shift_amt),
+                    .@"or" => try code.orrRegShifted64(dst_info.reg, unshifted_reg, shifted_reg, sai.shift_op, sai.shift_amt),
+                    .xor => try code.eorRegShifted64(dst_info.reg, unshifted_reg, shifted_reg, sai.shift_op, sai.shift_amt),
+                    else => unreachable,
+                }
+            }
+            try destCommit(code, reg_map, dst_info);
+            return;
+        }
+    }
+
+    // TST fusion: single-use `.@"and"` feeding `.select` or `.br_if` sets NZCV
+    // via `ANDS WZR/XZR, ...` without allocating a destination register.
+    if (kind == .@"and" and fctx.fused_cmp_cond != null and fctx.fused_cmp_cond.?.contains(dest)) {
+        if ((inst.type == .i32 or inst.type == .i64) and fctx.const_vals != null) {
+            const cmap = fctx.const_vals.?;
+            const rhs_const = cmap.get(bin.rhs);
+            const lhs_const = cmap.get(bin.lhs);
+            const pick: ?struct { enc: emit.CodeBuffer.LogicalImm, other: ir.VReg } = blk: {
+                if (rhs_const) |v| {
+                    if (encodeLogicalImmForType(v, inst.type)) |enc| {
+                        break :blk .{ .enc = enc, .other = bin.lhs };
+                    }
+                }
+                if (lhs_const) |v| {
+                    if (encodeLogicalImmForType(v, inst.type)) |enc| {
+                        break :blk .{ .enc = enc, .other = bin.rhs };
+                    }
+                }
+                break :blk null;
+            };
+            if (pick) |p| {
+                const other_reg = try useInto(code, reg_map, p.other, RegMap.tmp0);
+                if (inst.type == .i32) {
+                    try code.andsImm32(.xzr, other_reg, p.enc);
+                } else {
+                    try code.andsImm64(.xzr, other_reg, p.enc);
+                }
+                code.peepholeBarrier();
+                return;
+            }
+        }
+        const lhs_reg = try useInto(code, reg_map, bin.lhs, RegMap.tmp0);
+        const rhs_reg = try useInto(code, reg_map, bin.rhs, RegMap.tmp1);
+        if (inst.type == .i32) {
+            try code.andsRegReg32(.xzr, lhs_reg, rhs_reg);
+        } else {
+            try code.andsRegReg(.xzr, lhs_reg, rhs_reg);
+        }
+        code.peepholeBarrier();
+        return;
+    }
+
     // Allocate dest first; if spilled, dst_info.reg is tmp0 and we STR on commit.
     const dst_info = try destBegin(reg_map, dest, RegMap.tmp0);
 
@@ -12073,8 +12415,11 @@ fn vregsInterfere(
     liveness: *const std.AutoHashMap(ir.BlockId, analysis.BlockLiveness),
     mul_fused_opt: ?*const std.AutoHashMap(ir.VReg, void),
     simd_mul_fused_opt: ?*const std.AutoHashMap(ir.VReg, void),
+    shift_fused_opt: ?*const std.AutoHashMap(ir.VReg, void),
     fma_info_opt: ?*const std.AutoHashMap(ir.VReg, FmaInfo),
     simd_fma_info_opt: ?*const std.AutoHashMap(ir.VReg, FmaInfo),
+    ubfx_info_opt: ?*const std.AutoHashMap(ir.VReg, UbfxInfo),
+    shift_alu_info_opt: ?*const std.AutoHashMap(ir.VReg, ShiftAluInfo),
 ) bool {
     if (u == v) return false;
     const ReadCheck = struct {
@@ -12152,6 +12497,7 @@ fn vregsInterfere(
             if (inst.dest) |d| {
                 if (mul_fused_opt) |mf| if (mf.contains(d)) continue;
                 if (simd_mul_fused_opt) |smf| if (smf.contains(d)) continue;
+                if (shift_fused_opt) |sf| if (sf.contains(d)) continue;
             }
 
             var rc = ReadCheck{ .target_u = u, .target_v = v };
@@ -12171,6 +12517,23 @@ fn vregsInterfere(
                             rc.visit(fi.mul_lhs) catch unreachable;
                             rc.visit(fi.mul_rhs) catch unreachable;
                             rc.visit(fi.addend) catch unreachable;
+                            used_fma = true;
+                        }
+                    }
+                }
+                if (!used_fma) {
+                    if (ubfx_info_opt) |ubfx_map| {
+                        if (ubfx_map.get(d)) |ui| {
+                            rc.visit(ui.src) catch unreachable;
+                            used_fma = true;
+                        }
+                    }
+                }
+                if (!used_fma) {
+                    if (shift_alu_info_opt) |sai_map| {
+                        if (sai_map.get(d)) |sai| {
+                            rc.visit(sai.unshifted) catch unreachable;
+                            rc.visit(sai.shifted_src) catch unreachable;
                             used_fma = true;
                         }
                     }
@@ -12205,6 +12568,9 @@ fn collectCopyHints(
     simd_fma_info_opt: ?*const std.AutoHashMap(ir.VReg, FmaInfo),
     mul_fused_opt: ?*const std.AutoHashMap(ir.VReg, void),
     simd_mul_fused_opt: ?*const std.AutoHashMap(ir.VReg, void),
+    shift_fused_opt: ?*const std.AutoHashMap(ir.VReg, void),
+    ubfx_info_opt: ?*const std.AutoHashMap(ir.VReg, UbfxInfo),
+    shift_alu_info_opt: ?*const std.AutoHashMap(ir.VReg, ShiftAluInfo),
     suppress_iconst_opt: ?*const std.AutoHashMap(ir.VReg, void),
     liveness_out_opt: ?*?std.AutoHashMap(ir.BlockId, analysis.BlockLiveness),
     allocator: std.mem.Allocator,
@@ -12359,6 +12725,22 @@ fn collectCopyHints(
                                                 }
                                             }
                                         }
+                                        if (ubfx_info_opt) |ubfx_map| {
+                                            if (ubfx_map.get(md)) |ui| {
+                                                if (ui.src == p.dst) {
+                                                    hole_ok = false;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if (shift_alu_info_opt) |sai_map| {
+                                            if (sai_map.get(md)) |sai| {
+                                                if (sai.unshifted == p.dst or sai.shifted_src == p.dst) {
+                                                    hole_ok = false;
+                                                    break;
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 if (!hole_ok) break :intra_blk;
@@ -12405,8 +12787,11 @@ fn collectCopyHints(
                                         &liveness_opt_ptr.*.?,
                                         mul_fused_opt,
                                         simd_mul_fused_opt,
+                                        shift_fused_opt,
                                         fma_info_opt,
                                         simd_fma_info_opt,
+                                        ubfx_info_opt,
+                                        shift_alu_info_opt,
                                     )) {
                                         allow_overlap = true;
                                         is_cross_block_overlap = true;
@@ -19942,6 +20327,88 @@ test "ea cache & ldp fusion (#949): reverse-order loads on same base emit addExt
     try std.testing.expect(found_ldp_x16);
     try std.testing.expectEqual(@as(usize, 0), nop_count);
 }
+
+test "crcu16 fusions (#949): UBFX (shr_u+and), EOR shifted-reg (shr_u+xor), and TST+CSEL (and+select)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 3, 1, 3);
+    defer func.deinit();
+    const lt = try allocator.alloc(ir.IrType, 3);
+    lt[0] = .i32;
+    lt[1] = .i32;
+    lt[2] = .i32;
+    func.local_types = lt;
+
+    const bid = try func.newBlock();
+    const block = func.getBlock(bid);
+
+    const v_crc = func.newVReg();
+    const v_data = func.newVReg();
+    const v_poly = func.newVReg();
+    const c1 = func.newVReg();
+    const c2 = func.newVReg();
+    const c7fff = func.newVReg();
+    const v_shr1 = func.newVReg();
+    const v_ubfx = func.newVReg();
+    const v_xored_poly = func.newVReg();
+    const v_shr2 = func.newVReg();
+    const v_eor_shift = func.newVReg();
+    const v_bit = func.newVReg();
+    const v_sel = func.newVReg();
+
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_crc, .type = .i32 });
+    try block.append(.{ .op = .{ .local_get = 1 }, .dest = v_data, .type = .i32 });
+    try block.append(.{ .op = .{ .local_get = 2 }, .dest = v_poly, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = c1, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 2 }, .dest = c2, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 0x7fff }, .dest = c7fff, .type = .i32 });
+
+    // 1. (crc >>u 1) & 0x7fff -> UBFX Wd, Wn, #1, #15 (UBFM Wd, Wn, #1, #15)
+    try block.append(.{ .op = .{ .shr_u = .{ .lhs = v_crc, .rhs = c1 } }, .dest = v_shr1, .type = .i32 });
+    try block.append(.{ .op = .{ .@"and" = .{ .lhs = v_shr1, .rhs = c7fff } }, .dest = v_ubfx, .type = .i32 });
+    try block.append(.{ .op = .{ .xor = .{ .lhs = v_ubfx, .rhs = v_poly } }, .dest = v_xored_poly, .type = .i32 });
+
+    // 2. (data >>u 2) ^ crc -> EOR Wd, Wn, Wm, LSR #2
+    try block.append(.{ .op = .{ .shr_u = .{ .lhs = v_data, .rhs = c2 } }, .dest = v_shr2, .type = .i32 });
+    try block.append(.{ .op = .{ .xor = .{ .lhs = v_shr2, .rhs = v_crc } }, .dest = v_eor_shift, .type = .i32 });
+
+    // 3. (eor_shift & 1) ? xored_poly : ubfx -> TST Wn, #1 (ANDS WZR, Wn, #1) + CSEL Wd, Wt, Wf, NE
+    try block.append(.{ .op = .{ .@"and" = .{ .lhs = v_eor_shift, .rhs = c1 } }, .dest = v_bit, .type = .i32 });
+    try block.append(.{ .op = .{ .select = .{ .cond = v_bit, .if_true = v_xored_poly, .if_false = v_ubfx } }, .dest = v_sel, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_sel } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var found_ubfx = false;
+    var found_eor_lsr2 = false;
+    var found_tst_1 = false;
+    var found_csel = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        // UBFM Wd, Wn, #1, #15: 0x53013C00 | (rn << 5) | rd
+        if ((w & 0xFFFF_FC00) == 0x5301_3C00) {
+            found_ubfx = true;
+        }
+        // EOR Wd, Wn, Wm, LSR #2: 0x4A400800 | (rm << 16) | (rn << 5) | rd
+        if ((w & 0xFFE0_FC00) == 0x4A40_0800) {
+            found_eor_lsr2 = true;
+        }
+        // ANDS WZR, Wn, #1: 0x7200001F | (rn << 5)
+        if ((w & 0xFFFF_FC1F) == 0x7200_001F) {
+            found_tst_1 = true;
+        }
+        // CSEL Wd, Wn, Wm, cond: 0x1A800000
+        if ((w & 0xFFE0_0C00) == 0x1A80_0000) {
+            found_csel = true;
+        }
+    }
+    try std.testing.expect(found_ubfx);
+    try std.testing.expect(found_eor_lsr2);
+    try std.testing.expect(found_tst_1);
+    try std.testing.expect(found_csel);
+}
+
 
 
 
