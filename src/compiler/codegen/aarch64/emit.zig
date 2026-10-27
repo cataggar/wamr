@@ -2105,6 +2105,11 @@ pub const CodeBuffer = struct {
         try self.emit32(0xD5033BBF);
     }
 
+    /// ISB — instruction synchronization barrier.
+    pub fn isb(self: *CodeBuffer) !void {
+        try self.emit32(0xD5033FDF);
+    }
+
     /// LDAR / LDARB / LDARH — load-acquire (seq-cst), no offset.
     /// size: 1 → LDARB Wt, 2 → LDARH Wt, 4 → LDAR Wt, 8 → LDAR Xt.
     pub fn ldarSized(self: *CodeBuffer, rt: Reg, rn: Reg, size: u8) !void {

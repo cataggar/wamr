@@ -50,6 +50,69 @@ var initial_affinity_captured: std.atomic.Value(bool) = .init(false);
 var process_pinned_to_primary: std.atomic.Value(bool) = .init(false);
 var saved_initial_affinity: LinuxInitialAffinity = .{};
 
+var cached_tmpdir_buf: [208]u8 = @splat(0);
+var cached_tmpdir_len: usize = 0;
+var cached_tmpdir_state: std.atomic.Value(u8) = .init(0);
+
+fn getLinuxTmpdir() ?[]const u8 {
+    if (comptime builtin.os.tag != .linux) return null;
+    while (true) {
+        switch (cached_tmpdir_state.load(.acquire)) {
+            2 => return cached_tmpdir_buf[0..cached_tmpdir_len],
+            3 => return null,
+            1 => {
+                std.atomic.spinLoopHint();
+                continue;
+            },
+            else => {},
+        }
+        if (cached_tmpdir_state.cmpxchgWeak(0, 1, .acquire, .monotonic) == null) {
+            break;
+        }
+    }
+    const fd_rc = std.os.linux.openat(
+        std.os.linux.AT.FDCWD,
+        "/proc/self/environ",
+        .{ .ACCMODE = .RDONLY, .CLOEXEC = true },
+        0,
+    );
+    if (@as(isize, @bitCast(fd_rc)) < 0) {
+        cached_tmpdir_state.store(3, .release);
+        return null;
+    }
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = std.os.linux.close(fd);
+
+    var env_buf: [32768]u8 = undefined;
+    var total: usize = 0;
+    while (total < env_buf.len) {
+        const n_rc = std.os.linux.read(fd, env_buf[total..].ptr, env_buf.len - total);
+        const n: isize = @bitCast(n_rc);
+        if (n <= 0) break;
+        total += @intCast(n);
+    }
+    var it = std.mem.splitScalar(u8, env_buf[0..total], 0);
+    while (it.next()) |entry| {
+        if (std.mem.startsWith(u8, entry, "TMPDIR=")) {
+            var val = entry["TMPDIR=".len..];
+            while (val.len > 1 and val[val.len - 1] == '/') {
+                val = val[0 .. val.len - 1];
+            }
+            if (val.len > 0 and val.len <= 200 and val[0] == '/' and
+                !std.mem.startsWith(u8, val, "/home"))
+            {
+                @memcpy(cached_tmpdir_buf[0..val.len], val);
+                cached_tmpdir_len = val.len;
+                cached_tmpdir_state.store(2, .release);
+                return cached_tmpdir_buf[0..val.len];
+            }
+            break;
+        }
+    }
+    cached_tmpdir_state.store(3, .release);
+    return null;
+}
+
 fn singleCpuSet(cpu: u16) if (builtin.os.tag == .linux) std.os.linux.cpu_set_t else void {
     if (comptime builtin.os.tag != .linux) return {};
     var set = std.mem.zeroes(std.os.linux.cpu_set_t);
@@ -109,11 +172,21 @@ pub fn pinProcessToPrimaryCpu() void {
     std.os.linux.sched_setaffinity(0, &set) catch {};
 }
 
-fn prefaultPagesOnLastCpu(base: [*]align(page_size_min) u8, initial_bytes: usize) void {
+fn prefaultPagesOnLastCpu(
+    base: [*]align(page_size_min) u8,
+    initial_bytes: usize,
+    zero_all: bool,
+) void {
     if (comptime builtin.os.tag != .linux) return;
     if (initial_bytes == 0) return;
-    const aff = captureInitialAffinity() orelse return;
-    if (aff.count == 0) return;
+    const aff = captureInitialAffinity() orelse {
+        if (zero_all) @memset(base[0..initial_bytes], 0);
+        return;
+    };
+    if (aff.count == 0) {
+        if (zero_all) @memset(base[0..initial_bytes], 0);
+        return;
+    }
     var prev_set = std.mem.zeroes(std.os.linux.cpu_set_t);
     const has_prev = std.os.linux.sched_getaffinity(
         0,
@@ -129,6 +202,9 @@ fn prefaultPagesOnLastCpu(base: [*]align(page_size_min) u8, initial_bytes: usize
     while (page_idx > 0) {
         page_idx -= 1;
         @as(*volatile u8, @ptrCast(base + page_idx * 4096)).* = 0;
+    }
+    if (zero_all) {
+        @memset(base[0..initial_bytes], 0);
     }
 }
 
@@ -174,6 +250,8 @@ pub const Control = struct {
     current_bytes: std.atomic.Value(usize),
     ref_count: std.atomic.Value(u32) = .init(1),
     grow_mutex: SpinMutex = .{},
+    shm_lock_fd: i32 = -1,
+    shm_mapped_bytes: usize = 0,
     parking_lot: parking.ParkingLot align(64) = .init(),
 
     pub fn create(
@@ -191,9 +269,68 @@ pub const Control = struct {
         const base = platform.reserveAddressSpace(reserved_bytes) orelse
             return error.ReserveFailed;
         errdefer platform.releaseAddressSpace(base, reserved_bytes);
+
+        var shm_lock_fd: i32 = -1;
+        var shm_mapped_bytes: usize = 0;
+        if (comptime builtin.os.tag == .linux) {
+            if (initial_bytes > 0 and initial_bytes <= 16 * 1024 * 1024) {
+                if (getLinuxTmpdir()) |tmpdir| {
+                    const shm_bytes = @min(reserved_bytes, initial_bytes + 16 * wasm_page_size);
+                    var path_buf: [256]u8 = undefined;
+                    for (0..32) |slot| {
+                        const path_slice = std.fmt.bufPrint(
+                            &path_buf,
+                            "{s}/.wamr-shm-p{d}-s{d}\x00",
+                            .{ tmpdir, initial_pages, slot },
+                        ) catch break;
+                        const path_z: [*:0]const u8 = @ptrCast(path_slice.ptr);
+                        const fd_rc = std.os.linux.openat(
+                            std.os.linux.AT.FDCWD,
+                            path_z,
+                            .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true },
+                            0o600,
+                        );
+                        if (@as(isize, @bitCast(fd_rc)) < 0) break;
+                        const fd: i32 = @intCast(fd_rc);
+                        const lock_rc = std.os.linux.flock(
+                            fd,
+                            2 | 4, // LOCK_EX | LOCK_NB
+                        );
+                        if (@as(isize, @bitCast(lock_rc)) < 0) {
+                            _ = std.os.linux.close(fd);
+                            continue;
+                        }
+                        const trunc_rc = std.os.linux.ftruncate(fd, @intCast(shm_bytes));
+                        if (@as(isize, @bitCast(trunc_rc)) < 0) {
+                            _ = std.os.linux.close(fd);
+                            break;
+                        }
+                        const map_rc = std.os.linux.mmap(
+                            base,
+                            shm_bytes,
+                            .{},
+                            .{ .TYPE = .SHARED, .FIXED = true },
+                            fd,
+                            0,
+                        );
+                        if (@as(isize, @bitCast(map_rc)) < 0 or map_rc != @intFromPtr(base)) {
+                            _ = std.os.linux.close(fd);
+                            break;
+                        }
+                        shm_lock_fd = fd;
+                        shm_mapped_bytes = shm_bytes;
+                        break;
+                    }
+                }
+            }
+        }
+        errdefer if (comptime builtin.os.tag == .linux) {
+            if (shm_lock_fd >= 0) _ = std.os.linux.close(shm_lock_fd);
+        };
+
         platform.commitPages(base, initial_bytes) catch return error.CommitFailed;
         if (comptime builtin.os.tag == .linux) {
-            prefaultPagesOnLastCpu(base, initial_bytes);
+            prefaultPagesOnLastCpu(base, initial_bytes, shm_mapped_bytes > 0);
         }
 
         const control = allocator.create(Control) catch return error.OutOfMemory;
@@ -203,6 +340,8 @@ pub const Control = struct {
             .max_pages = max_pages,
             .current_pages = .init(initial_pages),
             .current_bytes = .init(initial_bytes),
+            .shm_lock_fd = shm_lock_fd,
+            .shm_mapped_bytes = shm_mapped_bytes,
         };
         return control;
     }
@@ -210,6 +349,11 @@ pub const Control = struct {
     pub fn destroy(self: *Control, allocator: std.mem.Allocator) void {
         self.parking_lot.deinit();
         releaseAddressSpaceOnLastCpu(self.base, self.reserved_bytes);
+        if (comptime builtin.os.tag == .linux) {
+            if (self.shm_lock_fd >= 0) {
+                _ = std.os.linux.close(self.shm_lock_fd);
+            }
+        }
         allocator.destroy(self);
     }
 
@@ -273,6 +417,11 @@ pub const Control = struct {
                 @alignCast(self.base + old_bytes),
                 new_bytes - old_bytes,
             ) catch return error.MemoryGrowFailed;
+            if (comptime builtin.os.tag == .linux) {
+                if (self.shm_mapped_bytes > old_bytes) {
+                    @memset((self.base + old_bytes)[0..(new_bytes - old_bytes)], 0);
+                }
+            }
         }
 
         // The release publication makes the completed commit and the
