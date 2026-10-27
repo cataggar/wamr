@@ -721,6 +721,10 @@ const FuncCompileCtx = struct {
     block_pos: []const usize = &.{},
     fallthrough_rep: ?ir.BlockId = null,
     cached_mem_index_vreg: ?ir.VReg = null,
+    cached_mem_ea_vreg: ?ir.VReg = null,
+    cached_mem_ea_epoch: u32 = 0,
+    precomputed_callee_mask: ?u16 = null,
+    uses_memory_base: bool = true,
     func_idx: u32 = 0,
     allocator: std.mem.Allocator,
 
@@ -2933,6 +2937,29 @@ pub fn compileFunctionImpl(
     fctx.hrp_save_off = hrp_save_off;
     fctx.scratch_base = scratch_base;
     fctx.frame_size = frame_size;
+    fctx.uses_memory_base = funcUsesMemoryBase(func);
+    if (alloc_result_storage) |*ar| {
+        var mask: u16 = if (fctx.uses_memory_base) 0b11 else 0b01;
+        var v: u32 = 0;
+        while (v < func.next_vreg) : (v += 1) {
+            if (ar.get(@intCast(v))) |loc| {
+                switch (loc) {
+                    .reg => |r| {
+                        const reg_num: u32 = @intCast(r);
+                        const idx: usize = if (reg_num <= 14) reg_num else reg_num - 6;
+                        if (idx >= RegMap.caller_saved_count) {
+                            mask |= (@as(u16, 1) << @intCast(idx - RegMap.caller_saved_count + 2));
+                        }
+                    },
+                    .stack => {},
+                }
+            }
+        }
+        fctx.precomputed_callee_mask = mask;
+        reg_map.used_callee_mask = mask;
+    } else if (!fctx.uses_memory_base) {
+        reg_map.used_callee_mask = 0b01;
+    }
 
     // Liveness-driven register scavenging: compute, for each instruction,
     // the set of vregs whose *last* static read occurs at that instruction.
@@ -3052,7 +3079,9 @@ pub fn compileFunctionImpl(
     // directly instead of rematerialising via
     // `mov tmp, x19; ldr tmp, [tmp]`. `memory.grow` and every wasm
     // call emit `ldr x20, [x19, #0]` afterward to refresh the base.
-    try code.ldrImm(.x20, .x19, 0);
+    if (fctx.uses_memory_base) {
+        try code.ldrImm(.x20, .x19, 0);
+    }
 
     // Spill VMContext (x0) and wasm params (x1..x7) to their frame slots.
     if (tmr) |t| t.begin();
@@ -3232,6 +3261,7 @@ pub fn compileFunctionImpl(
         }
         fctx.fallthrough_rep = if (order_idx + 1 < block_order.len) rep[order_idx + 1] else null;
         fctx.cached_mem_index_vreg = null;
+        fctx.cached_mem_ea_vreg = null;
         const block_insts = scheduled.instructions(bi);
         for (block_insts, 0..) |inst, ii| {
             last_was_ret = isRet(inst.op);
@@ -3266,6 +3296,9 @@ pub fn compileFunctionImpl(
             for (kill_lists[flat_idx].items) |v| {
                 if (fctx.cached_mem_index_vreg == v) {
                     fctx.cached_mem_index_vreg = null;
+                }
+                if (fctx.cached_mem_ea_vreg == v) {
+                    fctx.cached_mem_ea_vreg = null;
                 }
                 reg_map.freeVReg(v);
                 v128_cache.release(v);
@@ -4523,14 +4556,103 @@ fn emitCalleeSaveRestore(code: *emit.CodeBuffer, callee_save_base: u32) ![callee
 
 /// Wrap `emitCalleeSaveStore` + site tracking for the prologue.
 fn emitCalleeSaveStoreTracked(code: *emit.CodeBuffer, fctx: *FuncCompileCtx) !void {
+    if (fctx.precomputed_callee_mask) |mask| {
+        const top_scaled = (fctx.callee_save_base + (callee_saved_regs.len - 1) * 8) / 8;
+        if (top_scaled <= 4095) {
+            code.peepholeBarrier();
+            var slot_idx: u32 = 0;
+            for (callee_saved_regs, 0..) |r, i| {
+                if (((mask >> @intCast(i)) & 1) == 0) continue;
+                const off_scaled: u12 = @intCast((fctx.callee_save_base + slot_idx * 8) / 8);
+                try code.strImm(r, .fp, off_scaled);
+                slot_idx += 1;
+            }
+            code.peepholeBarrier();
+            return;
+        }
+        code.peepholeBarrier();
+        try frameAddr(code, RegMap.tmp0, fctx.callee_save_base);
+        var slot_idx: u12 = 0;
+        for (callee_saved_regs, 0..) |r, i| {
+            if (((mask >> @intCast(i)) & 1) == 0) continue;
+            try code.strImm(r, RegMap.tmp0, slot_idx);
+            slot_idx += 1;
+        }
+        code.peepholeBarrier();
+        return;
+    }
     const offs = try emitCalleeSaveStore(code, fctx.callee_save_base);
     try fctx.callee_save_sites.?.append(fctx.allocator, offs);
 }
 
 /// Wrap `emitCalleeSaveRestore` + site tracking for epilogues.
 fn emitCalleeSaveRestoreTracked(code: *emit.CodeBuffer, fctx: *FuncCompileCtx) !void {
+    if (fctx.precomputed_callee_mask) |mask| {
+        const top_scaled = (fctx.callee_save_base + (callee_saved_regs.len - 1) * 8) / 8;
+        if (top_scaled <= 4095) {
+            code.peepholeBarrier();
+            var slot_idx: u32 = 0;
+            for (callee_saved_regs, 0..) |r, i| {
+                if (((mask >> @intCast(i)) & 1) == 0) continue;
+                const off_scaled: u12 = @intCast((fctx.callee_save_base + slot_idx * 8) / 8);
+                try code.ldrImm(r, .fp, off_scaled);
+                slot_idx += 1;
+            }
+            code.peepholeBarrier();
+            return;
+        }
+        code.peepholeBarrier();
+        try frameAddr(code, RegMap.tmp0, fctx.callee_save_base);
+        var slot_idx: u12 = 0;
+        for (callee_saved_regs, 0..) |r, i| {
+            if (((mask >> @intCast(i)) & 1) == 0) continue;
+            try code.ldrImm(r, RegMap.tmp0, slot_idx);
+            slot_idx += 1;
+        }
+        code.peepholeBarrier();
+        return;
+    }
     const offs = try emitCalleeSaveRestore(code, fctx.callee_save_base);
     try fctx.callee_save_sites.?.append(fctx.allocator, offs);
+}
+
+fn funcUsesMemoryBase(func: *const ir.IrFunction) bool {
+    for (func.blocks.items) |blk| {
+        for (blk.instructions.items) |inst| {
+            switch (inst.op) {
+                .load,
+                .store,
+                .v128_load,
+                .v128_load_splat,
+                .v128_load_zero,
+                .v128_load_extend,
+                .v128_load_lane,
+                .v128_store,
+                .v128_store_lane,
+                .atomic_load,
+                .atomic_store,
+                .atomic_rmw,
+                .atomic_cmpxchg,
+                .atomic_wait,
+                .atomic_notify,
+                .memory_grow,
+                .memory_size,
+                .memory_fill,
+                .memory_copy,
+                .memory_init,
+                .table_grow,
+                .table_init,
+                .call,
+                .call_indirect,
+                .call_ref,
+                .throw,
+                .throw_ref,
+                => return true,
+                else => {},
+            }
+        }
+    }
+    return false;
 }
 
 /// Overwrite save/restore slots for callee-saved regs that were never
@@ -4732,6 +4854,7 @@ fn compileInst(
     if (instRequiresV128Flush(inst)) {
         try v128_cache.flushAll(code, v128_map);
         fctx.cached_mem_index_vreg = null;
+        fctx.cached_mem_ea_vreg = null;
     }
 
     switch (inst.op) {
@@ -4772,17 +4895,27 @@ fn compileInst(
         .add, .sub, .mul, .@"and", .@"or", .xor => {
             if (inst.type == .f32 or inst.type == .f64) {
                 fctx.cached_mem_index_vreg = null;
+                fctx.cached_mem_ea_vreg = null;
             } else if (fctx.fma_info) |fma_map| {
                 if (inst.dest) |d| {
-                    if (fma_map.contains(d)) fctx.cached_mem_index_vreg = null;
+                    if (fma_map.contains(d)) {
+                        fctx.cached_mem_index_vreg = null;
+                        fctx.cached_mem_ea_vreg = null;
+                    }
                 }
             }
         },
-        else => fctx.cached_mem_index_vreg = null,
+        else => {
+            fctx.cached_mem_index_vreg = null;
+            fctx.cached_mem_ea_vreg = null;
+        },
     }
     defer if (inst.dest) |d| {
         if (fctx.cached_mem_index_vreg == d) {
             fctx.cached_mem_index_vreg = null;
+        }
+        if (fctx.cached_mem_ea_vreg == d) {
+            fctx.cached_mem_ea_vreg = null;
         }
     };
 
@@ -8936,6 +9069,21 @@ fn emitMemAddrImpl(
     skip_bounds: bool,
     fctx: ?*FuncCompileCtx,
 ) !void {
+    if (fctx) |ctx| {
+        if (!ctx.has_memory64 and skip_bounds and offset == 0) {
+            if (ctx.cached_mem_ea_vreg == base_vreg and ctx.cached_mem_ea_epoch == code.tmp0_write_epoch) {
+                return;
+            }
+            if (ctx.cached_mem_index_vreg != base_vreg) {
+                const src = try useInto(code, reg_map, base_vreg, RegMap.tmp1);
+                try code.addExtUxtw(RegMap.tmp0, .x20, src);
+                ctx.cached_mem_ea_vreg = base_vreg;
+                ctx.cached_mem_ea_epoch = code.tmp0_write_epoch;
+                return;
+            }
+        }
+    }
+
     try emitMemIndexImpl(code, reg_map, base_vreg, end_offset, skip_bounds, fctx);
 
     // ea = mem_base (pinned x20, issue #466) + zext(wasm_addr).
@@ -8948,6 +9096,15 @@ fn emitMemAddrImpl(
         } else {
             try code.movImm64(RegMap.tmp1, offset);
             try code.addRegReg(RegMap.tmp0, RegMap.tmp0, RegMap.tmp1);
+        }
+    }
+
+    if (fctx) |ctx| {
+        if (!ctx.has_memory64 and offset == 0) {
+            ctx.cached_mem_ea_vreg = base_vreg;
+            ctx.cached_mem_ea_epoch = code.tmp0_write_epoch;
+        } else {
+            ctx.cached_mem_ea_vreg = null;
         }
     }
 }
@@ -10410,10 +10567,14 @@ fn emitLoad(
     const folded = scaledOffset(ld.offset, scale);
     const end_offset: u64 = if (ld.checked_end > 0) ld.checked_end else @as(u64, ld.offset) + @as(u64, ld.size);
     const folded_offset: u32 = if (folded == null) ld.offset else 0;
+    const has_cached_ea = fctx.cached_mem_ea_vreg == ld.base and fctx.cached_mem_ea_epoch == code.tmp0_write_epoch;
+    const shares_coalesced_ea = !ld.bounds_known and ld.checked_end > @as(u64, ld.offset) + @as(u64, ld.size);
     const use_reg_offset = fctx.options.enable_mem_reg_offset and
         ld.offset == 0 and
         !fctx.has_memory64 and
-        !fctx.has_shared_memory;
+        !fctx.has_shared_memory and
+        !has_cached_ea and
+        !shares_coalesced_ea;
     const use_uxtw = use_reg_offset and ld.bounds_known and fctx.cached_mem_index_vreg != ld.base;
     var uxtw_idx_reg: emit.Reg = RegMap.tmp2;
     if (use_uxtw) {
@@ -10493,10 +10654,14 @@ fn emitStore(
     const folded = scaledOffset(st.offset, scale);
     const end_offset: u64 = if (st.checked_end > 0) st.checked_end else @as(u64, st.offset) + @as(u64, st.size);
     const folded_offset: u32 = if (folded == null) st.offset else 0;
+    const has_cached_ea = fctx.cached_mem_ea_vreg == st.base and fctx.cached_mem_ea_epoch == code.tmp0_write_epoch;
+    const shares_coalesced_ea = !st.bounds_known and st.checked_end > @as(u64, st.offset) + @as(u64, st.size);
     const use_reg_offset = fctx.options.enable_mem_reg_offset and
         st.offset == 0 and
         !fctx.has_memory64 and
-        !fctx.has_shared_memory;
+        !fctx.has_shared_memory and
+        !has_cached_ea and
+        !shares_coalesced_ea;
     const use_uxtw = use_reg_offset and st.bounds_known and fctx.cached_mem_index_vreg != st.base;
     var uxtw_idx_reg: emit.Reg = RegMap.tmp2;
     if (use_uxtw) {
@@ -17589,31 +17754,43 @@ test "compile: br_if with two blocks" {
 // ── Phase 1b: VMContext ABI + locals tests ───────────────────────────────────
 
 test "compile: entry pins vmctx in x19 and memory_base in x20 (issues #465 / #466)" {
-    // Function with no params, no locals: prologue must copy x0 → x19
-    // and load `[x19 + 0]` → x20 after the 10 callee-save STRs
-    // (vmctx pinned in x19, memory_base pinned in x20 for the whole
-    // function body).
     const allocator = std.testing.allocator;
-    var func = ir.IrFunction.init(allocator, 0, 1, 0);
-    defer func.deinit();
-    const bid = try func.newBlock();
-    const v0 = func.newVReg();
-    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 7 }, .dest = v0, .type = .i32 });
-    try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
-    const code = try compileFunctionWithOptions(&func, allocator, .{ .enable_peephole = false });
-    defer allocator.free(code);
-    // Layout: prologue (STP + ADD fp,sp,0 = 8 bytes), then 10 callee-save
-    // STRs for x19..x28 (40 bytes), then MOV x19, x0 (= ORR x19, xzr, x0),
-    // then LDR x20, [x19, #0] (memory_base pin).
-    //   MOV encoding: 0xAA000000 | (rm=0 << 16) | (rn=31 << 5) | rd=19
-    //   = 0xAA000000 | 0x3E0 | 0x13 = 0xAA0003F3
-    const mov_word = std.mem.readInt(u32, code[48..][0..4], .little);
-    try std.testing.expectEqual(@as(u32, 0xAA0003F3), mov_word);
-    //   LDR encoding (LDR Xt, [Xn, #imm12*8]):
-    //     0xF9400000 | (imm12=0 << 10) | (rn=19 << 5) | rt=20
-    //     = 0xF9400000 | 0x260 | 0x14 = 0xF9400274
-    const ldr_word = std.mem.readInt(u32, code[52..][0..4], .little);
-    try std.testing.expectEqual(@as(u32, 0xF9400274), ldr_word);
+    // 1. Non-memory leaf function: saves only x19, pins x19 = x0, elides x20 save/pin (#949).
+    {
+        var func = ir.IrFunction.init(allocator, 0, 1, 0);
+        defer func.deinit();
+        const bid = try func.newBlock();
+        const v0 = func.newVReg();
+        try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 7 }, .dest = v0, .type = .i32 });
+        try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
+        const code = try compileFunctionWithOptions(&func, allocator, .{ .enable_peephole = false });
+        defer allocator.free(code);
+        // Layout: STP (0), ADD fp,sp,0 (4), STR x19 (8), MOV x19, x0 (12).
+        const mov_word = std.mem.readInt(u32, code[12..][0..4], .little);
+        try std.testing.expectEqual(@as(u32, 0xAA0003F3), mov_word);
+    }
+    // 2. Memory-accessing function: saves x19+x20, pins x19 = x0 and x20 = [x19, #0].
+    {
+        var func = ir.IrFunction.init(allocator, 0, 1, 0);
+        defer func.deinit();
+        const bid = try func.newBlock();
+        const v0 = func.newVReg();
+        const v1 = func.newVReg();
+        try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v0, .type = .i32 });
+        try func.getBlock(bid).append(.{
+            .op = .{ .load = .{ .base = v0, .offset = 0, .size = 4, .sign_extend = false } },
+            .dest = v1,
+            .type = .i32,
+        });
+        try func.getBlock(bid).append(.{ .op = .{ .ret = v1 } });
+        const code = try compileFunctionWithOptions(&func, allocator, .{ .enable_peephole = false });
+        defer allocator.free(code);
+        // Layout: STP (0), ADD fp,sp,0 (4), STR x19 (8), STR x20 (12), MOV x19, x0 (16), LDR x20, [x19, #0] (20).
+        const mov_word = std.mem.readInt(u32, code[16..][0..4], .little);
+        try std.testing.expectEqual(@as(u32, 0xAA0003F3), mov_word);
+        const ldr_word = std.mem.readInt(u32, code[20..][0..4], .little);
+        try std.testing.expectEqual(@as(u32, 0xF9400274), ldr_word);
+    }
 }
 
 test "compile: param spill — STR x1 into first local slot" {
@@ -17627,11 +17804,10 @@ test "compile: param spill — STR x1 into first local slot" {
     try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
     const code = try compileFunctionWithOptions(&func, allocator, .{ .enable_peephole = false });
     defer allocator.free(code);
-    // Layout: STP, ADD fp,sp,0, 10× callee-save STRs (40 bytes), MOV x19, x0
-    // (#465 vmctx pin), LDR x20, [x19, #0] (#466 memory_base pin), STR x1 local0.
+    // Layout: STP (0), ADD fp,sp,0 (4), STR x19 (8), MOV x19, x0 (12), STR x1 local0 (16).
     //   STR x1, [fp, #24]: rt=1, rn=29, imm12=3
     //   = 0xF9000000 | (3<<10) | (29<<5) | 1 = 0xF9000FA1
-    const str_param = std.mem.readInt(u32, code[56..][0..4], .little);
+    const str_param = std.mem.readInt(u32, code[16..][0..4], .little);
     try std.testing.expectEqual(@as(u32, 0xF9000FA1), str_param);
 }
 
@@ -17653,19 +17829,18 @@ test "compile: zero-init of declared local (beyond params) fuses into STP" {
     try func.getBlock(bid).append(.{ .op = .{ .ret = sum } });
     const code = try compileFunctionWithOptions(&func, allocator, .{ .enable_peephole = false });
     defer allocator.free(code);
-    // Layout (small-frame prologue):
+    // Layout (small-frame non-memory prologue):
     //   [0]   STP FP, LR, [SP, #-frame_size]!
     //   [4]   MOV FP, SP
-    //   [8]..[44] 10× callee-save STR (40 bytes)
-    //   [48]  MOV x19, x0 (#465 vmctx pin)
-    //   [52]  LDR x20, [x19, #0] (#466 memory_base pin)
-    //   [56]  MOVZ x16, #0
-    //   [60]  STP x16, x16, [fp, #24] (fused 16-byte zero store, issue #468)
-    const movz_word = std.mem.readInt(u32, code[56..][0..4], .little);
+    //   [8]   STR x19
+    //   [12]  MOV x19, x0 (#465 vmctx pin)
+    //   [16]  MOVZ x16, #0
+    //   [20]  STP x16, x16, [fp, #24] (fused 16-byte zero store, issue #468)
+    const movz_word = std.mem.readInt(u32, code[16..][0..4], .little);
     try std.testing.expectEqual(@as(u32, 0xD2800010), movz_word);
     // STP x16, x16, [fp, #24]: imm7=3 (#24/8), rt2=16, rn=29(fp), rt1=16
     //   0xA9000000 | (3 << 15) | (16 << 10) | (29 << 5) | 16
-    const stp_word = std.mem.readInt(u32, code[60..][0..4], .little);
+    const stp_word = std.mem.readInt(u32, code[20..][0..4], .little);
     const expected_stp: u32 = 0xA9000000 |
         (@as(u32, 3) << 15) |
         (@as(u32, 16) << 10) |
@@ -17690,11 +17865,11 @@ test "compile: prologue zero-init skipped when local is definitely set before an
     try func.getBlock(bid).append(.{ .op = .{ .ret = v1 } });
     const code = try compileFunctionWithOptions(&func, allocator, .{ .enable_peephole = false });
     defer allocator.free(code);
-    // Word at offset 56 is the slot right after the vmctx + memory_base
-    // pins. With zero-init skipped this is NOT a MOVZ x16, #0
-    // (0xD2800010); the body proper begins here.
-    const word56 = std.mem.readInt(u32, code[56..][0..4], .little);
-    try std.testing.expect(word56 != 0xD2800010);
+    // Word at offset 16 is the slot right after the vmctx pin.
+    // With zero-init skipped this is NOT a MOVZ x16, #0 (0xD2800010);
+    // the body proper begins here.
+    const word16 = std.mem.readInt(u32, code[16..][0..4], .little);
+    try std.testing.expect(word16 != 0xD2800010);
 }
 
 test "compile: prologue zero-init preserved when local is read before any set (#468)" {
@@ -17710,10 +17885,10 @@ test "compile: prologue zero-init preserved when local is read before any set (#
     try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
     const code = try compileFunctionWithOptions(&func, allocator, .{ .enable_peephole = false });
     defer allocator.free(code);
-    const movz_word = std.mem.readInt(u32, code[56..][0..4], .little);
+    const movz_word = std.mem.readInt(u32, code[16..][0..4], .little);
     try std.testing.expectEqual(@as(u32, 0xD2800010), movz_word);
     // single 8-byte STR x16, [fp, #24]: imm12=3
-    const str0 = std.mem.readInt(u32, code[60..][0..4], .little);
+    const str0 = std.mem.readInt(u32, code[20..][0..4], .little);
     try std.testing.expectEqual(@as(u32, 0xF9000FB0), str0);
 }
 
@@ -19712,5 +19887,61 @@ test "select (#949): fuses single-use icmp condition and emits CSINC for constan
     try std.testing.expect(found_csinc);
     try std.testing.expect(!found_cset);
 }
+
+test "ea cache & ldp fusion (#949): reverse-order loads on same base emit addExtUxtw and fuse into LDP" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 1);
+    defer func.deinit();
+    const lt = try allocator.alloc(ir.IrType, 1);
+    lt[0] = .i32;
+    func.local_types = lt;
+
+    const bid = try func.newBlock();
+    const block = func.getBlock(bid);
+
+    const p_base = func.newVReg();
+    const v_info = func.newVReg();
+    const v_next = func.newVReg();
+    const v_sum = func.newVReg();
+
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = p_base, .type = .i32 });
+    // Reverse order: load [base + 4] first, then [base + 0] (like CoreMark list->info then list->next).
+    try block.append(.{
+        .op = .{ .load = .{ .base = p_base, .offset = 4, .size = 4, .bounds_known = true } },
+        .dest = v_info,
+        .type = .i32,
+    });
+    try block.append(.{
+        .op = .{ .load = .{ .base = p_base, .offset = 0, .size = 4, .bounds_known = true } },
+        .dest = v_next,
+        .type = .i32,
+    });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_info, .rhs = v_next } }, .dest = v_sum, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_sum } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var found_add_uxtw = false;
+    var found_ldp_x16 = false;
+    var nop_count: usize = 0;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        // ADD x16, x20, wN, UXTW #0: (0b10001011001 << 21) | (rm << 16) | (0b010 << 13) | (20 << 5) | 16
+        if ((w & 0xFFE0_FFFF) == ((0b10001011001 << 21) | (0b010 << 13) | (20 << 5) | 16)) {
+            found_add_uxtw = true;
+        }
+        // 32-bit LDP Wt1, Wt2, [x16, #0]: top bits 0x29400000, rn = 16
+        if ((w & 0xFFC0_03E0) == (0x2940_0000 | (16 << 5))) {
+            found_ldp_x16 = true;
+        }
+        if (w == 0xD503_201F) nop_count += 1;
+    }
+    try std.testing.expect(found_add_uxtw);
+    try std.testing.expect(found_ldp_x16);
+    try std.testing.expectEqual(@as(usize, 0), nop_count);
+}
+
 
 

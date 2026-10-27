@@ -567,6 +567,14 @@ pub const CodeBuffer = struct {
         try self.modrm(0b11, dst.low3(), src.low3());
     }
 
+    /// CMOVcc dst, src (64-bit conditional move on condition code `cc`).
+    pub fn cmovcc(self: *CodeBuffer, cc: u4, dst: Reg, src: Reg) !void {
+        try self.rexW(dst, src);
+        try self.emitByte(0x0F);
+        try self.emitByte(@as(u8, 0x40) | @as(u8, cc));
+        try self.modrm(0b11, dst.low3(), src.low3());
+    }
+
     /// LZCNT dst, src — count leading zeros (BMI1).
     pub fn lzcnt(self: *CodeBuffer, dst: Reg, src: Reg) !void {
         try self.emitByte(0xF3); // mandatory prefix

@@ -121,6 +121,7 @@ pub const CodeBuffer = struct {
     allocator: std.mem.Allocator,
     peephole_options: peephole.Options = .{ .enabled = false },
     peephole_barrier: usize = 0,
+    tmp0_write_epoch: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator) CodeBuffer {
         return .{ .allocator = allocator };
@@ -144,10 +145,17 @@ pub const CodeBuffer = struct {
 
     pub fn peepholeBarrier(self: *CodeBuffer) void {
         self.peephole_barrier = self.bytes.items.len;
+        self.tmp0_write_epoch +%= 1;
     }
 
     /// Emit a 4-byte AArch64 instruction word (little-endian).
     fn emit32(self: *CodeBuffer, word: u32) !void {
+        if ((word & 0x1F) == Reg.x16.encoding() or
+            (word & 0xFC000000) == 0x94000000 or
+            (word & 0xFFFFFC1F) == 0xD63F0000)
+        {
+            self.tmp0_write_epoch +%= 1;
+        }
         if (self.peephole_options.enabled) {
             const prev1: ?u32 = if (self.bytes.items.len >= self.peephole_barrier + 4)
                 std.mem.readInt(u32, self.bytes.items[self.bytes.items.len - 4 ..][0..4], .little)
@@ -2533,6 +2541,16 @@ pub const CodeBuffer = struct {
         // sf=0, op21=00, 100111, N=0, o0=0, Rm=Rn, imms=shift, Rn=Rn, Rd=Rd
         try self.emit32(0x13800000 | (@as(u32, rn.encoding()) << 16) |
             (@as(u32, shift) << 10) | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// ADD Xd, Xn, Wm, UXTW #0 — add Xn + zero_extend_32(Wm).
+    pub fn addExtUxtw(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg) !void {
+        const inst: u32 = (0b10001011001 << 21) |
+            (@as(u32, rm.encoding()) << 16) |
+            (0b010 << 13) |
+            (@as(u32, rn.encoding()) << 5) |
+            @as(u32, rd.encoding());
+        try self.emit32(inst);
     }
 
     /// ADD Xd, Xn, Wm, UXTW #2 — add Xn + (zero_extend_32(Wm) << 2).
