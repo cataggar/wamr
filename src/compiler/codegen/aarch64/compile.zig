@@ -10794,8 +10794,6 @@ fn emitAtomicRmw(
     // != Rn (addr=tmp0) and Rt != Rs (rs_reg ∈ {tmp1, val's home reg}).
     const info = try destBegin(reg_map, dest, RegMap.tmp2);
     try code.lseAtomic(lse_op, rs_reg, info.reg, RegMap.tmp0, rmw.size);
-    try code.dmbIsh();
-    try code.isb();
     try destCommit(code, reg_map, info);
 }
 

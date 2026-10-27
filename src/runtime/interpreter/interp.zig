@@ -3909,11 +3909,7 @@ inline fn doAtomicStore(comptime T: type, ptr: *T, val: T) void {
 
 inline fn doAtomicRmw(comptime T: type, ptr: *T, comptime op: std.builtin.AtomicRmwOp, val: T) T {
     if (@bitSizeOf(T) <= 32 or has_64bit_atomics) {
-        const res = @atomicRmw(T, ptr, op, val, .seq_cst);
-        if (comptime builtin.cpu.arch == .aarch64) {
-            asm volatile ("dmb ish\n\tisb" ::: .{ .memory = true });
-        }
-        return res;
+        return @atomicRmw(T, ptr, op, val, .seq_cst);
     } else {
         const old = ptr.*;
         ptr.* = switch (op) {
