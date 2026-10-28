@@ -3448,6 +3448,7 @@ pub fn compileFunctionImpl(
                         .ge_s,
                         .ge_u,
                         .select,
+                        .lea,
                         .wrap_i64,
                         .extend_i32_s,
                         .extend_i32_u,
@@ -5216,6 +5217,9 @@ fn funcUsesVmctx(func: *const ir.IrFunction, fctx: *const FuncCompileCtx) bool {
                 .fconst_64,
                 .local_get,
                 .local_set,
+                .phi,
+                .parallel_copy,
+                .lea,
                 .br,
                 .br_if,
                 .br_table,
@@ -5268,6 +5272,8 @@ fn funcUsesVmctx(func: *const ir.IrFunction, fctx: *const FuncCompileCtx) bool {
                 .f_gt,
                 .f_le,
                 .f_ge,
+                .convert_s,
+                .convert_u,
                 .convert_i32_s,
                 .convert_i32_u,
                 .convert_i64_s,
@@ -5275,6 +5281,7 @@ fn funcUsesVmctx(func: *const ir.IrFunction, fctx: *const FuncCompileCtx) bool {
                 .demote_f64,
                 .promote_f32,
                 .reinterpret,
+                .atomic_fence,
                 => {},
                 .load => |ld| if (!elideBoundsCheck(fctx, ld.bounds_known)) return true,
                 .store => |st| if (!elideBoundsCheck(fctx, st.bounds_known)) return true,
@@ -21204,5 +21211,39 @@ test "wave11 (#949): frameless leaf elides prologue/epilogue and preserves x20 i
     try std.testing.expect(testCodeContainsWord(code, 0xF940_0014));
     try std.testing.expect(testCodeContainsWord(code, 0xAA14_03EE));
     try std.testing.expect(testCodeContainsWord(code, 0xAA0E_03F4));
+
+    // Wave 12: multi-block loop leaf with .parallel_copy and .lea also stays frameless.
+    var loop_func = ir.IrFunction.init(allocator, 1, 1, 1);
+    defer loop_func.deinit();
+    const b0 = try loop_func.newBlock();
+    const b1 = try loop_func.newBlock();
+    const b2 = try loop_func.newBlock();
+    const p0 = loop_func.newVReg();
+    const v_phi = loop_func.newVReg();
+    const v_step = loop_func.newVReg();
+    const v_next = loop_func.newVReg();
+    try loop_func.getBlock(b0).append(.{ .op = .{ .local_get = 0 }, .dest = p0, .type = .i32 });
+    const pc0 = try allocator.alloc(ir.Inst.ParallelCopy, 1);
+    pc0[0] = .{ .dst = v_phi, .src = p0, .ty = .i32 };
+    try loop_func.getBlock(b0).append(.{ .op = .{ .parallel_copy = pc0 } });
+    try loop_func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try loop_func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_step, .type = .i32 });
+    try loop_func.getBlock(b1).append(.{
+        .op = .{ .lea = .{ .base = v_phi, .index = v_step, .scale = 1, .disp = 0 } },
+        .dest = v_next,
+        .type = .i32,
+    });
+    const pc1 = try allocator.alloc(ir.Inst.ParallelCopy, 1);
+    pc1[0] = .{ .dst = v_phi, .src = v_next, .ty = .i32 };
+    try loop_func.getBlock(b1).append(.{ .op = .{ .parallel_copy = pc1 } });
+    try loop_func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_next, .then_block = b2, .else_block = b1 } } });
+    try loop_func.getBlock(b2).append(.{ .op = .{ .ret = v_phi } });
+
+    const loop_code = try compileFunctionWithOptions(&loop_func, allocator, .{
+        .guard_page_bounds_elision = true,
+    });
+    defer allocator.free(loop_code);
+    try std.testing.expect(!testCodeContainsWord(loop_code, 0xAA00_03F3));
+    try std.testing.expect(!testCodeContainsMasked(loop_code, 0xFFC0_7FFF, 0xA980_7BFD));
 }
 
