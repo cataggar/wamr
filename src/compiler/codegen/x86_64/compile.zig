@@ -2049,12 +2049,14 @@ const range_split = @import("../../ir/range_split.zig");
 /// `caller_saved_indices` / `callee_saved_indices` are stable indices
 /// into `alloc_regs` and match the bit positions used in clobber masks below.
 const x86_64_alloc_regs = [_]regalloc.PhysReg{ 2, 6, 7, 8, 9, 12, 13, 14 };
+const x86_64_alloc_regs_no_vmctx = [_]regalloc.PhysReg{ 2, 6, 7, 8, 9, 12, 13, 14, 3 };
 
 /// Indices into `x86_64_alloc_regs` of callee-saved registers (same on
 /// Win64 and SysV): r12..r14 (idx 5..7). rbx (vmctx, issue #465) and
 /// r15 (memory_base, issue #466) are excluded — both are saved/restored
 /// unconditionally by the prologue/epilogue rather than by the allocator.
 const x86_64_callee_saved_indices = [_]u8{ 5, 6, 7 };
+const x86_64_callee_saved_indices_no_vmctx = [_]u8{ 5, 6, 7, 8 };
 
 /// Indices into `x86_64_alloc_regs` of caller-saved registers, by ABI.
 /// On Win64: rdx, r8, r9. On SysV: add rsi, rdi.
@@ -2147,9 +2149,13 @@ fn addCallArgHints(
 /// Build the per-function `RegSet` for x86-64. `local_count` determines
 /// the spill-slot origin so it must be passed in.
 fn x86_64_reg_set(local_count: u32) regalloc.RegSet {
+    return x86_64_reg_set_ex(local_count, true);
+}
+
+fn x86_64_reg_set_ex(local_count: u32, uses_vmctx: bool) regalloc.RegSet {
     return .{
-        .alloc_regs = &x86_64_alloc_regs,
-        .callee_saved_indices = &x86_64_callee_saved_indices,
+        .alloc_regs = if (uses_vmctx) &x86_64_alloc_regs else &x86_64_alloc_regs_no_vmctx,
+        .callee_saved_indices = if (uses_vmctx) &x86_64_callee_saved_indices else &x86_64_callee_saved_indices_no_vmctx,
         .caller_saved_indices = &x86_64_caller_saved_indices,
         // Frame layout (see compileFunctionImpl): [rbp-8]=VmCtx,
         // [rbp-16..-(1+LC)*8]=locals (LC slots), [-(2+LC)*8..-(65+LC)*8]
@@ -2201,8 +2207,8 @@ fn smallFixedBulkMemLen(const_vals: *const std.AutoHashMap(ir.VReg, i64), len: i
 /// uses fold, no consumer reads the spill slot either.
 pub fn isSingleInsnImmX86(val: i64, ty: ir.IrType) bool {
     return switch (ty) {
-        .i32 => @as(i32, @bitCast(@as(u32, @truncate(@as(u64, @bitCast(val)))))) >= 0,
-        .i64 => val >= std.math.minInt(i32) and val <= std.math.maxInt(i32),
+        .i32 => true,
+        .i64 => val >= std.math.minInt(i32) and val <= 0xFFFF_FFFF,
         else => false,
     };
 }
@@ -2210,6 +2216,15 @@ pub fn isSingleInsnImmX86(val: i64, ty: ir.IrType) bool {
 fn buildIconstSuppress(
     func: *const ir.IrFunction,
     const_vals: *const std.AutoHashMap(ir.VReg, i64),
+    allocator: std.mem.Allocator,
+) !std.AutoHashMap(ir.VReg, void) {
+    return buildIconstSuppressWithOptions(func, const_vals, .{}, allocator);
+}
+
+fn buildIconstSuppressWithOptions(
+    func: *const ir.IrFunction,
+    const_vals: *const std.AutoHashMap(ir.VReg, i64),
+    options: FunctionCompileOptions,
     allocator: std.mem.Allocator,
 ) !std.AutoHashMap(ir.VReg, void) {
     var totals = std.AutoHashMap(ir.VReg, u32).init(allocator);
@@ -2298,6 +2313,28 @@ fn buildIconstSuppress(
                         if (const_vals.get(rv)) |imm| {
                             if (imm >= 0 and imm <= std.math.maxInt(i32)) {
                                 try bumpFold(&folds, rv);
+                            }
+                        }
+                    }
+                },
+                .load => |ld| {
+                    const elide_bounds = ld.bounds_known or options.guard_page_bounds_elision;
+                    if (elide_bounds) {
+                        if (const_vals.get(ld.base)) |c| {
+                            const addr64: u64 = @as(u64, @as(u32, @truncate(@as(u64, @bitCast(c))))) + @as(u64, ld.offset);
+                            if (addr64 <= 0x7FFFFFFF) {
+                                try bumpFold(&folds, ld.base);
+                            }
+                        }
+                    }
+                },
+                .store => |st| {
+                    const elide_bounds = st.bounds_known or options.guard_page_bounds_elision;
+                    if (elide_bounds) {
+                        if (const_vals.get(st.base)) |c| {
+                            const addr64: u64 = @as(u64, @as(u32, @truncate(@as(u64, @bitCast(c))))) + @as(u64, st.offset);
+                            if (addr64 <= 0x7FFFFFFF) {
+                                try bumpFold(&folds, st.base);
                             }
                         }
                     }
@@ -3016,6 +3053,7 @@ fn funcUsesVmctx(func: *const ir.IrFunction, options: FunctionCompileOptions) bo
                 .br_if,
                 .br_table,
                 .ret,
+                .phi,
                 .parallel_copy,
                 .add,
                 .sub,
@@ -3066,6 +3104,8 @@ fn funcUsesVmctx(func: *const ir.IrFunction, options: FunctionCompileOptions) bo
                 .f_gt,
                 .f_le,
                 .f_ge,
+                .convert_s,
+                .convert_u,
                 .convert_i32_s,
                 .convert_i32_u,
                 .convert_i64_s,
@@ -3073,6 +3113,7 @@ fn funcUsesVmctx(func: *const ir.IrFunction, options: FunctionCompileOptions) bo
                 .demote_f64,
                 .promote_f32,
                 .reinterpret,
+                .atomic_fence,
                 => {},
                 .load => |ld| if (!ld.bounds_known and !options.guard_page_bounds_elision) return true,
                 .store => |st| if (!st.bounds_known and !options.guard_page_bounds_elision) return true,
@@ -3886,7 +3927,7 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
     // Build iconst-mov suppression set (#523) before liveness/regalloc so
     // fully-folded iconst vregs can also be excluded from live ranges
     // (#1088) and never occupy physical registers or spill slots.
-    var suppress_iconst = try buildIconstSuppress(func, &const_vals, allocator);
+    var suppress_iconst = try buildIconstSuppressWithOptions(func, &const_vals, options, allocator);
     defer suppress_iconst.deinit();
 
     var fused_cmp_br_if = try buildFusedCmpBrIf(func, &suppress_iconst, allocator);
@@ -4204,7 +4245,12 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
     }
     if (timer) |t| t.end(.liveness);
     if (timer) |t| t.begin();
-    const reg_set = x86_64_reg_set(func.local_count);
+    const uses_memory_base = funcUsesMemoryBase(func);
+    const uses_vmctx = if (options.guard_page_bounds_elision)
+        funcUsesVmctx(func, options)
+    else
+        true;
+    const reg_set = x86_64_reg_set_ex(func.local_count, uses_vmctx);
     var remat_candidates: ?std.AutoHashMap(ir.VReg, regalloc.RematDef) =
         if (alloc_live_ranges.items.len > reg_set.alloc_regs.len)
             try regalloc.classifyRematCandidates(allocator, func)
@@ -4265,12 +4311,6 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
     // Everything below (used-register scans + emit loop + branch/table/
     // call patch resolution + toOwnedSlice) is attributed to the derived
     // `emit` bucket (total − setup − liveness − regalloc).
-    const uses_memory_base = funcUsesMemoryBase(func);
-    const uses_vmctx = if (options.guard_page_bounds_elision)
-        funcUsesVmctx(func, options)
-    else
-        true;
-
     var clean_u32_vregs = try buildCleanU32VRegs(func, allocator);
     defer clean_u32_vregs.deinit();
 
@@ -11249,6 +11289,16 @@ test "#798 Wave 11 x86_64: frameless leaf elides rbp/rbx and folds constant load
     try std.testing.expect(!containsBytes(res.code, &.{ 0x48, 0x89, 0xCB }));
     // Constant load from c_addr(16) + offset(8) = 24 folds directly to `[r15 + 24]` (disp8 = 0x18).
     try std.testing.expect(containsBytes(res.code, &.{ 0x18 }));
+
+    // Wave 12: c_addr is used exclusively as constant load/store base under guard_page_bounds_elision,
+    // so buildIconstSuppressWithOptions suppresses its iconst_32 materialization.
+    var const_vals = try buildConstVals(&func, allocator);
+    defer const_vals.deinit();
+    var suppress = try buildIconstSuppressWithOptions(&func, &const_vals, .{ .guard_page_bounds_elision = true }, allocator);
+    defer suppress.deinit();
+    try std.testing.expect(suppress.contains(c_addr));
+    try std.testing.expect(isSingleInsnImmX86(-5, .i32));
+    try std.testing.expectEqual(@as(usize, 9), x86_64_reg_set_ex(0, false).alloc_regs.len);
 }
 
 
