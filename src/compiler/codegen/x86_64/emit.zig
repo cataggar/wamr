@@ -318,6 +318,126 @@ pub const CodeBuffer = struct {
         try self.modrm(0b11, src.low3(), dst.low3());
     }
 
+    /// INC r32 (FF /0 without REX.W; implicitly zero-extends to 64 bits).
+    pub fn incReg32(self: *CodeBuffer, dst: Reg) !void {
+        if (dst.isExtended()) try self.rex(false, .rax, dst);
+        try self.emitByte(0xFF);
+        try self.modrm(0b11, 0, dst.low3());
+    }
+
+    /// DEC r32 (FF /1 without REX.W; implicitly zero-extends to 64 bits).
+    pub fn decReg32(self: *CodeBuffer, dst: Reg) !void {
+        if (dst.isExtended()) try self.rex(false, .rax, dst);
+        try self.emitByte(0xFF);
+        try self.modrm(0b11, 1, dst.low3());
+    }
+
+    /// ADD r32, imm32 (83 /0 ib or 81 /0 id without REX.W; implicitly zero-extends to 64 bits).
+    pub fn addRegImm32_32(self: *CodeBuffer, dst: Reg, imm: i32) !void {
+        if (imm == 0) {
+            try self.movRegReg32(dst, dst);
+            return;
+        }
+        if (dst.isExtended()) try self.rex(false, .rax, dst);
+        if (imm >= -128 and imm <= 127) {
+            try self.emitByte(0x83);
+            try self.modrm(0b11, 0, dst.low3());
+            try self.emitByte(@bitCast(@as(i8, @intCast(imm))));
+        } else {
+            try self.emitByte(0x81);
+            try self.modrm(0b11, 0, dst.low3());
+            try self.emitI32(imm);
+        }
+    }
+
+    /// SUB r32, imm32 (83 /5 ib or 81 /5 id without REX.W; implicitly zero-extends to 64 bits).
+    pub fn subRegImm32_32(self: *CodeBuffer, dst: Reg, imm: i32) !void {
+        if (imm == 0) {
+            try self.movRegReg32(dst, dst);
+            return;
+        }
+        if (dst.isExtended()) try self.rex(false, .rax, dst);
+        if (imm >= -128 and imm <= 127) {
+            try self.emitByte(0x83);
+            try self.modrm(0b11, 5, dst.low3());
+            try self.emitByte(@bitCast(@as(i8, @intCast(imm))));
+        } else {
+            try self.emitByte(0x81);
+            try self.modrm(0b11, 5, dst.low3());
+            try self.emitI32(imm);
+        }
+    }
+
+    /// AND r32, imm32 (83 /4 ib or 81 /4 id without REX.W; implicitly zero-extends to 64 bits).
+    pub fn andRegImm32_32(self: *CodeBuffer, dst: Reg, imm: i32) !void {
+        if (dst.isExtended()) try self.rex(false, .rax, dst);
+        if (imm >= -128 and imm <= 127) {
+            try self.emitByte(0x83);
+            try self.modrm(0b11, 4, dst.low3());
+            try self.emitByte(@bitCast(@as(i8, @intCast(imm))));
+        } else {
+            try self.emitByte(0x81);
+            try self.modrm(0b11, 4, dst.low3());
+            try self.emitI32(imm);
+        }
+    }
+
+    /// OR r32, imm32 (83 /1 ib or 81 /1 id without REX.W; implicitly zero-extends to 64 bits).
+    pub fn orRegImm32_32(self: *CodeBuffer, dst: Reg, imm: i32) !void {
+        if (dst.isExtended()) try self.rex(false, .rax, dst);
+        if (imm >= -128 and imm <= 127) {
+            try self.emitByte(0x83);
+            try self.modrm(0b11, 1, dst.low3());
+            try self.emitByte(@bitCast(@as(i8, @intCast(imm))));
+        } else {
+            try self.emitByte(0x81);
+            try self.modrm(0b11, 1, dst.low3());
+            try self.emitI32(imm);
+        }
+    }
+
+    /// XOR r32, imm32 (83 /6 ib or 81 /6 id without REX.W; implicitly zero-extends to 64 bits).
+    pub fn xorRegImm32_32(self: *CodeBuffer, dst: Reg, imm: i32) !void {
+        if (dst.isExtended()) try self.rex(false, .rax, dst);
+        if (imm >= -128 and imm <= 127) {
+            try self.emitByte(0x83);
+            try self.modrm(0b11, 6, dst.low3());
+            try self.emitByte(@bitCast(@as(i8, @intCast(imm))));
+        } else {
+            try self.emitByte(0x81);
+            try self.modrm(0b11, 6, dst.low3());
+            try self.emitI32(imm);
+        }
+    }
+
+    /// IMUL r64, r/m64, imm32 (REX.W + 6B /r ib or 69 /r id).
+    pub fn imulRegImm32(self: *CodeBuffer, dst: Reg, src: Reg, imm: i32) !void {
+        try self.rexW(dst, src);
+        if (imm >= -128 and imm <= 127) {
+            try self.emitByte(0x6B);
+            try self.modrm(0b11, dst.low3(), src.low3());
+            try self.emitByte(@bitCast(@as(i8, @intCast(imm))));
+        } else {
+            try self.emitByte(0x69);
+            try self.modrm(0b11, dst.low3(), src.low3());
+            try self.emitI32(imm);
+        }
+    }
+
+    /// IMUL r32, r/m32, imm32 (6B /r ib or 69 /r id without REX.W; implicitly zero-extends to 64 bits).
+    pub fn imulRegImm32_32(self: *CodeBuffer, dst: Reg, src: Reg, imm: i32) !void {
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, dst, src);
+        if (imm >= -128 and imm <= 127) {
+            try self.emitByte(0x6B);
+            try self.modrm(0b11, dst.low3(), src.low3());
+            try self.emitByte(@bitCast(@as(i8, @intCast(imm))));
+        } else {
+            try self.emitByte(0x69);
+            try self.modrm(0b11, dst.low3(), src.low3());
+            try self.emitI32(imm);
+        }
+    }
+
     /// PUSH reg (uses REX prefix only for r8–r15).
     pub fn pushReg(self: *CodeBuffer, reg: Reg) !void {
         const native_start = self.len();
@@ -520,6 +640,14 @@ pub const CodeBuffer = struct {
         try self.emitI32(imm);
     }
 
+    /// TEST reg32, imm32 (F7 /0 id without REX.W).
+    pub fn testRegImm32_32(self: *CodeBuffer, reg: Reg, imm: u32) !void {
+        if (reg.isExtended()) try self.rex(false, .rax, reg);
+        try self.emitByte(0xF7);
+        try self.modrm(0b11, 0, reg.low3());
+        try self.emitI32(@bitCast(imm));
+    }
+
     /// CQO — sign-extend RAX into RDX:RAX (REX.W + 99).
     pub fn cqo(self: *CodeBuffer) !void {
         try self.emitByte(0x48); // REX.W
@@ -570,6 +698,14 @@ pub const CodeBuffer = struct {
     /// CMOVcc dst, src (64-bit conditional move on condition code `cc`).
     pub fn cmovcc(self: *CodeBuffer, cc: u4, dst: Reg, src: Reg) !void {
         try self.rexW(dst, src);
+        try self.emitByte(0x0F);
+        try self.emitByte(@as(u8, 0x40) | @as(u8, cc));
+        try self.modrm(0b11, dst.low3(), src.low3());
+    }
+
+    /// CMOVcc r32, r/m32 (32-bit conditional move on `cc`; unconditionally zero-extends `dst` to 64 bits).
+    pub fn cmovcc32(self: *CodeBuffer, cc: u4, dst: Reg, src: Reg) !void {
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, dst, src);
         try self.emitByte(0x0F);
         try self.emitByte(@as(u8, 0x40) | @as(u8, cc));
         try self.modrm(0b11, dst.low3(), src.low3());

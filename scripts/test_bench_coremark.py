@@ -201,11 +201,16 @@ class BenchCoremarkTests(unittest.TestCase):
 
     def test_fixed_guest_args_are_applied_to_both_engines(self):
         self.assertEqual(
-            ("0", "0", "0", "200000", "0"),
+            ("0", "0", "0", "400000", "0"),
             bench_coremark.coremark_guest_args(
                 bench_coremark.PROFILE_ITERATIONS["ci"]
             ),
         )
+        for profile in ("authoritative", "ci"):
+            self.assertGreaterEqual(
+                bench_coremark.PROFILE_ITERATIONS[profile],
+                bench_coremark.EXPECTED_ITERATIONS,
+            )
         with (
             mock.patch.object(bench_coremark, "run", return_value=""),
             mock.patch.object(bench_coremark, "worktree_env", return_value={}),

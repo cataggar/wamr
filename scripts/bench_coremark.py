@@ -48,7 +48,7 @@ COREMARK_GUEST_ARGS = ("0", "0", "0", "400000", "0")
 EXPECTED_ITERATIONS = 400000
 PROFILE_ITERATIONS = {
     "authoritative": EXPECTED_ITERATIONS,
-    "ci": 200000,
+    "ci": EXPECTED_ITERATIONS,
 }
 DEFAULT_FIXTURE = Path("tests/benchmarks/coremark/coremark_wasi.wasm")
 DEFAULT_FIXTURE_SHA256 = "f4b7591296ead10264e0f101f355bdf848865c31329325594e66fbabefec235b"
