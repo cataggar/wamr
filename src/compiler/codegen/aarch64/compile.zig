@@ -5,6 +5,7 @@
 //! register allocator mapping VRegs to physical registers.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ir = @import("../../ir/ir.zig");
 const emit = @import("emit.zig");
 const schedule = @import("schedule.zig");
@@ -584,6 +585,10 @@ pub const CompileOptions = struct {
     /// Bounds-known, memory64-shaped, non-zero-offset, SIMD, and atomic/shared
     /// paths keep their existing address-materialization fallback.
     enable_mem_reg_offset: bool = true,
+    /// When the runtime reserves an 8 GiB virtual guard region for non-shared
+    /// 32-bit linear memory, elide explicit software bounds checks and let
+    /// hardware page faults trap out-of-bounds accesses.
+    guard_page_bounds_elision: bool = false,
     /// #778: native-codegen timing diagnostics. aarch64 reports per-function
     /// totals + a module summary (no x86_64-style setup/liveness/regalloc
     /// sub-phase breakdown — the #778 bottleneck is the x86_64 host path).
@@ -854,7 +859,10 @@ pub fn compileFunctionWithGlobalOffsetsPublic(
         .global_offsets = global_offsets,
         .has_memory64 = has_memory64,
         .has_shared_memory = has_shared_memory,
-        .options = .{ .cancel_points = cancel_points },
+        .options = .{
+            .cancel_points = cancel_points,
+            .guard_page_bounds_elision = !has_memory64 and !has_shared_memory and @sizeOf(usize) == 8 and builtin.os.tag != .windows and builtin.os.tag != .wasi and builtin.os.tag != .freestanding,
+        },
         .allocator = allocator,
     }, allocator);
 }
@@ -5067,13 +5075,6 @@ fn funcUsesMemoryBase(func: *const ir.IrFunction) bool {
                 .memory_fill,
                 .memory_copy,
                 .memory_init,
-                .table_grow,
-                .table_init,
-                .call,
-                .call_indirect,
-                .call_ref,
-                .throw,
-                .throw_ref,
                 => return true,
                 else => {},
             }
@@ -5405,13 +5406,13 @@ fn compileInst(
             try destCommit(code, reg_map, info);
         },
         .v128_const => |val| try emitV128Const(code, inst, val, v128_map, v128_cache),
-        .v128_load => |ld| try emitV128Load(code, inst, ld, reg_map, v128_map, v128_cache),
-        .v128_load_splat => |ld| try emitV128LoadSplat(code, inst, ld, reg_map, v128_map, v128_cache),
-        .v128_load_zero => |ld| try emitV128LoadZero(code, inst, ld, reg_map, v128_map, v128_cache),
-        .v128_load_extend => |ld| try emitV128LoadExtend(code, inst, ld, reg_map, v128_map, v128_cache),
+        .v128_load => |ld| try emitV128Load(code, inst, ld, reg_map, v128_map, v128_cache, fctx),
+        .v128_load_splat => |ld| try emitV128LoadSplat(code, inst, ld, reg_map, v128_map, v128_cache, fctx),
+        .v128_load_zero => |ld| try emitV128LoadZero(code, inst, ld, reg_map, v128_map, v128_cache, fctx),
+        .v128_load_extend => |ld| try emitV128LoadExtend(code, inst, ld, reg_map, v128_map, v128_cache, fctx),
         .v128_load_lane => |ld| try emitV128LoadLane(code, inst, ld, reg_map, v128_map, v128_cache, fctx),
-        .v128_store => |st| try emitV128Store(code, st, reg_map, v128_map, v128_cache),
-        .v128_store_lane => |st| try emitV128StoreLane(code, st, reg_map, v128_map, v128_cache),
+        .v128_store => |st| try emitV128Store(code, st, reg_map, v128_map, v128_cache, fctx),
+        .v128_store_lane => |st| try emitV128StoreLane(code, st, reg_map, v128_map, v128_cache, fctx),
         .v128_not => |src| try emitV128Not(code, inst, src, v128_map, v128_cache, fctx),
         .v128_bitwise => |bin| try emitV128Bitwise(code, inst, bin, v128_map, v128_cache, fctx),
         .v128_bitselect => |sel| try emitV128Bitselect(code, inst, sel, v128_map, v128_cache, fctx),
@@ -6010,6 +6011,10 @@ fn emitV128ImmediateIntoReg(
     try code.insDFromGp64(dest_reg, 1, RegMap.tmp0);
 }
 
+fn elideBoundsCheck(fctx: *const FuncCompileCtx, bounds_known: bool) bool {
+    return bounds_known or (fctx.options.guard_page_bounds_elision and !fctx.has_memory64 and !fctx.has_shared_memory);
+}
+
 fn emitV128Load(
     code: *emit.CodeBuffer,
     inst: ir.Inst,
@@ -6017,11 +6022,12 @@ fn emitV128Load(
     reg_map: *RegMap,
     v128_map: *V128StackMap,
     v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
 ) !void {
     const dest = inst.dest orelse return;
     const dest_reg = try v128_cache.defineFresh(code, v128_map, dest, null);
     const end_offset: u64 = if (ld.checked_end > 0) ld.checked_end else @as(u64, ld.offset) + 16;
-    if (ld.bounds_known) {
+    if (elideBoundsCheck(fctx, ld.bounds_known)) {
         try emitMemAddrSkipBounds(code, reg_map, ld.base, ld.offset);
     } else {
         try emitMemAddr(code, reg_map, ld.base, ld.offset, end_offset);
@@ -6036,11 +6042,12 @@ fn emitV128LoadSplat(
     reg_map: *RegMap,
     v128_map: *V128StackMap,
     v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
 ) !void {
     const dest = inst.dest orelse return;
     const dest_reg = try v128_cache.defineFresh(code, v128_map, dest, null);
     const end_offset: u64 = if (ld.checked_end > 0) ld.checked_end else @as(u64, ld.offset) + ld.accessSize();
-    if (ld.bounds_known) {
+    if (elideBoundsCheck(fctx, ld.bounds_known)) {
         try emitMemAddrSkipBounds(code, reg_map, ld.base, ld.offset);
     } else {
         try emitMemAddr(code, reg_map, ld.base, ld.offset, end_offset);
@@ -6060,11 +6067,12 @@ fn emitV128LoadZero(
     reg_map: *RegMap,
     v128_map: *V128StackMap,
     v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
 ) !void {
     const dest = inst.dest orelse return;
     const dest_reg = try v128_cache.defineFresh(code, v128_map, dest, null);
     const end_offset: u64 = if (ld.checked_end > 0) ld.checked_end else @as(u64, ld.offset) + ld.accessSize();
-    if (ld.bounds_known) {
+    if (elideBoundsCheck(fctx, ld.bounds_known)) {
         try emitMemAddrSkipBounds(code, reg_map, ld.base, ld.offset);
     } else {
         try emitMemAddr(code, reg_map, ld.base, ld.offset, end_offset);
@@ -6082,11 +6090,12 @@ fn emitV128LoadExtend(
     reg_map: *RegMap,
     v128_map: *V128StackMap,
     v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
 ) !void {
     const dest = inst.dest orelse return;
     const dest_reg = try v128_cache.defineFresh(code, v128_map, dest, null);
     const end_offset: u64 = if (ld.checked_end > 0) ld.checked_end else @as(u64, ld.offset) + ld.accessSize();
-    if (ld.bounds_known) {
+    if (elideBoundsCheck(fctx, ld.bounds_known)) {
         try emitMemAddrSkipBounds(code, reg_map, ld.base, ld.offset);
     } else {
         try emitMemAddr(code, reg_map, ld.base, ld.offset, end_offset);
@@ -6135,7 +6144,7 @@ fn emitV128LoadLane(
     };
 
     const end_offset: u64 = if (ld.checked_end > 0) ld.checked_end else @as(u64, ld.offset) + ld.accessSize();
-    if (ld.bounds_known) {
+    if (elideBoundsCheck(fctx, ld.bounds_known)) {
         try emitMemAddrSkipBounds(code, reg_map, ld.base, ld.offset);
     } else {
         try emitMemAddr(code, reg_map, ld.base, ld.offset, end_offset);
@@ -6154,10 +6163,11 @@ fn emitV128Store(
     reg_map: *RegMap,
     v128_map: *V128StackMap,
     v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
 ) !void {
     const val_reg = try v128_cache.ensure(code, v128_map, st.val, null);
     const end_offset: u64 = if (st.checked_end > 0) st.checked_end else @as(u64, st.offset) + 16;
-    if (st.bounds_known) {
+    if (elideBoundsCheck(fctx, st.bounds_known)) {
         try emitMemAddrSkipBounds(code, reg_map, st.base, st.offset);
     } else {
         try emitMemAddr(code, reg_map, st.base, st.offset, end_offset);
@@ -6171,12 +6181,13 @@ fn emitV128StoreLane(
     reg_map: *RegMap,
     v128_map: *V128StackMap,
     v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
 ) !void {
     if (st.lane >= st.width.laneCount()) return error.InvalidSimdLane;
 
     const vector_reg = try v128_cache.ensure(code, v128_map, st.vector, null);
     const end_offset: u64 = if (st.checked_end > 0) st.checked_end else @as(u64, st.offset) + st.accessSize();
-    if (st.bounds_known) {
+    if (elideBoundsCheck(fctx, st.bounds_known)) {
         try emitMemAddrSkipBounds(code, reg_map, st.base, st.offset);
     } else {
         try emitMemAddr(code, reg_map, st.base, st.offset, end_offset);
@@ -9471,7 +9482,9 @@ fn emitCall(
     // discipline restored *our* (pre-call) x20 in its epilogue, so the
     // value we hold is stale; reload from the now-current
     // `[vmctx + 0]`.
-    try code.ldrImm(.x20, .x19, 0);
+    if (fctx.uses_memory_base) {
+        try code.ldrImm(.x20, .x19, 0);
+    }
 
     // Commit result (in x0 or q0) to dest's location BEFORE restoring saved regs,
     // so restoration can't clobber the result holder (dest.reg is always a
@@ -10378,7 +10391,9 @@ fn emitCallIndirect(
     // Refresh pinned memory_base in x20 (issue #466) — the called
     // function may have invoked `memory.grow`; see emitCall for
     // rationale.
-    try code.ldrImm(.x20, .x19, 0);
+    if (fctx.uses_memory_base) {
+        try code.ldrImm(.x20, .x19, 0);
+    }
 
     try emitCapturePrimaryCallResult(code, inst, reg_map, v128_map, v128_cache);
 
@@ -10463,7 +10478,9 @@ fn emitCallRef(
     // Refresh pinned memory_base in x20 (issue #466) — the called
     // function may have invoked `memory.grow`; see emitCall for
     // rationale.
-    try code.ldrImm(.x20, .x19, 0);
+    if (fctx.uses_memory_base) {
+        try code.ldrImm(.x20, .x19, 0);
+    }
 
     try emitCapturePrimaryCallResult(code, inst, reg_map, v128_map, v128_cache);
 
@@ -11059,26 +11076,27 @@ fn emitLoad(
     if (ld.sign_extend and ld.size == 4 and !is64) return error.BadLoadSign;
 
     // Try to fold offset into the load's scaled immediate; else add it to tmp0.
+    const bounds_known = elideBoundsCheck(fctx, ld.bounds_known);
     const folded = scaledOffset(ld.offset, scale);
     const end_offset: u64 = if (ld.checked_end > 0) ld.checked_end else @as(u64, ld.offset) + @as(u64, ld.size);
     const folded_offset: u32 = if (folded == null) ld.offset else 0;
     const has_cached_ea = fctx.cached_mem_ea_vreg == ld.base and fctx.cached_mem_ea_epoch == code.tmp0_write_epoch;
-    const shares_coalesced_ea = !ld.bounds_known and ld.checked_end > @as(u64, ld.offset) + @as(u64, ld.size);
+    const shares_coalesced_ea = !bounds_known and ld.checked_end > @as(u64, ld.offset) + @as(u64, ld.size);
     const use_reg_offset = fctx.options.enable_mem_reg_offset and
         ld.offset == 0 and
         !fctx.has_memory64 and
         !fctx.has_shared_memory and
         !has_cached_ea and
         !shares_coalesced_ea;
-    const use_uxtw = use_reg_offset and ld.bounds_known and fctx.cached_mem_index_vreg != ld.base;
+    const use_uxtw = use_reg_offset and bounds_known and fctx.cached_mem_index_vreg != ld.base;
     var uxtw_idx_reg: emit.Reg = RegMap.tmp2;
     if (use_uxtw) {
         uxtw_idx_reg = try useInto(code, reg_map, ld.base, RegMap.tmp2);
         if (uxtw_idx_reg == RegMap.tmp2) fctx.cached_mem_index_vreg = null;
     } else if (use_reg_offset) {
-        try emitMemIndexImpl(code, reg_map, ld.base, end_offset, ld.bounds_known, fctx);
+        try emitMemIndexImpl(code, reg_map, ld.base, end_offset, bounds_known, fctx);
     } else {
-        try emitMemAddrImpl(code, reg_map, ld.base, folded_offset, end_offset, ld.bounds_known, fctx);
+        try emitMemAddrImpl(code, reg_map, ld.base, folded_offset, end_offset, bounds_known, fctx);
     }
     const disp: u12 = if (folded) |d| d else 0;
 
@@ -11146,26 +11164,27 @@ fn emitStore(
         else => return error.UnimplementedStoreSize,
     };
 
+    const bounds_known = elideBoundsCheck(fctx, st.bounds_known);
     const folded = scaledOffset(st.offset, scale);
     const end_offset: u64 = if (st.checked_end > 0) st.checked_end else @as(u64, st.offset) + @as(u64, st.size);
     const folded_offset: u32 = if (folded == null) st.offset else 0;
     const has_cached_ea = fctx.cached_mem_ea_vreg == st.base and fctx.cached_mem_ea_epoch == code.tmp0_write_epoch;
-    const shares_coalesced_ea = !st.bounds_known and st.checked_end > @as(u64, st.offset) + @as(u64, st.size);
+    const shares_coalesced_ea = !bounds_known and st.checked_end > @as(u64, st.offset) + @as(u64, st.size);
     const use_reg_offset = fctx.options.enable_mem_reg_offset and
         st.offset == 0 and
         !fctx.has_memory64 and
         !fctx.has_shared_memory and
         !has_cached_ea and
         !shares_coalesced_ea;
-    const use_uxtw = use_reg_offset and st.bounds_known and fctx.cached_mem_index_vreg != st.base;
+    const use_uxtw = use_reg_offset and bounds_known and fctx.cached_mem_index_vreg != st.base;
     var uxtw_idx_reg: emit.Reg = RegMap.tmp2;
     if (use_uxtw) {
         uxtw_idx_reg = try useInto(code, reg_map, st.base, RegMap.tmp2);
         if (uxtw_idx_reg == RegMap.tmp2) fctx.cached_mem_index_vreg = null;
     } else if (use_reg_offset) {
-        try emitMemIndexImpl(code, reg_map, st.base, end_offset, st.bounds_known, fctx);
+        try emitMemIndexImpl(code, reg_map, st.base, end_offset, bounds_known, fctx);
     } else {
-        try emitMemAddrImpl(code, reg_map, st.base, folded_offset, end_offset, st.bounds_known, fctx);
+        try emitMemAddrImpl(code, reg_map, st.base, folded_offset, end_offset, bounds_known, fctx);
     }
     const disp: u12 = if (folded) |d| d else 0;
 
@@ -20884,7 +20903,53 @@ test "wave9 (#949): SBFX (SBFM) signed bitfield extract fusion for shl + shr_s" 
     try std.testing.expect(testCodeContainsMasked(code, 0xFFFF_FC00, 0x9348_CC00));
 }
 
+test "wave10 (#949): guard_page_bounds_elision emits UXTW load without bounds check and non-memory call omits x20 reload" {
+    const allocator = std.testing.allocator;
 
+    // 1. i32.load with bounds_known = false and guard_page_bounds_elision = true
+    // emits LDR Wd, [X20, Wm, UXTW] and no B.LS bounds-check branch.
+    const elided_load = try compileAddressingLoadTest(allocator, .{ .size = 4, .result_type = .i32, .bounds_known = false }, .{
+        .enable_scheduler = false,
+        .enable_peephole = false,
+        .enable_post_emit_coalesce = false,
+        .guard_page_bounds_elision = true,
+    });
+    defer allocator.free(elided_load);
+    // LDR Wd, [X20, Wm, UXTW] (option=010, S=0): mask 0xFFE0_FFE0 == 0xB860_4800 | (20 << 5) = 0xB860_4A80.
+    try std.testing.expect(testCodeContainsMasked(elided_load, 0xFFE0_FFE0, 0xB860_4A80));
+    try std.testing.expect(testCodeContainsMasked(elided_load, 0x3B20_0C00, 0x3820_0800));
+    // No B.LS (0x5400_0009, mask 0xFF00_001F) from emitMemIndexBoundsCheck.
+    try std.testing.expect(!testCodeContainsMasked(elided_load, 0xFF00_001F, 0x5400_0009));
 
+    // 2. Non-memory function with a direct call omits LDR X20, [X19, #0] (0xF940_0274).
+    var module = ir.IrModule.init(allocator);
+    defer module.deinit();
 
+    var f0 = ir.IrFunction.init(allocator, 0, 1, 0);
+    {
+        const b = try f0.newBlock();
+        const v = f0.newVReg();
+        try f0.getBlock(b).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v, .type = .i32 });
+        try f0.getBlock(b).append(.{ .op = .{ .ret = v } });
+    }
+    _ = try module.addFunction(f0);
 
+    var f1 = ir.IrFunction.init(allocator, 0, 1, 0);
+    {
+        const b = try f1.newBlock();
+        const v = f1.newVReg();
+        try f1.getBlock(b).append(.{
+            .op = .{ .call = .{ .func_idx = 0, .args = &.{} } },
+            .dest = v,
+            .type = .i32,
+        });
+        try f1.getBlock(b).append(.{ .op = .{ .ret = v } });
+    }
+    _ = try module.addFunction(f1);
+
+    const res = try compileModule(&module, allocator);
+    defer allocator.free(res.code);
+    defer allocator.free(res.offsets);
+    const f1_code = res.code[res.offsets[1]..];
+    try std.testing.expect(!testCodeContainsWord(f1_code, 0xF940_0274));
+}

@@ -454,11 +454,19 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
         frame_attribution.cwasm_aot_version = emit_aot.aot_version;
         frame_attribution.compiler_build_id = wamr.version.string;
     }
+    const guard_page_bounds_elision = !native_profile and
+        !ir_module.has_memory64 and
+        !ir_module.has_shared_memory and
+        @sizeOf(usize) == 8 and
+        builtin.os.tag != .windows and
+        builtin.os.tag != .wasi and
+        builtin.os.tag != .freestanding;
     const compiled: codegen_cache.CompileResultCached = switch (target_arch) {
         .x86_64 => x86_64_compile.compileModuleCachedWithOptions(&ir_module, reuse_ptr, allocator, .{
             .codegen_timing = codegen_timing,
             .spill_metric = passes.spillMetricOptionsFromEnv(init.environ_map),
             .frame_attribution = frame_attribution,
+            .guard_page_bounds_elision = guard_page_bounds_elision,
         }) catch |err| {
             std.debug.print("Error compiling to x86-64: {}\n", .{err});
             std.process.exit(1);
@@ -470,6 +478,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
             .spill_metric = passes.spillMetricOptionsFromEnv(init.environ_map),
             .allocator_trace_func10 = envFlagEnabled(init.environ_map, "WAMR_AOT_ALLOC_TRACE_FUNC10"),
             .frame_attribution = frame_attribution,
+            .guard_page_bounds_elision = guard_page_bounds_elision,
         }) catch |err| {
             std.debug.print("Error compiling to AArch64: {}\n", .{err});
             std.process.exit(1);

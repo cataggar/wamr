@@ -457,7 +457,7 @@ pub const NameSection = struct {
 
 // ─── Instance-level structures ──────────────────────────────────────────────
 
-pub const MEM32_GUARD_RESERVATION_BYTES: usize = if (@sizeOf(usize) == 8) 8 * 1024 * 1024 * 1024 else 0;
+pub const MEM32_GUARD_RESERVATION_BYTES: usize = if (@sizeOf(usize) == 8) 8 * 1024 * 1024 * 1024 + 65536 else 0;
 
 /// Runtime memory instance
 /// Runtime memory instance (refcounted for cross-module sharing)
@@ -514,6 +514,45 @@ pub const MemoryInstance = struct {
     /// aarch64. wasm pages are always a multiple of any reasonable host page,
     /// so the OS calls never see sub-page slack.
     pub const page_size_min: u29 = std.heap.page_size_min;
+
+    const max_guard_ranges = 256;
+    var guard_range_bases: [max_guard_ranges]std.atomic.Value(usize) =
+        @splat(std.atomic.Value(usize).init(0));
+    var guard_range_ends: [max_guard_ranges]std.atomic.Value(usize) =
+        @splat(std.atomic.Value(usize).init(0));
+
+    fn registerGuardRange(base_addr: usize, end_addr: usize) void {
+        if (base_addr == 0 or end_addr <= base_addr) return;
+        for (&guard_range_bases, &guard_range_ends) |*base_slot, *end_slot| {
+            if (base_slot.cmpxchgStrong(0, base_addr, .acq_rel, .monotonic) == null) {
+                end_slot.store(end_addr, .release);
+                return;
+            }
+        }
+    }
+
+    fn unregisterGuardRange(base_addr: usize, end_addr: usize) void {
+        _ = end_addr;
+        if (base_addr == 0) return;
+        for (&guard_range_bases, &guard_range_ends) |*base_slot, *end_slot| {
+            if (base_slot.load(.acquire) == base_addr) {
+                end_slot.store(0, .release);
+                base_slot.store(0, .release);
+                return;
+            }
+        }
+    }
+
+    pub fn isAddressInRegisteredGuardRange(addr: usize) bool {
+        if (addr == 0) return false;
+        for (&guard_range_bases, &guard_range_ends) |*base_slot, *end_slot| {
+            const base = base_slot.load(.acquire);
+            if (base == 0) continue;
+            const end = end_slot.load(.acquire);
+            if (addr >= base and addr < end) return true;
+        }
+        return false;
+    }
 
     pub fn byteSizeForPages(pages: u32) ?usize {
         if (pages > max_addressable_pages) return null;
@@ -605,6 +644,8 @@ pub const MemoryInstance = struct {
             .reserved_bytes = reserved_size,
             .has_guard_pages = has_guard_pages,
         };
+        const base_addr = @intFromPtr(base);
+        registerGuardRange(base_addr, base_addr +| reserved_size);
         return mem;
     }
 
@@ -784,6 +825,8 @@ pub const MemoryInstance = struct {
         if (!self.ref_count.release()) return;
         self.vmctx_subscribers.deinit(allocator);
         if (self.reserved_base) |base| {
+            const base_addr = @intFromPtr(base);
+            unregisterGuardRange(base_addr, base_addr +| self.reserved_size);
             platform.releaseAddressSpace(base, self.reserved_size);
         } else if (self.data.len > 0) {
             allocator.free(self.data);
