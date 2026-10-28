@@ -197,6 +197,13 @@ pub const CodeBuffer = struct {
         try self.emitI32(imm);
     }
 
+    /// MOV reg32, imm32 (zero-extended to 64-bit via [REX.B] B8+rd id).
+    pub fn movRegImm32_32(self: *CodeBuffer, dst: Reg, imm: u32) !void {
+        try self.rex(false, .rax, dst);
+        try self.emitByte(0xB8 | @as(u8, dst.low3()));
+        try self.emitU32(imm);
+    }
+
     /// MOV reg, imm64 (REX.W + B8+rd io).
     pub fn movRegImm64(self: *CodeBuffer, dst: Reg, imm: u64) !void {
         try self.rex(true, .rax, dst);
