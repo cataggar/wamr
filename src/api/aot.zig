@@ -477,6 +477,7 @@ pub const Instance = struct {
         if (self.tables.len != 0) {
             self.vmctx.func_table_ptr = self.table_descriptors[0].ptr;
             self.vmctx.func_table_len = self.tables[0].size;
+            self.vmctx.func_table_type_backing_ptr = self.table_descriptors[0].type_backing_ptr;
         }
     }
 };

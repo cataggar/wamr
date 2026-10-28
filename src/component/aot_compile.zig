@@ -440,6 +440,13 @@ pub fn compileCoreWasmCached(
         frame_attribution_opts.cwasm_aot_version = emit_aot.aot_version;
         frame_attribution_opts.compiler_build_id = config.version;
     }
+    const guard_page_bounds_elision = !config.unikraft_jit and
+        !ir_module.has_memory64 and
+        !ir_module.has_shared_memory and
+        @sizeOf(usize) == 8 and
+        builtin.os.tag != .windows and
+        builtin.os.tag != .wasi and
+        builtin.os.tag != .freestanding;
     const compiled: codegen_cache.CompileResultCached = switch (if (config.unikraft_jit) passes.TargetArch.x86_64 else opts.target_arch) {
         .aarch64 => aarch64_compile.compileModuleCachedWithOptions(&ir_module, cache_ctx.reuse, allocator, .{
             .codegen_timing = opts.codegen_timing,
@@ -447,6 +454,7 @@ pub fn compileCoreWasmCached(
             .frame_attribution = frame_attribution_opts,
             .module_idx = opts.module_idx,
             .lazy_skip = lazy_skip,
+            .guard_page_bounds_elision = guard_page_bounds_elision,
         }) catch
             return error.CoreCompileFailed,
         .x86_64 => x86_64_compile.compileModuleCachedWithOptions(&ir_module, cache_ctx.reuse, allocator, .{
@@ -458,6 +466,7 @@ pub fn compileCoreWasmCached(
             .module_idx = opts.module_idx,
             .lazy_skip = lazy_skip,
             .lazy_entry_stubs = lazy_entry_stubs,
+            .guard_page_bounds_elision = guard_page_bounds_elision,
         }) catch |err| switch (err) {
             error.CompileCancelled, error.CompileLimitExceeded, error.CodeLimitExceeded, error.ClockFailed, error.UnsupportedNativeFeature => return @errorCast(err),
             else => return error.CoreCompileFailed,
@@ -851,6 +860,12 @@ pub const LazyCompileDriver = struct {
                         // module need the same entry and loop interruption
                         // points.
                         .cancel_points = self.lazy_out.ir_module.spawns_threads,
+                        .guard_page_bounds_elision = !self.lazy_out.ir_module.has_memory64 and
+                            !self.lazy_out.ir_module.has_shared_memory and
+                            @sizeOf(usize) == 8 and
+                            builtin.os.tag != .windows and
+                            builtin.os.tag != .wasi and
+                            builtin.os.tag != .freestanding,
                     },
                 ) catch |err| {
                     std.log.err("lazy-JIT spike: compiling deferred x86_64 function {d} failed: {s}", .{ local_idx, @errorName(err) });

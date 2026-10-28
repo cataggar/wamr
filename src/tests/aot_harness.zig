@@ -660,7 +660,10 @@ pub const Harness = struct {
         vmctx.trap_iovf_fn = @intFromPtr(&aot_runtime.aotTrapIntOverflow);
         vmctx.trap_ivc_fn = @intFromPtr(&aot_runtime.aotTrapInvalidConversion);
         vmctx.table_grow_fn = @intFromPtr(&aot_runtime.tableGrowHelper);
-        if (inst.tables_info.len > 0) vmctx.tables_info_ptr = @intFromPtr(inst.tables_info.ptr);
+        if (inst.tables_info.len > 0) {
+            vmctx.tables_info_ptr = @intFromPtr(inst.tables_info.ptr);
+            vmctx.func_table_type_backing_ptr = inst.tables_info[0].type_backing_ptr;
+        }
         vmctx.table_init_fn = @intFromPtr(&aot_runtime.tableInitHelper);
         vmctx.elem_drop_fn = @intFromPtr(&aot_runtime.elemDropHelper);
         vmctx.table_set_fn = @intFromPtr(&aot_runtime.tableSetHelper);
@@ -875,6 +878,7 @@ pub const Harness = struct {
         results_buf: []aot_runtime.ScalarResult,
     ) aot_runtime.ScalarCallError![]const aot_runtime.ScalarResult {
         const ft = self.getFuncType(func_idx) orelse return error.FunctionNotFound;
+        aot_runtime.ensurePosixTrapHandlerInstalled();
         return aot_runtime.callFuncScalar(self.inst, func_idx, ft.params, ft.results, args, results_buf);
     }
 };

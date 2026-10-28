@@ -444,6 +444,11 @@ fn allocateMemories(module: *const types.WasmModule, allocator: std.mem.Allocato
             mem_type.limits.max orelse 65536,
             types.MemoryInstance.max_addressable_pages,
         ));
+        if (types.MemoryInstance.createReserved(mem_type, min_pages, max_pages, allocator)) |mem| {
+            mems[import_count + i] = mem;
+            initialized += 1;
+            continue;
+        }
         const initial_size = types.MemoryInstance.byteSizeForPages(min_pages) orelse
             return error.MemoryAllocationFailed;
 

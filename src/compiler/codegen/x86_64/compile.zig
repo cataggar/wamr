@@ -99,6 +99,7 @@ const vmctx_exception_params_field: i32 = 264; // VmCtx.exception_params base ([
 const vmctx_exception_param_count_field: i32 = 392; // VmCtx.exception_param_count (u32)
 const vmctx_lazy_compile_fn_field: i32 = 408; // VmCtx.lazy_compile_fn offset (usize)
 const vmctx_trap_unaligned_fn_field: i32 = 424; // VmCtx.trap_unaligned_fn offset
+const vmctx_func_table_type_backing_field: i32 = 472; // VmCtx.func_table_type_backing_ptr offset (usize)
 // Per-table descriptor layout (TableInfo, 24 bytes):
 //   { ptr: u64, len: u32, _pad: u32, type_backing_ptr: u64 }
 const table_info_ptr_off: i32 = 0;
@@ -256,9 +257,14 @@ fn emitThrow(
 /// that need tables_info_ptr afterward (non-table-0 paths) must
 /// reload it from vmctx.
 fn emitCallIndirectSigCheck(code: *emit.CodeBuffer, type_idx: u32, table_idx: u32) !void {
-    const ti_tb_off: i32 = @as(i32, @intCast(table_idx)) * table_info_stride + table_info_type_backing_off;
-    // mov rcx, [r11 + ti_tb_off]  — rcx = type_backing_ptr
-    try code.movRegMem(.rcx, .r11, ti_tb_off);
+    if (table_idx == 0) {
+        // mov rcx, [rbx + vmctx_func_table_type_backing_field]  — rcx = type_backing_ptr
+        try code.movRegMem(.rcx, .rbx, vmctx_func_table_type_backing_field);
+    } else {
+        const ti_tb_off: i32 = @as(i32, @intCast(table_idx)) * table_info_stride + table_info_type_backing_off;
+        // mov rcx, [r11 + ti_tb_off]  — rcx = type_backing_ptr
+        try code.movRegMem(.rcx, .r11, ti_tb_off);
+    }
     // mov r11, [rbx + sig_table_field]  — r11 = sig_table_ptr (clobbers tables_info_ptr)
     try code.movRegMem(.r11, .rbx, vmctx_sig_table_field);
     // mov r11d, dword ptr [r11 + type_idx*4]  — r11d = expected sig_id
@@ -1696,6 +1702,7 @@ pub const CompileOptions = struct {
     /// are resolved by `callFuncScalar` before their first entry and emit no
     /// eager text.
     lazy_entry_stubs: []const bool = &.{},
+    guard_page_bounds_elision: bool = false,
 };
 
 fn compileLazyEntryStub(local_idx: u32, allocator: std.mem.Allocator) ![]u8 {
@@ -1898,7 +1905,11 @@ pub fn compileModuleCachedWithOptions(
                     .cwasm_aot_version = options.frame_attribution.cwasm_aot_version,
                     .compiler_build_id = options.frame_attribution.compiler_build_id,
                 } else null,
-                .{ .cancel_points = ir_module.spawns_threads, .native_fuel = options.native_fuel },
+                .{
+                    .cancel_points = ir_module.spawns_threads,
+                    .native_fuel = options.native_fuel,
+                    .guard_page_bounds_elision = options.guard_page_bounds_elision,
+                },
             );
             errdefer allocator.free(result.code);
             if (result.frame_attribution) |report_value| {
@@ -2914,6 +2925,7 @@ pub const FunctionCompileOptions = struct {
     /// modules that import `wasi.thread-spawn`, so other artifacts are
     /// byte-identical.
     cancel_points: bool = false,
+    guard_page_bounds_elision: bool = false,
 };
 
 const vmctx_cancel_flag_field: i32 = 432; // VmCtx.cancel_flag offset (u32)
@@ -4544,8 +4556,7 @@ fn loadWasmU32Addr(
     dst: emit.Reg,
 ) !void {
     const src_reg = try useVReg(code, alloc_result, vreg, dst);
-    if (src_reg != dst) try code.movRegReg(dst, src_reg);
-    try code.zeroExtend32(dst);
+    try code.movRegReg32(dst, src_reg);
 }
 
 fn emitStaticBulkMemBoundsCheck(
@@ -5540,8 +5551,7 @@ fn compileInstRA(
         .br_table => |bt| {
             // Load index into r11 (scratch) and canonicalize upper 32 bits to zero.
             const idx_reg = try useVReg(code, alloc_result, bt.index, .r11);
-            if (idx_reg != .r11) try code.movRegReg(.r11, idx_reg);
-            try code.zeroExtend32(.r11);
+            try code.movRegReg32(.r11, idx_reg);
 
             // cmp r11, targets.len ; jae default  (unsigned out-of-range goes to default)
             try code.cmpRegImm32(.r11, @intCast(bt.targets.len));
@@ -5777,8 +5787,7 @@ fn compileInstRA(
 
             // Load table element index
             const idx_reg = try useVReg(code, alloc_result, ci.elem_idx, .rax);
-            if (idx_reg != .rax) try code.movRegReg(.rax, idx_reg);
-            try code.zeroExtend32(.rax);
+            try code.movRegReg32(.rax, idx_reg);
 
             // VmCtx is pinned in rbx (#465). For table 0 we use the fast path
             // that reads vmctx.func_table_ptr/len directly from rbx. For
@@ -5798,11 +5807,8 @@ fn compileInstRA(
                 code.bytes.items[jb_disp] = @intCast(code.len() - trap_start);
                 // over_trap:
 
-                // Signature check. Load tables_info_ptr into r11
-                // so the sig-check sequence can read type_backing_ptr.
-                // r11 is clobbered by the sig check, but not needed after
-                // here (table-0 path reads func_table_ptr from vmctx).
-                try code.movRegMem(.r11, .rbx, vmctx_tables_info_field);
+                // Signature check: table-0 fast path reads func_table_type_backing_ptr
+                // directly from VmCtx (rbx), avoiding the tables_info_ptr indirection.
                 try emitCallIndirectSigCheck(code, ci.type_idx, ci.table_idx);
 
                 // Load func_table_ptr from VmCtx (rbx holds vmctx)
@@ -6048,9 +6054,8 @@ fn compileInstRA(
             // with the pinned memory_base in r15 (issue #466 / #798 Wave 9) —
             // eliminating `add rax, r15` on every load.
             const base_reg = try useVReg(code, alloc_result, ld.base, .rax);
-            if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
-            try code.zeroExtend32(.rax); // wasm addresses are i32
-            if (!ld.bounds_known) {
+            try code.movRegReg32(.rax, base_reg); // wasm addresses are i32
+            if (!ld.bounds_known and !options.guard_page_bounds_elision) {
                 const end_offset = if (ld.checked_end > 0) ld.checked_end else @as(u64, ld.offset) + @as(u64, ld.size);
                 try emitMemBoundsCheck(code, end_offset);
             }
@@ -6092,9 +6097,8 @@ fn compileInstRA(
             // eliminating `add rax, r15` on every store.
             // Compute zero-extended index in rax (not allocatable — safe to clobber).
             const base_reg = try useVReg(code, alloc_result, st.base, .rax);
-            if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
-            try code.zeroExtend32(.rax); // wasm addresses are i32
-            if (!st.bounds_known) {
+            try code.movRegReg32(.rax, base_reg); // wasm addresses are i32
+            if (!st.bounds_known and !options.guard_page_bounds_elision) {
                 const end_offset = if (st.checked_end > 0) st.checked_end else @as(u64, st.offset) + @as(u64, st.size);
                 try emitMemBoundsCheck(code, end_offset);
             }
@@ -6146,11 +6150,9 @@ fn compileInstRA(
             //
             // Bounds check semantics (wasm spec): trap if dst + len > mem_size.
             const len_reg = try useVReg(code, alloc_result, mf.len, .rcx);
-            if (len_reg != .rcx) try code.movRegReg(.rcx, len_reg);
-            try code.zeroExtend32(.rcx); // wasm lengths are u32
+            try code.movRegReg32(.rcx, len_reg); // wasm lengths are u32
             const dst_reg = try useVReg(code, alloc_result, mf.dst, .rdi);
-            if (dst_reg != .rdi) try code.movRegReg(.rdi, dst_reg);
-            try code.zeroExtend32(.rdi); // wasm addresses are i32
+            try code.movRegReg32(.rdi, dst_reg); // wasm addresses are i32
             // Bounds-check dst+len: uses rax for address and clobbers r11.
             try code.movRegReg(.rax, .rdi);
             try emitMemBoundsCheckDynamic(code);
@@ -6181,8 +6183,7 @@ fn compileInstRA(
             const arg_vmctx = param_regs[0];
             const arg_pages = param_regs[1];
             const pages_reg = try useVReg(code, alloc_result, pages_vreg, arg_pages);
-            if (pages_reg != arg_pages) try code.movRegReg(arg_pages, pages_reg);
-            try code.zeroExtend32(arg_pages);
+            try code.movRegReg32(arg_pages, pages_reg);
 
             // Load vmctx into param_regs[0].
             try code.movRegReg(arg_vmctx, .rbx);
@@ -6212,17 +6213,13 @@ fn compileInstRA(
             const arg_packed_sm_reg = param_regs[1];
 
             const len_reg = try useVReg(code, alloc_result, mi.len, arg_len_reg);
-            if (len_reg != arg_len_reg) try code.movRegReg(arg_len_reg, len_reg);
-            try code.zeroExtend32(arg_len_reg);
+            try code.movRegReg32(arg_len_reg, len_reg);
 
             const src_reg = try useVReg(code, alloc_result, mi.src, .r11);
-            if (src_reg != .r11) try code.movRegReg(.r11, src_reg);
-            try code.zeroExtend32(.r11);
+            try code.movRegReg32(.r11, src_reg);
             try code.emitSlice(&.{ 0x49, 0xC1, 0xE3, 0x20 });
             const dst_reg = try useVReg(code, alloc_result, mi.dst, arg_packed_ds_reg);
-            if (dst_reg != arg_packed_ds_reg)
-                try code.movRegReg(arg_packed_ds_reg, dst_reg);
-            try code.zeroExtend32(arg_packed_ds_reg);
+            try code.movRegReg32(arg_packed_ds_reg, dst_reg);
             try code.orRegReg(arg_packed_ds_reg, .r11);
 
             const packed_sm: u64 = @as(u64, mi.seg_idx);
@@ -6261,20 +6258,17 @@ fn compileInstRA(
 
             // Stage len into arg_len_reg (zero-extended i32).
             const len_reg = try useVReg(code, alloc_result, ti.len, arg_len_reg);
-            if (len_reg != arg_len_reg) try code.movRegReg(arg_len_reg, len_reg);
-            try code.zeroExtend32(arg_len_reg);
+            try code.movRegReg32(arg_len_reg, len_reg);
 
             // Build packed_dst_src in arg_packed_ds_reg.
             // 1. src -> r11, zero-extend, shl 32.
             const src_reg = try useVReg(code, alloc_result, ti.src, .r11);
-            if (src_reg != .r11) try code.movRegReg(.r11, src_reg);
-            try code.zeroExtend32(.r11);
+            try code.movRegReg32(.r11, src_reg);
             try code.emitSlice(&.{ 0x49, 0xC1, 0xE3, 0x20 }); // shl r11, 32
 
             // 2. dst -> arg_packed_ds_reg, zero-extend.
             const dst_reg = try useVReg(code, alloc_result, ti.dst, arg_packed_ds_reg);
-            if (dst_reg != arg_packed_ds_reg) try code.movRegReg(arg_packed_ds_reg, dst_reg);
-            try code.zeroExtend32(arg_packed_ds_reg);
+            try code.movRegReg32(arg_packed_ds_reg, dst_reg);
 
             // 3. or arg_packed_ds_reg, r11.
             try code.orRegReg(arg_packed_ds_reg, .r11);
@@ -6324,8 +6318,7 @@ fn compileInstRA(
 
             // Bring idx into rax, zero-extend to 64 bits.
             const idx_reg = try useVReg(code, alloc_result, tg.idx, .rax);
-            if (idx_reg != .rax) try code.movRegReg(.rax, idx_reg);
-            try code.zeroExtend32(.rax);
+            try code.movRegReg32(.rax, idx_reg);
 
             // r10 = vmctx.tables_info_ptr.
             try code.movRegMem(.r10, .rbx, vmctx_tables_info_field);
@@ -6361,8 +6354,7 @@ fn compileInstRA(
             const val_reg = try useVReg(code, alloc_result, ts.val, .r11);
             if (val_reg != .r11) try code.movRegReg(.r11, val_reg);
             const idx_reg = try useVReg(code, alloc_result, ts.idx, .rax);
-            if (idx_reg != .rax) try code.movRegReg(.rax, idx_reg);
-            try code.zeroExtend32(.rax);
+            try code.movRegReg32(.rax, idx_reg);
 
             if (comptime builtin.os.tag == .windows) {
                 // Win64: rcx=vmctx, rdx=table_idx, r8=elem_idx, r9=value
@@ -6403,16 +6395,14 @@ fn compileInstRA(
                 const init_reg = try useVReg(code, alloc_result, tg.init, .rdx);
                 if (init_reg != .rdx) try code.movRegReg(.rdx, init_reg);
                 const delta_reg = try useVReg(code, alloc_result, tg.delta, .r8);
-                if (delta_reg != .r8) try code.movRegReg(.r8, delta_reg);
-                try code.zeroExtend32(.r8);
+                try code.movRegReg32(.r8, delta_reg);
                 try code.movRegImm32(.r9, @bitCast(tg.table_idx));
             } else {
                 // SysV: rdi=vmctx, rsi=init, rdx=delta, rcx=table_idx.
                 const init_reg = try useVReg(code, alloc_result, tg.init, .rsi);
                 if (init_reg != .rsi) try code.movRegReg(.rsi, init_reg);
                 const delta_reg = try useVReg(code, alloc_result, tg.delta, .rdx);
-                if (delta_reg != .rdx) try code.movRegReg(.rdx, delta_reg);
-                try code.zeroExtend32(.rdx);
+                try code.movRegReg32(.rdx, delta_reg);
                 try code.movRegImm32(.rcx, @bitCast(tg.table_idx));
             }
 
@@ -7380,11 +7370,8 @@ fn compileInstRA(
         .convert_i32_u => |vreg| {
             const dest = inst.dest orelse return;
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
-            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
-            // Zero-extend low 32 bits to 64 bits, then use signed 64-bit conversion.
-            // (mov r32,r32 zero-extends to 64; the eax->rax extension already
-            // happened from any preceding 32-bit op, but be explicit.)
-            try code.emitSlice(&.{ 0x89, 0xC0 }); // mov eax, eax — zero-extends to RAX
+            // Zero-extend low 32 bits to 64 bits via 32-bit move into eax, then use signed 64-bit conversion.
+            try code.movRegReg32(.rax, src_reg);
             if (inst.type == .f32) {
                 try code.cvtsi2ss(.rax, .rax);
                 try code.movdFromXmm(.rax, .rax);
@@ -7464,8 +7451,7 @@ fn compileInstRA(
         .atomic_load => |ld| {
             const dest = inst.dest orelse return;
             const base_reg = try useVReg(code, alloc_result, ld.base, .rax);
-            if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
-            try code.zeroExtend32(.rax);
+            try code.movRegReg32(.rax, base_reg);
             try addAtomicStaticOffset(code, ld.offset);
             try emitAtomicAlignmentCheck(code, .rax, ld.size);
             try emitMemBoundsCheck(code, ld.size);
@@ -7476,8 +7462,7 @@ fn compileInstRA(
         },
         .atomic_store => |st| {
             const base_reg = try useVReg(code, alloc_result, st.base, .rax);
-            if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
-            try code.zeroExtend32(.rax);
+            try code.movRegReg32(.rax, base_reg);
             try addAtomicStaticOffset(code, st.offset);
             try emitAtomicAlignmentCheck(code, .rax, st.size);
             try emitMemBoundsCheck(code, st.size);
@@ -7490,8 +7475,7 @@ fn compileInstRA(
         .atomic_rmw => |rmw| {
             const dest = inst.dest orelse return;
             const base_reg = try useVReg(code, alloc_result, rmw.base, .rax);
-            if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
-            try code.zeroExtend32(.rax);
+            try code.movRegReg32(.rax, base_reg);
             try addAtomicStaticOffset(code, rmw.offset);
             try emitAtomicAlignmentCheck(code, .rax, rmw.size);
             try emitMemBoundsCheck(code, rmw.size);
@@ -7542,8 +7526,7 @@ fn compileInstRA(
             const dest = inst.dest orelse return;
             const base_reg =
                 try useVReg(code, alloc_result, cmpxchg.base, .rax);
-            if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
-            try code.zeroExtend32(.rax);
+            try code.movRegReg32(.rax, base_reg);
             try addAtomicStaticOffset(code, cmpxchg.offset);
             try emitAtomicAlignmentCheck(code, .rax, cmpxchg.size);
             try emitMemBoundsCheck(code, cmpxchg.size);
@@ -7569,8 +7552,7 @@ fn compileInstRA(
             const count_reg = try useVReg(code, alloc_result, an.count, .rax);
             if (count_reg != .rax) try code.movRegReg(.rax, count_reg);
             const base_reg = try useVReg(code, alloc_result, an.base, .rcx);
-            if (base_reg != .rcx) try code.movRegReg(.rcx, base_reg);
-            try code.zeroExtend32(.rcx); // wasm addr is i32
+            try code.movRegReg32(.rcx, base_reg); // wasm addr is i32
             // Add static offset
             if (an.offset > 0) try code.addRegImm32(.rcx, @intCast(an.offset));
 
@@ -7597,8 +7579,7 @@ fn compileInstRA(
             // Call aotAtomicWait32/64(vmctx, addr, expected[_lo, _hi], timeout_lo, timeout_hi)
             // Load operands into scratch registers first
             const base_reg = try useVReg(code, alloc_result, aw.base, .rax);
-            if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
-            try code.zeroExtend32(.rax);
+            try code.movRegReg32(.rax, base_reg);
             if (aw.offset > 0) try code.addRegImm32(.rax, @intCast(aw.offset));
             // Save computed addr in r11
             try code.movRegReg(.r11, .rax);
@@ -10844,6 +10825,93 @@ test "#798 Wave 9 x86_64: load uses SIB [r15 + rax + disp] without add rax, r15"
     // Must emit `mov r15, [rbx]` (4C 8B 3B) in prologue since this is a memory function.
     try std.testing.expect(containsBytes(code, &.{ 0x4C, 0x8B, 0x3B }));
 }
+
+test "#798 Wave 10 x86_64: guard_page_bounds_elision skips inline bounds check and lowers load to movRegReg32 + SIB" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 2, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const addr = func.newVReg();
+    const loaded = func.newVReg();
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = addr, .type = .i32 });
+    try block.append(.{
+        .op = .{ .load = .{ .base = addr, .offset = 8, .size = 4, .sign_extend = false } },
+        .dest = loaded,
+        .type = .i32,
+    });
+    try block.append(.{
+        .op = .{ .store = .{ .base = addr, .val = loaded, .offset = 16, .size = 4 } },
+    });
+    try block.append(.{ .op = .{ .ret = loaded } });
+
+    const result = try compileFunctionRAWithGlobalOffsetsEx(
+        &func,
+        0,
+        &.{},
+        allocator,
+        .{ .guard_page_bounds_elision = true },
+    );
+    defer allocator.free(result.call_patches);
+    defer allocator.free(result.code);
+    const code = result.code;
+
+    // Must NOT emit inline bounds check `cmp r11, [rbx + 8]` (4C 3B 5B 08)
+    // or `lea r11, [rax + disp8]` (4C 8D 58 ...).
+    try std.testing.expect(!containsBytes(code, &.{ 0x4C, 0x3B, 0x5B, 0x08 }));
+    try std.testing.expect(!containsBytes(code, &.{ 0x4C, 0x8D, 0x58 }));
+    // Must NOT emit unprefixed `mov eax, eax` (89 C0 without REX.R 0x44/0x4C prefix).
+    for (0..code.len -| 1) |idx| {
+        if (code[idx] == 0x89 and code[idx + 1] == 0xC0) {
+            try std.testing.expect(idx > 0 and (code[idx - 1] == 0x44 or code[idx - 1] == 0x4C));
+        }
+    }
+
+    // Verify the load lowers to 1-instruction `mov eax, <reg32>` ([0x44] 0x89 <modrm>)
+    // directly followed by `mov <dst>, [r15 + rax + 8]` ((0x41|0x45) 0x8B <modrm> 0x07 0x08).
+    var found_load_seq = false;
+    var i: usize = 0;
+    while (i + 7 <= code.len) : (i += 1) {
+        const mov_len: usize = if (code[i] == 0x44 and i + 8 <= code.len and code[i + 1] == 0x89 and (code[i + 2] & 0xC7) == 0xC0)
+            3
+        else if (code[i] == 0x89 and (code[i + 1] & 0xC7) == 0xC0)
+            2
+        else
+            continue;
+        const sib = i + mov_len;
+        if (sib + 5 <= code.len and
+            (code[sib] == 0x41 or code[sib] == 0x45) and code[sib + 1] == 0x8B and
+            (code[sib + 2] & 0xC7) == 0x44 and code[sib + 3] == 0x07 and code[sib + 4] == 0x08)
+        {
+            found_load_seq = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_load_seq);
+
+    // Table-0 call_indirect fast path check: verify table-0 sig check loads
+    // `rcx = [rbx + 472]` (48 8B 8B D8 01 00 00) without loading `tables_info_ptr`
+    // (`[rbx + 136]` = 4C 8B 9B 88 00 00 00).
+    var ci_func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer ci_func.deinit();
+    const ci_b = try ci_func.newBlock();
+    const v_idx = ci_func.newVReg();
+    const v_res = ci_func.newVReg();
+    try ci_func.getBlock(ci_b).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_idx, .type = .i32 });
+    try ci_func.getBlock(ci_b).append(.{
+        .op = .{ .call_indirect = .{ .type_idx = 0, .table_idx = 0, .elem_idx = v_idx, .args = &.{} } },
+        .dest = v_res,
+        .type = .i32,
+    });
+    try ci_func.getBlock(ci_b).append(.{ .op = .{ .ret = v_res } });
+    const ci_compiled = try compileFunctionRA(&ci_func, 0, allocator);
+    defer allocator.free(ci_compiled.call_patches);
+    defer allocator.free(ci_compiled.code);
+    try std.testing.expect(containsBytes(ci_compiled.code, &.{ 0x48, 0x8B, 0x8B, 0xD8, 0x01, 0x00, 0x00 }));
+    try std.testing.expect(!containsBytes(ci_compiled.code, &.{ 0x4C, 0x8B, 0x9B, 0x88, 0x00, 0x00, 0x00 }));
+}
+
 
 
 

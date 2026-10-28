@@ -441,7 +441,9 @@ fn posixTrapHandler(sig: PosixSig, info: *const PosixSiginfo, ctx_ptr: ?*anyopaq
         const guard_base = if (active_guard_base != 0) active_guard_base else if (state) |s| s.guard_base else 0;
         const guard_end = if (active_guard_end != 0) active_guard_end else if (state) |s| s.guard_end else 0;
         const fault_addr = posixTrapFaultAddr(info);
-        if (guard_base != 0 and fault_addr >= guard_base and fault_addr < guard_end) {
+        if ((guard_base != 0 and fault_addr >= guard_base and fault_addr < guard_end) or
+            types.MemoryInstance.isAddressInRegisteredGuardRange(fault_addr))
+        {
             noteTrapReason(.out_of_bounds_memory);
             trapLongjmp();
         }
@@ -480,7 +482,7 @@ fn posixTrapHandler(sig: PosixSig, info: *const PosixSiginfo, ctx_ptr: ?*anyopaq
     }
 }
 
-fn ensurePosixTrapHandlerInstalled() void {
+pub fn ensurePosixTrapHandlerInstalled() void {
     if (comptime !posix_trap_supported) return;
     while (true) {
         switch (posix_trap_handler_state.load(.acquire)) {
@@ -572,7 +574,9 @@ fn vehHandler(info: *windows.EXCEPTION_POINTERS) callconv(.winapi) c_long {
             const fault_addr = rec.ExceptionInformation[1];
             const guard_base = if (active_guard_base != 0) active_guard_base else state.?.guard_base;
             const guard_end = if (active_guard_end != 0) active_guard_end else state.?.guard_end;
-            if (guard_base != 0 and fault_addr >= guard_base and fault_addr < guard_end) {
+            if ((guard_base != 0 and fault_addr >= guard_base and fault_addr < guard_end) or
+                types.MemoryInstance.isAddressInRegisteredGuardRange(fault_addr))
+            {
                 noteTrapReason(.out_of_bounds_memory);
             }
         }
