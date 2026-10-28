@@ -126,9 +126,11 @@ fn emitOobCmpAndTrap(code: *emit.CodeBuffer) !void {
     //   REX.W|R=4C, opcode 0x3B, modrm=01_011_011 (mod=disp8, reg=r11 low=3,
     //   rm=rbx low=3), disp8=memsize_field.
     try code.emitSlice(&.{ 0x4C, 0x3B, 0x5B, @as(u8, @intCast(vmctx_memsize_field)) });
-    // jbe over_trap (rel8). Trap block size is 3 + 7 + 2 = 12 bytes below.
+    // jbe over_trap (rel8).
     try code.emitByte(0x76);
-    try code.emitByte(12);
+    const jbe_disp = code.len();
+    try code.emitByte(0);
+    const trap_start = code.len();
     // Trap block:
     //   mov param_regs[0], rbx            ; arg0 = vmctx (pinned in rbx)
     //   mov rax, [param_regs[0] + trap_oob_fn_field]
@@ -136,6 +138,7 @@ fn emitOobCmpAndTrap(code: *emit.CodeBuffer) !void {
     try code.movRegReg(param_regs[0], .rbx);
     try code.movRegMem(.rax, param_regs[0], vmctx_trap_oob_fn_field);
     try code.callReg(.rax);
+    code.bytes.items[jbe_disp] = @intCast(code.len() - trap_start);
     // over_trap:
 }
 
@@ -255,13 +258,9 @@ fn emitThrow(
 fn emitCallIndirectSigCheck(code: *emit.CodeBuffer, type_idx: u32, table_idx: u32) !void {
     const ti_tb_off: i32 = @as(i32, @intCast(table_idx)) * table_info_stride + table_info_type_backing_off;
     // mov rcx, [r11 + ti_tb_off]  — rcx = type_backing_ptr
-    //   REX.W|B = 0x49, opcode 0x8B, modrm=10_001_011 (mod=disp32, reg=rcx=1, rm=r11.low3=3) = 0x8B.
-    try code.emitSlice(&.{ 0x49, 0x8B, 0x8B });
-    try code.emitU32(@bitCast(ti_tb_off));
-    // mov r11, [r10 + sig_table_field]  — r11 = sig_table_ptr (clobbers tables_info_ptr)
-    //   REX.W|R|B = 0x4D, opcode 0x8B, modrm=10_011_010 (mod=disp32, reg=r11.low3=3, rm=r10.low3=2) = 0x9A.
-    try code.emitSlice(&.{ 0x4D, 0x8B, 0x9A });
-    try code.emitU32(@bitCast(@as(i32, vmctx_sig_table_field)));
+    try code.movRegMem(.rcx, .r11, ti_tb_off);
+    // mov r11, [rbx + sig_table_field]  — r11 = sig_table_ptr (clobbers tables_info_ptr)
+    try code.movRegMem(.r11, .rbx, vmctx_sig_table_field);
     // mov r11d, dword ptr [r11 + type_idx*4]  — r11d = expected sig_id
     //   REX.R|B = 0x45, opcode 0x8B, modrm=10_011_011 (mod=disp32, reg=r11.low3=3, rm=r11.low3=3) = 0x9B.
     try code.emitSlice(&.{ 0x45, 0x8B, 0x9B });
@@ -270,13 +269,14 @@ fn emitCallIndirectSigCheck(code: *emit.CodeBuffer, type_idx: u32, table_idx: u3
     //   REX.R = 0x44, opcode 0x3B, modrm=00_011_100 (mod=0, reg=r11.low3=3, rm=100=SIB) = 0x1C.
     //   SIB=10_000_001 (scale=10 ×4, index=rax=0, base=rcx=1) = 0x81.
     try code.emitSlice(&.{ 0x44, 0x3B, 0x1C, 0x81 });
-    // je over_trap (rel8). Trap block: 3 + 7 + 2 = 12 bytes.
+    // je over_trap (rel8).
     try code.emitByte(0x74);
-    try code.emitByte(12);
-    // Trap block: call trap_unreachable_fn(vmctx) — r10 holds vmctx.
-    try code.movRegReg(param_regs[0], .r10);
-    try code.movRegMem(.rax, param_regs[0], vmctx_trap_unreachable_fn_field);
-    try code.callReg(.rax);
+    const je_disp = code.len();
+    try code.emitByte(0);
+    const trap_start = code.len();
+    // Trap block: call trap_unreachable_fn(vmctx) — rbx holds vmctx.
+    try emitTrapHelperCall(code, vmctx_trap_unreachable_fn_field);
+    code.bytes.items[je_disp] = @intCast(code.len() - trap_start);
     // over_trap:
 }
 
@@ -1347,8 +1347,7 @@ fn compileInst(
         },
         .elem_drop => {},
         .table_size => {
-            try code.movRegReg(.r10, .rbx);
-            try code.movRegMemNoRex(.rax, .r10, vmctx_func_table_len_field);
+            try code.movRegMemNoRex(.rax, .rbx, vmctx_func_table_len_field);
             try stack.push(code, .rax);
         },
         .table_get => {
@@ -1367,8 +1366,7 @@ fn compileInst(
             try stack.push(code, .rax);
         },
         .ref_func => |fidx| {
-            try code.movRegReg(.r10, .rbx);
-            try code.movRegMem(.r10, .r10, vmctx_funcptrs_field);
+            try code.movRegMem(.r10, .rbx, vmctx_funcptrs_field);
             try code.movRegMem(.rax, .r10, @as(i32, @intCast(fidx * 8)));
             try stack.push(code, .rax);
         },
@@ -2934,8 +2932,11 @@ const vmctx_data_drop_fn_field: i32 = 456; // VmCtx.data_drop_fn (usize)
 fn emitCancelPoint(code: *emit.CodeBuffer) !void {
     try code.cmpMem32Imm8(.rbx, vmctx_cancel_flag_field, 0);
     try code.emitByte(0x74); // JE rel8
-    try code.emitByte(12);
+    const je_disp = code.len();
+    try code.emitByte(0);
+    const trap_start = code.len();
     try emitTrapHelperCall(code, vmctx_cancel_point_fn_field);
+    code.bytes.items[je_disp] = @intCast(code.len() - trap_start);
 }
 
 fn emitFuelPoint(code: *emit.CodeBuffer) !void {
@@ -2944,8 +2945,48 @@ fn emitFuelPoint(code: *emit.CodeBuffer) !void {
     try code.emitSlice(&.{ 0x83, 0xab });
     try code.emitI32(vmctx_cancel_flag_field);
     try code.emitByte(1);
-    try code.emitSlice(&.{ 0x75, 12 });
+    try code.emitByte(0x75); // JNZ rel8
+    const jnz_disp = code.len();
+    try code.emitByte(0);
+    const trap_start = code.len();
     try emitTrapHelperCall(code, vmctx_cancel_point_fn_field);
+    code.bytes.items[jnz_disp] = @intCast(code.len() - trap_start);
+}
+
+/// Returns true if `func` contains any instruction that accesses linear memory
+/// or requires the pinned `memory_base` register (`r15`). Non-memory functions
+/// skip loading `r15` from `[rbx + vmctx_membase_field]` in the prologue and
+/// after calls.
+fn funcUsesMemoryBase(func: *const ir.IrFunction) bool {
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            switch (inst.op) {
+                .load,
+                .store,
+                .memory_size,
+                .memory_grow,
+                .memory_copy,
+                .memory_fill,
+                .memory_init,
+                .v128_load,
+                .v128_load_splat,
+                .v128_load_zero,
+                .v128_load_extend,
+                .v128_load_lane,
+                .v128_store,
+                .v128_store_lane,
+                .atomic_load,
+                .atomic_store,
+                .atomic_rmw,
+                .atomic_cmpxchg,
+                .atomic_wait,
+                .atomic_notify,
+                => return true,
+                else => {},
+            }
+        }
+    }
+    return false;
 }
 
 /// Blocks that need a cancel poll: the function-entry block plus every branch
@@ -4276,12 +4317,16 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
     try code.movRegReg(.rbx, vmctx_reg);
 
     // Pin VmCtx.memory_base in r15 for the whole function body
-    // (issue #466). `push r15` above preserved the caller's r15, so
-    // we can now overwrite it. Every linear-memory access reads r15
-    // directly instead of doing `mov r10, rbx; mov r10, [r10 + 0]`.
-    // memory.grow and every wasm call reload r15 from [rbx + 0]
-    // afterward because either can invalidate the cached base.
-    try code.movRegMem(.r15, .rbx, vmctx_membase_field);
+    // (issue #466) when the function uses linear memory. `push r15`
+    // above preserved the caller's r15, so we can now overwrite it.
+    // Every linear-memory access reads r15 directly instead of doing
+    // `mov r10, rbx; mov r10, [r10 + 0]`. memory.grow and every wasm
+    // call reload r15 from [rbx + 0] afterward because either can
+    // invalidate the cached base.
+    const uses_memory_base = funcUsesMemoryBase(func);
+    if (uses_memory_base) {
+        try code.movRegMem(.r15, .rbx, vmctx_membase_field);
+    }
 
     var block_offsets = std.AutoHashMap(ir.BlockId, usize).init(allocator);
     defer block_offsets.deinit();
@@ -4316,7 +4361,7 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
         for (block.instructions.items) |inst| {
             last_was_ret = isRet(inst.op);
             const native_start = code.len();
-            try compileInstRA(&code, inst, &alloc_result, &const_vals, &suppress_iconst, &fused_cmp_br_if, &branch_patches, &call_patches, &table_patches, import_count, &used_caller_saved, &used_callee_saved, func.local_count, global_offsets, options);
+            try compileInstRA(&code, inst, &alloc_result, &const_vals, &suppress_iconst, &fused_cmp_br_if, &branch_patches, &call_patches, &table_patches, import_count, &used_caller_saved, &used_callee_saved, func.local_count, global_offsets, options, uses_memory_base);
             if (frame_attr_ctx != null) {
                 try emitted_ir_ranges.append(allocator, .{
                     .native_start = @intCast(native_start),
@@ -4509,7 +4554,6 @@ fn emitStaticBulkMemBoundsCheck(
     addr: ir.VReg,
     len: u8,
 ) !void {
-    try code.movRegReg(.r10, .rbx);
     try loadWasmU32Addr(code, alloc_result, addr, .rax);
     try emitMemBoundsCheck(code, len);
 }
@@ -5042,6 +5086,7 @@ fn compileInstRA(
     local_count: u32,
     global_offsets: []const u32,
     options: FunctionCompileOptions,
+    uses_memory_base: bool,
 ) !void {
     switch (inst.op) {
         // ── Constants ─────────────────────────────────────────────────
@@ -5716,7 +5761,9 @@ fn compileInstRA(
             // cached value is stale; reload from the now-current
             // `[vmctx + 0]`. Skip after tail-calls (control doesn't
             // return to us).
-            try code.movRegMem(.r15, .rbx, vmctx_membase_field);
+            if (uses_memory_base) {
+                try code.movRegMem(.r15, .rbx, vmctx_membase_field);
+            }
 
             if (inst.dest) |dest| {
                 try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
@@ -5733,38 +5780,36 @@ fn compileInstRA(
             if (idx_reg != .rax) try code.movRegReg(.rax, idx_reg);
             try code.zeroExtend32(.rax);
 
-            // Load vmctx into r10. For table 0 we use the fast path that
-            // reads vmctx.func_table_ptr/len directly. For higher-numbered
-            // tables we go through vmctx.tables_info_ptr[table_idx].
-            try code.movRegReg(.r10, .rbx);
-
+            // VmCtx is pinned in rbx (#465). For table 0 we use the fast path
+            // that reads vmctx.func_table_ptr/len directly from rbx. For
+            // higher-numbered tables we go through vmctx.tables_info_ptr[table_idx].
             if (ci.table_idx == 0) {
-                // cmp eax, dword ptr [r10 + func_table_len]
-                //   REX.B=0x41, opcode 0x3B, modrm=01_000_010 (mod=disp8, reg=eax=0,
-                //   rm=r10 low=2), disp8=60.
-                try code.emitSlice(&.{ 0x41, 0x3B, 0x42, @as(u8, @intCast(vmctx_func_table_len_field)) });
-                // jb over_trap (rel8). Trap block size is 3 + 7 + 2 = 12 bytes below.
+                // cmp eax, dword ptr [rbx + func_table_len]
+                //   opcode 0x3B, modrm=01_000_011 (mod=disp8, reg=eax=0,
+                //   rm=rbx low=3) = 0x43, disp8=60.
+                try code.emitSlice(&.{ 0x3B, 0x43, @as(u8, @intCast(vmctx_func_table_len_field)) });
+                // jb over_trap (rel8).
                 try code.emitByte(0x72);
-                try code.emitByte(12);
+                const jb_disp = code.len();
+                try code.emitByte(0);
+                const trap_start = code.len();
                 // Trap block: call trap_unreachable_fn(vmctx)
-                try code.movRegReg(param_regs[0], .r10);
-                try code.movRegMem(.rax, param_regs[0], vmctx_trap_unreachable_fn_field);
-                try code.callReg(.rax);
+                try emitTrapHelperCall(code, vmctx_trap_unreachable_fn_field);
+                code.bytes.items[jb_disp] = @intCast(code.len() - trap_start);
                 // over_trap:
 
                 // Signature check. Load tables_info_ptr into r11
                 // so the sig-check sequence can read type_backing_ptr.
                 // r11 is clobbered by the sig check, but not needed after
                 // here (table-0 path reads func_table_ptr from vmctx).
-                try code.movRegMem(.r11, .r10, vmctx_tables_info_field);
+                try code.movRegMem(.r11, .rbx, vmctx_tables_info_field);
                 try emitCallIndirectSigCheck(code, ci.type_idx, ci.table_idx);
 
-                // Load func_table_ptr from VmCtx (r10 still holds vmctx)
-                try code.movRegMem(.r10, .r10, vmctx_func_table_field);
+                // Load func_table_ptr from VmCtx (rbx holds vmctx)
+                try code.movRegMem(.r10, .rbx, vmctx_func_table_field);
             } else {
-                // r11 = vmctx.tables_info_ptr (kept in r11 so r10/vmctx
-                // survives for the trap path below).
-                try code.movRegMem(.r11, .r10, vmctx_tables_info_field);
+                // r11 = vmctx.tables_info_ptr
+                try code.movRegMem(.r11, .rbx, vmctx_tables_info_field);
 
                 const len_off: i32 = @as(i32, @intCast(ci.table_idx)) * table_info_stride + table_info_len_off;
                 // cmp eax, [r11 + len_off]
@@ -5772,19 +5817,20 @@ fn compileInstRA(
                 //   reg=eax=0, rm=r11 low=3), disp32=len_off.
                 try code.emitSlice(&.{ 0x41, 0x3B, 0x83 });
                 try code.emitU32(@bitCast(len_off));
-                // jb over_trap (rel8). Trap block: 3 + 7 + 2 = 12 bytes.
+                // jb over_trap (rel8).
                 try code.emitByte(0x72);
-                try code.emitByte(12);
-                // Trap block: call trap_unreachable_fn(vmctx) — r10 holds vmctx.
-                try code.movRegReg(param_regs[0], .r10);
-                try code.movRegMem(.rax, param_regs[0], vmctx_trap_unreachable_fn_field);
-                try code.callReg(.rax);
+                const jb_disp = code.len();
+                try code.emitByte(0);
+                const trap_start = code.len();
+                // Trap block: call trap_unreachable_fn(vmctx) — rbx holds vmctx.
+                try emitTrapHelperCall(code, vmctx_trap_unreachable_fn_field);
+                code.bytes.items[jb_disp] = @intCast(code.len() - trap_start);
                 // over_trap:
 
                 // Signature check (r11 already = tables_info_ptr).
                 // NOTE: sig check clobbers r11; reload tables_info_ptr afterward.
                 try emitCallIndirectSigCheck(code, ci.type_idx, ci.table_idx);
-                try code.movRegMem(.r11, .r10, vmctx_tables_info_field);
+                try code.movRegMem(.r11, .rbx, vmctx_tables_info_field);
 
                 // r10 = tables_info[table_idx].ptr
                 const ptr_off: i32 = @as(i32, @intCast(ci.table_idx)) * table_info_stride + table_info_ptr_off;
@@ -5874,7 +5920,9 @@ fn compileInstRA(
             // Refresh pinned memory_base in r15 (issue #466) — the
             // called function may have invoked `memory.grow`; see the
             // .call handler for the full rationale.
-            try code.movRegMem(.r15, .rbx, vmctx_membase_field);
+            if (uses_memory_base) {
+                try code.movRegMem(.r15, .rbx, vmctx_membase_field);
+            }
 
             if (inst.dest) |dest| {
                 try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
@@ -5887,17 +5935,17 @@ fn compileInstRA(
             if (ref_reg != .r11) try code.movRegReg(.r11, ref_reg);
 
             // Null check: if r11 == 0, trap via trap_unreachable_fn.
-            // Load vmctx into r10 first so the trap call has it handy.
-            try code.movRegReg(.r10, .rbx);
+            // VmCtx is pinned in rbx (#465).
             // test r11, r11  → 0x4D 0x85 0xDB
             try code.emitSlice(&.{ 0x4D, 0x85, 0xDB });
-            // jne over_trap (rel8). Trap block is 3 + 7 + 2 = 12 bytes.
+            // jne over_trap (rel8).
             try code.emitByte(0x75);
-            try code.emitByte(12);
+            const jne_disp = code.len();
+            try code.emitByte(0);
+            const trap_start = code.len();
             // Trap block: call trap_unreachable_fn(vmctx)
-            try code.movRegReg(param_regs[0], .r10);
-            try code.movRegMem(.rax, param_regs[0], vmctx_trap_unreachable_fn_field);
-            try code.callReg(.rax);
+            try emitTrapHelperCall(code, vmctx_trap_unreachable_fn_field);
+            code.bytes.items[jne_disp] = @intCast(code.len() - trap_start);
             // over_trap:
 
             const n_args: u32 = @intCast(cr.args.len);
@@ -5972,7 +6020,9 @@ fn compileInstRA(
             // Refresh pinned memory_base in r15 (issue #466) — the
             // called function may have invoked `memory.grow`; see the
             // .call handler for the full rationale.
-            try code.movRegMem(.r15, .rbx, vmctx_membase_field);
+            if (uses_memory_base) {
+                try code.movRegMem(.r15, .rbx, vmctx_membase_field);
+            }
 
             if (inst.dest) |dest| {
                 try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
@@ -5994,8 +6044,9 @@ fn compileInstRA(
             const dest = inst.dest orelse return;
             // The bounds check reads memory_size straight from the pinned
             // vmctx in `rbx` (#465 / #798 L2) — no per-access `mov r10, rbx`.
-            // The address arithmetic uses the pinned memory_base in r15
-            // (issue #466) — no per-access reload of `[vmctx + 0]`.
+            // The address arithmetic uses SIB indexed addressing `[r15 + rax + disp]`
+            // with the pinned memory_base in r15 (issue #466 / #798 Wave 9) —
+            // eliminating `add rax, r15` on every load.
             const base_reg = try useVReg(code, alloc_result, ld.base, .rax);
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
             try code.zeroExtend32(.rax); // wasm addresses are i32
@@ -6003,8 +6054,7 @@ fn compileInstRA(
                 const end_offset = if (ld.checked_end > 0) ld.checked_end else @as(u64, ld.offset) + @as(u64, ld.size);
                 try emitMemBoundsCheck(code, end_offset);
             }
-            try code.addRegReg(.rax, .r15); // rax = mem_base + wasm_addr
-            // Fold wasm offset into mov displacement when it fits in i32.
+            // Fold wasm offset into SIB displacement when it fits in i32.
             // For out-of-range offsets (address.wast uses 0xFFFFFFFF), first
             // add the offset to rax via a 64-bit imm.
             var ld_disp: i32 = 0;
@@ -6014,9 +6064,9 @@ fn compileInstRA(
                 try code.movRegImm64(.r10, @as(u64, ld.offset));
                 try code.addRegReg(.rax, .r10);
             }
-            // Load value into dest register (address is in rax).
+            // Load value into dest register via SIB `[r15 + rax + ld_disp]`.
             const dr = destReg(alloc_result, dest);
-            try code.movRegMemSized(dr, .rax, ld_disp, ld.size);
+            try code.movRegMemSIBSized(dr, .r15, .rax, 0, ld_disp, ld.size);
             if (ld.sign_extend and ld.size < 8) {
                 switch (ld.size) {
                     1 => try code.movsxByteToReg(dr, dr),
@@ -6025,7 +6075,7 @@ fn compileInstRA(
                     else => {},
                 }
             }
-            // For non-sign-extended loads ≤ 4 bytes, movRegMemSized already
+            // For non-sign-extended loads ≤ 4 bytes, movRegMemSIBSized already
             // produces a zero-extended (clean) i32 — skip redundant zeroExtend32.
             const load_is_clean = !ld.sign_extend and ld.size <= 4;
             if (load_is_clean) {
@@ -6037,9 +6087,10 @@ fn compileInstRA(
         .store => |st| {
             // The bounds check reads memory_size straight from the pinned
             // vmctx in `rbx` (#465 / #798 L2) — no per-access `mov r10, rbx`.
-            // The address arithmetic uses the pinned memory_base in r15
-            // (issue #466) — no per-access reload of `[vmctx + 0]`.
-            // Compute final address in rax (not allocatable — safe to clobber).
+            // The address arithmetic uses SIB indexed addressing `[r15 + rax + disp]`
+            // with the pinned memory_base in r15 (issue #466 / #798 Wave 9) —
+            // eliminating `add rax, r15` on every store.
+            // Compute zero-extended index in rax (not allocatable — safe to clobber).
             const base_reg = try useVReg(code, alloc_result, st.base, .rax);
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
             try code.zeroExtend32(.rax); // wasm addresses are i32
@@ -6047,12 +6098,11 @@ fn compileInstRA(
                 const end_offset = if (st.checked_end > 0) st.checked_end else @as(u64, st.offset) + @as(u64, st.size);
                 try emitMemBoundsCheck(code, end_offset);
             }
-            try code.addRegReg(.rax, .r15); // rax = mem_base + wasm_addr
             // Load value into rcx (not allocatable — safe to clobber).
             // useVReg writes spill loads into scratch=.rcx, so rax is preserved.
             const val_reg = try useVReg(code, alloc_result, st.val, .rcx);
             if (val_reg != .rcx) try code.movRegReg(.rcx, val_reg);
-            // Fold wasm offset into the mov displacement when it fits in i32.
+            // Fold wasm offset into the SIB displacement when it fits in i32.
             var st_disp: i32 = 0;
             if (st.offset <= 0x7FFFFFFF) {
                 st_disp = @intCast(st.offset);
@@ -6060,7 +6110,7 @@ fn compileInstRA(
                 try code.movRegImm64(.r10, @as(u64, st.offset));
                 try code.addRegReg(.rax, .r10);
             }
-            try code.movMemRegSized(.rax, st_disp, .rcx, st.size);
+            try code.movMemSIBRegSized(.r15, .rax, 0, st_disp, .rcx, st.size);
         },
         .memory_copy => |mc| {
             if (smallFixedBulkMemLen(const_vals, mc.len)) |len| {
@@ -6095,7 +6145,6 @@ fn compileInstRA(
             // REP STOSB: rdi=dst, al=val, rcx=len
             //
             // Bounds check semantics (wasm spec): trap if dst + len > mem_size.
-            try code.movRegReg(.r10, .rbx); // load VmCtx*
             const len_reg = try useVReg(code, alloc_result, mf.len, .rcx);
             if (len_reg != .rcx) try code.movRegReg(.rcx, len_reg);
             try code.zeroExtend32(.rcx); // wasm lengths are u32
@@ -6109,8 +6158,7 @@ fn compileInstRA(
             // clobbers r11, so we can't stash the value there).
             const val_reg = try useVReg(code, alloc_result, mf.val, .rax);
             if (val_reg != .rax) try code.movRegReg(.rax, val_reg);
-            try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
-            try code.addRegReg(.rdi, .r10); // rdi = mem_base + dst
+            try code.addRegReg(.rdi, .r15); // rdi = mem_base + dst (r15 is pinned memory_base)
             try code.emitSlice(&.{ 0xF3, 0xAA }); // REP STOSB
         },
 
@@ -6286,8 +6334,11 @@ fn compileInstRA(
             const len_off: i32 = @as(i32, @intCast(tg.table_idx)) * table_info_stride + table_info_len_off;
             try emitCmpEaxMemR10Disp8(code, len_off);
             try code.emitByte(0x72); // jb over_trap (rel8)
-            try code.emitByte(12);
+            const jb_disp = code.len();
+            try code.emitByte(0);
+            const trap_start = code.len();
             try emitTrapHelperCall(code, vmctx_trap_unreachable_fn_field);
+            code.bytes.items[jb_disp] = @intCast(code.len() - trap_start);
             // over_trap: rax still holds idx on the fall-through.
 
             // r10 = table_info[table_idx].ptr.
@@ -7622,7 +7673,6 @@ fn compileInstRA(
         .try_table_begin, .try_table_end => {},
         .throw => |th| try emitThrow(code, th, alloc_result),
         .throw_ref => {
-            try code.movRegReg(.r10, .rbx);
             try emitTrapHelperCall(code, vmctx_trap_unreachable_fn_field);
         },
 
@@ -8302,10 +8352,10 @@ test "compileFunctionRA: atomic alignment trap precedes bounds trap" {
 }
 
 test "compileFunctionRA: prologue pins vmctx in rbx (#465) and memory_base in r15 (#466)" {
-    // Every function's prologue must (a) `push rbx` (preserve the
+    // A memory-using function's prologue must (a) `push rbx` (preserve the
     // caller's rbx, since x86-64 callee-saved discipline requires it),
     // (b) `mov rbx, param_regs[0]` (capture vmctx), (c) `push r15`
-    // (preserve caller's r15), and (d) `mov r15, [rbx + 0]` (capture
+    // (preserve caller's r15), and (d) `mov r15, [rbx]` (capture
     // memory_base). The mov of vmctx must precede the load of
     // memory_base, since the load reads through rbx.
     const allocator = std.testing.allocator;
@@ -8315,7 +8365,7 @@ test "compileFunctionRA: prologue pins vmctx in rbx (#465) and memory_base in r1
     const block_id = try func.newBlock();
     const block = func.getBlock(block_id);
     const v0 = func.newVReg();
-    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .memory_size, .dest = v0, .type = .i32 });
     try block.append(.{ .op = .{ .ret = v0 } });
 
     const compile_result = try compileFunctionRA(&func, 0, allocator);
@@ -8337,10 +8387,10 @@ test "compileFunctionRA: prologue pins vmctx in rbx (#465) and memory_base in r1
     else
         .{ 0x48, 0x89, 0xFB };
 
-    // `mov r15, [rbx + 0]` via movRegMem (always disp32):
-    //   REX.WR (0x4C) + opcode 0x8B + ModR/M 0xBB (mod=10, reg=r15=7
-    //   low3, rm=rbx=3) + disp32 = 00 00 00 00.
-    const mov_r15_membase: [7]u8 = .{ 0x4C, 0x8B, 0xBB, 0x00, 0x00, 0x00, 0x00 };
+    // `mov r15, [rbx]` via movRegMem (mod=00 when disp == 0):
+    //   REX.WR (0x4C) + opcode 0x8B + ModR/M 0x3B (mod=00, reg=r15=7
+    //   low3, rm=rbx=3).
+    const mov_r15_membase: [3]u8 = .{ 0x4C, 0x8B, 0x3B };
 
     const idx_mov_rbx = std.mem.indexOf(u8, code, &mov_rbx) orelse
         return error.TestExpectedMovRbxFromParam0;
@@ -8440,9 +8490,8 @@ test "compileFunctionRA: memory.grow refreshes pinned r15 (issue #466)" {
     }
     try std.testing.expect(idx_call != null);
 
-    // After the call, we expect `mov r15, [rbx + 0]` =
-    //   4C 8B BB 00 00 00 00.
-    const reload: [7]u8 = .{ 0x4C, 0x8B, 0xBB, 0x00, 0x00, 0x00, 0x00 };
+    // After the call, we expect `mov r15, [rbx]` = 4C 8B 3B.
+    const reload: [3]u8 = .{ 0x4C, 0x8B, 0x3B };
     const tail = code[idx_call.? + 2 ..];
     const reload_off = std.mem.indexOf(u8, tail, &reload) orelse
         return error.TestExpectedR15ReloadAfterGrow;
@@ -8910,9 +8959,9 @@ test "compileFunctionRA: memory_size loads into allocated dest register" {
     defer allocator.free(code);
 
     // mov edx, [rbx + 56] — 32-bit load directly from pinned VmCtx (rbx), no REX.
-    // Opcode 0x8B, ModR/M = 10_010_011 (0x93),
-    // then disp32 = 0x38 00 00 00 (vmctx_mem_pages_field = 56).
-    try std.testing.expect(containsBytes(code, &.{ 0x8B, 0x93, 0x38, 0x00, 0x00, 0x00 }));
+    // Opcode 0x8B, ModR/M = 01_010_011 (0x53),
+    // then disp8 = 0x38 (vmctx_mem_pages_field = 56).
+    try std.testing.expect(containsBytes(code, &.{ 0x8B, 0x53, 0x38 }));
     // No redundant `mov r10, rbx` (49 89 DA).
     try std.testing.expect(!containsBytes(code, &.{ 0x49, 0x89, 0xDA }));
 }
@@ -9240,8 +9289,10 @@ test "compileFunctionRA: store folds wasm offset into mov disp and omits r11 sav
     // No `add r11, imm32` (49 81 C3 ... or 49 83 C3 ...) — offset is folded.
     try std.testing.expect(!containsBytes(code, &.{ 0x49, 0x81, 0xC3 }));
     try std.testing.expect(!containsBytes(code, &.{ 0x49, 0x83, 0xC3 }));
-    // 32-bit store `mov [rax+16], ecx` with disp32 encoding = 89 88 10 00 00 00.
-    try std.testing.expect(containsBytes(code, &.{ 0x89, 0x88, 0x10, 0x00, 0x00, 0x00 }));
+    // No `add rax, r15` (4C 01 F8) — SIB addressing `[r15 + rax + 16]` is used.
+    try std.testing.expect(!containsBytes(code, &.{ 0x4C, 0x01, 0xF8 }));
+    // 32-bit store `mov [r15 + rax + 16], ecx` with SIB + disp8 = 41 89 4C 07 10.
+    try std.testing.expect(containsBytes(code, &.{ 0x41, 0x89, 0x4C, 0x07, 0x10 }));
 }
 
 test "compileFunctionRA: add of two non-constant values emits LEA" {
@@ -9396,20 +9447,10 @@ test "compileFunctionRA: callee with >3 params spills stack args on Win64" {
     defer allocator.free(code);
 
     // On Windows the prologue must load at least one stack-passed param from
-    // [rbp + 48] via rax (48 00 00 00 disp32). Look for the mov rax, [rbp+48]
-    // opcode sequence: REX.W=48, 8B (mov r64, r/m64), ModR/M=85 (mod=10, reg=000(rax), r/m=101(rbp)).
+    // [rbp + 48] via rax (0x30 disp8). Look for the mov rax, [rbp+48]
+    // opcode sequence: REX.W=48, 8B (mov r64, r/m64), ModR/M=45 (mod=01, reg=000(rax), r/m=101(rbp)).
     if (builtin.os.tag == .windows) {
-        var found = false;
-        var i: usize = 0;
-        while (i + 6 < code.len) : (i += 1) {
-            if (code[i] == 0x48 and code[i + 1] == 0x8B and code[i + 2] == 0x85 and
-                code[i + 3] == 0x30 and code[i + 4] == 0 and code[i + 5] == 0 and code[i + 6] == 0)
-            {
-                found = true;
-                break;
-            }
-        }
-        try std.testing.expect(found);
+        try std.testing.expect(containsBytes(code, &.{ 0x48, 0x8B, 0x45, 0x30 }));
     }
 }
 
@@ -9492,7 +9533,7 @@ test "compileFunctionRAWithGlobalOffsetsPublic: lazy-body local call uses funcpt
     defer allocator.free(compiled.code);
 
     try std.testing.expectEqual(@as(usize, 0), compiled.call_patches.len);
-    try std.testing.expect(containsBytes(compiled.code, &.{ 0x4C, 0x8B, 0x9B, 0x78, 0x00, 0x00, 0x00 }));
+    try std.testing.expect(containsBytes(compiled.code, &.{ 0x4C, 0x8B, 0x5B, 0x78 }));
     try std.testing.expect(containsBytes(compiled.code, &.{ 0x41, 0xFF, 0xD3 }));
 }
 
@@ -9521,7 +9562,7 @@ test "compileFunctionRAWithGlobalOffsetsPublic: lazy-body tail call jumps via fu
     defer allocator.free(compiled.code);
 
     try std.testing.expectEqual(@as(usize, 0), compiled.call_patches.len);
-    try std.testing.expect(containsBytes(compiled.code, &.{ 0x4C, 0x8B, 0x9B, 0x78, 0x00, 0x00, 0x00 }));
+    try std.testing.expect(containsBytes(compiled.code, &.{ 0x4C, 0x8B, 0x5B, 0x78 }));
     try std.testing.expect(containsBytes(compiled.code, &.{ 0x41, 0xFF, 0xE3 }));
 }
 
@@ -9822,10 +9863,9 @@ test "compileFunctionRA: i32.load emits inline memory bounds check" {
     try std.testing.expect(containsBytes(code, &.{ 0x4C, 0x8D, 0x58, 0x02 }));
     // cmp r11, [rbx + 8]   → 4C 3B 5B 08  (#798 L2)
     try std.testing.expect(containsBytes(code, &.{ 0x4C, 0x3B, 0x5B, 0x08 }));
-    // jbe +12              → 76 0C
-    try std.testing.expect(containsBytes(code, &.{ 0x76, 0x0C }));
+    // jbe +9               → 76 09 (trap block is 3 + 4 + 2 = 9 bytes with disp8)
+    try std.testing.expect(containsBytes(code, &.{ 0x76, 0x09 }));
     // call qword ptr [vmctx + 80] is encoded as a two-step load+callReg.
-    // mov rax, [p0 + 80] fragment `48 8B ?? 50 00 00 00` + call rax (FF D0).
     // Verify `call rax` is present (FF D0).
     try std.testing.expect(containsBytes(code, &.{ 0xFF, 0xD0 }));
 }
@@ -9856,8 +9896,8 @@ test "compileFunctionRA: i32.store emits inline memory bounds check" {
     try std.testing.expect(containsBytes(code, &.{ 0x4C, 0x8D, 0x58, 0x04 }));
     // cmp r11, [rbx + 8]  → 4C 3B 5B 08  (#798 L2)
     try std.testing.expect(containsBytes(code, &.{ 0x4C, 0x3B, 0x5B, 0x08 }));
-    // jbe +12
-    try std.testing.expect(containsBytes(code, &.{ 0x76, 0x0C }));
+    // jbe +9              → 76 09 (trap block is 3 + 4 + 2 = 9 bytes with disp8)
+    try std.testing.expect(containsBytes(code, &.{ 0x76, 0x09 }));
     // call rax (trap dispatch)
     try std.testing.expect(containsBytes(code, &.{ 0xFF, 0xD0 }));
 }
@@ -10756,6 +10796,55 @@ test "#798 x86_64: 32-bit immediate ALU and single-use AND->TEST+CMOVcc32 in sel
     try std.testing.expect(found_cmovz32);
     try std.testing.expectEqual(@as(usize, 0), self_mov32_count);
 }
+
+test "#798 Wave 9 x86_64: non-memory function elides prologue mov r15, [rbx]" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v0 } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+
+    // `push r15` (41 57) and `pop r15` (41 5F) are preserved so callee_saved_bytes = 40.
+    try std.testing.expect(containsBytes(code, &.{ 0x41, 0x57 }));
+    try std.testing.expect(containsBytes(code, &.{ 0x41, 0x5F }));
+    // `mov r15, [rbx]` (4C 8B 3B) and `mov r15, [rbx + disp32]` (4C 8B BB ...) must NOT be emitted.
+    try std.testing.expect(!containsBytes(code, &.{ 0x4C, 0x8B, 0x3B }));
+    try std.testing.expect(!containsBytes(code, &.{ 0x4C, 0x8B, 0xBB }));
+}
+
+test "#798 Wave 9 x86_64: load uses SIB [r15 + rax + disp] without add rax, r15" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 1);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const addr = func.newVReg();
+    const val = func.newVReg();
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = addr, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = addr, .offset = 8, .size = 4, .sign_extend = false } }, .dest = val, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = val } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+
+    // Must NOT emit `add rax, r15` (4C 01 F8).
+    try std.testing.expect(!containsBytes(code, &.{ 0x4C, 0x01, 0xF8 }));
+    // Must emit `mov r15, [rbx]` (4C 8B 3B) in prologue since this is a memory function.
+    try std.testing.expect(containsBytes(code, &.{ 0x4C, 0x8B, 0x3B }));
+}
+
 
 
 

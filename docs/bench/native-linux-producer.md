@@ -18,7 +18,7 @@ inputs remain mandatory; enabling this software does not qualify hardware or ima
 
 ## Build and correctness checks
 
-From the repository root, with Zig 0.16:
+From the repository root, with Zig 0.17.0:
 
 ```sh
 zig build native-bench-linux native-bench-fixtures -Doptimize=fast -j2

@@ -1,6 +1,7 @@
 //! Core WebAssembly types used throughout the runtime.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const config = @import("config");
 const platform = @import("../../platform/platform.zig");
 const shared_memory = @import("shared_memory.zig");
@@ -456,6 +457,8 @@ pub const NameSection = struct {
 
 // ─── Instance-level structures ──────────────────────────────────────────────
 
+pub const MEM32_GUARD_RESERVATION_BYTES: usize = if (@sizeOf(usize) == 8) 8 * 1024 * 1024 * 1024 else 0;
+
 /// Runtime memory instance
 /// Runtime memory instance (refcounted for cross-module sharing)
 pub const MemoryInstance = struct {
@@ -496,6 +499,8 @@ pub const MemoryInstance = struct {
     /// Size of the reservation when `reserved_base != null`. Constant
     /// for the lifetime of the memory.
     reserved_size: usize = 0,
+    reserved_bytes: usize = 0,
+    has_guard_pages: bool = false,
 
     pub const page_size: u32 = 65536;
     pub const max_addressable_pages: u32 = @intCast(@min(
@@ -515,12 +520,33 @@ pub const MemoryInstance = struct {
         return std.math.mul(usize, @intCast(pages), page_size) catch null;
     }
 
+    fn osReserveMemory(size: usize) ?[*]align(page_size_min) u8 {
+        if (size == 0) return null;
+        if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) {
+            return platform.reserveAddressSpace(size);
+        }
+        var map_flags: std.posix.system.MAP = .{ .TYPE = .PRIVATE, .ANONYMOUS = true };
+        if (@hasField(std.posix.system.MAP, "NORESERVE")) {
+            map_flags.NORESERVE = true;
+        }
+        const slice = std.posix.mmap(
+            null,
+            size,
+            .{},
+            map_flags,
+            -1,
+            0,
+        ) catch return null;
+        return slice.ptr;
+    }
+
     /// Allocate a `MemoryInstance` with **stable-address backing** when the
     /// host supports it. The memory's `data.ptr` is pinned to a virtual
-    /// address reservation of `cap_pages * 64 KiB`, with `initial_pages`
+    /// address reservation of `cap_pages * 64 KiB` (or 8 GiB with guard
+    /// pages for 32-bit memories on 64-bit POSIX), with `initial_pages`
     /// committed up front. `grow` extends the committed window via
     /// `mprotect`; the pointer never moves, so external aliases into the
-    /// memory survive any `memory.grow` calls. (Issue #752.)
+    /// memory survive any `memory.grow` calls. (Issue #752, #798.)
     ///
     /// `cap_pages` should be `min(mem_type.limits.max orelse 65536, 65536)`.
     /// When the OS reservation fails, this function returns null and the
@@ -535,9 +561,24 @@ pub const MemoryInstance = struct {
     ) ?*MemoryInstance {
         if (mem_type.is_shared) return null;
         if (!platform.supports_reserved_memory) return null;
-        if (cap_pages == 0) return null;
-        const reserved_size = byteSizeForPages(cap_pages) orelse return null;
-        const base = platform.reserveAddressSpace(reserved_size) orelse return null;
+        const can_use_guard_pages = !mem_type.is_memory64 and @sizeOf(usize) == 8 and
+            builtin.os.tag != .windows and builtin.os.tag != .wasi and builtin.os.tag != .freestanding;
+        if (cap_pages == 0 and !can_use_guard_pages) return null;
+        const cap_reserved_size = byteSizeForPages(cap_pages) orelse return null;
+
+        var reserved_size: usize = cap_reserved_size;
+        var has_guard_pages = false;
+        const base: [*]align(page_size_min) u8 = blk: {
+            if (can_use_guard_pages and MEM32_GUARD_RESERVATION_BYTES >= cap_reserved_size) {
+                if (osReserveMemory(MEM32_GUARD_RESERVATION_BYTES)) |guard_base| {
+                    reserved_size = MEM32_GUARD_RESERVATION_BYTES;
+                    has_guard_pages = true;
+                    break :blk guard_base;
+                }
+            }
+            if (cap_reserved_size == 0) return null;
+            break :blk osReserveMemory(cap_reserved_size) orelse return null;
+        };
         errdefer platform.releaseAddressSpace(base, reserved_size);
 
         const initial_size = byteSizeForPages(initial_pages) orelse return null;
@@ -561,6 +602,8 @@ pub const MemoryInstance = struct {
             .max_pages = cap_pages,
             .reserved_base = base,
             .reserved_size = reserved_size,
+            .reserved_bytes = reserved_size,
+            .has_guard_pages = has_guard_pages,
         };
         return mem;
     }
@@ -593,6 +636,7 @@ pub const MemoryInstance = struct {
             .shared_control = control,
             .reserved_base = control.base,
             .reserved_size = control.reserved_bytes,
+            .reserved_bytes = control.reserved_bytes,
         };
         return mem;
     }
@@ -637,7 +681,7 @@ pub const MemoryInstance = struct {
                 // extend `data.len`. mmap PROT_NONE pages were
                 // anonymous so they are already zero; mprotect to
                 // READ|WRITE makes them touchable. (#752)
-                if (new_size > self.reserved_size) return error.MemoryGrowFailed;
+                if (new_pages > self.max_pages or new_size > self.reserved_size) return error.MemoryGrowFailed;
                 platform.commitPages(@alignCast(base + old_size), new_size - old_size) catch
                     return error.MemoryGrowFailed;
                 self.data = base[0..new_size];
@@ -1784,7 +1828,12 @@ test "MemoryInstance: createReserved keeps data.ptr stable across grow" {
     defer mem.release(allocator);
 
     try std.testing.expect(mem.reserved_base != null);
-    try std.testing.expectEqual(@as(usize, 8) * MemoryInstance.page_size, mem.reserved_size);
+    const expected_reserved = if (mem.has_guard_pages)
+        MEM32_GUARD_RESERVATION_BYTES
+    else
+        @as(usize, 8) * MemoryInstance.page_size;
+    try std.testing.expectEqual(expected_reserved, mem.reserved_size);
+    try std.testing.expectEqual(expected_reserved, mem.reserved_bytes);
     try std.testing.expectEqual(@as(u32, 1), mem.current_pages);
     try std.testing.expectEqual(@as(usize, MemoryInstance.page_size), mem.data.len);
 
@@ -1820,6 +1869,22 @@ test "MemoryInstance: createReserved keeps data.ptr stable across grow" {
     // Growing past the cap fails.
     try std.testing.expectError(error.MemoryGrowFailed, mem.grow(1, allocator));
     try std.testing.expectEqual(@as(u32, 8), mem.current_pages);
+}
+
+test "MemoryInstance: createReserved reserves 8 GiB guard pages on 64-bit POSIX" {
+    if (!platform.supports_reserved_memory) return error.SkipZigTest;
+    if (@sizeOf(usize) != 8 or builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) {
+        return error.SkipZigTest;
+    }
+    const allocator = std.testing.allocator;
+    const mem_type: MemoryType = .{ .limits = .{ .min = 1, .max = 16 }, .is_memory64 = false };
+    const mem = MemoryInstance.createReserved(mem_type, 1, 16, allocator) orelse
+        return error.SkipZigTest;
+    defer mem.release(allocator);
+
+    try std.testing.expect(mem.has_guard_pages);
+    try std.testing.expectEqual(MEM32_GUARD_RESERVATION_BYTES, mem.reserved_bytes);
+    try std.testing.expectEqual(MEM32_GUARD_RESERVATION_BYTES, mem.reserved_size);
 }
 
 test "MemoryInstance: page sizing respects host pointer width" {

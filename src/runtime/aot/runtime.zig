@@ -414,6 +414,117 @@ fn resetStackGuardPage() void {
     }
 }
 
+threadlocal var active_guard_base: usize = 0;
+threadlocal var active_guard_end: usize = 0;
+
+const PosixSig = if (builtin.os.tag == .linux) std.os.linux.SIG else if (posix_trap_supported) std.posix.SIG else void;
+const PosixSiginfo = if (builtin.os.tag == .linux) std.os.linux.siginfo_t else if (posix_trap_supported) std.posix.siginfo_t else void;
+const PosixSigaction = if (builtin.os.tag == .linux) std.os.linux.Sigaction else if (posix_trap_supported) std.posix.Sigaction else void;
+
+var posix_trap_handler_state: std.atomic.Value(u8) = .init(0);
+var prev_sigsegv_action: PosixSigaction = undefined;
+var prev_sigbus_action: PosixSigaction = undefined;
+
+fn posixTrapFaultAddr(info: *const PosixSiginfo) usize {
+    if (@hasField(PosixSiginfo, "fields")) {
+        return @intFromPtr(info.fields.sigfault.addr);
+    } else if (@hasField(PosixSiginfo, "addr")) {
+        return @intFromPtr(info.addr);
+    }
+    return 0;
+}
+
+fn posixTrapHandler(sig: PosixSig, info: *const PosixSiginfo, ctx_ptr: ?*anyopaque) callconv(.c) void {
+    if (comptime !posix_trap_supported) return;
+    if (isTrapCatching()) {
+        const state = activeAotCallState();
+        const guard_base = if (active_guard_base != 0) active_guard_base else if (state) |s| s.guard_base else 0;
+        const guard_end = if (active_guard_end != 0) active_guard_end else if (state) |s| s.guard_end else 0;
+        const fault_addr = posixTrapFaultAddr(info);
+        if (guard_base != 0 and fault_addr >= guard_base and fault_addr < guard_end) {
+            noteTrapReason(.out_of_bounds_memory);
+            trapLongjmp();
+        }
+    }
+
+    const prev_act: *const PosixSigaction = if (sig == .SEGV) &prev_sigsegv_action else &prev_sigbus_action;
+    const sa_siginfo_flag = if (comptime builtin.os.tag == .linux) std.os.linux.SA.SIGINFO else std.posix.SA.SIGINFO;
+    if ((prev_act.flags & sa_siginfo_flag) != 0) {
+        if (prev_act.handler.sigaction) |prev_sa| {
+            if (prev_sa != &posixTrapHandler) {
+                prev_sa(sig, info, ctx_ptr);
+                return;
+            }
+        }
+    } else if (prev_act.handler.handler) |prev_h| {
+        if (prev_h != PosixSig.DFL and prev_h != PosixSig.IGN) {
+            prev_h(sig);
+            return;
+        }
+    }
+
+    if (comptime builtin.os.tag == .linux) {
+        const dfl_act: std.os.linux.Sigaction = .{
+            .handler = .{ .handler = std.os.linux.SIG.DFL },
+            .mask = std.os.linux.sigemptyset(),
+            .flags = 0,
+        };
+        _ = std.os.linux.sigaction(sig, &dfl_act, null);
+    } else {
+        const dfl_act: std.posix.Sigaction = .{
+            .handler = .{ .handler = std.posix.SIG.DFL },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(sig, &dfl_act, null);
+    }
+}
+
+fn ensurePosixTrapHandlerInstalled() void {
+    if (comptime !posix_trap_supported) return;
+    while (true) {
+        switch (posix_trap_handler_state.load(.acquire)) {
+            2 => return,
+            0 => {
+                if (posix_trap_handler_state.cmpxchgWeak(0, 1, .acq_rel, .acquire) == null) {
+                    if (comptime builtin.os.tag == .linux) {
+                        const act: std.os.linux.Sigaction = .{
+                            .handler = .{ .sigaction = posixTrapHandler },
+                            .mask = std.os.linux.sigemptyset(),
+                            .flags = std.os.linux.SA.SIGINFO | std.os.linux.SA.NODEFER,
+                        };
+                        _ = std.os.linux.sigaction(.SEGV, &act, &prev_sigsegv_action);
+                        _ = std.os.linux.sigaction(.BUS, &act, &prev_sigbus_action);
+                    } else {
+                        const act: std.posix.Sigaction = .{
+                            .handler = .{ .sigaction = posixTrapHandler },
+                            .mask = std.posix.sigemptyset(),
+                            .flags = std.posix.SA.SIGINFO | std.posix.SA.NODEFER,
+                        };
+                        std.posix.sigaction(.SEGV, &act, &prev_sigsegv_action);
+                        std.posix.sigaction(.BUS, &act, &prev_sigbus_action);
+                    }
+                    posix_trap_handler_state.store(2, .release);
+                    return;
+                }
+            },
+            1 => std.atomic.spinLoopHint(),
+            else => unreachable,
+        }
+    }
+}
+
+fn computeGuardRange(inst: *const AotInstance) struct { base: usize, end: usize } {
+    if (inst.memories.len > 0) {
+        const mem = inst.memories[0];
+        if (mem.reserved_size > 0) {
+            const base: usize = if (mem.reserved_base) |rb| @intFromPtr(rb) else @intFromPtr(mem.data.ptr);
+            return .{ .base = base, .end = base +| mem.reserved_size };
+        }
+    }
+    return .{ .base = 0, .end = 0 };
+}
+
 fn trapLongjmp() noreturn {
     const state = activeAotCallState() orelse std.process.exit(2);
     state.trap_occurred.store(true, .seq_cst);
@@ -457,6 +568,14 @@ fn vehHandler(info: *windows.EXCEPTION_POINTERS) callconv(.winapi) c_long {
     // distinguish wasm traps from unrelated process-wide faults.
     if (is_wasm_fault and state != null and state.?.trap_catching.load(.seq_cst)) {
         _ = in_code;
+        if (code == 0xC0000005 and rec.NumberParameters >= 2) {
+            const fault_addr = rec.ExceptionInformation[1];
+            const guard_base = if (active_guard_base != 0) active_guard_base else state.?.guard_base;
+            const guard_end = if (active_guard_end != 0) active_guard_end else state.?.guard_end;
+            if (guard_base != 0 and fault_addr >= guard_base and fault_addr < guard_end) {
+                noteTrapReason(.out_of_bounds_memory);
+            }
+        }
         state.?.trap_occurred.store(true, .seq_cst);
         state.?.last_trap_code.store(code, .seq_cst);
         if (code == 0xC00000FD) {
@@ -714,7 +833,16 @@ pub const VmCtx = extern struct {
     /// compare it with acquire ordering and never dereference group storage.
     cancel_group_token: u32 = 0,
     _pad_cancel_group: u32 = 0,
+    /// Cached `tables_info[0].type_backing_ptr` (`[*]const u32` sig-id array
+    /// for table 0) so `call_indirect` on table 0 can load the signature ID
+    /// directly from `VmCtx` without chasing `tables_info_ptr`.
+    func_table_type_backing_ptr: usize = 0,
 };
+
+pub const vmctx_func_table_type_backing_ptr_offset: u32 = @offsetOf(VmCtx, "func_table_type_backing_ptr");
+comptime {
+    std.debug.assert(vmctx_func_table_type_backing_ptr_offset == 472);
+}
 
 test "native embedding ABI matches every hosted VmCtx field" {
     const Native = @import("native_abi.zig").VmCtx;
@@ -771,6 +899,8 @@ const AotCallState = struct {
     last_trap_code: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     trap_reason: std.atomic.Value(u8) =
         std.atomic.Value(u8).init(@backingInt(TrapReason.unknown)),
+    guard_base: usize = 0,
+    guard_end: usize = 0,
 };
 
 fn contextTerminating(
@@ -2777,6 +2907,12 @@ fn refreshVmCtxForInstance(inst: *AotInstance, globals_buf: ?[]u8) void {
     }
     vmctx.table_grow_fn = @intFromPtr(&tableGrowHelper);
     vmctx.tables_info_ptr = if (inst.tables_info.len > 0) @intFromPtr(inst.tables_info.ptr) else 0;
+    vmctx.func_table_type_backing_ptr = if (inst.tables_info.len > 0)
+        inst.tables_info[0].type_backing_ptr
+    else if (inst.tables.len > 0 and inst.tables[0].type_backing.len > 0)
+        @intFromPtr(inst.tables[0].type_backing.ptr)
+    else
+        0;
     vmctx.table_init_fn = @intFromPtr(&tableInitHelper);
     vmctx.elem_drop_fn = @intFromPtr(&elemDropHelper);
     vmctx.table_set_fn = @intFromPtr(&tableSetHelper);
@@ -3445,6 +3581,7 @@ fn refreshVmCtxTable(
             @intFromPtr(backing.ptr)
         else
             0;
+        inst.vmctx.func_table_type_backing_ptr = type_backing_ptr;
     } else if (table_idx - 1 < inst.extra_tables_storage.len) {
         inst.extra_tables_storage[table_idx - 1] = backing;
     }
@@ -3986,6 +4123,7 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
 
         inst.tables_info = info;
         inst.extra_tables_storage = extra;
+        inst.vmctx.func_table_type_backing_ptr = if (info.len > 0) info[0].type_backing_ptr else 0;
     }
 
     try subscribeVmCtxToTables(inst);
@@ -4054,13 +4192,66 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     var aot_call_state = AotCallState{};
     var backend_scope = call_thread_context.bindBackendContext(@ptrCast(&aot_call_state));
     defer backend_scope.deinit();
+    const prev_guard_base = active_guard_base;
+    const prev_guard_end = active_guard_end;
+    const guard_range = computeGuardRange(inst);
+    active_guard_base = guard_range.base;
+    active_guard_end = guard_range.end;
+    aot_call_state.guard_base = guard_range.base;
+    aot_call_state.guard_end = guard_range.end;
+    defer {
+        active_guard_base = prev_guard_base;
+        active_guard_end = prev_guard_end;
+    }
     installTrapDecodeFrameFor(inst);
     if (comptime windows_trap_supported) {
         aot_call_state.trap_decode.mem_base = vmctx.memory_base;
         aot_call_state.trap_decode.mem_size = vmctx.memory_size;
         ensureVehInstalled();
+        aot_call_state.trap_occurred.store(false, .seq_cst);
+        aot_call_state.last_trap_code.store(0, .seq_cst);
+        var guarantee: u32 = 16 * 1024;
+        _ = SetThreadStackGuarantee(&guarantee);
+        aot_call_state.trap_catching.store(true, .seq_cst);
+        RtlCaptureContext(&aot_call_state.saved_ctx);
+        if (aot_call_state.trap_occurred.load(.seq_cst)) {
+            aot_call_state.trap_catching.store(false, .seq_cst);
+            const cancelled = aot_call_state.cancel_unwind.load(.acquire);
+            if (!cancelled) call_thread_context.markTrap();
+            if (aot_call_state.last_trap_code.load(.seq_cst) == 0xC00000FD) {
+                resetStackGuardPage();
+            }
+            inst.last_trap_reason.store(
+                aot_call_state.trap_reason.load(.acquire),
+                .release,
+            );
+            readGlobalsFromStorage(inst, globals_buf);
+            return if (cancelled) error.ThreadCancelled else error.WasmTrap;
+        }
+    }
+    if (comptime posix_trap_supported) {
+        ensurePosixTrapHandlerInstalled();
+        aot_call_state.trap_occurred.store(false, .seq_cst);
+        aot_call_state.trap_catching.store(true, .seq_cst);
+        if (trap_jmp.capture(&aot_call_state.posix_trap_buf) != 0) {
+            aot_call_state.trap_catching.store(false, .seq_cst);
+            const cancelled = aot_call_state.cancel_unwind.load(.acquire);
+            if (!cancelled) call_thread_context.markTrap();
+            inst.last_trap_reason.store(
+                aot_call_state.trap_reason.load(.acquire),
+                .release,
+            );
+            readGlobalsFromStorage(inst, globals_buf);
+            return if (cancelled) error.ThreadCancelled else error.WasmTrap;
+        }
     }
     const result = func_ptr(vmctx);
+    if (comptime windows_trap_supported) {
+        aot_call_state.trap_catching.store(false, .seq_cst);
+    }
+    if (comptime posix_trap_supported) {
+        aot_call_state.trap_catching.store(false, .seq_cst);
+    }
 
     // Sync globals back from flat storage to GlobalInstance objects.
     const vmctx_after: *VmCtx = @ptrFromInt(vmctx_storage_addr);
@@ -4544,6 +4735,17 @@ pub fn callFuncScalar(
     var aot_call_state = AotCallState{};
     var backend_scope = call_thread_context.bindBackendContext(@ptrCast(&aot_call_state));
     defer backend_scope.deinit();
+    const prev_guard_base = active_guard_base;
+    const prev_guard_end = active_guard_end;
+    const guard_range = computeGuardRange(inst);
+    active_guard_base = guard_range.base;
+    active_guard_end = guard_range.end;
+    aot_call_state.guard_base = guard_range.base;
+    aot_call_state.guard_end = guard_range.end;
+    defer {
+        active_guard_base = prev_guard_base;
+        active_guard_end = prev_guard_end;
+    }
     installTrapDecodeFrameFor(inst);
     if (comptime windows_trap_supported) {
         aot_call_state.trap_decode.mem_base = vmctx.memory_base;
@@ -4597,6 +4799,7 @@ pub fn callFuncScalar(
     // below when the call-local trap state is armed; we then return
     // `error.WasmTrap` instead of aborting the process.
     if (comptime posix_trap_supported) {
+        ensurePosixTrapHandlerInstalled();
         aot_call_state.trap_occurred.store(false, .seq_cst);
         aot_call_state.trap_catching.store(true, .seq_cst);
         if (trap_jmp.capture(&aot_call_state.posix_trap_buf) != 0) {
@@ -5807,7 +6010,59 @@ test "VmCtx layout: fields at expected offsets" {
     try std.testing.expectEqual(@as(usize, 448), @offsetOf(VmCtx, "memory_init_fn"));
     try std.testing.expectEqual(@as(usize, 456), @offsetOf(VmCtx, "data_drop_fn"));
     try std.testing.expectEqual(@as(usize, 464), @offsetOf(VmCtx, "cancel_group_token"));
-    try std.testing.expectEqual(@as(usize, 472), @sizeOf(VmCtx));
+    try std.testing.expectEqual(@as(usize, 472), @offsetOf(VmCtx, "func_table_type_backing_ptr"));
+    try std.testing.expectEqual(@as(usize, 480), @sizeOf(VmCtx));
+}
+
+noinline fn triggerGuardPageFaultForTest(ptr: *allowzero const volatile u8) u8 {
+    return ptr.*;
+}
+
+test "POSIX hardware guard-page fault traps with out_of_bounds_memory" {
+    if (comptime !posix_trap_supported) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mem_type: types.MemoryType = .{ .limits = .{ .min = 1, .max = 4 } };
+    const mem = types.MemoryInstance.createReserved(mem_type, 1, 4, allocator) orelse
+        return error.SkipZigTest;
+    defer mem.release(allocator);
+
+    var thread_ctx = execution_context.ThreadExecutionContext{};
+    var exec_scope = thread_ctx.enter();
+    defer exec_scope.deinit();
+
+    var aot_call_state = AotCallState{};
+    var backend_scope = thread_ctx.bindBackendContext(@ptrCast(&aot_call_state));
+    defer backend_scope.deinit();
+
+    const base = @intFromPtr(mem.reserved_base.?);
+    const prev_guard_base = active_guard_base;
+    const prev_guard_end = active_guard_end;
+    active_guard_base = base;
+    active_guard_end = base + mem.reserved_size;
+    aot_call_state.guard_base = active_guard_base;
+    aot_call_state.guard_end = active_guard_end;
+    defer {
+        active_guard_base = prev_guard_base;
+        active_guard_end = prev_guard_end;
+    }
+
+    ensurePosixTrapHandlerInstalled();
+    aot_call_state.trap_occurred.store(false, .seq_cst);
+    aot_call_state.trap_catching.store(true, .seq_cst);
+    defer aot_call_state.trap_catching.store(false, .seq_cst);
+
+    if (trap_jmp.capture(&aot_call_state.posix_trap_buf) == 0) {
+        const guard_ptr: *allowzero const volatile u8 =
+            @ptrFromInt(base + types.MemoryInstance.page_size);
+        std.mem.doNotOptimizeAway(triggerGuardPageFaultForTest(guard_ptr));
+        return error.TestExpectedTrap;
+    }
+
+    try std.testing.expect(aot_call_state.trap_occurred.load(.seq_cst));
+    try std.testing.expectEqual(
+        TrapReason.out_of_bounds_memory,
+        @as(TrapReason, @enumFromInt(aot_call_state.trap_reason.load(.acquire))),
+    );
 }
 
 test "AOT thread context inherits retained process state without thread-local flags" {
