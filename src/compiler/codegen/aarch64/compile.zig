@@ -696,6 +696,9 @@ const FuncCompileCtx = struct {
     /// Single-use integer comparison dest vreg → condition code consumed
     /// directly by the same block's terminating `br_if` (skipping `cset`).
     fused_cmp_cond: ?*const std.AutoHashMap(ir.VReg, emit.Cond) = null,
+    /// Single-use `.eqz` or `.eq`/`.ne` against zero whose result feeds the
+    /// block-terminating `br_if` via a single `CBZ`/`CBNZ`.
+    cbz_br_if_info: ?*const std.AutoHashMap(ir.VReg, CbzBrIfInfo) = null,
     /// Byte offsets of every callee-save save/restore block emitted. Each
     /// entry is the 10 STR/LDR offsets for one `emitCalleeSaveStore` or
     /// `emitCalleeSaveRestore` call. After the body is compiled, offsets
@@ -754,11 +757,19 @@ const FmaInfo = struct {
     is_sub: bool,
 };
 
-/// Pre-computed info for a fused UBFX (`UBFM`): `dest = (src >> lsb) & ((1 << width) - 1)`.
+/// Pre-computed info for a fused UBFX (`UBFM`) or SBFX (`SBFM`).
 const UbfxInfo = struct {
     src: ir.VReg,
     lsb: u6,
     width: u6,
+};
+
+/// Pre-computed info for a fused CBZ/CBNZ branch: `br_if` whose single-use
+/// condition is `.eqz(src)` or `.eq/.ne(src, 0)`.
+const CbzBrIfInfo = struct {
+    src: ir.VReg,
+    is_64: bool,
+    branch_on_zero: bool,
 };
 
 /// Pre-computed info for a fused shifted-register ALU op: `dest = unshifted <op> (shifted_src <shift_op> shift_amt)`.
@@ -2485,6 +2496,63 @@ pub fn compileFunctionImpl(
                     if (ubfx_info.contains(dest)) continue;
                 }
 
+                // 1b. Check SBFX: `shr_s(shl(src, a), b)` with `b >= a` and `b >= 1`.
+                if (inst.op == .shr_s) {
+                    const shr_bin = inst.op.shr_s;
+                    const bit_w: u7 = if (inst.type == .i32) 32 else 64;
+                    if (!const_vals.contains(shr_bin.lhs)) {
+                        if (const_vals.get(shr_bin.rhs)) |shr_c| {
+                            const b: u6 = if (inst.type == .i32)
+                                @as(u5, @truncate(@as(u64, @bitCast(shr_c))))
+                            else
+                                @as(u6, @truncate(@as(u64, @bitCast(shr_c))));
+                            if (b >= 1 and (use_counts.get(shr_bin.lhs) orelse 0) == 1 and !shift_fused.contains(shr_bin.lhs)) {
+                                var j: usize = i;
+                                while (j > 0) : (j -= 1) {
+                                    const prev = insts[j - 1];
+                                    if (prev.op == .parallel_copy) break;
+                                    if (prev.dest) |d| {
+                                        if (d != shr_bin.lhs) continue;
+                                        if (prev.op == .shl and prev.type == inst.type) {
+                                            const shl_bin = prev.op.shl;
+                                            if (!const_vals.contains(shl_bin.lhs)) {
+                                                if (const_vals.get(shl_bin.rhs)) |shl_c| {
+                                                    const a: u6 = if (inst.type == .i32)
+                                                        @as(u5, @truncate(@as(u64, @bitCast(shl_c))))
+                                                    else
+                                                        @as(u6, @truncate(@as(u64, @bitCast(shl_c))));
+                                                    if (b >= a) {
+                                                        var clobbered = false;
+                                                        for (insts[j..i]) |mid| {
+                                                            if (mid.dest == shl_bin.lhs) {
+                                                                clobbered = true;
+                                                                break;
+                                                            }
+                                                        }
+                                                        if (!clobbered) {
+                                                            const lsb: u6 = b - a;
+                                                            const eff_width: u6 = @intCast(bit_w - @as(u7, b));
+                                                            try shift_fused.put(shr_bin.lhs, {});
+                                                            try ubfx_info.put(dest, .{
+                                                                .src = shl_bin.lhs,
+                                                                .lsb = lsb,
+                                                                .width = eff_width,
+                                                            });
+                                                            try ubfx_pos.put(dest, global_idx);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (ubfx_info.contains(dest)) continue;
+                }
+
                 // 2. Check shifted-register ALU: `add/sub/and/or/xor` with a single-use constant shift.
                 const bin: ir.Inst.BinOp = switch (inst.op) {
                     .add => |b| b,
@@ -2501,7 +2569,7 @@ pub fn compileFunctionImpl(
                     .{ bin.rhs, bin.lhs };
                 for (candidates) |maybe_shift_dest| {
                     const shift_dest = maybe_shift_dest orelse continue;
-                    if ((use_counts.get(shift_dest) orelse 0) != 1 or shift_fused.contains(shift_dest)) continue;
+                    if ((use_counts.get(shift_dest) orelse 0) != 1 or shift_fused.contains(shift_dest) or ubfx_info.contains(shift_dest)) continue;
                     var j: usize = i;
                     var fused_this = false;
                     while (j > 0) : (j -= 1) {
@@ -2677,9 +2745,18 @@ pub fn compileFunctionImpl(
                         try cls_ctx.bumpTotal(b.lhs);
                         try cls_ctx.bumpTotal(b.rhs);
                         if (inst.type == .i32 or inst.type == .i64) {
+                            var pick_rhs = false;
+                            var pick_lhs = false;
                             if (cls_ctx.cv.get(b.rhs)) |v| {
-                                if (encodeCmpImm(v) != null) try cls_ctx.bumpFold(b.rhs);
+                                if (encodeCmpImmForType(v, inst.type) != null) pick_rhs = true;
                             }
+                            if (!pick_rhs and (inst.op == .eq or inst.op == .ne)) {
+                                if (cls_ctx.cv.get(b.lhs)) |v| {
+                                    if (encodeCmpImmForType(v, inst.type) != null) pick_lhs = true;
+                                }
+                            }
+                            if (pick_lhs) try cls_ctx.bumpFold(b.lhs);
+                            if (pick_rhs) try cls_ctx.bumpFold(b.rhs);
                         }
                     },
                     .store => |st| {
@@ -2756,75 +2833,139 @@ pub fn compileFunctionImpl(
     // consumes NZCV directly.
     var fused_cmp_cond = std.AutoHashMap(ir.VReg, emit.Cond).init(allocator);
     defer fused_cmp_cond.deinit();
-    for (block_order) |bo_bid| {
-        const insts = scheduled.instructions(bo_bid);
-        for (insts, 0..) |inst, idx| {
-            switch (inst.op) {
-                .select => |sel| {
-                    if ((use_counts.get(sel.cond) orelse 0) != 1) continue;
-                    var j: usize = idx;
-                    while (j > 0) {
-                        j -= 1;
-                        const prev = insts[j];
-                        if (prev.dest) |d| {
-                            if (d == sel.cond) {
-                                if (prev.type == .i32 or prev.type == .i64) {
-                                    if (cmpOpToCond(prev.op)) |cc| {
-                                        try fused_cmp_cond.put(sel.cond, cc);
-                                    } else if (prev.op == .@"and" and !ubfx_info.contains(d) and !shift_alu_info.contains(d)) {
-                                        try fused_cmp_cond.put(sel.cond, .ne);
+    var cbz_br_if_info = std.AutoHashMap(ir.VReg, CbzBrIfInfo).init(allocator);
+    defer cbz_br_if_info.deinit();
+    var cbz_br_if_pos = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer cbz_br_if_pos.deinit();
+    {
+        var flat_base: u32 = 0;
+        for (block_order) |bo_bid| {
+            const insts = scheduled.instructions(bo_bid);
+            defer flat_base += @intCast(insts.len);
+            for (insts, 0..) |inst, idx| {
+                switch (inst.op) {
+                    .select => |sel| {
+                        if ((use_counts.get(sel.cond) orelse 0) != 1) continue;
+                        var j: usize = idx;
+                        while (j > 0) {
+                            j -= 1;
+                            const prev = insts[j];
+                            if (prev.dest) |d| {
+                                if (d == sel.cond) {
+                                    if (prev.type == .i32 or prev.type == .i64) {
+                                        if (cmpOpToCond(prev.op)) |cc| {
+                                            try fused_cmp_cond.put(sel.cond, cc);
+                                        } else if (prev.op == .@"and" and !ubfx_info.contains(d) and !shift_alu_info.contains(d)) {
+                                            try fused_cmp_cond.put(sel.cond, .ne);
+                                        }
                                     }
+                                    break;
                                 }
-                                break;
+                            }
+                            switch (prev.op) {
+                                .iconst_32, .iconst_64 => {
+                                    if (prev.dest) |d| {
+                                        if (suppress_iconst.contains(d)) continue;
+                                    }
+                                    break;
+                                },
+                                else => break,
                             }
                         }
-                        switch (prev.op) {
-                            .iconst_32, .iconst_64 => {
-                                if (prev.dest) |d| {
-                                    if (suppress_iconst.contains(d)) continue;
-                                }
-                                break;
-                            },
-                            else => break,
-                        }
-                    }
-                },
-                .br_if => |br_op| {
-                    if (idx != insts.len - 1) continue;
-                    if ((use_counts.get(br_op.cond) orelse 0) != 1) continue;
-                    var j: usize = idx;
-                    while (j > 0) {
-                        j -= 1;
-                        const prev = insts[j];
-                        if (prev.dest) |d| {
-                            if (d == br_op.cond) {
-                                if (prev.type == .i32 or prev.type == .i64) {
-                                    if (cmpOpToCond(prev.op)) |cc| {
-                                        try fused_cmp_cond.put(br_op.cond, cc);
-                                    } else if (prev.op == .@"and" and !ubfx_info.contains(d) and !shift_alu_info.contains(d)) {
-                                        try fused_cmp_cond.put(br_op.cond, .ne);
+                    },
+                    .br_if => |br_op| {
+                        if (idx != insts.len - 1) continue;
+                        if ((use_counts.get(br_op.cond) orelse 0) != 1) continue;
+                        var j: usize = idx;
+                        while (j > 0) {
+                            j -= 1;
+                            const prev = insts[j];
+                            if (prev.dest) |d| {
+                                if (d == br_op.cond) {
+                                    if (prev.type == .i32 or prev.type == .i64) {
+                                        const maybe_cbz: ?CbzBrIfInfo = switch (prev.op) {
+                                            .eqz => |vreg| if (!const_vals.contains(vreg))
+                                                CbzBrIfInfo{
+                                                    .src = vreg,
+                                                    .is_64 = prev.type == .i64,
+                                                    .branch_on_zero = true,
+                                                }
+                                            else
+                                                null,
+                                            .eq, .ne => |b| blk_cbz: {
+                                                const on_zero = prev.op == .eq;
+                                                if (const_vals.get(b.rhs)) |rv| {
+                                                    if (isZeroConstForType(rv, prev.type) and !const_vals.contains(b.lhs)) {
+                                                        break :blk_cbz CbzBrIfInfo{
+                                                            .src = b.lhs,
+                                                            .is_64 = prev.type == .i64,
+                                                            .branch_on_zero = on_zero,
+                                                        };
+                                                    }
+                                                }
+                                                if (const_vals.get(b.lhs)) |lv| {
+                                                    if (isZeroConstForType(lv, prev.type) and !const_vals.contains(b.rhs)) {
+                                                        break :blk_cbz CbzBrIfInfo{
+                                                            .src = b.rhs,
+                                                            .is_64 = prev.type == .i64,
+                                                            .branch_on_zero = on_zero,
+                                                        };
+                                                    }
+                                                }
+                                                break :blk_cbz null;
+                                            },
+                                            else => null,
+                                        };
+                                        var fused_as_cbz = false;
+                                        if (maybe_cbz) |ci| {
+                                            var src_clobbered = false;
+                                            for (insts[j + 1 .. idx]) |mid| {
+                                                if (mid.op == .parallel_copy) {
+                                                    for (mid.op.parallel_copy) |pp| {
+                                                        if (pp.dst == ci.src and pp.src != ci.src) {
+                                                            src_clobbered = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                if (src_clobbered) break;
+                                            }
+                                            if (!src_clobbered) {
+                                                try cbz_br_if_info.put(br_op.cond, ci);
+                                                try cbz_br_if_pos.put(br_op.cond, flat_base + @as(u32, @intCast(idx)));
+                                                fused_as_cbz = true;
+                                            }
+                                        }
+                                        if (!fused_as_cbz) {
+                                            if (cmpOpToCond(prev.op)) |cc| {
+                                                try fused_cmp_cond.put(br_op.cond, cc);
+                                            } else if (prev.op == .@"and" and !ubfx_info.contains(d) and !shift_alu_info.contains(d)) {
+                                                try fused_cmp_cond.put(br_op.cond, .ne);
+                                            }
+                                        }
                                     }
+                                    break;
                                 }
-                                break;
+                            }
+                            switch (prev.op) {
+                                .parallel_copy => continue,
+                                .iconst_32, .iconst_64 => {
+                                    if (prev.dest) |d| {
+                                        if (suppress_iconst.contains(d)) continue;
+                                    }
+                                    break;
+                                },
+                                else => break,
                             }
                         }
-                        switch (prev.op) {
-                            .parallel_copy => continue,
-                            .iconst_32, .iconst_64 => {
-                                if (prev.dest) |d| {
-                                    if (suppress_iconst.contains(d)) continue;
-                                }
-                                break;
-                            },
-                            else => break,
-                        }
-                    }
-                },
-                else => {},
+                    },
+                    else => {},
+                }
             }
         }
     }
     fctx.fused_cmp_cond = &fused_cmp_cond;
+    fctx.cbz_br_if_info = &cbz_br_if_info;
     if (tmr) |t| t.end(.prepass);
 
     // Compute live ranges using the SAME block order as code emission.
@@ -2838,10 +2979,11 @@ pub fn compileFunctionImpl(
         &simd_fma_info,
         &ubfx_info,
         &shift_alu_info,
+        &cbz_br_if_info,
         allocator,
     );
     defer allocator.free(live_ranges);
-    if (fma_info.count() > 0 or simd_fma_info.count() > 0 or ubfx_info.count() > 0 or shift_alu_info.count() > 0) {
+    if (fma_info.count() > 0 or simd_fma_info.count() > 0 or ubfx_info.count() > 0 or shift_alu_info.count() > 0 or cbz_br_if_info.count() > 0) {
         // Build a vreg→range-index lookup for the patch loop.
         var range_idx = std.AutoHashMap(ir.VReg, usize).init(allocator);
         defer range_idx.deinit();
@@ -2899,6 +3041,17 @@ pub fn compileFunctionImpl(
                 }
             }
         }
+        var cbit = cbz_br_if_info.iterator();
+        while (cbit.next()) |entry| {
+            const cond_vreg = entry.key_ptr.*;
+            const ci = entry.value_ptr.*;
+            const cpos = cbz_br_if_pos.get(cond_vreg) orelse continue;
+            if (range_idx.get(ci.src)) |idx| {
+                if (live_ranges[idx].end < cpos) {
+                    live_ranges[idx].end = cpos;
+                }
+            }
+        }
     }
 
     var scalar_live_ranges: std.ArrayList(analysis.LiveRange) = .empty;
@@ -2910,7 +3063,7 @@ pub fn compileFunctionImpl(
         if (range.type == .v128) {
             legacy_v128_spill_slots += 1;
             try v128_live_ranges.append(allocator, range);
-        } else if (!fused_cmp_cond.contains(range.vreg) and !mul_fused.contains(range.vreg) and !shift_fused.contains(range.vreg) and (!ctx.options.enable_xreg_alloc or !suppress_iconst.contains(range.vreg))) {
+        } else if (!fused_cmp_cond.contains(range.vreg) and !cbz_br_if_info.contains(range.vreg) and !mul_fused.contains(range.vreg) and !shift_fused.contains(range.vreg) and (!ctx.options.enable_xreg_alloc or !suppress_iconst.contains(range.vreg))) {
             try scalar_live_ranges.append(allocator, range);
         }
     }
@@ -2999,6 +3152,7 @@ pub fn compileFunctionImpl(
                 fctx.shift_fused,
                 &ubfx_info,
                 &shift_alu_info,
+                &cbz_br_if_info,
                 &suppress_iconst,
                 &liveness_opt,
                 allocator,
@@ -3015,6 +3169,7 @@ pub fn compileFunctionImpl(
                 simd_fma_info_opt: ?*const std.AutoHashMap(ir.VReg, FmaInfo),
                 ubfx_info_opt: ?*const std.AutoHashMap(ir.VReg, UbfxInfo),
                 shift_alu_info_opt: ?*const std.AutoHashMap(ir.VReg, ShiftAluInfo),
+                cbz_br_if_info_opt: ?*const std.AutoHashMap(ir.VReg, CbzBrIfInfo),
                 allocator: std.mem.Allocator,
 
                 fn check(raw_ctx: *const anyopaque, u: ir.VReg, v: ir.VReg) anyerror!bool {
@@ -3035,6 +3190,7 @@ pub fn compileFunctionImpl(
                         self.simd_fma_info_opt,
                         self.ubfx_info_opt,
                         self.shift_alu_info_opt,
+                        self.cbz_br_if_info_opt,
                     );
                 }
             };
@@ -3049,6 +3205,7 @@ pub fn compileFunctionImpl(
                 .simd_fma_info_opt = &simd_fma_info,
                 .ubfx_info_opt = &ubfx_info,
                 .shift_alu_info_opt = &shift_alu_info,
+                .cbz_br_if_info_opt = &cbz_br_if_info,
                 .allocator = allocator,
             };
             _ = try regalloc.coalesceMovesWithInterfere(
@@ -3255,17 +3412,25 @@ pub fn compileFunctionImpl(
                 const inst = insts[ii_rev];
                 const flat_idx = block_flat_base[bi_rev] + ii_rev;
 
-                // FMA / shift fusion awareness: a fused mul/shift has no effective reads
+                // FMA / shift / CBZ fusion awareness: a fused mul/shift/cmp has no effective reads
                 // (it doesn't emit); a fused consumer reads the underlying sources.
                 const is_fused_producer = if (inst.dest) |d|
                     (inst.op == .mul and mul_fused.contains(d)) or
                         ((inst.op == .shl or inst.op == .shr_u or inst.op == .shr_s) and shift_fused.contains(d)) or
+                        cbz_br_if_info.contains(d) or
                         ((inst.op == .f32x4_binop and inst.op.f32x4_binop.op == .mul) or
                             (inst.op == .f64x2_binop and inst.op.f64x2_binop.op == .mul)) and
                             simd_mul_fused.contains(d)
                 else
                     false;
                 if (is_fused_producer) continue;
+
+                if (inst.op == .br_if) {
+                    if (cbz_br_if_info.get(inst.op.br_if.cond)) |ci| {
+                        try recordKill(&seen, kill_lists, allocator, ci.src, flat_idx);
+                        continue;
+                    }
+                }
 
                 if (inst.dest) |d| {
                     if (fma_info.get(d)) |fi| {
@@ -3960,6 +4125,7 @@ fn computeLiveRangesScheduled(
     simd_fma_info: *const std.AutoHashMap(ir.VReg, FmaInfo),
     ubfx_info: *const std.AutoHashMap(ir.VReg, UbfxInfo),
     shift_alu_info: *const std.AutoHashMap(ir.VReg, ShiftAluInfo),
+    cbz_br_if_info: *const std.AutoHashMap(ir.VReg, CbzBrIfInfo),
     allocator: std.mem.Allocator,
 ) ![]analysis.LiveRange {
     const liveness = try analysis.computeLiveness(func, allocator);
@@ -4104,6 +4270,15 @@ fn computeLiveRangesScheduled(
                 if (cur_cp > cp_idx and clobbers[cur_cp - 1].pos == pos) {
                     cur_cp -= 1;
                     clobbers[cur_cp].live_vregs = try live_bs.clone(allocator);
+                }
+                if (inst.op == .br_if) {
+                    if (cbz_br_if_info.get(inst.op.br_if.cond)) |ci| {
+                        try setBitUse(&live_bs, ci.src);
+                        continue;
+                    }
+                }
+                if (inst.dest) |d| {
+                    if (cbz_br_if_info.contains(d)) continue;
                 }
                 if (inst.op != .phi) {
                     try schedule.forEachUse(inst, &live_bs, setBitUse);
@@ -5332,7 +5507,7 @@ fn compileInst(
             try emitCmp(code, inst, bin, reg_map, fctx, comptime tagToCond(tag));
         },
 
-        .eqz => |vreg| try emitEqz(code, inst, vreg, reg_map),
+        .eqz => |vreg| try emitEqz(code, inst, vreg, reg_map, fctx),
 
         // ── Unary bit ops ────────────────────────────────────────────
         .clz => |vreg| try emitClz(code, inst, vreg, reg_map),
@@ -7646,9 +7821,21 @@ fn emitEqz(
     inst: ir.Inst,
     vreg: ir.VReg,
     reg_map: *RegMap,
+    fctx: *const FuncCompileCtx,
 ) !void {
     const dest = inst.dest orelse return;
+    if (fctx.cbz_br_if_info != null and fctx.cbz_br_if_info.?.contains(dest)) return;
+    const is_fused = if (fctx.fused_cmp_cond) |fc| fc.contains(dest) else false;
     const src = try useInto(code, reg_map, vreg, RegMap.tmp0);
+    if (is_fused) {
+        if (inst.type == .i32) {
+            try code.cmpImm32(src, 0);
+        } else {
+            try code.cmpImm(src, 0);
+        }
+        code.peepholeBarrier();
+        return;
+    }
     const info = try destBegin(reg_map, dest, RegMap.tmp1);
     if (inst.type == .i32) {
         try code.cmpImm32(src, 0);
@@ -7662,7 +7849,7 @@ fn emitEqz(
 
 fn cmpOpToCond(op: ir.Inst.Op) ?emit.Cond {
     return switch (op) {
-        .eq => .eq,
+        .eq, .eqz => .eq,
         .ne => .ne,
         .lt_s => .lt,
         .lt_u => .lo,
@@ -7685,6 +7872,32 @@ fn encodeCmpImm(value: i64) ?u12 {
     return null;
 }
 
+const CmpImmEnc = struct {
+    imm12: u12,
+    is_cmn: bool,
+};
+
+fn encodeCmpImmForType(value: i64, ty: ir.IrType) ?CmpImmEnc {
+    const sval: i64 = if (ty == .i32)
+        @as(i64, @as(i32, @truncate(value)))
+    else
+        value;
+    if (sval >= 0 and sval <= 4095) {
+        return .{ .imm12 = @intCast(sval), .is_cmn = false };
+    }
+    if (sval >= -4095 and sval <= -1) {
+        return .{ .imm12 = @intCast(-sval), .is_cmn = true };
+    }
+    return null;
+}
+
+fn isZeroConstForType(value: i64, ty: ir.IrType) bool {
+    if (ty == .i32) {
+        return @as(i32, @truncate(value)) == 0;
+    }
+    return value == 0;
+}
+
 fn emitCmp(
     code: *emit.CodeBuffer,
     inst: ir.Inst,
@@ -7694,31 +7907,45 @@ fn emitCmp(
     cond: emit.Cond,
 ) !void {
     const dest = inst.dest orelse return;
+    if (fctx.cbz_br_if_info != null and fctx.cbz_br_if_info.?.contains(dest)) return;
     const is_fused = if (fctx.fused_cmp_cond) |fc| fc.contains(dest) else false;
     if ((inst.type == .i32 or inst.type == .i64) and fctx.const_vals != null) {
-        if (fctx.const_vals.?.get(bin.rhs)) |v| {
-            if (encodeCmpImm(v)) |imm12| {
-                const lhs = try useInto(code, reg_map, bin.lhs, RegMap.tmp0);
-                if (is_fused) {
-                    if (inst.type == .i32) {
-                        try code.cmpImm32(lhs, imm12);
-                    } else {
-                        try code.cmpImm(lhs, imm12);
+        const picked: ?struct { lhs_vreg: ir.VReg, enc: CmpImmEnc } = blk: {
+            if (fctx.const_vals.?.get(bin.rhs)) |v| {
+                if (encodeCmpImmForType(v, inst.type)) |enc| {
+                    break :blk .{ .lhs_vreg = bin.lhs, .enc = enc };
+                }
+            }
+            if (cond == .eq or cond == .ne) {
+                if (fctx.const_vals.?.get(bin.lhs)) |v| {
+                    if (encodeCmpImmForType(v, inst.type)) |enc| {
+                        break :blk .{ .lhs_vreg = bin.rhs, .enc = enc };
                     }
-                    code.peepholeBarrier();
-                    return;
                 }
-                const info = try destBegin(reg_map, dest, RegMap.tmp0);
+            }
+            break :blk null;
+        };
+        if (picked) |pk| {
+            const lhs = try useInto(code, reg_map, pk.lhs_vreg, RegMap.tmp0);
+            if (is_fused) {
                 if (inst.type == .i32) {
-                    try code.cmpImm32(lhs, imm12);
-                    try code.cset32(info.reg, cond);
+                    if (pk.enc.is_cmn) try code.cmnImm32(lhs, pk.enc.imm12) else try code.cmpImm32(lhs, pk.enc.imm12);
                 } else {
-                    try code.cmpImm(lhs, imm12);
-                    try code.cset(info.reg, cond);
+                    if (pk.enc.is_cmn) try code.cmnImm(lhs, pk.enc.imm12) else try code.cmpImm(lhs, pk.enc.imm12);
                 }
-                try destCommit(code, reg_map, info);
+                code.peepholeBarrier();
                 return;
             }
+            const info = try destBegin(reg_map, dest, RegMap.tmp0);
+            if (inst.type == .i32) {
+                if (pk.enc.is_cmn) try code.cmnImm32(lhs, pk.enc.imm12) else try code.cmpImm32(lhs, pk.enc.imm12);
+                try code.cset32(info.reg, cond);
+            } else {
+                if (pk.enc.is_cmn) try code.cmnImm(lhs, pk.enc.imm12) else try code.cmpImm(lhs, pk.enc.imm12);
+                try code.cset(info.reg, cond);
+            }
+            try destCommit(code, reg_map, info);
+            return;
         }
     }
     const lhs = try useInto(code, reg_map, bin.lhs, RegMap.tmp0);
@@ -8822,6 +9049,21 @@ fn emitShift(
 ) !void {
     const dest = inst.dest orelse return;
     if (fctx.shift_fused != null and fctx.shift_fused.?.contains(dest)) return;
+    // SBFX fusion: shl + shr_s -> SBFM.
+    if (op == .asr and fctx.ubfx_info != null) {
+        if (fctx.ubfx_info.?.get(dest)) |ui| {
+            const dst_info = try destBegin(reg_map, dest, RegMap.tmp0);
+            const src_scratch: emit.Reg = if (dst_info.spill_slot == null) RegMap.tmp0 else dst_info.reg;
+            const src_reg = try useInto(code, reg_map, ui.src, src_scratch);
+            if (inst.type == .i32) {
+                try code.sbfm32(dst_info.reg, src_reg, @intCast(ui.lsb), @intCast(ui.lsb + ui.width - 1));
+            } else {
+                try code.sbfm64(dst_info.reg, src_reg, ui.lsb, ui.lsb + ui.width - 1);
+            }
+            try destCommit(code, reg_map, dst_info);
+            return;
+        }
+    }
     if ((inst.type == .i32 or inst.type == .i64) and fctx.const_vals != null) {
         if (fctx.const_vals.?.get(bin.rhs)) |v| {
             const lhs = try useInto(code, reg_map, bin.lhs, RegMap.tmp0);
@@ -11203,6 +11445,55 @@ fn emitBrIf(
     fctx: *const FuncCompileCtx,
 ) !void {
     const allocator = fctx.allocator;
+    if (fctx.cbz_br_if_info) |cbz_map| {
+        if (cbz_map.get(br.cond)) |ci| {
+            const src_r = try useInto(code, reg_map, ci.src, RegMap.tmp0);
+            const emitCbzOrCbnz = struct {
+                fn f(cb: *emit.CodeBuffer, reg: emit.Reg, is_64: bool, on_zero: bool) !void {
+                    if (is_64) {
+                        if (on_zero) try cb.cbz64(reg, 0) else try cb.cbnz64(reg, 0);
+                    } else {
+                        if (on_zero) try cb.cbz32(reg, 0) else try cb.cbnz32(reg, 0);
+                    }
+                }
+            }.f;
+            if (fctx.targetIsFallthrough(br.else_block)) {
+                const p = code.len();
+                try emitCbzOrCbnz(code, src_r, ci.is_64, ci.branch_on_zero);
+                try patches.append(allocator, .{
+                    .patch_offset = p,
+                    .target_block = br.then_block,
+                    .kind = .b_cond,
+                });
+                return;
+            }
+            if (fctx.targetIsFallthrough(br.then_block)) {
+                const p = code.len();
+                try emitCbzOrCbnz(code, src_r, ci.is_64, !ci.branch_on_zero);
+                try patches.append(allocator, .{
+                    .patch_offset = p,
+                    .target_block = br.else_block,
+                    .kind = .b_cond,
+                });
+                return;
+            }
+            const cond_patch = code.len();
+            try emitCbzOrCbnz(code, src_r, ci.is_64, ci.branch_on_zero);
+            try patches.append(allocator, .{
+                .patch_offset = cond_patch,
+                .target_block = br.then_block,
+                .kind = .b_cond,
+            });
+            const else_patch = code.len();
+            try code.b(0);
+            try patches.append(allocator, .{
+                .patch_offset = else_patch,
+                .target_block = br.else_block,
+                .kind = .b_uncond,
+            });
+            return;
+        }
+    }
     if (fctx.fused_cmp_cond) |fc| {
         if (fc.get(br.cond)) |cc| {
             code.peepholeBarrier();
@@ -12420,6 +12711,7 @@ fn vregsInterfere(
     simd_fma_info_opt: ?*const std.AutoHashMap(ir.VReg, FmaInfo),
     ubfx_info_opt: ?*const std.AutoHashMap(ir.VReg, UbfxInfo),
     shift_alu_info_opt: ?*const std.AutoHashMap(ir.VReg, ShiftAluInfo),
+    cbz_br_if_info_opt: ?*const std.AutoHashMap(ir.VReg, CbzBrIfInfo),
 ) bool {
     if (u == v) return false;
     const ReadCheck = struct {
@@ -12498,10 +12790,19 @@ fn vregsInterfere(
                 if (mul_fused_opt) |mf| if (mf.contains(d)) continue;
                 if (simd_mul_fused_opt) |smf| if (smf.contains(d)) continue;
                 if (shift_fused_opt) |sf| if (sf.contains(d)) continue;
+                if (cbz_br_if_info_opt) |cm| if (cm.contains(d)) continue;
             }
 
             var rc = ReadCheck{ .target_u = u, .target_v = v };
             var used_fma = false;
+            if (inst.op == .br_if) {
+                if (cbz_br_if_info_opt) |cm| {
+                    if (cm.get(inst.op.br_if.cond)) |ci| {
+                        rc.visit(ci.src) catch unreachable;
+                        used_fma = true;
+                    }
+                }
+            }
             if (inst.dest) |d| {
                 if (fma_info_opt) |fma_map| {
                     if (fma_map.get(d)) |fi| {
@@ -12571,6 +12872,7 @@ fn collectCopyHints(
     shift_fused_opt: ?*const std.AutoHashMap(ir.VReg, void),
     ubfx_info_opt: ?*const std.AutoHashMap(ir.VReg, UbfxInfo),
     shift_alu_info_opt: ?*const std.AutoHashMap(ir.VReg, ShiftAluInfo),
+    cbz_br_if_info_opt: ?*const std.AutoHashMap(ir.VReg, CbzBrIfInfo),
     suppress_iconst_opt: ?*const std.AutoHashMap(ir.VReg, void),
     liveness_out_opt: ?*?std.AutoHashMap(ir.BlockId, analysis.BlockLiveness),
     allocator: std.mem.Allocator,
@@ -12792,6 +13094,7 @@ fn collectCopyHints(
                                         simd_fma_info_opt,
                                         ubfx_info_opt,
                                         shift_alu_info_opt,
+                                        cbz_br_if_info_opt,
                                     )) {
                                         allow_overlap = true;
                                         is_cross_block_overlap = true;
@@ -20408,6 +20711,179 @@ test "crcu16 fusions (#949): UBFX (shr_u+and), EOR shifted-reg (shr_u+xor), and 
     try std.testing.expect(found_tst_1);
     try std.testing.expect(found_csel);
 }
+
+test "wave9 (#949): CBZ/CBNZ fusion in br_if for eqz and eq/ne zero" {
+    const allocator = std.testing.allocator;
+
+    // 1. i32.eqz -> br_if emits CBZ W (or CBNZ W if fallthrough to then_block) and no CMP #0 / CSET.
+    {
+        var func = ir.IrFunction.init(allocator, 1, 1, 1);
+        defer func.deinit();
+        func.local_types = try allocator.dupe(ir.IrType, &[_]ir.IrType{.i32});
+
+        const b0 = try func.newBlock();
+        const b1 = try func.newBlock();
+        const b2 = try func.newBlock();
+        const v_x = func.newVReg();
+        const v_eqz = func.newVReg();
+        const v_r1 = func.newVReg();
+        const v_r2 = func.newVReg();
+
+        try func.getBlock(b0).append(.{ .op = .{ .local_get = 0 }, .dest = v_x, .type = .i32 });
+        try func.getBlock(b0).append(.{ .op = .{ .eqz = v_x }, .dest = v_eqz, .type = .i32 });
+        try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_eqz, .then_block = b2, .else_block = b1 } } });
+
+        try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 10 }, .dest = v_r1, .type = .i32 });
+        try func.getBlock(b1).append(.{ .op = .{ .ret = v_r1 } });
+        try func.getBlock(b2).append(.{ .op = .{ .iconst_32 = 20 }, .dest = v_r2, .type = .i32 });
+        try func.getBlock(b2).append(.{ .op = .{ .ret = v_r2 } });
+
+        const code = try compileFunction(&func, allocator);
+        defer allocator.free(code);
+
+        // CBZ W (top byte 0x34): mask 0xFF00_0000 == 0x3400_0000.
+        try std.testing.expect(testCodeContainsMasked(code, 0xFF00_0000, 0x3400_0000));
+        // No CSET and no B.cond needed.
+        try std.testing.expect(!testCodeContainsMasked(code, 0x7FFF_07E0, 0x1A9F_07E0));
+        try std.testing.expect(!testCodeContainsMasked(code, 0xFF00_0010, 0x5400_0000));
+    }
+
+    // 2. i64.ne(0, x) -> br_if emits CBNZ X (top byte 0xB5) and no CMP / B.cond.
+    {
+        var func = ir.IrFunction.init(allocator, 1, 1, 1);
+        defer func.deinit();
+        func.local_types = try allocator.dupe(ir.IrType, &[_]ir.IrType{.i64});
+
+        const b0 = try func.newBlock();
+        const b1 = try func.newBlock();
+        const b2 = try func.newBlock();
+        const v_x = func.newVReg();
+        const v_zero = func.newVReg();
+        const v_ne = func.newVReg();
+        const v_r1 = func.newVReg();
+        const v_r2 = func.newVReg();
+
+        try func.getBlock(b0).append(.{ .op = .{ .local_get = 0 }, .dest = v_x, .type = .i64 });
+        try func.getBlock(b0).append(.{ .op = .{ .iconst_64 = 0 }, .dest = v_zero, .type = .i64 });
+        try func.getBlock(b0).append(.{ .op = .{ .ne = .{ .lhs = v_zero, .rhs = v_x } }, .dest = v_ne, .type = .i64 });
+        try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_ne, .then_block = b2, .else_block = b1 } } });
+
+        try func.getBlock(b1).append(.{ .op = .{ .iconst_64 = 10 }, .dest = v_r1, .type = .i64 });
+        try func.getBlock(b1).append(.{ .op = .{ .ret = v_r1 } });
+        try func.getBlock(b2).append(.{ .op = .{ .iconst_64 = 20 }, .dest = v_r2, .type = .i64 });
+        try func.getBlock(b2).append(.{ .op = .{ .ret = v_r2 } });
+
+        const code = try compileFunction(&func, allocator);
+        defer allocator.free(code);
+
+        // CBNZ X (top byte 0xB5): mask 0xFF00_0000 == 0xB500_0000.
+        try std.testing.expect(testCodeContainsMasked(code, 0xFF00_0000, 0xB500_0000));
+        try std.testing.expect(!testCodeContainsMasked(code, 0xFF00_0010, 0x5400_0000));
+    }
+}
+
+test "wave9 (#949): CMN immediate emission for negative compare constants (-1 and -4095)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 1, 2);
+    defer func.deinit();
+    func.local_types = try allocator.dupe(ir.IrType, &[_]ir.IrType{ .i32, .i64 });
+
+    const bid = try func.newBlock();
+    const block = func.getBlock(bid);
+
+    const v32 = func.newVReg();
+    const v64 = func.newVReg();
+    const c_neg1 = func.newVReg();
+    const c_neg4095 = func.newVReg();
+    const cmp32 = func.newVReg();
+    const cmp64 = func.newVReg();
+    const cmp64_i32 = func.newVReg();
+    const sum = func.newVReg();
+
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v32, .type = .i32 });
+    try block.append(.{ .op = .{ .local_get = 1 }, .dest = v64, .type = .i64 });
+    try block.append(.{ .op = .{ .iconst_32 = -1 }, .dest = c_neg1, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_64 = -4095 }, .dest = c_neg4095, .type = .i64 });
+
+    // v32 == -1 -> CMN Wn, #1 (ADDS WZR, Wn, #1: 0x3100_041F | rn<<5)
+    try block.append(.{ .op = .{ .eq = .{ .lhs = v32, .rhs = c_neg1 } }, .dest = cmp32, .type = .i32 });
+    // v64 <s -4095 -> CMN Xn, #4095 (ADDS XZR, Xn, #4095: 0xB13F_FC1F | rn<<5)
+    try block.append(.{ .op = .{ .lt_s = .{ .lhs = v64, .rhs = c_neg4095 } }, .dest = cmp64, .type = .i64 });
+    try block.append(.{ .op = .{ .wrap_i64 = cmp64 }, .dest = cmp64_i32, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = cmp32, .rhs = cmp64_i32 } }, .dest = sum, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = sum } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // CMN Wn, #1: 0x3100_041F (mask out Rn bits [9:5] -> 0xFFFF_FC1F).
+    try std.testing.expect(testCodeContainsMasked(code, 0xFFFF_FC1F, 0x3100_041F));
+    // CMN Xn, #4095: 0xB13F_FC1F (mask out Rn bits [9:5] -> 0xFFFF_FC1F).
+    try std.testing.expect(testCodeContainsMasked(code, 0xFFFF_FC1F, 0xB13F_FC1F));
+    // Neither -1 nor -4095 should materialize via MOVN (0x1280_0000 / 0x9280_0000, mask 0x7F80_0000).
+    try std.testing.expect(!testCodeContainsMasked(code, 0x7F80_0000, 0x1280_0000));
+}
+
+test "wave9 (#949): SBFX (SBFM) signed bitfield extract fusion for shl + shr_s" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 1, 2);
+    defer func.deinit();
+    func.local_types = try allocator.dupe(ir.IrType, &[_]ir.IrType{ .i32, .i64 });
+
+    const bid = try func.newBlock();
+    const block = func.getBlock(bid);
+
+    const x32 = func.newVReg();
+    const x64 = func.newVReg();
+    const c8 = func.newVReg();
+    const c16 = func.newVReg();
+    const c12_64 = func.newVReg();
+    const c20_64 = func.newVReg();
+    const shl16 = func.newVReg();
+    const sxth = func.newVReg();
+    const shl8 = func.newVReg();
+    const sbfx32 = func.newVReg();
+    const sum32 = func.newVReg();
+    const shl64 = func.newVReg();
+    const sbfx64 = func.newVReg();
+    const sbfx64_32 = func.newVReg();
+    const out = func.newVReg();
+
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = x32, .type = .i32 });
+    try block.append(.{ .op = .{ .local_get = 1 }, .dest = x64, .type = .i64 });
+    try block.append(.{ .op = .{ .iconst_32 = 8 }, .dest = c8, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 16 }, .dest = c16, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_64 = 12 }, .dest = c12_64, .type = .i64 });
+    try block.append(.{ .op = .{ .iconst_64 = 20 }, .dest = c20_64, .type = .i64 });
+
+    // 1. (x32 << 16) >>s 16 -> SBFM Wd, Wn, #0, #15 (SXTH: 0x1300_3C00 | rn<<5 | rd)
+    try block.append(.{ .op = .{ .shl = .{ .lhs = x32, .rhs = c16 } }, .dest = shl16, .type = .i32 });
+    try block.append(.{ .op = .{ .shr_s = .{ .lhs = shl16, .rhs = c16 } }, .dest = sxth, .type = .i32 });
+
+    // 2. (x32 << 8) >>s 16 -> SBFM Wd, Wn, #8, #23 (SBFX Wd, Wn, #8, #16: 0x1308_5C00 | rn<<5 | rd)
+    try block.append(.{ .op = .{ .shl = .{ .lhs = x32, .rhs = c8 } }, .dest = shl8, .type = .i32 });
+    try block.append(.{ .op = .{ .shr_s = .{ .lhs = shl8, .rhs = c16 } }, .dest = sbfx32, .type = .i32 });
+
+    // 3. (x64 << 12) >>s 20 -> SBFM Xd, Xn, #8, #51 (SBFX Xd, Xn, #8, #44: 0x9348_CC00 | rn<<5 | rd)
+    try block.append(.{ .op = .{ .shl = .{ .lhs = x64, .rhs = c12_64 } }, .dest = shl64, .type = .i64 });
+    try block.append(.{ .op = .{ .shr_s = .{ .lhs = shl64, .rhs = c20_64 } }, .dest = sbfx64, .type = .i64 });
+
+    try block.append(.{ .op = .{ .add = .{ .lhs = sxth, .rhs = sbfx32 } }, .dest = sum32, .type = .i32 });
+    try block.append(.{ .op = .{ .wrap_i64 = sbfx64 }, .dest = sbfx64_32, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = sum32, .rhs = sbfx64_32 } }, .dest = out, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = out } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // SBFM Wd, Wn, #0, #15: 0x1300_3C00 (mask 0xFFFF_FC00)
+    try std.testing.expect(testCodeContainsMasked(code, 0xFFFF_FC00, 0x1300_3C00));
+    // SBFM Wd, Wn, #8, #23: 0x1308_5C00 (mask 0xFFFF_FC00)
+    try std.testing.expect(testCodeContainsMasked(code, 0xFFFF_FC00, 0x1308_5C00));
+    // SBFM Xd, Xn, #8, #51: 0x9348_CC00 (mask 0xFFFF_FC00)
+    try std.testing.expect(testCodeContainsMasked(code, 0xFFFF_FC00, 0x9348_CC00));
+}
+
 
 
 

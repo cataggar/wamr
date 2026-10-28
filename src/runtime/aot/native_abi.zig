@@ -64,7 +64,10 @@ pub const VmCtx = extern struct {
     data_drop_fn: usize = 0,
     cancel_group_token: u32 = 0,
     _pad_cancel_group: u32 = 0,
+    func_table_type_backing_ptr: usize = 0,
 };
+
+pub const vmctx_func_table_type_backing_ptr_offset: u32 = @offsetOf(VmCtx, "func_table_type_backing_ptr");
 
 pub const Table = extern struct {
     ptr: usize = 0,

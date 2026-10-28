@@ -343,6 +343,18 @@ pub const CodeBuffer = struct {
             (@as(u32, imms) << 10) | (@as(u32, rn.encoding()) << 5) | rd.encoding());
     }
 
+    /// SBFM Xd, Xn, #immr, #imms (64-bit signed bitfield move / SBFX)
+    pub fn sbfm64(self: *CodeBuffer, rd: Reg, rn: Reg, immr: u6, imms: u6) !void {
+        try self.emit32(0x93400000 | (@as(u32, immr) << 16) |
+            (@as(u32, imms) << 10) | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// SBFM Wd, Wn, #immr, #imms (32-bit signed bitfield move / SBFX)
+    pub fn sbfm32(self: *CodeBuffer, rd: Reg, rn: Reg, immr: u5, imms: u5) !void {
+        try self.emit32(0x13000000 | (@as(u32, immr) << 16) |
+            (@as(u32, imms) << 10) | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
     fn shiftOpBits(shift: ShiftOp) u32 {
         return switch (shift) {
             .lsl => 0,
@@ -518,6 +530,20 @@ pub const CodeBuffer = struct {
     pub fn cmpImm32(self: *CodeBuffer, rn: Reg, imm12: u12) !void {
         // 0|11|100010|0|imm12|Rn|11111
         try self.emit32(0x7100001F | (@as(u32, imm12) << 10) |
+            (@as(u32, rn.encoding()) << 5));
+    }
+
+    /// CMN Xn, #imm12 (alias ADDS XZR, Xn, #imm12)
+    pub fn cmnImm(self: *CodeBuffer, rn: Reg, imm12: u12) !void {
+        // 1|01|100010|0|imm12|Rn|11111
+        try self.emit32(0xB100001F | (@as(u32, imm12) << 10) |
+            (@as(u32, rn.encoding()) << 5));
+    }
+
+    /// CMN Wn, #imm12 — 32-bit variant (alias ADDS WZR, Wn, #imm12)
+    pub fn cmnImm32(self: *CodeBuffer, rn: Reg, imm12: u12) !void {
+        // 0|01|100010|0|imm12|Rn|11111
+        try self.emit32(0x3100001F | (@as(u32, imm12) << 10) |
             (@as(u32, rn.encoding()) << 5));
     }
 
@@ -2287,6 +2313,12 @@ pub const CodeBuffer = struct {
     pub fn cbz64(self: *CodeBuffer, rt: Reg, offset_words: i19) !void {
         const imm19: u19 = @bitCast(offset_words);
         try self.emit32(0xB4000000 | (@as(u32, imm19) << 5) | rt.encoding());
+    }
+
+    /// CBNZ Xt, #imm19 — branch if 64-bit reg is non-zero (word offset).
+    pub fn cbnz64(self: *CodeBuffer, rt: Reg, offset_words: i19) !void {
+        const imm19: u19 = @bitCast(offset_words);
+        try self.emit32(0xB5000000 | (@as(u32, imm19) << 5) | rt.encoding());
     }
 
     /// LSE atomic read-modify-write ops (ARMv8.1-A). All variants emit a
@@ -5024,6 +5056,49 @@ test "emit: CBZ X offset" {
     defer code2.deinit();
     try code2.cbz64(.lr, 1);
     try expectWord(0xB400003E, &code2);
+}
+
+test "emit: CBNZ X offset" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.cbnz64(.x5, 4);
+    try expectWord(0xB5000085, &code);
+    var code2 = CodeBuffer.init(std.testing.allocator);
+    defer code2.deinit();
+    try code2.cbnz64(.x0, 1);
+    try expectWord(0xB5000020, &code2);
+}
+
+test "emit: CMN immediate 32-bit and 64-bit" {
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.cmnImm32(.x0, 1);
+        try expectWord(0x3100041F, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.cmnImm(.x1, 4095);
+        try expectWord(0xB13FFC3F, &code);
+    }
+}
+
+test "emit: SBFM 32-bit and 64-bit" {
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        // SBFM w0, w1, #8, #23 (SBFX w0, w1, #8, #16)
+        try code.sbfm32(.x0, .x1, 8, 23);
+        try expectWord(0x13085C20, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        // SBFM x0, x1, #12, #43 (SBFX x0, x1, #12, #32)
+        try code.sbfm64(.x0, .x1, 12, 43);
+        try expectWord(0x934CAC20, &code);
+    }
 }
 
 test "emit: LSE LDADDAL W" {
