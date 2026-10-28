@@ -676,10 +676,10 @@ fn rewriteReadReg(word: u32, old_reg: u5, new_reg: u5) ?u32 {
     return null;
 }
 
-/// True if `reg` is in {19, 29, 30, 31}: special-purpose registers we
+/// True if `reg` is in {19, 20, 29, 30, 31}: special-purpose registers we
 /// always refuse to coalesce. See module-level docs.
 fn isReservedReg(reg: u5) bool {
-    return reg == 19 or reg == 29 or reg == 30 or reg == 31;
+    return reg == 19 or reg == 20 or reg == 29 or reg == 30 or reg == 31;
 }
 
 /// Block-local coalescing scan for one `[start, end)` byte range.

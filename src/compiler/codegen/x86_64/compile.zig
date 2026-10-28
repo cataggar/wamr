@@ -3001,6 +3001,118 @@ fn funcUsesMemoryBase(func: *const ir.IrFunction) bool {
     return false;
 }
 
+fn funcUsesVmctx(func: *const ir.IrFunction, options: FunctionCompileOptions) bool {
+    if (options.cancel_points or options.native_fuel) return true;
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            switch (inst.op) {
+                .iconst_32,
+                .iconst_64,
+                .fconst_32,
+                .fconst_64,
+                .local_get,
+                .local_set,
+                .br,
+                .br_if,
+                .br_table,
+                .ret,
+                .parallel_copy,
+                .add,
+                .sub,
+                .mul,
+                .@"and",
+                .@"or",
+                .xor,
+                .shl,
+                .shr_s,
+                .shr_u,
+                .rotl,
+                .rotr,
+                .clz,
+                .ctz,
+                .popcnt,
+                .eqz,
+                .eq,
+                .ne,
+                .lt_s,
+                .lt_u,
+                .gt_s,
+                .gt_u,
+                .le_s,
+                .le_u,
+                .ge_s,
+                .ge_u,
+                .select,
+                .lea,
+                .wrap_i64,
+                .extend_i32_s,
+                .extend_i32_u,
+                .extend8_s,
+                .extend16_s,
+                .extend32_s,
+                .f_abs,
+                .f_neg,
+                .f_sqrt,
+                .f_ceil,
+                .f_floor,
+                .f_trunc,
+                .f_nearest,
+                .f_min,
+                .f_max,
+                .f_copysign,
+                .f_eq,
+                .f_ne,
+                .f_lt,
+                .f_gt,
+                .f_le,
+                .f_ge,
+                .convert_i32_s,
+                .convert_i32_u,
+                .convert_i64_s,
+                .convert_i64_u,
+                .demote_f64,
+                .promote_f32,
+                .reinterpret,
+                => {},
+                .load => |ld| if (!ld.bounds_known and !options.guard_page_bounds_elision) return true,
+                .store => |st| if (!st.bounds_known and !options.guard_page_bounds_elision) return true,
+                else => return true,
+            }
+        }
+    }
+    return false;
+}
+
+fn buildCleanU32VRegs(
+    func: *const ir.IrFunction,
+    allocator: std.mem.Allocator,
+) !std.AutoHashMap(ir.VReg, void) {
+    var clean = std.AutoHashMap(ir.VReg, void).init(allocator);
+    errdefer clean.deinit();
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            switch (inst.op) {
+                .parallel_copy => |pairs| {
+                    for (pairs) |p| {
+                        if (p.ty == .i32) {
+                            try clean.put(p.dst, {});
+                        }
+                    }
+                },
+                .extend_i32_u => {
+                    if (inst.dest) |d| try clean.put(d, {});
+                },
+                else => {
+                    if (inst.type == .i32) {
+                        if (inst.dest) |d| try clean.put(d, {});
+                    }
+                },
+            }
+        }
+    }
+    return clean;
+}
+
 /// Blocks that need a cancel poll: the function-entry block plus every branch
 /// target that is not strictly ahead of its source in emission order, i.e.
 /// every loop back-edge target. Marking entry in the same set deduplicates a
@@ -4153,25 +4265,26 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
     // Everything below (used-register scans + emit loop + branch/table/
     // call patch resolution + toOwnedSlice) is attributed to the derived
     // `emit` bucket (total − setup − liveness − regalloc).
+    const uses_memory_base = funcUsesMemoryBase(func);
+    const uses_vmctx = if (options.guard_page_bounds_elision)
+        funcUsesVmctx(func, options)
+    else
+        true;
+
+    var clean_u32_vregs = try buildCleanU32VRegs(func, allocator);
+    defer clean_u32_vregs.deinit();
+
     // Compute which caller-saved registers are actually used by this function.
     // Only these need to be saved/restored around call sites.
     var used_caller_saved: [caller_saved_alloc.len]bool = @splat(false);
     // Track which callee-saved registers are used (for prologue/epilogue preservation).
     var used_callee_saved: [callee_saved_alloc.len]bool = @splat(false);
-    // rbx is permanently pinned to vmctx for the function body (issue
-    // #465). It's at index 0 of `callee_saved_alloc` on both Win64 and
-    // SysV, so always mark it used: the prologue must `push rbx` (to
-    // preserve the caller's value) before the prologue copies vmctx
-    // (`param_regs[0]`) into it.
-    used_callee_saved[0] = true;
-    // r15 is permanently pinned to memory_base for the function body
-    // (issue #466). Locate it in `callee_saved_alloc` (Win64 index 6,
-    // SysV index 4) and force its slot on so the prologue / epilogue
-    // push-pop it around the body, and so the prologue's
-    // `mov r15, [rbx + 0]` load can rely on its caller value having
-    // been preserved.
+    // rbx is pinned to vmctx when the function body reads vmctx (issue #465).
+    used_callee_saved[0] = uses_vmctx;
+    // r15 is pinned to memory_base (issue #466); when guard_page_bounds_elision
+    // is enabled and the function never accesses linear memory, skip saving r15.
     inline for (callee_saved_alloc, 0..) |cs_reg, i| {
-        if (cs_reg == .r15) used_callee_saved[i] = true;
+        if (cs_reg == .r15) used_callee_saved[i] = uses_memory_base or !options.guard_page_bounds_elision;
     }
     {
         var it = alloc_result.assignments.iterator();
@@ -4223,6 +4336,135 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
         if (used) callee_save_count += 1;
     }
 
+    const needs_init = try local_init.computeNeedsInit(allocator, func);
+    defer allocator.free(needs_init);
+
+    const max_reg_params: u32 = @as(u32, @intCast(param_regs.len)) - 1;
+    const spill_count = @min(func.param_count, max_reg_params);
+    var param_direct_reg: [8]?emit.Reg = @splat(null);
+    var param_unused: [8]bool = @splat(false);
+    if (options.guard_page_bounds_elision and spill_count > 0 and func.blocks.items.len > 0) {
+        var block0_has_preds = false;
+        for (func.blocks.items) |blk| {
+            for (blk.instructions.items) |b_inst| {
+                switch (b_inst.op) {
+                    .br => |t| if (t == 0) {
+                        block0_has_preds = true;
+                    },
+                    .br_if => |br| if (br.then_block == 0 or br.else_block == 0) {
+                        block0_has_preds = true;
+                    },
+                    .br_table => |bt| {
+                        if (bt.default == 0) block0_has_preds = true;
+                        for (bt.targets) |t| if (t == 0) {
+                            block0_has_preds = true;
+                        };
+                    },
+                    .try_table_begin => |tt| {
+                        for (tt.clauses) |c| if (c.handler == 0) {
+                            block0_has_preds = true;
+                        };
+                    },
+                    else => {},
+                }
+            }
+        }
+        if (!block0_has_preds) {
+            const b0_insts = func.blocks.items[0].instructions.items;
+            var p_idx: u32 = 0;
+            while (p_idx < spill_count) : (p_idx += 1) {
+                const param_reg = param_regs[p_idx + 1];
+                var can_bypass = true;
+                var last_get_pos: ?usize = null;
+                for (func.blocks.items, 0..) |blk, bid| {
+                    for (blk.instructions.items, 0..) |s_inst, s_pos| {
+                        switch (s_inst.op) {
+                            .local_set => |ls| if (ls.idx == p_idx) {
+                                can_bypass = false;
+                                break;
+                            },
+                            .local_get => |lg_idx| if (lg_idx == p_idx) {
+                                if (bid != 0) {
+                                    can_bypass = false;
+                                    break;
+                                }
+                                last_get_pos = s_pos;
+                            },
+                            else => {},
+                        }
+                    }
+                    if (!can_bypass) break;
+                }
+                if (!can_bypass) continue;
+                const lg_pos = last_get_pos orelse {
+                    param_unused[p_idx] = true;
+                    continue;
+                };
+                for (b0_insts[0..lg_pos]) |early_inst| {
+                    switch (early_inst.op) {
+                        .local_get, .iconst_32, .iconst_64, .fconst_32, .fconst_64 => {},
+                        else => {
+                            can_bypass = false;
+                            break;
+                        },
+                    }
+                    if (early_inst.op == .local_get and early_inst.op.local_get == p_idx) continue;
+                    if (early_inst.dest) |d| {
+                        if (destReg(&alloc_result, d) == param_reg) {
+                            can_bypass = false;
+                            break;
+                        }
+                    }
+                }
+                if (can_bypass) {
+                    param_direct_reg[p_idx] = param_reg;
+                }
+            }
+        }
+    }
+
+    var frameless = false;
+    if (options.guard_page_bounds_elision and !uses_vmctx and alloc_result.spill_count == 0 and
+        func.result_count <= 1 and func.param_count <= max_reg_params)
+    {
+        var uses_stack_frame = false;
+        for (0..spill_count) |p| {
+            if (param_direct_reg[p] == null and !param_unused[p]) {
+                uses_stack_frame = true;
+                break;
+            }
+        }
+        if (!uses_stack_frame and func.local_count > func.param_count) {
+            for (func.param_count..func.local_count) |li| {
+                if (needs_init[li]) {
+                    uses_stack_frame = true;
+                    break;
+                }
+            }
+        }
+        if (!uses_stack_frame) {
+            for (func.blocks.items, 0..) |blk, bid| {
+                for (blk.instructions.items) |s_inst| {
+                    switch (s_inst.op) {
+                        .local_set => {
+                            uses_stack_frame = true;
+                            break;
+                        },
+                        .local_get => |idx| {
+                            if (bid != 0 or idx >= max_reg_params or param_direct_reg[idx] == null) {
+                                uses_stack_frame = true;
+                                break;
+                            }
+                        },
+                        else => {},
+                    }
+                }
+                if (uses_stack_frame) break;
+            }
+        }
+        if (!uses_stack_frame) frameless = true;
+    }
+
     // Frame: locals + spill slots + 1 vmctx slot, aligned to 16 bytes.
     // No push/pop at call sites (allocator handles clobbering), so after
     // push rbp (rsp=0 mod 16) + sub rsp + callee-save pushes, rsp must
@@ -4238,106 +4480,71 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
     if (options.native_fuel and frame_size + callee_save_count * 8 + 256 >
         @import("../../../runtime/aot/native_abi.zig").max_fuel_frame_bytes)
         return error.UnsupportedNativeFeature;
-    try code.emitPrologue(frame_size);
+    if (!frameless) {
+        try code.emitPrologue(frame_size);
+    }
 
-    // VMContext is pinned in rbx for the whole function body (issue
-    // #465). The slot at `[rbp - 8]` remains structurally reserved
-    // (locals start at `[rbp - 16]`) but is no longer initialized —
-    // every reload site reads `rbx` directly. The `push rbx` below
-    // (always emitted because `used_callee_saved[0]` is forced true)
-    // preserves the caller's rbx before we overwrite it.
     const vmctx_reg = param_regs[0]; // rcx on Win64, rdi on SysV
 
-    // Spill wasm parameters from ABI registers to stack frame slots.
-    // Wasm params are shifted by 1 because the first ABI register is the VMContext.
-    const max_reg_params: u32 = @as(u32, @intCast(param_regs.len)) - 1;
-    const spill_count = @min(func.param_count, max_reg_params);
-    for (0..spill_count) |i| {
-        try code.movMemReg(.rbp, -@as(i32, @intCast((i + 2) * 8)), param_regs[i + 1]);
-    }
-
-    // Spill wasm parameters passed on the stack by the caller (beyond max_reg_params).
-    // Caller layout after push rbp; mov rbp, rsp:
-    //   Win64: [rbp+16..rbp+48] is the 4-slot shadow space; stack args start at [rbp+48].
-    //   SysV:  no shadow; stack args start at [rbp+16].
-    if (func.param_count > max_reg_params) {
-        const stack_arg_base: i32 = if (comptime builtin.os.tag == .windows) 48 else 16;
-        var k: u32 = max_reg_params;
-        while (k < func.param_count) : (k += 1) {
-            const src_off: i32 = stack_arg_base + @as(i32, @intCast((k - max_reg_params) * 8));
-            const dst_off: i32 = -@as(i32, @intCast((k + 2) * 8));
-            try code.movRegMem(.rax, .rbp, src_off);
-            try code.movMemReg(.rbp, dst_off, .rax);
+    if (!frameless) {
+        for (0..spill_count) |i| {
+            if (param_direct_reg[i] != null or param_unused[i]) continue;
+            try code.movMemReg(.rbp, -@as(i32, @intCast((i + 2) * 8)), param_regs[i + 1]);
         }
-    }
 
-    // Zero-initialize declared locals (wasm spec requires locals to be zero)
-    // for those flagged by `needs_init`. A local whose every reachable
-    // `local_get` is dominated by a `local_set` does not need a prologue
-    // store (issue #468 part 1).
-    const needs_init = try local_init.computeNeedsInit(allocator, func);
-    defer allocator.free(needs_init);
-    if (func.local_count > func.param_count) {
-        var any_init = false;
-        for (func.param_count..func.local_count) |i| {
-            if (needs_init[i]) {
-                any_init = true;
-                break;
-            }
-        }
-        if (any_init) {
-            try code.xorReg32(.rax);
-            for (func.param_count..func.local_count) |i| {
-                if (!needs_init[i]) continue;
-                try code.movMemReg(.rbp, -@as(i32, @intCast((i + 2) * 8)), .rax);
-            }
-        }
-    }
-
-    // Multi-value returns: callee receives a hidden return pointer (HRP)
-    // as an implicit trailing user-arg. Save it to a fixed frame slot so
-    // `.ret_multi` can load it at function exit. HRP lives in
-    // param_regs[1 + func.param_count] if that fits, else on the caller's
-    // stack at the usual extra-arg location.
-    if (func.result_count > 1) {
-        const hrp_save_off: i32 = -@as(i32, @intCast((func.local_count + 2) * 8));
-        const max_reg_params_local: u32 = @as(u32, @intCast(param_regs.len)) - 1;
-        if (func.param_count < max_reg_params_local) {
-            try code.movMemReg(.rbp, hrp_save_off, param_regs[1 + func.param_count]);
-        } else {
+        if (func.param_count > max_reg_params) {
             const stack_arg_base: i32 = if (comptime builtin.os.tag == .windows) 48 else 16;
-            const src_off: i32 = stack_arg_base + @as(i32, @intCast((func.param_count - max_reg_params_local) * 8));
-            try code.movRegMem(.rax, .rbp, src_off);
-            try code.movMemReg(.rbp, hrp_save_off, .rax);
+            var k: u32 = max_reg_params;
+            while (k < func.param_count) : (k += 1) {
+                const src_off: i32 = stack_arg_base + @as(i32, @intCast((k - max_reg_params) * 8));
+                const dst_off: i32 = -@as(i32, @intCast((k + 2) * 8));
+                try code.movRegMem(.rax, .rbp, src_off);
+                try code.movMemReg(.rbp, dst_off, .rax);
+            }
+        }
+
+        if (func.local_count > func.param_count) {
+            var any_init = false;
+            for (func.param_count..func.local_count) |i| {
+                if (needs_init[i]) {
+                    any_init = true;
+                    break;
+                }
+            }
+            if (any_init) {
+                try code.xorReg32(.rax);
+                for (func.param_count..func.local_count) |i| {
+                    if (!needs_init[i]) continue;
+                    try code.movMemReg(.rbp, -@as(i32, @intCast((i + 2) * 8)), .rax);
+                }
+            }
+        }
+
+        if (func.result_count > 1) {
+            const hrp_save_off: i32 = -@as(i32, @intCast((func.local_count + 2) * 8));
+            const max_reg_params_local: u32 = @as(u32, @intCast(param_regs.len)) - 1;
+            if (func.param_count < max_reg_params_local) {
+                try code.movMemReg(.rbp, hrp_save_off, param_regs[1 + func.param_count]);
+            } else {
+                const stack_arg_base: i32 = if (comptime builtin.os.tag == .windows) 48 else 16;
+                const src_off: i32 = stack_arg_base + @as(i32, @intCast((func.param_count - max_reg_params_local) * 8));
+                try code.movRegMem(.rax, .rbp, src_off);
+                try code.movMemReg(.rbp, hrp_save_off, .rax);
+            }
         }
     }
 
-    // Save callee-saved registers used by this function.
-    // rbx is always pushed (pinned vmctx, issue #465). Win64: rsi, rdi,
-    // r12..r15 if used. SysV: r12..r15 if used.
     for (callee_saved_alloc, 0..) |reg, i| {
         if (used_callee_saved[i]) try code.pushReg(reg);
     }
 
-    // Capture vmctx into rbx (pinned for the whole function body).
-    // `vmctx_reg` (param_regs[0] = rdi on SysV / rcx on Win64) still
-    // holds the runtime-supplied VmCtx*: param_regs[0] is never
-    // overwritten by the param-spill loop above (which copies
-    // param_regs[1..]) nor by the zero-locals / HRP setup (both use
-    // rax). Doing the move AFTER `push rbx` preserves the caller's
-    // rbx in the slot reserved by the push.
-    try code.movRegReg(.rbx, vmctx_reg);
-
-    // Pin VmCtx.memory_base in r15 for the whole function body
-    // (issue #466) when the function uses linear memory. `push r15`
-    // above preserved the caller's r15, so we can now overwrite it.
-    // Every linear-memory access reads r15 directly instead of doing
-    // `mov r10, rbx; mov r10, [r10 + 0]`. memory.grow and every wasm
-    // call reload r15 from [rbx + 0] afterward because either can
-    // invalidate the cached base.
-    const uses_memory_base = funcUsesMemoryBase(func);
-    if (uses_memory_base) {
-        try code.movRegMem(.r15, .rbx, vmctx_membase_field);
+    if (uses_vmctx) {
+        try code.movRegReg(.rbx, vmctx_reg);
+        if (uses_memory_base) {
+            try code.movRegMem(.r15, .rbx, vmctx_membase_field);
+        }
+    } else if (uses_memory_base) {
+        try code.movRegMem(.r15, vmctx_reg, vmctx_membase_field);
     }
 
     var block_offsets = std.AutoHashMap(ir.BlockId, usize).init(allocator);
@@ -4373,7 +4580,7 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
         for (block.instructions.items) |inst| {
             last_was_ret = isRet(inst.op);
             const native_start = code.len();
-            try compileInstRA(&code, inst, &alloc_result, &const_vals, &suppress_iconst, &fused_cmp_br_if, &branch_patches, &call_patches, &table_patches, import_count, &used_caller_saved, &used_callee_saved, func.local_count, global_offsets, options, uses_memory_base);
+            try compileInstRA(&code, inst, &alloc_result, &const_vals, &suppress_iconst, &fused_cmp_br_if, &clean_u32_vregs, &branch_patches, &call_patches, &table_patches, import_count, &used_caller_saved, &used_callee_saved, func.local_count, global_offsets, options, uses_memory_base, frameless, block_id == 0, &param_direct_reg);
             if (frame_attr_ctx != null) {
                 try emitted_ir_ranges.append(allocator, .{
                     .native_start = @intCast(native_start),
@@ -4423,7 +4630,11 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
             ci -= 1;
             if (used_callee_saved[ci]) try code.popReg(callee_saved_alloc[ci]);
         }
-        try code.emitEpilogue();
+        if (frameless) {
+            try code.ret();
+        } else {
+            try code.emitEpilogue();
+        }
     }
 
     if (spill_metric_value) |*metric| {
@@ -4484,9 +4695,10 @@ fn emitRematConst(
         .iconst_32 => |v| {
             if (v == 0) {
                 try code.xorReg32(dst);
+            } else if (v < 0) {
+                try code.movRegImm32_32(dst, @bitCast(v));
             } else {
                 try code.movRegImm32(dst, v);
-                if (v < 0) try code.zeroExtend32(dst);
             }
         },
         .iconst_64 => |v| {
@@ -4494,6 +4706,8 @@ fn emitRematConst(
                 try code.xorReg32(dst);
             } else if (v >= std.math.minInt(i32) and v <= std.math.maxInt(i32)) {
                 try code.movRegImm32(dst, @intCast(v));
+            } else if (v > 0 and v <= 0xFFFF_FFFF) {
+                try code.movRegImm32_32(dst, @intCast(v));
             } else {
                 try code.movRegImm64(dst, @bitCast(v));
             }
@@ -4819,8 +5033,17 @@ fn writeDefI32(
     dest: ir.VReg,
     result_reg: emit.Reg,
 ) !void {
-    try code.zeroExtend32(result_reg);
-    try writeDef(code, alloc_result, dest, result_reg);
+    const alloc = alloc_result.get(dest) orelse return;
+    switch (alloc) {
+        .reg => |preg| {
+            const dst = @as(emit.Reg, @fromBackingInt(@intCast(preg)));
+            try code.movRegReg32(dst, result_reg);
+        },
+        .stack => |offset| {
+            try code.zeroExtend32(result_reg);
+            try code.movMemReg(.rbp, offset, result_reg);
+        },
+    }
 }
 
 /// Type-aware writeDef: applies i32 zero-extension when needed.
@@ -4888,12 +5111,17 @@ fn parallelCopyLocEq(a: ParallelCopyLoc, b: ParallelCopyLoc) bool {
 fn emitParallelCopyConst(code: *emit.CodeBuffer, dst_reg: emit.Reg, remat: regalloc.RematDef) !void {
     switch (remat) {
         .iconst_32 => |v| {
-            try code.movRegImm32(dst_reg, v);
-            if (v < 0) try code.zeroExtend32(dst_reg);
+            if (v < 0) {
+                try code.movRegImm32_32(dst_reg, @bitCast(v));
+            } else {
+                try code.movRegImm32(dst_reg, v);
+            }
         },
         .iconst_64 => |v| {
             if (v >= std.math.minInt(i32) and v <= std.math.maxInt(i32)) {
                 try code.movRegImm32(dst_reg, @intCast(v));
+            } else if (v > 0 and v <= 0xFFFF_FFFF) {
+                try code.movRegImm32_32(dst_reg, @intCast(v));
             } else {
                 try code.movRegImm64(dst_reg, @bitCast(v));
             }
@@ -4901,17 +5129,33 @@ fn emitParallelCopyConst(code: *emit.CodeBuffer, dst_reg: emit.Reg, remat: regal
     }
 }
 
-fn emitParallelCopyLocMove(code: *emit.CodeBuffer, dst: ParallelCopyLoc, src: ParallelCopyLoc) !void {
+fn emitParallelCopyLocMove(code: *emit.CodeBuffer, dst: ParallelCopyLoc, src: ParallelCopyLoc, ty: ir.IrType) !void {
     switch (dst) {
         .reg => |dr| switch (src) {
-            .reg => |sr| if (dr != sr) try code.movRegReg(dr, sr),
-            .stack => |so| try code.movRegMem(dr, .rbp, so),
+            .reg => |sr| if (dr != sr) {
+                if (ty == .i32) {
+                    try code.movRegReg32(dr, sr);
+                } else {
+                    try code.movRegReg(dr, sr);
+                }
+            },
+            .stack => |so| {
+                if (ty == .i32) {
+                    try code.movRegMem32(dr, .rbp, so);
+                } else {
+                    try code.movRegMem(dr, .rbp, so);
+                }
+            },
             .remat => |rem| try emitParallelCopyConst(code, dr, rem),
         },
         .stack => |do| switch (src) {
             .reg => |sr| try code.movMemReg(.rbp, do, sr),
             .stack => |so| if (do != so) {
-                try code.movRegMem(.r11, .rbp, so);
+                if (ty == .i32) {
+                    try code.movRegMem32(.r11, .rbp, so);
+                } else {
+                    try code.movRegMem(.r11, .rbp, so);
+                }
                 try code.movMemReg(.rbp, do, .r11);
             },
             .remat => |rem| {
@@ -4942,6 +5186,7 @@ fn emitParallelCopyRA(
     const ResolvedPair = struct {
         dst: ParallelCopyLoc,
         src: ParallelCopyLoc,
+        ty: ir.IrType,
         done: bool = false,
     };
 
@@ -4993,7 +5238,7 @@ fn emitParallelCopyRA(
         };
 
         if (parallelCopyLocEq(dst_loc, src_loc)) continue;
-        resolved[n] = .{ .dst = dst_loc, .src = src_loc, .done = false };
+        resolved[n] = .{ .dst = dst_loc, .src = src_loc, .ty = p.ty, .done = false };
         n += 1;
     }
     const active = resolved[0..n];
@@ -5012,7 +5257,7 @@ fn emitParallelCopyRA(
                 }
             }
             if (!blocked) {
-                try emitParallelCopyLocMove(code, pair.dst, pair.src);
+                try emitParallelCopyLocMove(code, pair.dst, pair.src, pair.ty);
                 pair.done = true;
                 progress = true;
             }
@@ -5029,7 +5274,7 @@ fn emitParallelCopyRA(
     for (active, 0..) |*start_pair, start_idx| {
         if (start_pair.done) continue;
         const tmp_loc: ParallelCopyLoc = .{ .reg = .r10 };
-        try emitParallelCopyLocMove(code, tmp_loc, start_pair.src);
+        try emitParallelCopyLocMove(code, tmp_loc, start_pair.src, start_pair.ty);
         start_pair.done = true;
 
         var cur_free = start_pair.src;
@@ -5044,12 +5289,12 @@ fn emitParallelCopyRA(
                 }
             }
             if (next_opt) |next_idx| {
-                try emitParallelCopyLocMove(code, active[next_idx].dst, active[next_idx].src);
+                try emitParallelCopyLocMove(code, active[next_idx].dst, active[next_idx].src, active[next_idx].ty);
                 active[next_idx].done = true;
                 cur_free = active[next_idx].src;
             } else break;
         }
-        try emitParallelCopyLocMove(code, start_pair.dst, tmp_loc);
+        try emitParallelCopyLocMove(code, start_pair.dst, tmp_loc, start_pair.ty);
     }
 }
 
@@ -5088,6 +5333,7 @@ fn compileInstRA(
     const_vals: *const std.AutoHashMap(ir.VReg, i64),
     suppress_iconst: *const std.AutoHashMap(ir.VReg, void),
     fused_cmp_br_if: *const std.AutoHashMap(ir.VReg, u4),
+    clean_u32_vregs: *const std.AutoHashMap(ir.VReg, void),
     patches: *std.ArrayList(BranchPatch),
     call_patches: *std.ArrayList(CallPatch),
     table_patches: *std.ArrayList(TablePatch),
@@ -5098,6 +5344,9 @@ fn compileInstRA(
     global_offsets: []const u32,
     options: FunctionCompileOptions,
     uses_memory_base: bool,
+    frameless: bool,
+    in_block0: bool,
+    param_direct_reg: *const [8]?emit.Reg,
 ) !void {
     switch (inst.op) {
         // ── Constants ─────────────────────────────────────────────────
@@ -5444,6 +5693,18 @@ fn compileInstRA(
         .local_get => |idx| {
             const dest = inst.dest orelse return;
             const dr = destReg(alloc_result, dest);
+            if (in_block0 and idx < 8) {
+                if (param_direct_reg[idx]) |p_reg| {
+                    if (inst.type == .i32) {
+                        try code.movRegReg32(dr, p_reg);
+                        try writeDef(code, alloc_result, dest, dr);
+                    } else {
+                        if (dr != p_reg) try code.movRegReg(dr, p_reg);
+                        try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+                    }
+                    return;
+                }
+            }
             if (inst.type == .i32) {
                 // 32-bit load reads the low-32 (the i32 value) and
                 // zero-extends — no trailing `mov eXX,eXX` needed (#393).
@@ -5488,7 +5749,11 @@ fn compileInstRA(
                 ci -= 1;
                 if (used_callee_saved[ci]) try code.popReg(callee_saved_alloc[ci]);
             }
-            try code.emitEpilogue();
+            if (frameless) {
+                try code.ret();
+            } else {
+                try code.emitEpilogue();
+            }
         },
         .ret_multi => |vregs| {
             // First result → RAX; remaining → [HRP + (i-1)*8] where HRP is
@@ -5517,7 +5782,11 @@ fn compileInstRA(
                 ci -= 1;
                 if (used_callee_saved[ci]) try code.popReg(callee_saved_alloc[ci]);
             }
-            try code.emitEpilogue();
+            if (frameless) {
+                try code.ret();
+            } else {
+                try code.emitEpilogue();
+            }
         },
 
         // ── Branches ──────────────────────────────────────────────────
@@ -6048,20 +6317,42 @@ fn compileInstRA(
         // ── Memory ────────────────────────────────────────────────────
         .load => |ld| {
             const dest = inst.dest orelse return;
-            // The bounds check reads memory_size straight from the pinned
-            // vmctx in `rbx` (#465 / #798 L2) — no per-access `mov r10, rbx`.
-            // The address arithmetic uses SIB indexed addressing `[r15 + rax + disp]`
-            // with the pinned memory_base in r15 (issue #466 / #798 Wave 9) —
-            // eliminating `add rax, r15` on every load.
+            const elide_bounds = ld.bounds_known or options.guard_page_bounds_elision;
+            const dr = destReg(alloc_result, dest);
+            if (elide_bounds) {
+                if (const_vals.get(ld.base)) |c| {
+                    const addr64: u64 = @as(u64, @as(u32, @truncate(@as(u64, @bitCast(c))))) + @as(u64, ld.offset);
+                    if (addr64 <= 0x7FFFFFFF) {
+                        try code.movRegMemSized(dr, .r15, @intCast(addr64), ld.size);
+                        if (ld.sign_extend and ld.size < 8) {
+                            switch (ld.size) {
+                                1 => try code.movsxByteToReg(dr, dr),
+                                2 => try code.movsxWordToReg(dr, dr),
+                                4 => try code.movsxd(dr, dr),
+                                else => {},
+                            }
+                        }
+                        const load_is_clean = !ld.sign_extend and ld.size <= 4;
+                        if (load_is_clean) {
+                            try writeDef(code, alloc_result, dest, dr);
+                        } else {
+                            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+                        }
+                        return;
+                    }
+                }
+            }
             const base_reg = try useVReg(code, alloc_result, ld.base, .rax);
-            try code.movRegReg32(.rax, base_reg); // wasm addresses are i32
-            if (!ld.bounds_known and !options.guard_page_bounds_elision) {
+            const idx_reg: emit.Reg = if (elide_bounds and ld.offset <= 0x7FFFFFFF and clean_u32_vregs.contains(ld.base))
+                base_reg
+            else blk: {
+                try code.movRegReg32(.rax, base_reg); // wasm addresses are i32
+                break :blk .rax;
+            };
+            if (!elide_bounds) {
                 const end_offset = if (ld.checked_end > 0) ld.checked_end else @as(u64, ld.offset) + @as(u64, ld.size);
                 try emitMemBoundsCheck(code, end_offset);
             }
-            // Fold wasm offset into SIB displacement when it fits in i32.
-            // For out-of-range offsets (address.wast uses 0xFFFFFFFF), first
-            // add the offset to rax via a 64-bit imm.
             var ld_disp: i32 = 0;
             if (ld.offset <= 0x7FFFFFFF) {
                 ld_disp = @intCast(ld.offset);
@@ -6069,9 +6360,7 @@ fn compileInstRA(
                 try code.movRegImm64(.r10, @as(u64, ld.offset));
                 try code.addRegReg(.rax, .r10);
             }
-            // Load value into dest register via SIB `[r15 + rax + ld_disp]`.
-            const dr = destReg(alloc_result, dest);
-            try code.movRegMemSIBSized(dr, .r15, .rax, 0, ld_disp, ld.size);
+            try code.movRegMemSIBSized(dr, .r15, idx_reg, 0, ld_disp, ld.size);
             if (ld.sign_extend and ld.size < 8) {
                 switch (ld.size) {
                     1 => try code.movsxByteToReg(dr, dr),
@@ -6080,8 +6369,6 @@ fn compileInstRA(
                     else => {},
                 }
             }
-            // For non-sign-extended loads ≤ 4 bytes, movRegMemSIBSized already
-            // produces a zero-extended (clean) i32 — skip redundant zeroExtend32.
             const load_is_clean = !ld.sign_extend and ld.size <= 4;
             if (load_is_clean) {
                 try writeDef(code, alloc_result, dest, dr);
@@ -6090,23 +6377,33 @@ fn compileInstRA(
             }
         },
         .store => |st| {
-            // The bounds check reads memory_size straight from the pinned
-            // vmctx in `rbx` (#465 / #798 L2) — no per-access `mov r10, rbx`.
-            // The address arithmetic uses SIB indexed addressing `[r15 + rax + disp]`
-            // with the pinned memory_base in r15 (issue #466 / #798 Wave 9) —
-            // eliminating `add rax, r15` on every store.
-            // Compute zero-extended index in rax (not allocatable — safe to clobber).
+            const elide_bounds = st.bounds_known or options.guard_page_bounds_elision;
+            if (elide_bounds) {
+                if (const_vals.get(st.base)) |c| {
+                    const addr64: u64 = @as(u64, @as(u32, @truncate(@as(u64, @bitCast(c))))) + @as(u64, st.offset);
+                    if (addr64 <= 0x7FFFFFFF) {
+                        const val_reg = try useVReg(code, alloc_result, st.val, .rcx);
+                        try code.movMemRegSized(.r15, @intCast(addr64), val_reg, st.size);
+                        return;
+                    }
+                }
+            }
             const base_reg = try useVReg(code, alloc_result, st.base, .rax);
-            try code.movRegReg32(.rax, base_reg); // wasm addresses are i32
-            if (!st.bounds_known and !options.guard_page_bounds_elision) {
+            const idx_reg: emit.Reg = if (elide_bounds and st.offset <= 0x7FFFFFFF and clean_u32_vregs.contains(st.base))
+                base_reg
+            else blk: {
+                try code.movRegReg32(.rax, base_reg); // wasm addresses are i32
+                break :blk .rax;
+            };
+            if (!elide_bounds) {
                 const end_offset = if (st.checked_end > 0) st.checked_end else @as(u64, st.offset) + @as(u64, st.size);
                 try emitMemBoundsCheck(code, end_offset);
             }
-            // Load value into rcx (not allocatable — safe to clobber).
-            // useVReg writes spill loads into scratch=.rcx, so rax is preserved.
             const val_reg = try useVReg(code, alloc_result, st.val, .rcx);
-            if (val_reg != .rcx) try code.movRegReg(.rcx, val_reg);
-            // Fold wasm offset into the SIB displacement when it fits in i32.
+            const store_src_reg: emit.Reg = if (elide_bounds) val_reg else blk: {
+                if (val_reg != .rcx) try code.movRegReg(.rcx, val_reg);
+                break :blk .rcx;
+            };
             var st_disp: i32 = 0;
             if (st.offset <= 0x7FFFFFFF) {
                 st_disp = @intCast(st.offset);
@@ -6114,7 +6411,7 @@ fn compileInstRA(
                 try code.movRegImm64(.r10, @as(u64, st.offset));
                 try code.addRegReg(.rax, .r10);
             }
-            try code.movMemSIBRegSized(.r15, .rax, 0, st_disp, .rcx, st.size);
+            try code.movMemSIBRegSized(.r15, idx_reg, 0, st_disp, store_src_reg, st.size);
         },
         .memory_copy => |mc| {
             if (smallFixedBulkMemLen(const_vals, mc.len)) |len| {
@@ -6659,10 +6956,11 @@ fn compileInstRA(
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
             if (inst.type == .i32) {
                 try code.lzcnt32(dr, src_reg);
+                try writeDef(code, alloc_result, dest, dr);
             } else {
                 try code.lzcnt(dr, src_reg);
+                try writeDefTyped(code, alloc_result, dest, dr, inst.type);
             }
-            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
         .ctz => |vreg| {
             const dest = inst.dest orelse return;
@@ -6670,10 +6968,11 @@ fn compileInstRA(
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
             if (inst.type == .i32) {
                 try code.tzcnt32(dr, src_reg);
+                try writeDef(code, alloc_result, dest, dr);
             } else {
                 try code.tzcnt(dr, src_reg);
+                try writeDefTyped(code, alloc_result, dest, dr, inst.type);
             }
-            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
         .popcnt => |vreg| {
             const dest = inst.dest orelse return;
@@ -6681,10 +6980,11 @@ fn compileInstRA(
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
             if (inst.type == .i32) {
                 try code.popcnt32(dr, src_reg);
+                try writeDef(code, alloc_result, dest, dr);
             } else {
                 try code.popcntReg(dr, src_reg);
+                try writeDefTyped(code, alloc_result, dest, dr, inst.type);
             }
-            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
 
         // ── Select ────────────────────────────────────────────────────
@@ -10868,21 +11168,16 @@ test "#798 Wave 10 x86_64: guard_page_bounds_elision skips inline bounds check a
         }
     }
 
-    // Verify the load lowers to 1-instruction `mov eax, <reg32>` ([0x44] 0x89 <modrm>)
-    // directly followed by `mov <dst>, [r15 + rax + 8]` ((0x41|0x45) 0x8B <modrm> 0x07 0x08).
+    // Verify the load lowers to SIB `mov <dst>, [r15 + <idx_reg> + 8]`
+    // ((0x41|0x43|0x45|0x47) 0x8B <modrm> <sib> 0x08 where base is r15, low3=7).
     var found_load_seq = false;
     var i: usize = 0;
-    while (i + 7 <= code.len) : (i += 1) {
-        const mov_len: usize = if (code[i] == 0x44 and i + 8 <= code.len and code[i + 1] == 0x89 and (code[i + 2] & 0xC7) == 0xC0)
-            3
-        else if (code[i] == 0x89 and (code[i + 1] & 0xC7) == 0xC0)
-            2
-        else
-            continue;
-        const sib = i + mov_len;
-        if (sib + 5 <= code.len and
-            (code[sib] == 0x41 or code[sib] == 0x45) and code[sib + 1] == 0x8B and
-            (code[sib + 2] & 0xC7) == 0x44 and code[sib + 3] == 0x07 and code[sib + 4] == 0x08)
+    while (i + 5 <= code.len) : (i += 1) {
+        if ((code[i] == 0x41 or code[i] == 0x43 or code[i] == 0x45 or code[i] == 0x47) and
+            code[i + 1] == 0x8B and
+            (code[i + 2] & 0xC7) == 0x44 and
+            (code[i + 3] & 0xC7) == 0x07 and
+            code[i + 4] == 0x08)
         {
             found_load_seq = true;
             break;
@@ -10911,6 +11206,51 @@ test "#798 Wave 10 x86_64: guard_page_bounds_elision skips inline bounds check a
     try std.testing.expect(containsBytes(ci_compiled.code, &.{ 0x48, 0x8B, 0x8B, 0xD8, 0x01, 0x00, 0x00 }));
     try std.testing.expect(!containsBytes(ci_compiled.code, &.{ 0x4C, 0x8B, 0x9B, 0x88, 0x00, 0x00, 0x00 }));
 }
+
+test "#798 Wave 11 x86_64: frameless leaf elides rbp/rbx and folds constant load address into [r15 + disp]" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 1);
+    defer func.deinit();
+
+    const b = try func.newBlock();
+    const p0 = func.newVReg();
+    const c_addr = func.newVReg();
+    const loaded = func.newVReg();
+    const c_neg = func.newVReg();
+    const sum = func.newVReg();
+    try func.getBlock(b).append(.{ .op = .{ .local_get = 0 }, .dest = p0, .type = .i32 });
+    try func.getBlock(b).append(.{ .op = .{ .iconst_32 = 16 }, .dest = c_addr, .type = .i32 });
+    try func.getBlock(b).append(.{
+        .op = .{ .load = .{ .base = c_addr, .offset = 8, .size = 4, .sign_extend = false } },
+        .dest = loaded,
+        .type = .i32,
+    });
+    try func.getBlock(b).append(.{ .op = .{ .iconst_32 = -5 }, .dest = c_neg, .type = .i32 });
+    try func.getBlock(b).append(.{ .op = .{ .add = .{ .lhs = loaded, .rhs = p0 } }, .dest = sum, .type = .i32 });
+    try func.getBlock(b).append(.{
+        .op = .{ .store = .{ .base = c_addr, .val = c_neg, .offset = 12, .size = 4 } },
+    });
+    try func.getBlock(b).append(.{ .op = .{ .ret = sum } });
+
+    const res = try compileFunctionRAWithGlobalOffsetsEx(
+        &func,
+        0,
+        &.{},
+        allocator,
+        .{ .guard_page_bounds_elision = true },
+    );
+    defer allocator.free(res.call_patches);
+    defer allocator.free(res.code);
+
+    // Frameless leaf: must NOT start with `push rbp; mov rbp, rsp` (55 48 89 E5)
+    // and must NOT contain `push rbx` (53) or `mov rbx, rdi/rcx` (48 89 FB / 48 89 CB).
+    try std.testing.expect(!containsBytes(res.code, &.{ 0x55, 0x48, 0x89, 0xE5 }));
+    try std.testing.expect(!containsBytes(res.code, &.{ 0x48, 0x89, 0xFB }));
+    try std.testing.expect(!containsBytes(res.code, &.{ 0x48, 0x89, 0xCB }));
+    // Constant load from c_addr(16) + offset(8) = 24 folds directly to `[r15 + 24]` (disp8 = 0x18).
+    try std.testing.expect(containsBytes(res.code, &.{ 0x18 }));
+}
+
 
 
 

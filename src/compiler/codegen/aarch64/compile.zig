@@ -739,6 +739,9 @@ const FuncCompileCtx = struct {
     cached_mem_ea_epoch: u32 = 0,
     precomputed_callee_mask: ?u16 = null,
     uses_memory_base: bool = true,
+    uses_vmctx: bool = true,
+    frameless: bool = false,
+    saved_mem_base_reg: ?emit.Reg = null,
     func_idx: u32 = 0,
     allocator: std.mem.Allocator,
 
@@ -3336,20 +3339,233 @@ pub fn compileFunctionImpl(
     fctx.scratch_base = scratch_base;
     fctx.frame_size = frame_size;
     fctx.uses_memory_base = funcUsesMemoryBase(func);
+    fctx.uses_vmctx = if (ctx.options.enable_peephole and ctx.options.guard_page_bounds_elision and alloc_result_storage != null)
+        funcUsesVmctx(func, &fctx)
+    else
+        true;
+
+    if (tmr) |t| t.begin();
+    const needs_init = try local_init.computeNeedsInit(allocator, func);
+    if (tmr) |t| t.end(.prepass);
+    defer allocator.free(needs_init);
+
+    if (ctx.options.enable_peephole and alloc_result_storage != null and func.param_count > 0 and func.blocks.items.len > 0) {
+        var entry_abi = try buildEntryAbiPlan(allocator, func.*, fctx.local_types);
+        defer entry_abi.deinit();
+
+        var block0_has_preds = false;
+        for (func.blocks.items) |blk| {
+            for (blk.instructions.items) |b_inst| {
+                switch (b_inst.op) {
+                    .br => |t| if (t == 0) {
+                        block0_has_preds = true;
+                    },
+                    .br_if => |br| if (br.then_block == 0 or br.else_block == 0) {
+                        block0_has_preds = true;
+                    },
+                    .br_table => |bt| {
+                        if (bt.default == 0) block0_has_preds = true;
+                        for (bt.targets) |t| if (t == 0) {
+                            block0_has_preds = true;
+                        };
+                    },
+                    .try_table_begin => |tt| {
+                        for (tt.clauses) |c| if (c.handler == 0) {
+                            block0_has_preds = true;
+                        };
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        if (!block0_has_preds) {
+            const b0_insts = scheduled.instructions(0);
+            const max_p: u32 = @min(func.param_count, 8);
+            var p_idx: u32 = 0;
+            while (p_idx < max_p) : (p_idx += 1) {
+                const param_reg: emit.Reg = switch (entry_abi.locs[@intCast(p_idx)]) {
+                    .scalar_reg => |r| r,
+                    else => continue,
+                };
+                var can_bypass = true;
+                var last_get_pos: ?usize = null;
+                for (0..func.blocks.items.len) |bid| {
+                    for (scheduled.instructions(@intCast(bid)), 0..) |s_inst, s_pos| {
+                        switch (s_inst.op) {
+                            .local_set => |ls| if (ls.idx == p_idx) {
+                                can_bypass = false;
+                                break;
+                            },
+                            .local_get => |lg_idx| if (lg_idx == p_idx) {
+                                if (bid != 0) {
+                                    can_bypass = false;
+                                    break;
+                                }
+                                last_get_pos = s_pos;
+                            },
+                            else => {},
+                        }
+                    }
+                    if (!can_bypass) break;
+                }
+                if (!can_bypass) continue;
+                const lg_pos = last_get_pos orelse {
+                    fctx.param_direct_reg[@intCast(p_idx)] = param_reg;
+                    continue;
+                };
+
+                for (b0_insts[0..lg_pos]) |early_inst| {
+                    switch (early_inst.op) {
+                        .local_get,
+                        .iconst_32,
+                        .iconst_64,
+                        .fconst_32,
+                        .fconst_64,
+                        .add,
+                        .sub,
+                        .mul,
+                        .@"and",
+                        .@"or",
+                        .xor,
+                        .shl,
+                        .shr_s,
+                        .shr_u,
+                        .rotl,
+                        .rotr,
+                        .clz,
+                        .ctz,
+                        .popcnt,
+                        .eqz,
+                        .eq,
+                        .ne,
+                        .lt_s,
+                        .lt_u,
+                        .gt_s,
+                        .gt_u,
+                        .le_s,
+                        .le_u,
+                        .ge_s,
+                        .ge_u,
+                        .select,
+                        .wrap_i64,
+                        .extend_i32_s,
+                        .extend_i32_u,
+                        .extend8_s,
+                        .extend16_s,
+                        .extend32_s,
+                        .reinterpret,
+                        => {},
+                        .load => |ld| if (!elideBoundsCheck(&fctx, ld.bounds_known)) {
+                            can_bypass = false;
+                            break;
+                        },
+                        .store => |st| if (!elideBoundsCheck(&fctx, st.bounds_known)) {
+                            can_bypass = false;
+                            break;
+                        },
+                        else => {
+                            can_bypass = false;
+                            break;
+                        },
+                    }
+                    if (early_inst.op == .local_get and early_inst.op.local_get == p_idx) continue;
+                    if (early_inst.dest) |d| {
+                        if (alloc_result_storage.?.get(d)) |loc| {
+                            if (loc == .reg) {
+                                const assigned_reg: emit.Reg = @enumFromInt(@as(u5, @intCast(loc.reg)));
+                                if (assigned_reg == param_reg) {
+                                    can_bypass = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (can_bypass) {
+                    fctx.param_direct_reg[@intCast(p_idx)] = param_reg;
+                }
+            }
+        }
+    }
+
     if (alloc_result_storage) |*ar| {
-        var mask: u16 = if (fctx.uses_memory_base) 0b11 else 0b01;
+        var mask: u16 = (if (fctx.uses_vmctx) @as(u16, 0b01) else @as(u16, 0)) |
+            (if (fctx.uses_memory_base) @as(u16, 0b10) else @as(u16, 0));
+        var used_reg: [32]bool = @splat(false);
         var v: u32 = 0;
         while (v < func.next_vreg) : (v += 1) {
             if (ar.get(@intCast(v))) |loc| {
                 switch (loc) {
                     .reg => |r| {
                         const reg_num: u32 = @intCast(r);
+                        if (reg_num < 32) used_reg[reg_num] = true;
                         const idx: usize = if (reg_num <= 14) reg_num else reg_num - 6;
                         if (idx >= RegMap.caller_saved_count) {
                             mask |= (@as(u16, 1) << @intCast(idx - RegMap.caller_saved_count + 2));
                         }
                     },
                     .stack => {},
+                }
+            }
+        }
+        if (!fctx.uses_vmctx and ctx.options.enable_peephole) {
+            var uses_stack_frame = false;
+            if (ar.spill_count > 0) uses_stack_frame = true;
+            if (v128_alloc_result_storage != null and v128_alloc_result_storage.?.spill_count > 0) uses_stack_frame = true;
+            if (func.result_count > 1 or func.param_count > 8) uses_stack_frame = true;
+            if (!uses_stack_frame) {
+                var p: u32 = 0;
+                while (p < func.param_count) : (p += 1) {
+                    if (fctx.param_direct_reg[p] == null) {
+                        uses_stack_frame = true;
+                        break;
+                    }
+                }
+            }
+            if (!uses_stack_frame) {
+                var li: u32 = func.param_count;
+                while (li < func.local_count) : (li += 1) {
+                    if (needs_init[li]) {
+                        uses_stack_frame = true;
+                        break;
+                    }
+                }
+            }
+            if (!uses_stack_frame) {
+                for (0..func.blocks.items.len) |bid| {
+                    for (scheduled.instructions(@intCast(bid))) |s_inst| {
+                        switch (s_inst.op) {
+                            .local_set => {
+                                uses_stack_frame = true;
+                                break;
+                            },
+                            .local_get => |idx| {
+                                if (bid != 0 or idx >= 8 or fctx.param_direct_reg[idx] == null) {
+                                    uses_stack_frame = true;
+                                    break;
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                    if (uses_stack_frame) break;
+                }
+            }
+            if (!uses_stack_frame) {
+                if (mask == 0) {
+                    fctx.frameless = true;
+                } else if (mask == 0b10) {
+                    var r: usize = 15;
+                    while (r > 8) {
+                        r -= 1;
+                        if (!used_reg[r]) {
+                            fctx.saved_mem_base_reg = @enumFromInt(@as(u5, @intCast(r)));
+                            mask = 0;
+                            fctx.frameless = true;
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -3476,127 +3692,26 @@ pub fn compileFunctionImpl(
     }
     if (tmr) |t| t.end(.liveness);
 
-    try code.emitPrologue(frame_size);
-    try emitCalleeSaveStoreTracked(&code, &fctx);
-
-    // Pin vmctx (AAPCS64 arg0 = x0) in callee-saved x19 for the whole
-    // function body (issue #465). The preceding callee-save STR has
-    // already preserved the caller's x19, and `RegMap.init` forces
-    // x19's bit in `used_callee_mask` so the STR is not NOP-patched.
-    // Every former `ldr Xd, [fp + vmctx_slot_offset/8]` is replaced by
-    // a `mov Xd, x19` (or a `mov x0, x19` when staging arg0 for a
-    // helper / cross-function call).
-    try code.movRegReg(.x19, .x0);
-
-    // Pin VmCtx.memory_base in callee-saved x20 for the whole function
-    // body (issue #466). The preceding callee-save STR preserved the
-    // caller's x20, and `RegMap.init` forces x20's bit in
-    // `used_callee_mask`. Every linear-memory access reads `x20`
-    // directly instead of rematerialising via
-    // `mov tmp, x19; ldr tmp, [tmp]`. `memory.grow` and every wasm
-    // call emit `ldr x20, [x19, #0]` afterward to refresh the base.
-    if (fctx.uses_memory_base) {
-        try code.ldrImm(.x20, .x19, 0);
+    if (!fctx.frameless) {
+        try code.emitPrologue(frame_size);
+        try emitCalleeSaveStoreTracked(&code, &fctx);
     }
 
-    // Spill VMContext (x0) and wasm params (x1..x7) to their frame slots.
-    if (tmr) |t| t.begin();
-    const needs_init = try local_init.computeNeedsInit(allocator, func);
-    if (tmr) |t| t.end(.prepass);
-    defer allocator.free(needs_init);
-
-    if (ctx.options.enable_peephole and alloc_result_storage != null and func.param_count > 0 and func.blocks.items.len > 0) {
-        var entry_abi = try buildEntryAbiPlan(allocator, func.*, fctx.local_types);
-        defer entry_abi.deinit();
-
-        var block0_has_preds = false;
-        for (func.blocks.items) |blk| {
-            for (blk.instructions.items) |b_inst| {
-                switch (b_inst.op) {
-                    .br => |t| if (t == 0) {
-                        block0_has_preds = true;
-                    },
-                    .br_if => |br| if (br.then_block == 0 or br.else_block == 0) {
-                        block0_has_preds = true;
-                    },
-                    .br_table => |bt| {
-                        if (bt.default == 0) block0_has_preds = true;
-                        for (bt.targets) |t| if (t == 0) {
-                            block0_has_preds = true;
-                        };
-                    },
-                    .try_table_begin => |tt| {
-                        for (tt.clauses) |c| if (c.handler == 0) {
-                            block0_has_preds = true;
-                        };
-                    },
-                    else => {},
-                }
-            }
+    if (fctx.uses_vmctx) {
+        try code.movRegReg(.x19, .x0);
+        if (fctx.uses_memory_base) {
+            try code.ldrImm(.x20, .x19, 0);
         }
-
-        if (!block0_has_preds) {
-            const b0_insts = scheduled.instructions(0);
-            const max_p: u32 = @min(func.param_count, 8);
-            var p_idx: u32 = 0;
-            while (p_idx < max_p) : (p_idx += 1) {
-                const param_reg: emit.Reg = switch (entry_abi.locs[@intCast(p_idx)]) {
-                    .scalar_reg => |r| r,
-                    else => continue,
-                };
-                var can_bypass = true;
-                var last_get_pos: ?usize = null;
-                for (0..func.blocks.items.len) |bid| {
-                    for (scheduled.instructions(@intCast(bid)), 0..) |s_inst, s_pos| {
-                        switch (s_inst.op) {
-                            .local_set => |ls| if (ls.idx == p_idx) {
-                                can_bypass = false;
-                                break;
-                            },
-                            .local_get => |lg_idx| if (lg_idx == p_idx) {
-                                if (bid != 0) {
-                                    can_bypass = false;
-                                    break;
-                                }
-                                last_get_pos = s_pos;
-                            },
-                            else => {},
-                        }
-                    }
-                    if (!can_bypass) break;
-                }
-                if (!can_bypass) continue;
-                const lg_pos = last_get_pos orelse continue;
-
-                for (b0_insts[0..lg_pos]) |early_inst| {
-                    switch (early_inst.op) {
-                        .local_get, .iconst_32, .iconst_64 => {},
-                        else => {
-                            can_bypass = false;
-                            break;
-                        },
-                    }
-                    if (early_inst.op == .local_get and early_inst.op.local_get == p_idx) continue;
-                    if (early_inst.dest) |d| {
-                        if (alloc_result_storage.?.get(d)) |loc| {
-                            if (loc == .reg) {
-                                const assigned_reg: emit.Reg = @enumFromInt(@as(u5, @intCast(loc.reg)));
-                                if (assigned_reg == param_reg) {
-                                    can_bypass = false;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                if (can_bypass) {
-                    fctx.param_direct_reg[@intCast(p_idx)] = param_reg;
-                }
-            }
+    } else if (fctx.uses_memory_base) {
+        if (fctx.saved_mem_base_reg) |save_reg| {
+            try code.movRegReg(save_reg, .x20);
         }
+        try code.ldrImm(.x20, .x0, 0);
     }
 
-    try emitEntrySpill(&code, func.*, local_layout.offsets, fctx.local_types, needs_init, hrp_save_off, frame_size, fctx.param_direct_reg, allocator);
+    if (!fctx.frameless) {
+        try emitEntrySpill(&code, func.*, local_layout.offsets, fctx.local_types, needs_init, hrp_save_off, frame_size, fctx.param_direct_reg, allocator);
+    }
 
     var block_offsets = try allocator.alloc(usize, func.blocks.items.len);
     defer allocator.free(block_offsets);
@@ -3724,8 +3839,15 @@ pub fn compileFunctionImpl(
     }
 
     if (!last_was_ret) {
-        try emitCalleeSaveRestoreTracked(&code, &fctx);
-        try code.emitEpilogue(frame_size);
+        if (fctx.saved_mem_base_reg) |save_reg| {
+            try code.movRegReg(.x20, save_reg);
+        }
+        if (fctx.frameless) {
+            try code.ret();
+        } else {
+            try emitCalleeSaveRestoreTracked(&code, &fctx);
+            try code.emitEpilogue(frame_size);
+        }
     }
 
     // Elide saves/restores for callee-saved regs never assigned by RegMap.
@@ -5083,6 +5205,86 @@ fn funcUsesMemoryBase(func: *const ir.IrFunction) bool {
     return false;
 }
 
+fn funcUsesVmctx(func: *const ir.IrFunction, fctx: *const FuncCompileCtx) bool {
+    if (fctx.options.cancel_points or fctx.has_memory64 or fctx.has_shared_memory) return true;
+    for (func.blocks.items) |blk| {
+        for (blk.instructions.items) |inst| {
+            switch (inst.op) {
+                .iconst_32,
+                .iconst_64,
+                .fconst_32,
+                .fconst_64,
+                .local_get,
+                .local_set,
+                .br,
+                .br_if,
+                .br_table,
+                .ret,
+                .add,
+                .sub,
+                .mul,
+                .@"and",
+                .@"or",
+                .xor,
+                .shl,
+                .shr_s,
+                .shr_u,
+                .rotl,
+                .rotr,
+                .clz,
+                .ctz,
+                .popcnt,
+                .eqz,
+                .eq,
+                .ne,
+                .lt_s,
+                .lt_u,
+                .gt_s,
+                .gt_u,
+                .le_s,
+                .le_u,
+                .ge_s,
+                .ge_u,
+                .select,
+                .wrap_i64,
+                .extend_i32_s,
+                .extend_i32_u,
+                .extend8_s,
+                .extend16_s,
+                .extend32_s,
+                .f_abs,
+                .f_neg,
+                .f_sqrt,
+                .f_ceil,
+                .f_floor,
+                .f_trunc,
+                .f_nearest,
+                .f_min,
+                .f_max,
+                .f_copysign,
+                .f_eq,
+                .f_ne,
+                .f_lt,
+                .f_gt,
+                .f_le,
+                .f_ge,
+                .convert_i32_s,
+                .convert_i32_u,
+                .convert_i64_s,
+                .convert_i64_u,
+                .demote_f64,
+                .promote_f32,
+                .reinterpret,
+                => {},
+                .load => |ld| if (!elideBoundsCheck(fctx, ld.bounds_known)) return true,
+                .store => |st| if (!elideBoundsCheck(fctx, st.bounds_known)) return true,
+                else => return true,
+            }
+        }
+    }
+    return false;
+}
+
 /// Overwrite save/restore slots for callee-saved regs that were never
 /// assigned to any vreg with NOPs. `sites` contains the STR/LDR offsets
 /// captured by each emitCalleeSaveStore/emitCalleeSaveRestore call.
@@ -5620,8 +5822,15 @@ fn compileInst(
             if (maybe_val) |val| {
                 try emitPrimaryReturnValue(code, val, reg_map, v128_map, v128_cache, fctx);
             }
-            try emitCalleeSaveRestoreTracked(code, fctx);
-            try code.emitEpilogue(frame_size);
+            if (fctx.saved_mem_base_reg) |save_reg| {
+                try code.movRegReg(.x20, save_reg);
+            }
+            if (fctx.frameless) {
+                try code.ret();
+            } else {
+                try emitCalleeSaveRestoreTracked(code, fctx);
+                try code.emitEpilogue(frame_size);
+            }
         },
         .ret_multi => |vregs| try emitRetMulti(code, vregs, reg_map, v128_map, v128_cache, fctx, frame_size),
         .call_result => |idx| try emitCallResult(code, inst, idx, reg_map, v128_map, v128_cache, fctx),
@@ -10537,8 +10746,15 @@ fn emitRetMulti(
     frame_size: u32,
 ) !void {
     if (vregs.len == 0) {
-        try emitCalleeSaveRestoreTracked(code, fctx);
-        try code.emitEpilogue(frame_size);
+        if (fctx.saved_mem_base_reg) |save_reg| {
+            try code.movRegReg(.x20, save_reg);
+        }
+        if (fctx.frameless) {
+            try code.ret();
+        } else {
+            try emitCalleeSaveRestoreTracked(code, fctx);
+            try code.emitEpilogue(frame_size);
+        }
         return;
     }
 
@@ -10567,8 +10783,15 @@ fn emitRetMulti(
         }
     }
 
-    try emitCalleeSaveRestoreTracked(code, fctx);
-    try code.emitEpilogue(frame_size);
+    if (fctx.saved_mem_base_reg) |save_reg| {
+        try code.movRegReg(.x20, save_reg);
+    }
+    if (fctx.frameless) {
+        try code.ret();
+    } else {
+        try emitCalleeSaveRestoreTracked(code, fctx);
+        try code.emitEpilogue(frame_size);
+    }
 }
 
 /// same caller-save snapshot pattern as `emitCall`: all currently-used
@@ -20953,3 +21176,33 @@ test "wave10 (#949): guard_page_bounds_elision emits UXTW load without bounds ch
     const f1_code = res.code[res.offsets[1]..];
     try std.testing.expect(!testCodeContainsWord(f1_code, 0xF940_0274));
 }
+
+test "wave11 (#949): frameless leaf elides prologue/epilogue and preserves x20 in scratch GPR" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 1);
+    defer func.deinit();
+    const b = try func.newBlock();
+    const addr = func.newVReg();
+    const val = func.newVReg();
+    try func.getBlock(b).append(.{ .op = .{ .local_get = 0 }, .dest = addr, .type = .i32 });
+    try func.getBlock(b).append(.{
+        .op = .{ .load = .{ .base = addr, .offset = 0, .size = 4, .bounds_known = false } },
+        .dest = val,
+        .type = .i32,
+    });
+    try func.getBlock(b).append(.{ .op = .{ .ret = val } });
+
+    const code = try compileFunctionWithOptions(&func, allocator, .{
+        .guard_page_bounds_elision = true,
+    });
+    defer allocator.free(code);
+
+    // Must NOT emit `mov x19, x0` (0xAA00_03F3) or `stp x29, x30, [sp, #-imm]!` (mask 0xFFC0_7FFF == 0xA980_7BFD).
+    try std.testing.expect(!testCodeContainsWord(code, 0xAA00_03F3));
+    try std.testing.expect(!testCodeContainsMasked(code, 0xFFC0_7FFF, 0xA980_7BFD));
+    // Must emit `ldr x20, [x0, #0]` (0xF940_0014) and `mov x14, x20` (0xAA14_03EE) + `mov x20, x14` (0xAA0E_03F4).
+    try std.testing.expect(testCodeContainsWord(code, 0xF940_0014));
+    try std.testing.expect(testCodeContainsWord(code, 0xAA14_03EE));
+    try std.testing.expect(testCodeContainsWord(code, 0xAA0E_03F4));
+}
+
