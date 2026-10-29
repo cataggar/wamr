@@ -602,13 +602,23 @@ const LinuxCpuAffinity = struct {
     ) ParentAffinityAction {
         if (comptime builtin.os.tag != .linux) return .none;
         self.ensureInitializedLocked();
-        if (self.count < 2 or self.saw_full_worker_set) return .none;
-        if (generation > 0 or
+        if (self.count < 2) return .none;
+        const is_sequential = generation > 0 or
             (slot_index > 0 and !slot_zero_active) or
-            slot_index >= self.count - 1)
-        {
+            slot_index >= 8;
+        if (self.saw_full_worker_set) {
+            if (!self.sequential_lifecycle and is_sequential) {
+                self.sequential_lifecycle = true;
+                if (self.parent_pinned_single) {
+                    self.parent_pinned_single = false;
+                    return .{ .restore_initial = self.initial_set };
+                }
+            }
+            return .none;
+        }
+        if (is_sequential or slot_index >= self.count - 1) {
             self.saw_full_worker_set = true;
-            if (slot_index > 0 and !slot_zero_active) {
+            if (is_sequential) {
                 self.sequential_lifecycle = true;
             }
             if (self.parent_pinned_single) {
@@ -649,7 +659,7 @@ const LinuxCpuAffinity = struct {
 
     fn workerCpuLocked(self: *LinuxCpuAffinity, slot_index: usize, generation: u16) ?u16 {
         if (comptime builtin.os.tag != .linux) return null;
-        if (generation > 0 or self.sequential_lifecycle) return null;
+        if (generation > 0 or self.sequential_lifecycle or slot_index >= 8) return null;
         self.ensureInitializedLocked();
         if (self.count < 2) return null;
         return self.cpus[slot_index % self.count];
@@ -669,6 +679,8 @@ const LinuxCpuAffinity = struct {
 /// spawns and joins every record; it does not detach or preempt guest code.
 pub const ThreadManager = struct {
     slots: std.ArrayList(ThreadSlot),
+    retained_slot_count: usize = 0,
+    first_free_slot_hint: usize = 0,
     mutex: Mutex = .init,
     trap_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     allocator: std.mem.Allocator,
@@ -889,14 +901,7 @@ pub const ThreadManager = struct {
     }
 
     fn retainedSlotCountLocked(self: *const ThreadManager) usize {
-        var count: usize = 0;
-        for (self.slots.items) |slot| {
-            switch (slot.state) {
-                .live, .joining => count += 1,
-                .free, .retired => {},
-            }
-        }
-        return count;
+        return self.retained_slot_count;
     }
 
     fn initWithTestHooks(allocator: std.mem.Allocator, hooks: *const TestHooks) ThreadManager {
@@ -913,6 +918,8 @@ pub const ThreadManager = struct {
         std.debug.assert(current.spawning == 0);
         std.debug.assert(current.joining == 0);
         self.slots.deinit(self.allocator);
+        self.retained_slot_count = 0;
+        self.first_free_slot_hint = 0;
         self.aux_stack_pool.deinit(self.allocator);
         self.shared_memory = null;
         self.cancel_broadcast = null;
@@ -1643,7 +1650,9 @@ pub const ThreadManager = struct {
     }!i32 {
         if (self.retainedSlotCountLocked() + self.active_component_threads >= max_thread_slots)
             return error.ThreadIdExhausted;
-        for (self.slots.items, 0..) |*slot, slot_index| {
+        var slot_index = self.first_free_slot_hint;
+        while (slot_index < self.slots.items.len) : (slot_index += 1) {
+            const slot = &self.slots.items[slot_index];
             if (slot.state != .free) continue;
             if (slot.generation == max_tid_generation) {
                 slot.state = .retired;
@@ -1652,18 +1661,23 @@ pub const ThreadManager = struct {
             slot.generation += 1;
             slot.state = .live;
             slot.record = record;
+            self.retained_slot_count += 1;
+            self.first_free_slot_hint = slot_index + 1;
             return makeTid(slot_index, slot.generation);
         }
 
+        self.first_free_slot_hint = self.slots.items.len;
         if (self.slots.items.len == max_thread_slots)
             return error.ThreadIdExhausted;
-        const slot_index = self.slots.items.len;
+        const new_slot_index = self.slots.items.len;
         try self.slots.append(self.allocator, .{
             .generation = 0,
             .state = .live,
             .record = record,
         });
-        return makeTid(slot_index, 0);
+        self.retained_slot_count += 1;
+        self.first_free_slot_hint = self.slots.items.len;
+        return makeTid(new_slot_index, 0);
     }
 
     fn beginSpawn(self: *ThreadManager) bool {
@@ -1698,6 +1712,11 @@ pub const ThreadManager = struct {
         std.debug.assert(slot.state == .live);
         slot.record = null;
         slot.state = .free;
+        std.debug.assert(self.retained_slot_count > 0);
+        self.retained_slot_count -= 1;
+        if (parsed.slot_index < self.first_free_slot_hint) {
+            self.first_free_slot_hint = parsed.slot_index;
+        }
     }
 
     fn claimOneLocked(self: *ThreadManager, tid: i32) JoinError!JoinClaim {
@@ -1751,6 +1770,11 @@ pub const ThreadManager = struct {
         std.debug.assert(slot.state == .joining);
         std.debug.assert(slot.record == null);
         slot.state = .free;
+        std.debug.assert(self.retained_slot_count > 0);
+        self.retained_slot_count -= 1;
+        if (claim.slot_index < self.first_free_slot_hint) {
+            self.first_free_slot_hint = claim.slot_index;
+        }
         std.debug.assert(self.joining_count > 0);
         self.joining_count -= 1;
         self.mutex.unlock();
@@ -3729,3 +3753,162 @@ test "LinuxCpuAffinity: workerCpuLocked maps generation-0 pool slots and restore
     try std.testing.expect(affinity.sequential_lifecycle);
     try std.testing.expectEqual(@as(?u16, null), affinity.workerCpuLocked(1, 0));
 }
+
+test "ThreadManager: LinuxCpuAffinity latches sequential_lifecycle after Round-0 full worker set" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var affinity: LinuxCpuAffinity = .{
+        .initialized = true,
+        .count = 4,
+    };
+    affinity.cpus[0] = 2;
+    affinity.cpus[1] = 4;
+    affinity.cpus[2] = 6;
+    affinity.cpus[3] = 8;
+
+    // Round 0 spawns slots 0..7 while slot 0 is still active (`slot_zero_active == true`).
+    switch (affinity.planParentSpawnLocked(0, 0, true)) {
+        .pin_single => |cpu| try std.testing.expectEqual(@as(u16, 8), cpu),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(ParentAffinityAction.none, affinity.planParentSpawnLocked(1, 0, true));
+    try std.testing.expectEqual(ParentAffinityAction.none, affinity.planParentSpawnLocked(2, 0, true));
+    switch (affinity.planParentSpawnLocked(3, 0, true)) {
+        .restore_initial => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(affinity.saw_full_worker_set);
+    try std.testing.expect(!affinity.sequential_lifecycle);
+    try std.testing.expect(!affinity.parent_pinned_single);
+
+    for (4..8) |slot_idx| {
+        try std.testing.expectEqual(
+            ParentAffinityAction.none,
+            affinity.planParentSpawnLocked(slot_idx, 0, true),
+        );
+        try std.testing.expect(!affinity.sequential_lifecycle);
+        try std.testing.expect(affinity.workerCpuLocked(slot_idx, 0) != null);
+    }
+
+    // Even before sequential_lifecycle latches, workerCpuLocked never pins slot >= 8.
+    try std.testing.expectEqual(@as(?u16, null), affinity.workerCpuLocked(8, 0));
+
+    // Round 1 spawns slot 8 (or any slot with !slot_zero_active): sequential_lifecycle latches true.
+    try std.testing.expectEqual(
+        ParentAffinityAction.none,
+        affinity.planParentSpawnLocked(8, 0, true),
+    );
+    try std.testing.expect(affinity.sequential_lifecycle);
+    try std.testing.expectEqual(@as(?u16, null), affinity.workerCpuLocked(0, 0));
+    try std.testing.expectEqual(@as(?u16, null), affinity.workerCpuLocked(8, 0));
+
+    // Also verify latching when slot 4 spawns with !slot_zero_active after saw_full_worker_set.
+    var affinity4: LinuxCpuAffinity = .{
+        .initialized = true,
+        .count = 4,
+    };
+    affinity4.cpus[0] = 2;
+    affinity4.cpus[1] = 4;
+    affinity4.cpus[2] = 6;
+    affinity4.cpus[3] = 8;
+    _ = affinity4.planParentSpawnLocked(0, 0, true);
+    _ = affinity4.planParentSpawnLocked(1, 0, true);
+    _ = affinity4.planParentSpawnLocked(2, 0, true);
+    _ = affinity4.planParentSpawnLocked(3, 0, true);
+    try std.testing.expect(affinity4.saw_full_worker_set);
+    try std.testing.expect(!affinity4.sequential_lifecycle);
+    try std.testing.expectEqual(
+        ParentAffinityAction.none,
+        affinity4.planParentSpawnLocked(4, 0, false),
+    );
+    try std.testing.expect(affinity4.sequential_lifecycle);
+    try std.testing.expectEqual(@as(?u16, null), affinity4.workerCpuLocked(4, 0));
+}
+
+test "ThreadManager: retainedSlotCountLocked and first_free_slot_hint stay exact across transitions" {
+    const allocator = std.testing.allocator;
+    var manager = ThreadManager.init(allocator);
+    defer manager.deinit();
+
+    var dummy_records: [4]ThreadRecord = undefined;
+    for (&dummy_records) |*rec| {
+        rec.* = .{
+            .manager = &manager,
+            .backend_context = undefined,
+            .backend_ops = &interp_thread_ops,
+            .aux_stack_top = null,
+            .cancellation_group = null,
+        };
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), manager.retainedSlotCountLocked());
+    try std.testing.expectEqual(@as(usize, 0), manager.first_free_slot_hint);
+
+    // Append 3 live slots (0, 1, 2).
+    const tid0 = try manager.publishRecordLocked(&dummy_records[0]);
+    try std.testing.expectEqual(@as(usize, 1), manager.retainedSlotCountLocked());
+    try std.testing.expectEqual(@as(usize, 1), manager.first_free_slot_hint);
+
+    const tid1 = try manager.publishRecordLocked(&dummy_records[1]);
+    try std.testing.expectEqual(@as(usize, 2), manager.retainedSlotCountLocked());
+    try std.testing.expectEqual(@as(usize, 2), manager.first_free_slot_hint);
+
+    const tid2 = try manager.publishRecordLocked(&dummy_records[2]);
+    try std.testing.expectEqual(@as(usize, 3), manager.retainedSlotCountLocked());
+    try std.testing.expectEqual(@as(usize, 3), manager.first_free_slot_hint);
+
+    // Rollback slot 1: retained drops to 2, hint rewinds to 1.
+    manager.rollbackPublishedLocked(tid1);
+    try std.testing.expectEqual(@as(usize, 2), manager.retainedSlotCountLocked());
+    try std.testing.expectEqual(@as(usize, 1), manager.first_free_slot_hint);
+
+    // Rollback slot 2: retained drops to 1, hint stays 1.
+    manager.rollbackPublishedLocked(tid2);
+    try std.testing.expectEqual(@as(usize, 1), manager.retainedSlotCountLocked());
+    try std.testing.expectEqual(@as(usize, 1), manager.first_free_slot_hint);
+
+    // Reuse slot 1: retained becomes 2, hint advances to 2.
+    const tid1_gen1 = try manager.publishRecordLocked(&dummy_records[1]);
+    try std.testing.expectEqual(@as(usize, 1), parseTid(tid1_gen1).?.slot_index);
+    try std.testing.expectEqual(@as(u16, 1), parseTid(tid1_gen1).?.generation);
+    try std.testing.expectEqual(@as(usize, 2), manager.retainedSlotCountLocked());
+    try std.testing.expectEqual(@as(usize, 2), manager.first_free_slot_hint);
+
+    // Exhaust generation on slot 2 so next publish retires slot 2 and appends slot 3.
+    manager.slots.items[2].generation = max_tid_generation;
+    const tid3 = try manager.publishRecordLocked(&dummy_records[3]);
+    try std.testing.expectEqual(SlotState.retired, manager.slots.items[2].state);
+    try std.testing.expectEqual(@as(usize, 3), parseTid(tid3).?.slot_index);
+    try std.testing.expectEqual(@as(usize, 3), manager.retainedSlotCountLocked());
+    try std.testing.expectEqual(@as(usize, 4), manager.first_free_slot_hint);
+
+    // Clean up live slots so manager.deinit() sees 0 live/joining records.
+    manager.rollbackPublishedLocked(tid0);
+    manager.rollbackPublishedLocked(tid1_gen1);
+    manager.rollbackPublishedLocked(tid3);
+    try std.testing.expectEqual(@as(usize, 0), manager.retainedSlotCountLocked());
+    try std.testing.expectEqual(@as(usize, 0), manager.first_free_slot_hint);
+
+    if (comptime config.lib_wasi_threads and config.thread_mgr and !builtin.single_threaded) {
+        const ctx = try buildThreadTestModule(&nop_thread_code, allocator);
+        defer cleanupThreadTest(ctx, allocator);
+        var join_manager = ThreadManager.init(allocator);
+        defer join_manager.deinit();
+        ctx.inst.thread_manager = &join_manager;
+
+        const t0 = try join_manager.spawnThread(ctx.inst, 0);
+        const t1 = try join_manager.spawnThread(ctx.inst, 0);
+        try std.testing.expectEqual(@as(usize, 2), join_manager.retainedSlotCountLocked());
+        try std.testing.expectEqual(@as(usize, 2), join_manager.first_free_slot_hint);
+
+        try std.testing.expectEqual(ThreadOutcome.completed, try join_manager.joinOne(t0));
+        try std.testing.expectEqual(@as(usize, 1), join_manager.retainedSlotCountLocked());
+        try std.testing.expectEqual(@as(usize, 0), join_manager.first_free_slot_hint);
+
+        const summary = join_manager.joinAllWithSummary();
+        try std.testing.expectEqual(@as(usize, 1), summary.joined);
+        _ = t1;
+        try std.testing.expectEqual(@as(usize, 0), join_manager.retainedSlotCountLocked());
+        try std.testing.expectEqual(@as(usize, 0), join_manager.first_free_slot_hint);
+    }
+}
+

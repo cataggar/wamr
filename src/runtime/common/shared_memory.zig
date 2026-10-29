@@ -52,7 +52,53 @@ var saved_initial_affinity: LinuxInitialAffinity = .{};
 
 var cached_tmpdir_buf: [208]u8 = @splat(0);
 var cached_tmpdir_len: usize = 0;
+var cached_use_dev_shm: std.atomic.Value(bool) = .init(false);
 var cached_tmpdir_state: std.atomic.Value(u8) = .init(0);
+
+pub fn normalizeLinuxTmpdir(raw: []const u8) []const u8 {
+    var val = raw;
+    while (val.len > 1 and val[val.len - 1] == '/') {
+        val = val[0 .. val.len - 1];
+    }
+    return val;
+}
+
+pub fn isAllowedLinuxTmpdir(val: []const u8) bool {
+    if (val.len == 0 or val.len > 200 or val[0] != '/') return false;
+    const norm = normalizeLinuxTmpdir(val);
+    if (std.mem.eql(u8, norm, "/home/g") or std.mem.startsWith(u8, norm, "/home/g/")) {
+        return false;
+    }
+    return true;
+}
+
+pub fn hashLinuxTmpdir(tmpdir: []const u8) u64 {
+    return std.hash.Fnv1a_64.hash(normalizeLinuxTmpdir(tmpdir));
+}
+
+pub fn formatLinuxShmPath(
+    buf: []u8,
+    tmpdir: []const u8,
+    use_dev_shm: bool,
+    initial_pages: u32,
+    slot: usize,
+) ?[:0]const u8 {
+    const norm = normalizeLinuxTmpdir(tmpdir);
+    if (!isAllowedLinuxTmpdir(norm)) return null;
+    const slice = if (use_dev_shm) blk: {
+        const hash = hashLinuxTmpdir(norm);
+        break :blk std.fmt.bufPrint(
+            buf,
+            "/dev/shm/wamr_shm_{x:0>16}_p{d}_s{d}.bin\x00",
+            .{ hash, initial_pages, slot },
+        ) catch return null;
+    } else std.fmt.bufPrint(
+        buf,
+        "{s}/.wamr-shm-p{d}-s{d}\x00",
+        .{ norm, initial_pages, slot },
+    ) catch return null;
+    return slice[0 .. slice.len - 1 :0];
+}
 
 fn getLinuxTmpdir() ?[]const u8 {
     if (comptime builtin.os.tag != .linux) return null;
@@ -94,15 +140,16 @@ fn getLinuxTmpdir() ?[]const u8 {
     var it = std.mem.splitScalar(u8, env_buf[0..total], 0);
     while (it.next()) |entry| {
         if (std.mem.startsWith(u8, entry, "TMPDIR=")) {
-            var val = entry["TMPDIR=".len..];
-            while (val.len > 1 and val[val.len - 1] == '/') {
-                val = val[0 .. val.len - 1];
-            }
-            if (val.len > 0 and val.len <= 200 and val[0] == '/' and
-                !std.mem.startsWith(u8, val, "/home"))
-            {
+            const raw_val = entry["TMPDIR=".len..];
+            if (isAllowedLinuxTmpdir(raw_val)) {
+                const val = normalizeLinuxTmpdir(raw_val);
                 @memcpy(cached_tmpdir_buf[0..val.len], val);
                 cached_tmpdir_len = val.len;
+                const dev_shm_ok = std.os.linux.access(
+                    "/dev/shm",
+                    std.os.linux.W_OK | std.os.linux.X_OK,
+                ) == 0;
+                cached_use_dev_shm.store(dev_shm_ok, .release);
                 cached_tmpdir_state.store(2, .release);
                 return cached_tmpdir_buf[0..val.len];
             }
@@ -277,19 +324,38 @@ pub const Control = struct {
                 if (getLinuxTmpdir()) |tmpdir| {
                     const shm_bytes = @min(reserved_bytes, initial_bytes + 16 * wasm_page_size);
                     var path_buf: [256]u8 = undefined;
+                    var use_dev_shm = cached_use_dev_shm.load(.acquire);
                     for (0..32) |slot| {
-                        const path_slice = std.fmt.bufPrint(
+                        const path_z = formatLinuxShmPath(
                             &path_buf,
-                            "{s}/.wamr-shm-p{d}-s{d}\x00",
-                            .{ tmpdir, initial_pages, slot },
-                        ) catch break;
-                        const path_z: [*:0]const u8 = @ptrCast(path_slice.ptr);
-                        const fd_rc = std.os.linux.openat(
+                            tmpdir,
+                            use_dev_shm,
+                            initial_pages,
+                            slot,
+                        ) orelse break;
+                        var fd_rc = std.os.linux.openat(
                             std.os.linux.AT.FDCWD,
-                            path_z,
+                            path_z.ptr,
                             .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true },
                             0o600,
                         );
+                        if (@as(isize, @bitCast(fd_rc)) < 0 and use_dev_shm) {
+                            use_dev_shm = false;
+                            cached_use_dev_shm.store(false, .release);
+                            const fallback_z = formatLinuxShmPath(
+                                &path_buf,
+                                tmpdir,
+                                false,
+                                initial_pages,
+                                slot,
+                            ) orelse break;
+                            fd_rc = std.os.linux.openat(
+                                std.os.linux.AT.FDCWD,
+                                fallback_z.ptr,
+                                .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true },
+                                0o600,
+                            );
+                        }
                         if (@as(isize, @bitCast(fd_rc)) < 0) break;
                         const fd: i32 = @intCast(fd_rc);
                         const lock_rc = std.os.linux.flock(
@@ -611,4 +677,49 @@ test "SharedMemory: wait APIs validate bounds and alignment" {
     try std.testing.expectError(error.Unaligned, control.wait32(1, 0, 0));
     try std.testing.expectError(error.OutOfBounds, control.wait64(wasm_page_size, 0, 0));
     try std.testing.expectError(error.OutOfBounds, control.notify(wasm_page_size, 1));
+}
+
+test "SharedMemory: isAllowedLinuxTmpdir allows runner temp and blocks /home/g" {
+    try std.testing.expect(isAllowedLinuxTmpdir("/home/runner/work/_temp/wasi-thread-123/tmp"));
+    try std.testing.expect(isAllowedLinuxTmpdir("/home/runner/work/_temp/wasi-thread-123/tmp/"));
+    try std.testing.expect(isAllowedLinuxTmpdir("/d/tmp"));
+    try std.testing.expect(isAllowedLinuxTmpdir("/d/wamr-worktrees/iss-966-v34/.cache-1a"));
+    try std.testing.expect(isAllowedLinuxTmpdir("/tmp/wasi-thread"));
+    try std.testing.expect(isAllowedLinuxTmpdir("/dev/shm"));
+
+    try std.testing.expect(!isAllowedLinuxTmpdir("/home/g"));
+    try std.testing.expect(!isAllowedLinuxTmpdir("/home/g/"));
+    try std.testing.expect(!isAllowedLinuxTmpdir("/home/g/tmp"));
+    try std.testing.expect(!isAllowedLinuxTmpdir(""));
+    try std.testing.expect(!isAllowedLinuxTmpdir("relative/path"));
+    try std.testing.expect(!isAllowedLinuxTmpdir("./tmp"));
+
+    var too_long: [201]u8 = @splat('a');
+    too_long[0] = '/';
+    try std.testing.expect(!isAllowedLinuxTmpdir(&too_long));
+}
+
+test "SharedMemory: formatLinuxShmPath isolates TMPDIR sandboxes in /dev/shm and supports fallback" {
+    var buf_a: [256]u8 = undefined;
+    var buf_b: [256]u8 = undefined;
+    var buf_c: [256]u8 = undefined;
+
+    const runner_a = "/home/runner/work/_temp/wasi-thread-123/tmp";
+    const runner_a_slash = "/home/runner/work/_temp/wasi-thread-123/tmp///";
+    const runner_b = "/home/runner/work/_temp/wasi-thread-456/tmp";
+
+    const shm_a = formatLinuxShmPath(&buf_a, runner_a, true, 3, 0).?;
+    const shm_a_slash = formatLinuxShmPath(&buf_b, runner_a_slash, true, 3, 0).?;
+    const shm_b = formatLinuxShmPath(&buf_c, runner_b, true, 3, 0).?;
+
+    try std.testing.expect(std.mem.startsWith(u8, shm_a, "/dev/shm/wamr_shm_"));
+    try std.testing.expect(std.mem.endsWith(u8, shm_a, "_p3_s0.bin"));
+    try std.testing.expectEqualStrings(shm_a, shm_a_slash);
+    try std.testing.expect(!std.mem.eql(u8, shm_a, shm_b));
+
+    const fallback = formatLinuxShmPath(&buf_a, "/d/tmp/", false, 4, 2).?;
+    try std.testing.expectEqualStrings("/d/tmp/.wamr-shm-p4-s2", fallback);
+
+    try std.testing.expect(formatLinuxShmPath(&buf_a, "/home/g/tmp", true, 1, 0) == null);
+    try std.testing.expect(formatLinuxShmPath(&buf_a, "relative/tmp", false, 1, 0) == null);
 }

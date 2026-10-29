@@ -3895,13 +3895,356 @@ fn buildFrameAttribution(
     };
 }
 
+/// In functions that contain both full-call-clobber instructions (such as
+/// `.call`, `.atomic_wait`, `.atomic_notify`) and call-free innermost loops
+/// (such as `bench_hot_kernel` inlined into `hot_worker` or `main`), x86-64's
+/// 3 callee-saved registers (`r12..r14`) cannot hold 4+ call-spanning values
+/// (`sp`, `iterations`, `arg`, `seed`, ...). Linear scan spills the longest-
+/// lived interval (`sp`, used at function exit to restore `__stack_pointer`)
+/// to `[rbp - offset]` for the entire function, forcing `useVReg(..., .rax)`
+/// to reload `sp` into `rax` before every `.load`/`.store` inside the hot loop
+/// and defeating Zen 3 static register-based memory renaming on `[r15 + reg + 8]`.
+///
+/// For each innermost call-free loop with a dedicated preheader `ph` (outside
+/// all loops), this helper copies up to 4 call-spanning outer scalar VRegs
+/// (`v_outer -> v_loop`) in `ph`'s trailing `.parallel_copy` and rewrites
+/// operand uses of `v_outer` inside `loop.blocks` to `v_loop`. Because `v_loop`
+/// is live only across `[ph_end .. loop_end]` (zero call clobbers), linear
+/// scan allocates `v_loop` to a caller-saved register for the entire loop.
+fn localizeCallFreeLoopInvariants(
+    func_in: *const ir.IrFunction,
+    block_order: []const ir.BlockId,
+    allocator: std.mem.Allocator,
+) !?ir.IrFunction {
+    if (comptime builtin.os.tag == .windows) return null;
+    if (func_in.blocks.items.len < 2) return null;
+
+    var has_call_clobber = false;
+    for (func_in.blocks.items) |*blk| {
+        for (blk.instructions.items) |inst| {
+            if (isFullCallClobber(inst.op)) {
+                has_call_clobber = true;
+                break;
+            }
+        }
+        if (has_call_clobber) break;
+    }
+    if (!has_call_clobber) return null;
+
+    var dom = try analysis.computeDominators(func_in, allocator);
+    defer dom.deinit();
+    var lf = try analysis.computeLoops(func_in, &dom, allocator);
+    defer lf.deinit();
+    if (lf.loops.len == 0) return null;
+
+    var has_candidate_loop = false;
+    for (lf.loops, 0..) |*loop, loop_idx| {
+        var is_innermost = true;
+        for (lf.loops, 0..) |*other, other_idx| {
+            if (other_idx == loop_idx) continue;
+            if (loop.containsBlock(other.header)) {
+                is_innermost = false;
+                break;
+            }
+        }
+        if (!is_innermost) continue;
+
+        var loop_has_clobber = false;
+        for (loop.blocks) |bid| {
+            for (func_in.blocks.items[bid].instructions.items) |inst| {
+                if (isFullCallClobber(inst.op) or inst.op == .memory_copy or inst.op == .memory_fill) {
+                    loop_has_clobber = true;
+                    break;
+                }
+            }
+            if (loop_has_clobber) break;
+        }
+        if (!loop_has_clobber) {
+            has_candidate_loop = true;
+            break;
+        }
+    }
+    if (!has_candidate_loop) return null;
+
+    var vreg_types = std.AutoHashMap(ir.VReg, ir.IrType).init(allocator);
+    defer vreg_types.deinit();
+    var is_const = std.AutoHashMap(ir.VReg, void).init(allocator);
+    defer is_const.deinit();
+
+    for (func_in.blocks.items) |*blk| {
+        for (blk.instructions.items) |inst| {
+            if (inst.dest) |d| {
+                try vreg_types.put(d, inst.type);
+                switch (inst.op) {
+                    .iconst_32, .iconst_64, .fconst_32, .fconst_64, .v128_const => {
+                        try is_const.put(d, {});
+                    },
+                    else => {},
+                }
+            }
+            if (inst.op == .parallel_copy) {
+                for (inst.op.parallel_copy) |p| {
+                    try vreg_types.put(p.dst, p.ty);
+                }
+            }
+        }
+    }
+
+    var clobbers: std.ArrayList(regalloc.ClobberPoint) = .empty;
+    defer {
+        for (clobbers.items) |*cp| {
+            if (cp.live_vregs) |*bs| bs.deinit(allocator);
+        }
+        clobbers.deinit(allocator);
+    }
+    {
+        var pos: u32 = 0;
+        for (block_order) |bid| {
+            for (func_in.blocks.items[bid].instructions.items) |inst| {
+                if (isFullCallClobber(inst.op)) {
+                    try clobbers.append(allocator, .{
+                        .pos = pos,
+                        .regs_clobbered = x86_64_call_clobber_mask,
+                    });
+                }
+                pos += 1;
+            }
+        }
+    }
+    if (clobbers.items.len == 0) return null;
+    try analysis.populateClobberLiveVregs(func_in, block_order, clobbers.items, allocator);
+
+    var clobber_spanning_vregs = std.AutoHashMap(ir.VReg, void).init(allocator);
+    defer clobber_spanning_vregs.deinit();
+    for (clobbers.items) |cp| {
+        if (cp.live_vregs) |bs| {
+            var bit_it = bs.iterator(.{});
+            while (bit_it.next()) |bit_idx| {
+                const v: ir.VReg = @intCast(bit_idx);
+                if (is_const.contains(v)) continue;
+                const ty = vreg_types.get(v) orelse continue;
+                if (ty == .i32 or ty == .i64) {
+                    try clobber_spanning_vregs.put(v, {});
+                }
+            }
+        }
+    }
+    if (clobber_spanning_vregs.count() <= x86_64_callee_saved_indices.len) return null;
+
+    var out_opt: ?ir.IrFunction = null;
+    errdefer if (out_opt) |*o| o.deinit();
+
+    for (lf.loops, 0..) |*loop, loop_idx| {
+        var is_innermost = true;
+        for (lf.loops, 0..) |*other, other_idx| {
+            if (other_idx == loop_idx) continue;
+            if (loop.containsBlock(other.header)) {
+                is_innermost = false;
+                break;
+            }
+        }
+        if (!is_innermost) continue;
+
+        var loop_has_clobber = false;
+        for (loop.blocks) |bid| {
+            for (func_in.blocks.items[bid].instructions.items) |inst| {
+                if (isFullCallClobber(inst.op) or inst.op == .memory_copy or inst.op == .memory_fill) {
+                    loop_has_clobber = true;
+                    break;
+                }
+            }
+            if (loop_has_clobber) break;
+        }
+        if (loop_has_clobber) continue;
+
+        // Find unique outside-loop predecessor `ph` of `loop.header` (which must
+        // end in unconditional `.br loop.header`).
+        var maybe_ph: ?ir.BlockId = null;
+        var invalid_outside_pred = false;
+        for (func_in.blocks.items, 0..) |*cand_blk, cand_idx| {
+            const pred_id: ir.BlockId = @intCast(cand_idx);
+            if (loop.containsBlock(pred_id)) continue;
+            const c_insts = cand_blk.instructions.items;
+            if (c_insts.len == 0) continue;
+            switch (c_insts[c_insts.len - 1].op) {
+                .br => |target| {
+                    if (target == loop.header) {
+                        if (maybe_ph != null and maybe_ph.? != pred_id) {
+                            invalid_outside_pred = true;
+                            break;
+                        }
+                        maybe_ph = pred_id;
+                    }
+                },
+                .br_if => |bi| {
+                    if (bi.then_block == loop.header or bi.else_block == loop.header) {
+                        invalid_outside_pred = true;
+                        break;
+                    }
+                },
+                .br_table => |bt| {
+                    if (bt.default == loop.header) {
+                        invalid_outside_pred = true;
+                        break;
+                    }
+                    for (bt.targets) |t| {
+                        if (t == loop.header) {
+                            invalid_outside_pred = true;
+                            break;
+                        }
+                    }
+                    if (invalid_outside_pred) break;
+                },
+                else => {},
+            }
+        }
+        if (invalid_outside_pred) continue;
+        const ph = maybe_ph orelse continue;
+        if (!dom.dominates(ph, loop.header)) continue;
+
+        var ph_in_any_loop = false;
+        for (lf.loops) |*other| {
+            if (other.containsBlock(ph)) {
+                ph_in_any_loop = true;
+                break;
+            }
+        }
+        if (ph_in_any_loop) continue;
+
+        const ph_in_insts = func_in.blocks.items[ph].instructions.items;
+        if (ph_in_insts.len == 0) continue;
+        switch (ph_in_insts[ph_in_insts.len - 1].op) {
+            .br => |target| if (target != loop.header) continue,
+            else => continue,
+        }
+
+        var loop_defs = std.AutoHashMap(ir.VReg, void).init(allocator);
+        defer loop_defs.deinit();
+        for (loop.blocks) |bid| {
+            for (func_in.blocks.items[bid].instructions.items) |inst| {
+                if (inst.dest) |d| try loop_defs.put(d, {});
+                if (inst.op == .parallel_copy) {
+                    for (inst.op.parallel_copy) |p| {
+                        try loop_defs.put(p.dst, {});
+                    }
+                }
+            }
+        }
+        if (ph_in_insts.len >= 2 and ph_in_insts[ph_in_insts.len - 2].op == .parallel_copy) {
+            for (ph_in_insts[ph_in_insts.len - 2].op.parallel_copy) |p| {
+                try loop_defs.put(p.dst, {});
+            }
+        }
+
+        var candidates: std.ArrayList(ir.VReg) = .empty;
+        defer candidates.deinit(allocator);
+        var candidate_set = std.AutoHashMap(ir.VReg, void).init(allocator);
+        defer candidate_set.deinit();
+
+        const UseCollector = struct {
+            loop_defs_ptr: *const std.AutoHashMap(ir.VReg, void),
+            clobber_spanning_ptr: *const std.AutoHashMap(ir.VReg, void),
+            seen_ptr: *std.AutoHashMap(ir.VReg, void),
+            list_ptr: *std.ArrayList(ir.VReg),
+            alloc: std.mem.Allocator,
+
+            fn visit(ctx: *@This(), v: ir.VReg) !void {
+                if (ctx.loop_defs_ptr.contains(v)) return;
+                if (!ctx.clobber_spanning_ptr.contains(v)) return;
+                const gop = try ctx.seen_ptr.getOrPut(v);
+                if (!gop.found_existing) {
+                    try ctx.list_ptr.append(ctx.alloc, v);
+                }
+            }
+        };
+        var collector: UseCollector = .{
+            .loop_defs_ptr = &loop_defs,
+            .clobber_spanning_ptr = &clobber_spanning_vregs,
+            .seen_ptr = &candidate_set,
+            .list_ptr = &candidates,
+            .alloc = allocator,
+        };
+
+        for (loop.blocks) |bid| {
+            for (func_in.blocks.items[bid].instructions.items) |inst| {
+                if (inst.op == .phi) {
+                    for (inst.op.phi) |edge| {
+                        if (loop.containsBlock(edge.block)) {
+                            try collector.visit(edge.val);
+                        }
+                    }
+                } else {
+                    try range_split.forEachUseInst(inst, &collector, UseCollector.visit);
+                }
+            }
+        }
+
+        if (candidates.items.len == 0) continue;
+        const max_localized: usize = 4;
+        const take_count = @min(candidates.items.len, max_localized);
+
+        if (out_opt == null) {
+            out_opt = try func_in.clone(allocator);
+        }
+        const out = &out_opt.?;
+
+        var new_pairs: std.ArrayList(ir.Inst.ParallelCopy) = .empty;
+        defer new_pairs.deinit(allocator);
+        try new_pairs.ensureTotalCapacity(allocator, take_count);
+
+        for (candidates.items[0..take_count]) |v_outer| {
+            const ty = vreg_types.get(v_outer).?;
+            const v_loop = out.newVReg();
+            new_pairs.appendAssumeCapacity(.{
+                .dst = v_loop,
+                .src = v_outer,
+                .ty = ty,
+            });
+            for (loop.blocks) |bid| {
+                for (out.blocks.items[bid].instructions.items) |*inst| {
+                    if (inst.op == .phi) {
+                        for (@constCast(inst.op.phi)) |*edge| {
+                            if (loop.containsBlock(edge.block) and edge.val == v_outer) {
+                                edge.val = v_loop;
+                            }
+                        }
+                    } else {
+                        passes.replaceInInst(inst, v_outer, v_loop);
+                    }
+                }
+            }
+        }
+
+        const ph_block = &out.blocks.items[ph];
+        const term_idx = ph_block.instructions.items.len - 1;
+        if (term_idx > 0 and ph_block.instructions.items[term_idx - 1].op == .parallel_copy) {
+            const old_pairs = ph_block.instructions.items[term_idx - 1].op.parallel_copy;
+            const merged = try out.allocator.alloc(ir.Inst.ParallelCopy, old_pairs.len + new_pairs.items.len);
+            @memcpy(merged[0..old_pairs.len], old_pairs);
+            @memcpy(merged[old_pairs.len..], new_pairs.items);
+            if (old_pairs.len > 0) out.allocator.free(old_pairs);
+            ph_block.instructions.items[term_idx - 1].op = .{ .parallel_copy = merged };
+        } else {
+            const owned_pairs = try out.allocator.dupe(ir.Inst.ParallelCopy, new_pairs.items);
+            errdefer out.allocator.free(owned_pairs);
+            try ph_block.instructions.insert(out.allocator, term_idx, .{
+                .op = .{ .parallel_copy = owned_pairs },
+                .type = .void,
+                .dest = null,
+            });
+        }
+    }
+
+    return out_opt;
+}
+
 /// #778: same as `compileFunctionRAWithGlobalOffsets`, but records the
 /// contiguous setup / liveness / regalloc spans into `timer` when codegen
 /// timing is live. `timer == null` is the normal (untimed) path.
 /// `spill_ctx` (≠ null) additionally requests the #808 Lever 1 per-function
 /// spill-cost diagnostic.
 fn compileFunctionRAWithGlobalOffsetsTimed(
-    func: *const ir.IrFunction,
+    func_in: *const ir.IrFunction,
     import_count: u32,
     global_offsets: []const u32,
     allocator: std.mem.Allocator,
@@ -3910,7 +4253,7 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
     frame_attr_ctx: ?FrameAttributionCtx,
     options: FunctionCompileOptions,
 ) !FuncCompileResult {
-    if (functionUsesV128(func)) return error.UnsupportedV128;
+    if (functionUsesV128(func_in)) return error.UnsupportedV128;
 
     // Setup span: block ordering + const-fold table + clobber/hint walk.
     if (timer) |t| t.begin();
@@ -3918,8 +4261,12 @@ fn compileFunctionRAWithGlobalOffsetsTimed(
     // Compute block emission order ONCE, before anything that uses global
     // instruction numbering. Clobber points, live ranges, and code emission
     // all must use THIS order (same fix as aarch64 — see PR #195 / #203).
-    const block_order = try passes.reorderBlocks(func, allocator);
+    const block_order = try passes.reorderBlocks(func_in, allocator);
     defer allocator.free(block_order);
+
+    var localized_func = try localizeCallFreeLoopInvariants(func_in, block_order, allocator);
+    defer if (localized_func) |*lf| lf.deinit();
+    const func: *const ir.IrFunction = if (localized_func) |*lf| lf else func_in;
 
     var const_vals = try buildConstVals(func, allocator);
     defer const_vals.deinit();
@@ -11300,6 +11647,146 @@ test "#798 Wave 11 x86_64: frameless leaf elides rbp/rbx and folds constant load
     try std.testing.expect(isSingleInsnImmX86(-5, .i32));
     try std.testing.expectEqual(@as(usize, 9), x86_64_reg_set_ex(0, false).alloc_regs.len);
 }
+
+test "VmCtx layout: call-free loop localizes call-spanning outer VRegs into registers" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 1, 2);
+    defer func.deinit();
+
+    const b_entry = try func.newBlock();
+    const b_loop = try func.newBlock();
+    const b_exit = try func.newBlock();
+
+    const entry_blk = func.getBlock(b_entry);
+    const loop_blk = func.getBlock(b_loop);
+    const exit_blk = func.getBlock(b_exit);
+
+    // 5 non-constant values defined in b_entry and used after the loop in b_exit,
+    // all spanning an `.atomic_wait` clobber in b_entry (> 3 callee-saved regs).
+    // Without preheader localization, linear scan spills the longest-lived value
+    // (`v_sp`, used at function exit) to `[rbp - offset]`, causing every `.load`
+    // and `.store` in `b_loop` to reload `v_sp` into `rax` from the stack.
+    const v_arg = func.newVReg();
+    const v_sp = func.newVReg();
+    const v_iter = func.newVReg();
+    const v_seed = func.newVReg();
+    const v_extra = func.newVReg();
+    const v_c16 = func.newVReg();
+    const v_wait_exp = func.newVReg();
+    const v_wait_tmo = func.newVReg();
+    const v_wait_res = func.newVReg();
+    const v_zero64 = func.newVReg();
+    const v_one64 = func.newVReg();
+    const v_i = func.newVReg();
+    const v_state = func.newVReg();
+
+    try entry_blk.append(.{ .op = .{ .local_get = 0 }, .dest = v_arg, .type = .i32 });
+    try entry_blk.append(.{ .op = .{ .iconst_32 = 16 }, .dest = v_c16, .type = .i32 });
+    try entry_blk.append(.{ .op = .{ .sub = .{ .lhs = v_arg, .rhs = v_c16 } }, .dest = v_sp, .type = .i32 });
+    try entry_blk.append(.{ .op = .{ .load = .{ .base = v_arg, .offset = 8, .size = 8, .sign_extend = false } }, .dest = v_iter, .type = .i64 });
+    try entry_blk.append(.{ .op = .{ .load = .{ .base = v_arg, .offset = 16, .size = 8, .sign_extend = false } }, .dest = v_seed, .type = .i64 });
+    try entry_blk.append(.{ .op = .{ .load = .{ .base = v_arg, .offset = 24, .size = 8, .sign_extend = false } }, .dest = v_extra, .type = .i64 });
+
+    try entry_blk.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_wait_exp, .type = .i32 });
+    try entry_blk.append(.{ .op = .{ .iconst_64 = -1 }, .dest = v_wait_tmo, .type = .i64 });
+    try entry_blk.append(.{
+        .op = .{ .atomic_wait = .{
+            .base = v_arg,
+            .offset = 0,
+            .expected = v_wait_exp,
+            .timeout = v_wait_tmo,
+            .size = 4,
+        } },
+        .dest = v_wait_res,
+        .type = .i32,
+    });
+
+    try entry_blk.append(.{ .op = .{ .iconst_64 = 0 }, .dest = v_zero64, .type = .i64 });
+    const entry_copies = try allocator.alloc(ir.Inst.ParallelCopy, 2);
+    entry_copies[0] = .{ .dst = v_i, .src = v_zero64, .ty = .i64 };
+    entry_copies[1] = .{ .dst = v_state, .src = v_seed, .ty = .i64 };
+    try entry_blk.append(.{ .op = .{ .parallel_copy = entry_copies }, .type = .void });
+    try entry_blk.append(.{ .op = .{ .br = b_loop } });
+
+    // Call-free hot loop `b_loop`: store [v_sp + 8], load [v_sp + 8], ALU, compare with v_iter.
+    const v_cur = func.newVReg();
+    const v_next_state = func.newVReg();
+    const v_next_i = func.newVReg();
+    const v_cond = func.newVReg();
+    try loop_blk.append(.{ .op = .{ .store = .{ .base = v_sp, .val = v_state, .offset = 8, .size = 8 } } });
+    try loop_blk.append(.{ .op = .{ .load = .{ .base = v_sp, .offset = 8, .size = 8, .sign_extend = false } }, .dest = v_cur, .type = .i64 });
+    try loop_blk.append(.{ .op = .{ .add = .{ .lhs = v_cur, .rhs = v_i } }, .dest = v_next_state, .type = .i64 });
+    try loop_blk.append(.{ .op = .{ .iconst_64 = 1 }, .dest = v_one64, .type = .i64 });
+    try loop_blk.append(.{ .op = .{ .add = .{ .lhs = v_i, .rhs = v_one64 } }, .dest = v_next_i, .type = .i64 });
+    try loop_blk.append(.{ .op = .{ .ne = .{ .lhs = v_next_i, .rhs = v_iter } }, .dest = v_cond, .type = .i32 });
+    const latch_copies = try allocator.alloc(ir.Inst.ParallelCopy, 2);
+    latch_copies[0] = .{ .dst = v_i, .src = v_next_i, .ty = .i64 };
+    latch_copies[1] = .{ .dst = v_state, .src = v_next_state, .ty = .i64 };
+    try loop_blk.append(.{ .op = .{ .parallel_copy = latch_copies }, .type = .void });
+    try loop_blk.append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b_loop, .else_block = b_exit } } });
+
+    // Exit block uses all outer VRegs so `v_sp` has the longest live range.
+    const v_sum1 = func.newVReg();
+    const v_sum2 = func.newVReg();
+    const v_ret = func.newVReg();
+    try exit_blk.append(.{ .op = .{ .add = .{ .lhs = v_next_state, .rhs = v_extra } }, .dest = v_sum1, .type = .i64 });
+    try exit_blk.append(.{ .op = .{ .add = .{ .lhs = v_sum1, .rhs = v_seed } }, .dest = v_sum2, .type = .i64 });
+    try exit_blk.append(.{ .op = .{ .store = .{ .base = v_arg, .val = v_sum2, .offset = 32, .size = 8 } } });
+    try exit_blk.append(.{ .op = .{ .add = .{ .lhs = v_sp, .rhs = v_wait_res } }, .dest = v_ret, .type = .i32 });
+    try exit_blk.append(.{ .op = .{ .ret = v_ret } });
+
+    const block_order = try passes.reorderBlocks(&func, allocator);
+    defer allocator.free(block_order);
+    var localized_opt = try localizeCallFreeLoopInvariants(&func, block_order, allocator);
+    defer if (localized_opt) |*lf| lf.deinit();
+    try std.testing.expect(localized_opt != null);
+    const localized = &localized_opt.?;
+
+    // Verify `v_sp` and `v_iter` were localized in `b_entry`'s trailing `.parallel_copy`
+    // and rewritten inside `b_loop`.
+    const ph_insts = localized.blocks.items[b_entry].instructions.items;
+    const ph_pc = ph_insts[ph_insts.len - 2].op.parallel_copy;
+    try std.testing.expectEqual(@as(usize, 4), ph_pc.len);
+    const loop_insts = localized.blocks.items[b_loop].instructions.items;
+    try std.testing.expect(loop_insts[0].op.store.base != v_sp);
+    try std.testing.expectEqual(loop_insts[0].op.store.base, loop_insts[1].op.load.base);
+
+    const fa_ctx = FrameAttributionCtx{
+        .output_prefix = "test",
+        .module_idx = 0,
+        .func_idx = 0,
+        .cwasm_aot_version = 1,
+        .compiler_build_id = "test",
+    };
+    var result = try compileFunctionRAWithGlobalOffsetsTimed(
+        &func,
+        0,
+        &.{},
+        allocator,
+        null,
+        null,
+        fa_ctx,
+        .{ .guard_page_bounds_elision = true },
+    );
+    defer allocator.free(result.code);
+    defer allocator.free(result.call_patches);
+    defer if (result.frame_attribution) |*fa| fa.deinit(allocator);
+
+    // Every instruction inside `b_loop` (IR positions covering the loop block)
+    // must execute with 0 allocator spill reloads/stores.
+    const fa = result.frame_attribution.?;
+    const b0_len: u32 = @intCast(localized.blocks.items[b_entry].instructions.items.len);
+    const b1_len: u32 = @intCast(localized.blocks.items[b_loop].instructions.items.len);
+    for (fa.accesses) |acc| {
+        if (acc.origin == .allocator_spill) {
+            if (acc.ir_position) |ir_pos| {
+                try std.testing.expect(ir_pos < b0_len or ir_pos >= b0_len + b1_len);
+            }
+        }
+    }
+}
+
 
 
 
