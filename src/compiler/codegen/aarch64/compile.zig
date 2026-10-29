@@ -11546,9 +11546,6 @@ fn emitAtomicRmw(
     // != Rn (addr=tmp0) and Rt != Rs (rs_reg ∈ {tmp1, val's home reg}).
     const info = try destBegin(reg_map, dest, RegMap.tmp2);
     try code.lseAtomic(lse_op, rs_reg, info.reg, RegMap.tmp0, rmw.size);
-    try code.dmbIsh();
-    const isb_bytes = std.mem.toBytes(std.mem.nativeToLittle(u32, 0xD5033FDF));
-    try code.bytes.appendSlice(code.allocator, &isb_bytes);
     try destCommit(code, reg_map, info);
 }
 
@@ -19396,24 +19393,14 @@ test "compile: atomic_rmw add emits LDADDAL" {
     const code = try compileFunction(&func, allocator);
     defer allocator.free(code);
     // Look for any LDADDAL Ws, Wt, [Xn]: top 12 bits = 0xB8E and
-    // opcode[15:12]=0000. Mask low bits for Rs/Rn/Rt. Verify it is
-    // immediately followed by DMB ISH (0xD5033BBF) + ISB (0xD5033FDF).
+    // opcode[15:12]=0000. Mask low bits for Rs/Rn/Rt.
     var found = false;
-    var found_pacing = false;
     var i: usize = 0;
     while (i + 4 <= code.len) : (i += 4) {
         const w = std.mem.readInt(u32, code[i..][0..4], .little);
-        if ((w & 0xFFE0FC00) == 0xB8E00000) {
-            found = true;
-            if (i + 12 <= code.len) {
-                const dmb = std.mem.readInt(u32, code[i + 4 ..][0..4], .little);
-                const isb = std.mem.readInt(u32, code[i + 8 ..][0..4], .little);
-                if (dmb == 0xD5033BBF and isb == 0xD5033FDF) found_pacing = true;
-            }
-        }
+        if ((w & 0xFFE0FC00) == 0xB8E00000) found = true;
     }
     try std.testing.expect(found);
-    try std.testing.expect(found_pacing);
 }
 
 test "compile: atomic alignment trap precedes bounds trap" {
