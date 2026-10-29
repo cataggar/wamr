@@ -436,22 +436,19 @@ fn decode(word: u32) Inst {
 
     // ── FP/SIMD↔GPR transfers (FMOV between scalar FP and GPR) ──
     // `sf 0011110 type 1 rmode opcode 000000 Rn Rd` — covers FMOV
-    // Sd/Dd ← Wn/Xn and the reverse. We can decode the GPR direction
-    // safely: opcode 110/111 = GPR→VFP, opcode 100/101 = no? Decode
-    // conservatively from the encoded bits.
+    // Sd/Dd ← Wn/Xn and the reverse.
     if ((word & 0x5F207C00) == 0x1E200000) {
         // Floating-point ↔ integer conversions. opcode bits 18:16.
         const opcode = (word >> 16) & 0b111;
         const rd: u5 = @intCast(word & 0x1F);
         const rn: u5 = @intCast((word >> 5) & 0x1F);
-        // opcode 110 = FMOV Vd ← Rn (GPR→V). opcode 111 = FMOV Rd ← Vn.
+        // opcode 110 = FMOV Rd ← Vn (V→GPR, Rd written).
+        // opcode 111 = FMOV Vd ← Rn (GPR→V, Rn read).
         // opcode 010 = SCVTF (Rn read, V written). 011 = UCVTF.
-        // opcode 000/001 = FCVTNS/FCVTNU (V read, Rd written).
+        // opcode 000/001/100/101 = FCVT* (V read, Rd written).
         return switch (opcode) {
-            0b110 => Inst{ .reads = bit(rn), .writes = 0, .decoded = true },
-            0b111 => Inst{ .reads = 0, .writes = bit(rd), .decoded = true },
-            0b010, 0b011 => Inst{ .reads = bit(rn), .writes = 0, .decoded = true },
-            0b000, 0b001, 0b100, 0b101 => Inst{ .reads = 0, .writes = bit(rd), .decoded = true },
+            0b111, 0b010, 0b011 => Inst{ .reads = bit(rn), .writes = 0, .decoded = true },
+            0b110, 0b000, 0b001, 0b100, 0b101 => Inst{ .reads = 0, .writes = bit(rd), .decoded = true },
             else => Inst.barrier(),
         };
     }
@@ -662,9 +659,10 @@ fn rewriteReadReg(word: u32, old_reg: u5, new_reg: u5) ?u32 {
     // FP/SIMD ↔ GPR scalar transfers.
     if ((word & 0x5F207C00) == 0x1E200000) {
         const opcode = (word >> 16) & 0b111;
-        // Only the GPR→FP / GPR-read directions read Rn. Rewrite Rn.
+        // Only the GPR→FP / GPR-read directions (FMOV Vd,Rn=111, SCVTF=010,
+        // UCVTF=011) read GPR Rn. Rewrite Rn.
         switch (opcode) {
-            0b110, 0b010, 0b011 => {
+            0b111, 0b010, 0b011 => {
                 _ = replaceField(&w, 5, old_reg, new_reg);
                 return w;
             },
@@ -680,6 +678,24 @@ fn rewriteReadReg(word: u32, old_reg: u5, new_reg: u5) ?u32 {
 /// always refuse to coalesce. See module-level docs.
 fn isReservedReg(reg: u5) bool {
     return reg == 19 or reg == 20 or reg == 29 or reg == 30 or reg == 31;
+}
+
+/// True if every GPR read performed by `word` is 32-bit (W-form, ignoring
+/// bits [63:32]). Used to guard 32-bit `mov wD, wS` (`uxtw`) coalescing:
+/// `mov wD, wS` zeroes bits [63:32] of `xD`, whereas `xS` may hold non-zero
+/// upper bits (e.g. from `i32.wrap_i64` or 64-bit values). Rewriting a
+/// 64-bit consumer (or a 64-bit load/store base address `Xn`) from `xD` to
+/// `xS` would observe un-cleared upper 32 bits.
+fn readsOnly32Bit(word: u32) bool {
+    // Load/store instructions always read their base register `Rn` as a
+    // 64-bit address (`Xn`).
+    if ((word & 0x3A000000) == 0x28000000) return false;
+    if ((word & 0x3B000000) == 0x39000000) return false;
+    if ((word & 0x3B200C00) == 0x38200800) return false;
+    if ((word & 0x3B200C00) == 0x38000000) return false;
+    // All other decoded instructions encode `sf` (or `b5` for TBZ/TBNZ) at
+    // bit 31: 0 = 32-bit W operands, 1 = 64-bit X operands.
+    return (word >> 31) == 0;
 }
 
 /// Block-local coalescing scan for one `[start, end)` byte range.
@@ -726,10 +742,14 @@ fn coalesceBlock(bytes: []u8, start: usize, end: usize) struct {
             const rm: u5 = if (mov64) |m| m.rm else mov32.?.rm;
 
             if (rd == rm) {
-                // Self-MOV: always eliminable. NOP it.
-                std.mem.writeInt(u32, bytes[off..][0..4], NOP, .little);
-                self_eliminated += 1;
-                changed = true;
+                // Only 64-bit `mov xD, xD` is a pure no-op. 32-bit
+                // `mov wD, wD` (`uxtw xD, wD`) zeroes the upper 32 bits
+                // of `xD` and is emitted deliberately for 32→64 zero-ext.
+                if (mov64 != null) {
+                    std.mem.writeInt(u32, bytes[off..][0..4], NOP, .little);
+                    self_eliminated += 1;
+                    changed = true;
+                }
                 continue;
             }
 
@@ -772,9 +792,10 @@ fn coalesceBlock(bytes: []u8, start: usize, end: usize) struct {
                 const writes_xs = inst.writes & rm_mask != 0;
 
                 if (reads_xd) {
-                    if (xs_clobbered) {
-                        // Substituted read would observe the new xS,
-                        // not the value the MOV captured. Refuse.
+                    if (xs_clobbered or (mov32 != null and !readsOnly32Bit(wj))) {
+                        // Substituted read would observe the new xS (or,
+                        // for mov32/uxtw, un-zeroed upper 32 bits of xS).
+                        // Refuse.
                         blocked = true;
                         break;
                     }
@@ -941,6 +962,10 @@ fn encodeSubX(rd: u5, rn: u5, rm: u5) u32 {
 
 fn encodeAddImm(rd: u5, rn: u5, imm12: u12) u32 {
     return 0x91000000 | (@as(u32, imm12) << 10) | (@as(u32, rn) << 5) | rd;
+}
+
+fn encodeAddImmW(rd: u5, rn: u5, imm12: u12) u32 {
+    return 0x11000000 | (@as(u32, imm12) << 10) | (@as(u32, rn) << 5) | rd;
 }
 
 fn encodeLdrUImm(rt: u5, rn: u5, off: u12) u32 {
@@ -1282,7 +1307,23 @@ test "coalesce_post: block boundary respected" {
     try testing.expectEqual(input[7], out[7]);
 }
 
-test "coalesce_post: 32-bit MOV w-form also coalesced" {
+test "coalesce_post: 32-bit MOV w-form also coalesced into 32-bit consumer" {
+    const input = [_]u32{
+        encodeMovzX(1, 5),
+        encodeMovW(2, 1),
+        encodeAddImmW(3, 2, 4),
+        encodeMovzX(2, 0),
+        encodeRet(),
+    };
+    const out = try runCoalesce(&input, testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqual(NOP, out[1]);
+    try testing.expectEqual(encodeAddImmW(3, 1, 4), out[2]);
+}
+
+test "coalesce_post: 32-bit MOV w-form blocked when consumer is 64-bit" {
+    // mov w2, w1 zeroes upper 32 bits of x2; rewriting `add x3, x2, #4`
+    // to `add x3, x1, #4` would expose un-zeroed upper bits of x1.
     const input = [_]u32{
         encodeMovzX(1, 5),
         encodeMovW(2, 1),
@@ -1292,6 +1333,41 @@ test "coalesce_post: 32-bit MOV w-form also coalesced" {
     };
     const out = try runCoalesce(&input, testing.allocator);
     defer testing.allocator.free(out);
-    try testing.expectEqual(NOP, out[1]);
-    try testing.expectEqual(encodeAddImm(3, 1, 4), out[2]);
+    try testing.expectEqualSlices(u32, &input, out);
+}
+
+test "coalesce_post: 32-bit self-MOV (uxtw wD, wD) preserved" {
+    const input = [_]u32{
+        encodeMovW(1, 1),
+        encodeRet(),
+    };
+    const out = try runCoalesce(&input, testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualSlices(u32, &input, out);
+}
+
+test "coalesce_post: FMOV direction opcodes decoded and rewritten accurately" {
+    // Verify `fmov x6, d0` (0x9E660006, opcode 110) writes x6 and does NOT
+    // read/rewrite x0: a preceding `mov x0, x21` must NOT rewrite `d0` to `d21`.
+    // Conversely, `fmov d0, x2` (0x9E670040, opcode 111) reads x2 and CAN
+    // coalesce a preceding `mov x2, x1`.
+    const fmov_x6_d0: u32 = 0x9E660006;
+    const fmov_d0_x2: u32 = 0x9E670040;
+    const fmov_d0_x1: u32 = 0x9E670020;
+    const input = [_]u32{
+        encodeMovX(0, 21),
+        fmov_x6_d0,
+        encodeMovzX(0, 0),
+        encodeMovX(2, 1),
+        fmov_d0_x2,
+        encodeMovzX(2, 0),
+        encodeRet(),
+    };
+    const out = try runCoalesce(&input, testing.allocator);
+    defer testing.allocator.free(out);
+    // `mov x0, x21` has no uses before `movz x0, #0`; `fmov x6, d0` must stay untouched.
+    try testing.expectEqual(fmov_x6_d0, out[1]);
+    // `mov x2, x1` is coalesced into `fmov d0, x1`.
+    try testing.expectEqual(NOP, out[3]);
+    try testing.expectEqual(fmov_d0_x1, out[4]);
 }

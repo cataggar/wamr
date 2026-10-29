@@ -7662,7 +7662,7 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
     const nblocks = func.blocks.items.len;
     const nlocals = func.local_count;
 
-    // ── Step 1: find which blocks define (local.set) each local ──────
+    // ── Step 1: find which blocks define (local.set) and upward-expose (local.get) each local ──
     var def_blocks = try allocator.alloc(std.ArrayList(ir.BlockId), nlocals);
     defer {
         for (def_blocks) |*l| l.deinit(allocator);
@@ -7670,28 +7670,46 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
     }
     for (def_blocks) |*l| l.* = .empty;
 
+    var uevar_blocks = try allocator.alloc(std.ArrayList(ir.BlockId), nlocals);
+    defer {
+        for (uevar_blocks) |*l| l.deinit(allocator);
+        allocator.free(uevar_blocks);
+    }
+    for (uevar_blocks) |*l| l.* = .empty;
+
+    const last_def_block = try allocator.alloc(u32, nlocals);
+    defer allocator.free(last_def_block);
+    @memset(last_def_block, std.math.maxInt(u32));
+
+    const last_ue_block = try allocator.alloc(u32, nlocals);
+    defer allocator.free(last_ue_block);
+    @memset(last_ue_block, std.math.maxInt(u32));
+
     for (func.blocks.items, 0..) |block, bid_usize| {
         const bid: ir.BlockId = @intCast(bid_usize);
         for (block.instructions.items) |inst| {
-            if (inst.op == .local_set) {
-                const idx = inst.op.local_set.idx;
-                if (idx < nlocals) {
-                    // Deduplicate.
-                    var dup = false;
-                    for (def_blocks[idx].items) |existing| {
-                        if (existing == bid) {
-                            dup = true;
-                            break;
-                        }
+            switch (inst.op) {
+                .local_get => |idx| {
+                    if (idx < nlocals and last_def_block[idx] != bid and last_ue_block[idx] != bid) {
+                        last_ue_block[idx] = bid;
+                        try uevar_blocks[idx].append(allocator, bid);
                     }
-                    if (!dup) try def_blocks[idx].append(allocator, bid);
-                }
+                },
+                .local_set => |ls| {
+                    const idx = ls.idx;
+                    if (idx < nlocals and last_def_block[idx] != bid) {
+                        last_def_block[idx] = bid;
+                        try def_blocks[idx].append(allocator, bid);
+                    }
+                },
+                else => {},
             }
         }
     }
 
-    // ── Step 2: place phi nodes at iterated dominance frontiers ──────
-    // For each local, compute IDF(def_blocks) and insert phi.
+    // ── Step 2: place phi nodes at liveness-pruned iterated dominance frontiers ──
+    // For each local, compute LiveIn(local) via backward BFS from upward-exposed
+    // uses, then intersect IDF(def_blocks) with LiveIn(local) (Pruned SSA).
     // has_phi[local][block] tracks whether a phi was already placed.
     var has_phi = try allocator.alloc(std.AutoHashMap(ir.BlockId, ir.VReg), nlocals);
     defer {
@@ -7707,28 +7725,58 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
     var phi_local = std.AutoHashMap(ir.VReg, usize).init(allocator);
     defer phi_local.deinit();
 
-    // Worklist for iterated DF.
+    // Worklist and generation stamps for per-local LiveIn and IDF.
     var worklist: std.ArrayList(ir.BlockId) = .empty;
     defer worklist.deinit(allocator);
-    var in_worklist = try allocator.alloc(bool, nblocks);
-    defer allocator.free(in_worklist);
+    var in_worklist_stamp = try allocator.alloc(u32, nblocks);
+    defer allocator.free(in_worklist_stamp);
+    @memset(in_worklist_stamp, 0);
+    var kill_stamp = try allocator.alloc(u32, nblocks);
+    defer allocator.free(kill_stamp);
+    @memset(kill_stamp, 0);
+    var live_in_stamp = try allocator.alloc(u32, nblocks);
+    defer allocator.free(live_in_stamp);
+    @memset(live_in_stamp, 0);
 
     for (0..nlocals) |local_idx| {
-        // Pruned SSA: skip locals that have no defs (never set).
-        if (def_blocks[local_idx].items.len == 0) continue;
+        // Pruned SSA: skip locals that have no defs or no upward-exposed reads.
+        if (def_blocks[local_idx].items.len == 0 or uevar_blocks[local_idx].items.len == 0) continue;
+        const stamp: u32 = @intCast(local_idx + 1);
 
-        // Seed worklist with defining blocks.
+        for (def_blocks[local_idx].items) |b| {
+            kill_stamp[b] = stamp;
+        }
+
+        // Backward BFS from upward-exposed blocks to mark all LiveIn blocks for `local_idx`.
         worklist.clearRetainingCapacity();
-        @memset(in_worklist, false);
+        for (uevar_blocks[local_idx].items) |b| {
+            live_in_stamp[b] = stamp;
+            try worklist.append(allocator, b);
+        }
+        var lwi: usize = 0;
+        while (lwi < worklist.items.len) : (lwi += 1) {
+            const b = worklist.items[lwi];
+            const pred_list = preds.get(b) orelse continue;
+            for (pred_list) |p| {
+                if (kill_stamp[p] != stamp and live_in_stamp[p] != stamp) {
+                    live_in_stamp[p] = stamp;
+                    try worklist.append(allocator, p);
+                }
+            }
+        }
+
+        // Seed IDF worklist with defining blocks.
+        worklist.clearRetainingCapacity();
         for (def_blocks[local_idx].items) |b| {
             try worklist.append(allocator, b);
-            in_worklist[b] = true;
+            in_worklist_stamp[b] = stamp;
         }
 
         var wi: usize = 0;
         while (wi < worklist.items.len) : (wi += 1) {
             const b = worklist.items[wi];
             for (df[b]) |y| {
+                if (live_in_stamp[y] != stamp) continue;
                 if (!has_phi[local_idx].contains(y)) {
                     // Insert phi at top of block y.
                     const phi_dest = func.newVReg();
@@ -7754,9 +7802,9 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
                     const gop = try phi_local.getOrPut(phi_dest);
                     std.debug.assert(!gop.found_existing);
                     gop.value_ptr.* = local_idx;
-                    if (!in_worklist[y]) {
+                    if (in_worklist_stamp[y] != stamp) {
                         try worklist.append(allocator, y);
-                        in_worklist[y] = true;
+                        in_worklist_stamp[y] = stamp;
                     }
                 }
             }
@@ -19354,6 +19402,49 @@ test "foldInverseCompareEqz and foldBranchOnEqz: xor folds to eq/ne" {
         try std.testing.expect(try foldBranchOnEqz(&func, allocator));
         try std.testing.expect(func.getBlock(b0).instructions.items[2].op == .ne);
     }
+}
+
+test "promoteLocalsToSSA: pruned SSA omits phis at join blocks where local is not live-in" {
+    const allocator = std.testing.allocator;
+    const local_types = try allocator.dupe(ir.IrType, &.{ .i32, .i32 });
+    var func = ir.IrFunction.init(allocator, 0, 1, 2);
+    func.local_types = local_types;
+    defer func.deinit();
+
+    // Diamond CFG: b0 -> b1 | b2 -> b3.
+    // Local 0 is set in b1 and read in b3 (live-in at b3 -> gets a phi).
+    // Local 1 is set in b1 and NEVER read in b3 (dead at b3 -> pruned, no phi).
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+
+    const v_cond = func.newVReg();
+    const v_val0 = func.newVReg();
+    const v_val1 = func.newVReg();
+    const v_ret = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_cond, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b1, .else_block = b2 } } });
+
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 42 }, .dest = v_val0, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_val0 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 99 }, .dest = v_val1, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .local_set = .{ .idx = 1, .val = v_val1 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+
+    try func.getBlock(b3).append(.{ .op = .{ .local_get = 0 }, .dest = v_ret, .type = .i32 });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = v_ret } });
+
+    try std.testing.expect(try promoteLocalsToSSA(&func, allocator));
+
+    var phi_count: usize = 0;
+    for (func.getBlock(b3).instructions.items) |inst| {
+        if (inst.op == .phi) phi_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), phi_count);
 }
 
 test "promoteLocalsToSSA: inserts entry local_get in ascending local index order" {
