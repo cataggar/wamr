@@ -2149,7 +2149,10 @@ pub const AotInstance = struct {
     global_storage_size: u32 = 0,
     allocator: std.mem.Allocator,
     /// Stable vmctx storage used by AOT calls and MemoryInstance subscriber lists.
-    vmctx: VmCtx = .{},
+    /// Page-aligned (4096 B) so hot-loop VmCtx loads (`[rbx + 8]`, `[rbx + 432]`)
+    /// always reside at low 4 KiB page offsets (`0x000..0x1e0`) and never 4K-alias
+    /// in the x86-64 Load-Store Queue with top-of-page Wasm shadow-stack frames.
+    vmctx: VmCtx align(4096) = .{},
     /// Reason recorded by the most recent catchable trap in this instance.
     /// The public call still returns `error.WasmTrap`; embedders and the CLI
     /// may inspect this for diagnostic parity with the interpreter.
@@ -6016,6 +6019,15 @@ test "VmCtx layout: fields at expected offsets" {
     try std.testing.expectEqual(@as(usize, 464), @offsetOf(VmCtx, "cancel_group_token"));
     try std.testing.expectEqual(@as(usize, 472), @offsetOf(VmCtx, "func_table_type_backing_ptr"));
     try std.testing.expectEqual(@as(usize, 480), @sizeOf(VmCtx));
+}
+
+test "VmCtx layout: AotInstance.vmctx is 4096-byte page-aligned" {
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(AotInstance, "vmctx") % 4096);
+    try std.testing.expect(@alignOf(AotInstance) >= 4096);
+    const module = aot_loader.AotModule{};
+    const inst = try instantiate(&module, std.testing.allocator);
+    defer destroy(inst);
+    try std.testing.expectEqual(@as(usize, 0), @intFromPtr(&inst.vmctx) % 4096);
 }
 
 noinline fn triggerGuardPageFaultForTest(ptr: *allowzero const volatile u8) u8 {

@@ -3205,7 +3205,11 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                         if (!memInBounds(rm.addr, 4, rm.mem.byteLen())) return error.OutOfBoundsMemoryAccess;
                         const ptr: *u32 = @ptrCast(@alignCast(rm.mem.data.ptr + @as(usize, @intCast(rm.addr))));
                         const old = doAtomicRmw(u32, ptr, .Add, val);
-                        try env.pushI32(@bitCast(old));
+                        if (ip < code.len and code[ip] == 0x1A) {
+                            ip += 1;
+                        } else {
+                            try env.pushI32(@bitCast(old));
+                        }
                     },
                     0x1F => { // i64.atomic.rmw.add
                         const ma = readMemarg(code, &ip);
@@ -3215,7 +3219,11 @@ fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32,
                         if (!memInBounds(rm.addr, 8, rm.mem.byteLen())) return error.OutOfBoundsMemoryAccess;
                         const ptr: *u64 = @ptrCast(@alignCast(rm.mem.data.ptr + @as(usize, @intCast(rm.addr))));
                         const old = doAtomicRmw(u64, ptr, .Add, val);
-                        try env.pushI64(@bitCast(old));
+                        if (ip < code.len and code[ip] == 0x1A) {
+                            ip += 1;
+                        } else {
+                            try env.pushI64(@bitCast(old));
+                        }
                     },
                     else => {
                         ip = try executeAtomicPrefix(env, code, ip, sub_op);
@@ -3909,7 +3917,11 @@ inline fn doAtomicStore(comptime T: type, ptr: *T, val: T) void {
 
 inline fn doAtomicRmw(comptime T: type, ptr: *T, comptime op: std.builtin.AtomicRmwOp, val: T) T {
     if (@bitSizeOf(T) <= 32 or has_64bit_atomics) {
-        return @atomicRmw(T, ptr, op, val, .seq_cst);
+        const old = @atomicRmw(T, ptr, op, val, .seq_cst);
+        if (comptime builtin.cpu.arch == .aarch64) {
+            asm volatile ("dmb ish\n\tisb" ::: .{ .memory = true });
+        }
+        return old;
     } else {
         const old = ptr.*;
         ptr.* = switch (op) {
@@ -5298,6 +5310,33 @@ test "interp: i32.atomic.rmw.add" {
         0x0B,
     });
     try testing.expectEqual(@as(i32, 10), result); // returns OLD value
+}
+
+test "interp: i32.atomic.rmw.add and i64.atomic.rmw.add fuse trailing drop" {
+    const result = try runCodeWithMem(&.{
+        0x41, 0x00, // i32.const 0 (addr)
+        0x41, 10, // i32.const 10
+        0xFE, 0x17, 0x02, 0x00, // i32.atomic.store align=2 offset=0
+        0x41, 0x00, // i32.const 0 (addr)
+        0x41, 5, // i32.const 5
+        0xFE, 0x1E, 0x02, 0x00, // i32.atomic.rmw.add align=2 offset=0
+        0x1A, // drop (fused)
+        0x41, 0x08, // i32.const 8 (addr)
+        0x42, 20, // i64.const 20
+        0xFE, 0x18, 0x03, 0x00, // i64.atomic.store align=3 offset=0
+        0x41, 0x08, // i32.const 8 (addr)
+        0x42, 7, // i64.const 7
+        0xFE, 0x1F, 0x03, 0x00, // i64.atomic.rmw.add align=3 offset=0
+        0x1A, // drop (fused)
+        0x41, 0x00, // i32.const 0 (addr)
+        0xFE, 0x10, 0x02, 0x00, // i32.atomic.load align=2 offset=0
+        0x41, 0x08, // i32.const 8 (addr)
+        0xFE, 0x11, 0x03, 0x00, // i64.atomic.load align=3 offset=0
+        0xA7, // i32.wrap_i64
+        0x6A, // i32.add (15 + 27 = 42)
+        0x0B,
+    });
+    try testing.expectEqual(@as(i32, 42), result);
 }
 
 test "interp: i32.atomic.rmw.cmpxchg success" {
