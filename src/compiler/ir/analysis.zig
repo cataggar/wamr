@@ -1194,6 +1194,9 @@ fn computeLiveRangesImpl(
                 if (!def_pos.contains(dest)) {
                     try def_pos.put(dest, global_idx);
                     try def_type.put(dest, inst.type);
+                } else {
+                    const existing = last_use_pos.get(dest) orelse 0;
+                    try last_use_pos.put(dest, @max(existing, global_idx));
                 }
                 try recordAccessDepth(&max_access_depth, &max_depth_hits, dest, block_depth);
             }
@@ -1202,6 +1205,9 @@ fn computeLiveRangesImpl(
                     if (!def_pos.contains(p.dst)) {
                         try def_pos.put(p.dst, global_idx);
                         try def_type.put(p.dst, p.ty);
+                    } else {
+                        const existing = last_use_pos.get(p.dst) orelse 0;
+                        try last_use_pos.put(p.dst, @max(existing, global_idx));
                     }
                     try recordAccessDepth(&max_access_depth, &max_depth_hits, p.dst, block_depth);
                 }
@@ -3060,6 +3066,49 @@ test "computeLiveRanges: loop-carried parallel_copy dst spans the back-edge (#81
     // from at-or-before the header use through at-or-after the latch def.
     try std.testing.expect(r_loop.start <= header_use_pos);
     try std.testing.expect(r_loop.end >= latch_def_pos);
+}
+
+test "computeLiveRanges: multi-def parallel_copy dst extends end to all def sites" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    // Diamond where v_phi is defined by parallel_copy in both b1 and b2
+    // and never used in b3: its live range must still cover the later
+    // parallel_copy definition in b2 so regalloc does not assign v_phi's
+    // register to another value live across b2's parallel_copy.
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+
+    const v_cond = func.newVReg();
+    const v_s1 = func.newVReg();
+    const v_s2 = func.newVReg();
+    const v_phi = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_cond });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b1, .else_block = b2 } } });
+
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 10 }, .dest = v_s1 });
+    const c1 = try allocator.dupe(ir.Inst.ParallelCopy, &.{.{ .dst = v_phi, .src = v_s1, .ty = .i32 }});
+    try func.getBlock(b1).append(.{ .op = .{ .parallel_copy = c1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+
+    try func.getBlock(b2).append(.{ .op = .{ .iconst_32 = 20 }, .dest = v_s2 });
+    const c2 = try allocator.dupe(ir.Inst.ParallelCopy, &.{.{ .dst = v_phi, .src = v_s2, .ty = .i32 }});
+    try func.getBlock(b2).append(.{ .op = .{ .parallel_copy = c2 } });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+
+    try func.getBlock(b3).append(.{ .op = .{ .ret = null } });
+
+    const ranges = try computeLiveRanges(&func, allocator);
+    defer allocator.free(ranges);
+
+    const r_phi = findRange(ranges, v_phi).?;
+    // b0: 0,1; b1: 2,3(def1),4; b2: 5,6(def2),7; b3: 8
+    try std.testing.expectEqual(@as(u32, 3), r_phi.start);
+    try std.testing.expect(r_phi.end >= 6);
 }
 
 fn expectLivenessEqual(

@@ -2877,8 +2877,9 @@ pub fn compileFunctionImpl(
                                 .iconst_32, .iconst_64 => {
                                     if (prev.dest) |d| {
                                         if (suppress_iconst.contains(d)) continue;
+                                        break;
                                     }
-                                    break;
+                                    continue;
                                 },
                                 else => break,
                             }
@@ -2963,8 +2964,9 @@ pub fn compileFunctionImpl(
                                 .iconst_32, .iconst_64 => {
                                     if (prev.dest) |d| {
                                         if (suppress_iconst.contains(d)) continue;
+                                        break;
                                     }
-                                    break;
+                                    continue;
                                 },
                                 else => break,
                             }
@@ -4323,6 +4325,9 @@ fn computeLiveRangesScheduled(
                 if (!def_pos.contains(dest)) {
                     try def_pos.put(dest, global_idx);
                     try def_type.put(dest, inst.type);
+                } else {
+                    const existing = last_use_pos.get(dest) orelse 0;
+                    try last_use_pos.put(dest, @max(existing, global_idx));
                 }
                 try recordAccessDepth(&max_access_depth, &max_depth_hits, dest, block_depth);
             }
@@ -4334,6 +4339,9 @@ fn computeLiveRangesScheduled(
                     if (!def_pos.contains(p.dst)) {
                         try def_pos.put(p.dst, global_idx);
                         try def_type.put(p.dst, p.ty);
+                    } else {
+                        const existing = last_use_pos.get(p.dst) orelse 0;
+                        try last_use_pos.put(p.dst, @max(existing, global_idx));
                     }
                     try recordAccessDepth(&max_access_depth, &max_depth_hits, p.dst, block_depth);
                 }
