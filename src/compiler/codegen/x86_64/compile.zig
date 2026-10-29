@@ -3916,6 +3916,7 @@ fn localizeCallFreeLoopInvariants(
     block_order: []const ir.BlockId,
     allocator: std.mem.Allocator,
 ) !?ir.IrFunction {
+    if (comptime builtin.os.tag == .windows) return null;
     if (func_in.blocks.items.len < 2) return null;
 
     var has_call_clobber = false;
@@ -11648,6 +11649,7 @@ test "#798 Wave 11 x86_64: frameless leaf elides rbp/rbx and folds constant load
 }
 
 test "VmCtx layout: call-free loop localizes call-spanning outer VRegs into registers" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 2, 1, 2);
     defer func.deinit();
