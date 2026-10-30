@@ -708,9 +708,12 @@ python3 scripts/bench_wasi_threads.py \
 
 ## Hosted calibration, dispatch security, and cohorts
 
-The workflow remains path-filtered/manual and always runs with `--no-budget`.
-Every run is explicitly marked non-enforcing. No threshold is declared or
-enabled by this workflow/cohort phase.
+The workflow is path-filtered/manual: PR and `main` push smoke runs and
+`noise-calibration` runs use `--no-budget`, whereas authoritative
+`candidate-evaluation` runs enforce `tests/benchmarks/wasi-threads/budget.json`
+(`"calibrated": true, "enforcement": true`), and the unit test suite verifies
+the enforced budget against passing candidate reports, deliberate regressions,
+and uncalibrated CPU models on every run.
 
 A successful hosted smoke run validates only smoke coverage; it does not
 validate the 88-pilot authoritative profile. This change requires a full
@@ -1002,6 +1005,15 @@ envelope, rounding, caps, timeouts, or algorithm identity may not. Earlier
 failed/partial runs and the retained timing-quality failure remain excluded
 and cannot be retried, relabelled, or mixed into the fresh cohort.
 
-Until that cohort exists, claiming a statistically sound hard gate would be
-fabricating evidence. Issue #966 must remain open and #963 remains dependent on
-the published hosted baseline.
+`tests/benchmarks/wasi-threads/budget.json` is now calibrated and enforced
+(`"calibrated": true, "enforcement": true`, `cache_key`
+`3d32fba25c32077623d80a7d858ab1eec2fe0cc50ab40ee16c3bf5594ccab31b`) from the
+20-workflow (`40`-report: `16` training + `4` untouched holdouts per platform)
+`wasi-thread-calibration-966-v34` cohort (`cohort_id`
+`346d5146d61f406bbde901c97de927df`, baseline commit
+`b105872d23b1a81dc08afcde0765dd7d4ce8b199`, `source_cohort_sha256`
+`129d6522a0ddc9745b17e6931fdbfc6494654d8b72be413c2fc8733147f28464`) under
+`tests/benchmarks/wasi-threads/derivation-policy.production.json` across
+`ubuntu-22.04-x86_64` (`AMD EPYC 7763 64-Core Processor`) and
+`ubuntu-24.04-aarch64` (`Neoverse-N2`), closing #966 and supplying the hosted
+threaded baseline for #963.
