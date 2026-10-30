@@ -342,7 +342,7 @@ jobs:
             git diff --exit-code -- tests/benchmarks/wasi-threads
           )
 
-      - name: Run non-enforcing paired benchmark
+      - name: Run paired benchmark
         env:
           PURPOSE: ${{ needs.prepare.outputs.purpose }}
           PROFILE: ${{ needs.prepare.outputs.profile }}
@@ -350,6 +350,12 @@ jobs:
           SAMPLES: ${{ needs.prepare.outputs.samples }}
         run: |
           set -euo pipefail
+          BUDGET_ARGS=(--no-budget)
+          SUMMARY_BANNER="> **Smoke / calibration run:** budget enforcement requires authoritative candidate-evaluation against the calibrated baseline."
+          if [ "$PURPOSE" = candidate-evaluation ] && [ "$PROFILE" = authoritative ]; then
+            BUDGET_ARGS=(--budget "$PWD/candidate/tests/benchmarks/wasi-threads/budget.json")
+            SUMMARY_BANNER="> **Enforcing (\`tests/benchmarks/wasi-threads/budget.json\`):** calibrated v34 budget enforced."
+          fi
           python3 candidate/scripts/bench_wasi_threads.py \
             --baseline-repo "$PWD/baseline" \
             --candidate-repo "$PWD/candidate" \
@@ -362,9 +368,9 @@ jobs:
             --host-pair-id "github:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}:${{ matrix.platform }}" \
             --runner-environment github-hosted \
             --output-dir "$WASI_THREAD_OUTPUT" \
-            --no-budget
+            "${BUDGET_ARGS[@]}"
           {
-            echo "> **Non-enforcing:** budgets remain disabled pending a reviewed calibration cohort."
+            echo "$SUMMARY_BANNER"
             echo
             cat "$WASI_THREAD_OUTPUT/report.md"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -715,7 +721,7 @@ jobs:
           name: wasi-thread-bench-ubuntu-22.04-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
           path: retained-report
 
-      - name: Comment with non-enforcing report
+      - name: Comment with paired smoke report
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
           script: |
@@ -730,7 +736,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               body: [
-                '> **Non-enforcing:** budgets remain disabled pending calibration.',
+                '> **PR smoke report:** calibrated v34 budgets are enforced in `tests/benchmarks/wasi-threads/budget.json` (`calibrated: true, enforcement: true`) for authoritative `candidate-evaluation` runs.',
                 '',
                 fs.readFileSync(path, 'utf8'),
               ].join('\n'),

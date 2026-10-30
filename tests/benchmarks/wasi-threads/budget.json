@@ -1,19 +1,1016 @@
 {
-  "schema_version": 16,
-  "kind": "wasi-thread-benchmark-budget",
-  "calibrated": false,
-  "enforcement": false,
+  "calibrated": true,
+  "calibration_provenance": {
+    "accepted_cpu_classes": {
+      "ubuntu-22.04-x86_64": [
+        "AMD EPYC 7763 64-Core Processor"
+      ],
+      "ubuntu-24.04-aarch64": [
+        "Neoverse-N2"
+      ]
+    },
+    "baseline_revision": {
+      "build_source_sha256": "63da060d14f018e9d552822a63d0e75db0ec19227d7c1325a0dced885c8c1282",
+      "commit": "b105872d23b1a81dc08afcde0765dd7d4ce8b199"
+    },
+    "candidate_revision": {
+      "build_source_sha256": "63da060d14f018e9d552822a63d0e75db0ec19227d7c1325a0dced885c8c1282",
+      "commit": "b105872d23b1a81dc08afcde0765dd7d4ce8b199"
+    },
+    "comparison_purpose": "noise-calibration",
+    "fixture_set_sha256": "66f7c9b6eb3f04542ca68fcdb0ba56744b77afb30ea191dad1a224b1690a6ea2",
+    "measurement_plan_sha256": "c93aef4dd975f536ff64267243fe48cc49ab1f9b606aca5341bd2b5cfc5da699",
+    "measurement_plan_version": 20,
+    "partition_report_count_by_cpu_class": {
+      "ubuntu-22.04-x86_64": {
+        "AMD EPYC 7763 64-Core Processor": {
+          "holdout": 4,
+          "training": 16
+        }
+      },
+      "ubuntu-24.04-aarch64": {
+        "Neoverse-N2": {
+          "holdout": 4,
+          "training": 16
+        }
+      }
+    },
+    "profile": "authoritative",
+    "report_count_by_cpu_class": {
+      "ubuntu-22.04-x86_64": {
+        "AMD EPYC 7763 64-Core Processor": 20
+      },
+      "ubuntu-24.04-aarch64": {
+        "Neoverse-N2": 20
+      }
+    },
+    "report_count_by_platform": {
+      "ubuntu-22.04-x86_64": 20,
+      "ubuntu-24.04-aarch64": 20
+    }
+  },
   "calibration_requirements": {
-    "minimum_reports_per_platform": 20,
-    "minimum_reports_per_cpu_class": 20,
-    "minimum_training_reports_per_cpu_class": 16,
     "minimum_holdout_reports_per_cpu_class": 4,
-    "required_profile": "authoritative",
+    "minimum_reports_per_cpu_class": 20,
+    "minimum_reports_per_platform": 20,
+    "minimum_training_reports_per_cpu_class": 16,
     "required_platforms": [
       "ubuntu-22.04-x86_64",
       "ubuntu-24.04-aarch64"
-    ]
+    ],
+    "required_profile": "authoritative"
   },
-  "calibration_provenance": null,
-  "platforms": {}
+  "enforcement": true,
+  "kind": "wasi-thread-benchmark-budget",
+  "platforms": {
+    "ubuntu-22.04-x86_64": {
+      "accepted_cpu_classes": [
+        "AMD EPYC 7763 64-Core Processor"
+      ],
+      "comparisons": [
+        {
+          "condition": "cancel-points-off",
+          "max_candidate_over_baseline_elapsed_ratio": 1.004399900231141,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9956193740858302,
+          "pair_key": "cancel-points/hot/1"
+        },
+        {
+          "condition": "cancel-points-on",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0048828067759457,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9951409191768218,
+          "pair_key": "cancel-points/hot/1"
+        },
+        {
+          "condition": "cancel-points-off",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0077929606026652,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9922673000236024,
+          "pair_key": "cancel-points/hot/2"
+        },
+        {
+          "condition": "cancel-points-on",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0053340123691148,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9946942883623868,
+          "pair_key": "cancel-points/hot/2"
+        },
+        {
+          "condition": "cancel-points-off",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0029881027488918,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9970207994085849,
+          "pair_key": "cancel-points/hot/4"
+        },
+        {
+          "condition": "cancel-points-on",
+          "max_candidate_over_baseline_elapsed_ratio": 1.002685379653412,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9973218122973512,
+          "pair_key": "cancel-points/hot/4"
+        },
+        {
+          "condition": "cancel-points-off",
+          "max_candidate_over_baseline_elapsed_ratio": 1.004866174472508,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.995157390510171,
+          "pair_key": "cancel-points/hot/8"
+        },
+        {
+          "condition": "cancel-points-on",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0026488646663825,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9973581332810226,
+          "pair_key": "cancel-points/hot/8"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0059439287651986,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9940911927640991,
+          "pair_key": "runtime/atomic/1"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0946974350810026,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9134944213384455,
+          "pair_key": "runtime/atomic/1"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0238652540866822,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9766910206285183,
+          "pair_key": "runtime/atomic/2"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.009490735445864,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9905984917814297,
+          "pair_key": "runtime/atomic/2"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.005547162410295,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9944834388503484,
+          "pair_key": "runtime/atomic/4"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.015190810127638,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9850364975962222,
+          "pair_key": "runtime/atomic/4"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0128414631161213,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9873213493090889,
+          "pair_key": "runtime/atomic/8"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.011310359823849,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9888161337279102,
+          "pair_key": "runtime/atomic/8"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0044749550699943,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9955449809401347,
+          "pair_key": "runtime/hot/1"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0236032305390865,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9769410355156314,
+          "pair_key": "runtime/hot/1"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0082603972148023,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9918072779238187,
+          "pair_key": "runtime/hot/2"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0398482539699345,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9616787797471383,
+          "pair_key": "runtime/hot/2"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.003594549928535,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9964183245825805,
+          "pair_key": "runtime/hot/4"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0301045967505322,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9707752039496776,
+          "pair_key": "runtime/hot/4"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0020693249817454,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9979349482813652,
+          "pair_key": "runtime/hot/8"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.024949211526531,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.975658099693182,
+          "pair_key": "runtime/hot/8"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0068219011800197,
+          "metric_kind": "spawn-join-lifecycle",
+          "min_candidate_over_baseline_throughput_ratio": 0.9932243218269055,
+          "pair_key": "runtime/spawn-join/1"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0109647875472616,
+          "metric_kind": "spawn-join-lifecycle",
+          "min_candidate_over_baseline_throughput_ratio": 0.9891541350575981,
+          "pair_key": "runtime/spawn-join/1"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0080380965945115,
+          "metric_kind": "spawn-join-lifecycle",
+          "min_candidate_over_baseline_throughput_ratio": 0.9920259991942089,
+          "pair_key": "runtime/spawn-join/2"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0056927629180414,
+          "metric_kind": "spawn-join-lifecycle",
+          "min_candidate_over_baseline_throughput_ratio": 0.9943394611874076,
+          "pair_key": "runtime/spawn-join/2"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0134984030782712,
+          "metric_kind": "spawn-join-lifecycle",
+          "min_candidate_over_baseline_throughput_ratio": 0.986681377062585,
+          "pair_key": "runtime/spawn-join/4"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.016637930479155,
+          "metric_kind": "spawn-join-lifecycle",
+          "min_candidate_over_baseline_throughput_ratio": 0.9836343599030253,
+          "pair_key": "runtime/spawn-join/4"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0112801694902518,
+          "metric_kind": "spawn-join-lifecycle",
+          "min_candidate_over_baseline_throughput_ratio": 0.9888456534296152,
+          "pair_key": "runtime/spawn-join/8"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0100457349945537,
+          "metric_kind": "spawn-join-lifecycle",
+          "min_candidate_over_baseline_throughput_ratio": 0.9900541780965898,
+          "pair_key": "runtime/spawn-join/8"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.021999280879619,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.97847426970723,
+          "pair_key": "runtime/wait-notify/1"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0209137239771915,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9795146999339799,
+          "pair_key": "runtime/wait-notify/1"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0088578625488762,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9912199102790399,
+          "pair_key": "runtime/wait-notify/2"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0177404259459397,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9825688107756438,
+          "pair_key": "runtime/wait-notify/2"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0338308367092945,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9672762356199599,
+          "pair_key": "runtime/wait-notify/4"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0333841289203463,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9676943665128424,
+          "pair_key": "runtime/wait-notify/4"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0511912784694348,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9513016522131251,
+          "pair_key": "runtime/wait-notify/8"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0304493138761848,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9704504496571066,
+          "pair_key": "runtime/wait-notify/8"
+        },
+        {
+          "condition": "threads-disabled",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0016248986658904,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9983777373465306,
+          "pair_key": "single-infrastructure/aot"
+        },
+        {
+          "condition": "threads-enabled",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0015585233204627,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9984439018947238,
+          "pair_key": "single-infrastructure/aot"
+        },
+        {
+          "condition": "threads-disabled",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0185218735654542,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9818149476744991,
+          "pair_key": "single-infrastructure/interpreter"
+        },
+        {
+          "condition": "threads-enabled",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0117290807903805,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9884068956669533,
+          "pair_key": "single-infrastructure/interpreter"
+        }
+      ],
+      "host_machine": "x86_64",
+      "host_system": "Linux",
+      "ratio_of_ratios": [
+        {
+          "left": "cancel-points-off",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0136225306222237,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9865605487144586,
+          "pair_key": "cancel-points/hot/1",
+          "right": "cancel-points-on"
+        },
+        {
+          "left": "cancel-points-off",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0175475416753317,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9827550645481982,
+          "pair_key": "cancel-points/hot/2",
+          "right": "cancel-points-on"
+        },
+        {
+          "left": "cancel-points-off",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0060182519716476,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9940177507119266,
+          "pair_key": "cancel-points/hot/4",
+          "right": "cancel-points-on"
+        },
+        {
+          "left": "cancel-points-off",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0049030598249118,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9951208628763003,
+          "pair_key": "cancel-points/hot/8",
+          "right": "cancel-points-on"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0718151857192513,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9329966708103148,
+          "pair_key": "runtime/atomic/1",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0451364962268466,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9568128216842503,
+          "pair_key": "runtime/atomic/2",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0177044970035245,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9826034992911485,
+          "pair_key": "runtime/atomic/4",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0218307346574804,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9786356644823386,
+          "pair_key": "runtime/atomic/8",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0413402722533096,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9603008993747504,
+          "pair_key": "runtime/hot/1",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.058535306354607,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9447016022959195,
+          "pair_key": "runtime/hot/2",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0274964750668638,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.973239348519348,
+          "pair_key": "runtime/hot/4",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.024800189861048,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.975799975345038,
+          "pair_key": "runtime/hot/8",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0136039389790799,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9865786443245479,
+          "pair_key": "runtime/spawn-join/1",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0116410611656483,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9884928937619086,
+          "pair_key": "runtime/spawn-join/2",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.01781390766177,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9824978736017728,
+          "pair_key": "runtime/spawn-join/4",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.019619319119998,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9807581920506058,
+          "pair_key": "runtime/spawn-join/8",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0252697250232026,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9753530954767733,
+          "pair_key": "runtime/wait-notify/1",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0168131328508854,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9834648744123264,
+          "pair_key": "runtime/wait-notify/2",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0403768165484004,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9611901996409755,
+          "pair_key": "runtime/wait-notify/4",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0606378926517983,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9428288456674011,
+          "pair_key": "runtime/wait-notify/8",
+          "right": "aot"
+        },
+        {
+          "left": "threads-disabled",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0011262505238738,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9988750164893957,
+          "pair_key": "single-infrastructure/aot",
+          "right": "threads-enabled"
+        },
+        {
+          "left": "threads-disabled",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0013576004374494,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9986442401427253,
+          "pair_key": "single-infrastructure/interpreter",
+          "right": "threads-enabled"
+        }
+      ],
+      "runner_environment": "github-hosted"
+    },
+    "ubuntu-24.04-aarch64": {
+      "accepted_cpu_classes": [
+        "Neoverse-N2"
+      ],
+      "comparisons": [
+        {
+          "condition": "cancel-points-off",
+          "max_candidate_over_baseline_elapsed_ratio": 1.001144055705147,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9988572516626073,
+          "pair_key": "cancel-points/hot/1"
+        },
+        {
+          "condition": "cancel-points-on",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0011410480847052,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9988602524220861,
+          "pair_key": "cancel-points/hot/1"
+        },
+        {
+          "condition": "cancel-points-off",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0013002173787335,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9987014709912498,
+          "pair_key": "cancel-points/hot/2"
+        },
+        {
+          "condition": "cancel-points-on",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0012285973422677,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.998772910256928,
+          "pair_key": "cancel-points/hot/2"
+        },
+        {
+          "condition": "cancel-points-off",
+          "max_candidate_over_baseline_elapsed_ratio": 1.00157760825682,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.998424876670749,
+          "pair_key": "cancel-points/hot/4"
+        },
+        {
+          "condition": "cancel-points-on",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0013485842171461,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9986532320129055,
+          "pair_key": "cancel-points/hot/4"
+        },
+        {
+          "condition": "cancel-points-off",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0014239271426972,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9985780975428057,
+          "pair_key": "cancel-points/hot/8"
+        },
+        {
+          "condition": "cancel-points-on",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0013091123444355,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9986925991901041,
+          "pair_key": "cancel-points/hot/8"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0010875691178023,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9989136124037977,
+          "pair_key": "runtime/atomic/1"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0034301373519305,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9965815882698286,
+          "pair_key": "runtime/atomic/1"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0028638073829597,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.99714437058963,
+          "pair_key": "runtime/atomic/2"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0041709294367083,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9958463949568351,
+          "pair_key": "runtime/atomic/2"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.003749952504809,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9962640571036131,
+          "pair_key": "runtime/atomic/4"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0033443022977035,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.996666844780955,
+          "pair_key": "runtime/atomic/4"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0036922271103874,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9963213552813721,
+          "pair_key": "runtime/atomic/8"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.002382407402402,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9976232549725453,
+          "pair_key": "runtime/atomic/8"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0011730202967315,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.998828354067729,
+          "pair_key": "runtime/hot/1"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0038198824725115,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9961946535038705,
+          "pair_key": "runtime/hot/1"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0013124397339241,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9986892805064185,
+          "pair_key": "runtime/hot/2"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0061640817201871,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9938736814082557,
+          "pair_key": "runtime/hot/2"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0013263080108634,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9986754487520679,
+          "pair_key": "runtime/hot/4"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0040416942736154,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9959745752624942,
+          "pair_key": "runtime/hot/4"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0012613335343863,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9987402554236927,
+          "pair_key": "runtime/hot/8"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0034088214540322,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9966027591335178,
+          "pair_key": "runtime/hot/8"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0175479653694002,
+          "metric_kind": "spawn-join-lifecycle",
+          "min_candidate_over_baseline_throughput_ratio": 0.9827546553414511,
+          "pair_key": "runtime/spawn-join/1"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0143651748126512,
+          "metric_kind": "spawn-join-lifecycle",
+          "min_candidate_over_baseline_throughput_ratio": 0.9858382610431146,
+          "pair_key": "runtime/spawn-join/1"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.019704057766586,
+          "metric_kind": "spawn-join-lifecycle",
+          "min_candidate_over_baseline_throughput_ratio": 0.9806766898527957,
+          "pair_key": "runtime/spawn-join/2"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0286320630757484,
+          "metric_kind": "spawn-join-lifecycle",
+          "min_candidate_over_baseline_throughput_ratio": 0.9721649128939908,
+          "pair_key": "runtime/spawn-join/2"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.022162811217864,
+          "metric_kind": "spawn-join-lifecycle",
+          "min_candidate_over_baseline_throughput_ratio": 0.9783177288640961,
+          "pair_key": "runtime/spawn-join/4"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0146668659784033,
+          "metric_kind": "spawn-join-lifecycle",
+          "min_candidate_over_baseline_throughput_ratio": 0.9855451414940397,
+          "pair_key": "runtime/spawn-join/4"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0291484013125354,
+          "metric_kind": "spawn-join-lifecycle",
+          "min_candidate_over_baseline_throughput_ratio": 0.9716771640753082,
+          "pair_key": "runtime/spawn-join/8"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0234736292672777,
+          "metric_kind": "spawn-join-lifecycle",
+          "min_candidate_over_baseline_throughput_ratio": 0.9770647444193726,
+          "pair_key": "runtime/spawn-join/8"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0166115361829449,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9836598980124538,
+          "pair_key": "runtime/wait-notify/1"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0061427976497153,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9938947059363098,
+          "pair_key": "runtime/wait-notify/1"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.014976634091248,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9852443557928235,
+          "pair_key": "runtime/wait-notify/2"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0116357216591312,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9884981111184489,
+          "pair_key": "runtime/wait-notify/2"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0199962733797303,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9803957387868946,
+          "pair_key": "runtime/wait-notify/4"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0193085323346496,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9810572248518078,
+          "pair_key": "runtime/wait-notify/4"
+        },
+        {
+          "condition": "aot",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0138403967118537,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9863485448432112,
+          "pair_key": "runtime/wait-notify/8"
+        },
+        {
+          "condition": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0217174519947962,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9787441704627858,
+          "pair_key": "runtime/wait-notify/8"
+        },
+        {
+          "condition": "threads-disabled",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0010906626702905,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.998910525578791,
+          "pair_key": "single-infrastructure/aot"
+        },
+        {
+          "condition": "threads-enabled",
+          "max_candidate_over_baseline_elapsed_ratio": 1.001206353781911,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9987950997540572,
+          "pair_key": "single-infrastructure/aot"
+        },
+        {
+          "condition": "threads-disabled",
+          "max_candidate_over_baseline_elapsed_ratio": 1.0066367521609905,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9934070039199918,
+          "pair_key": "single-infrastructure/interpreter"
+        },
+        {
+          "condition": "threads-enabled",
+          "max_candidate_over_baseline_elapsed_ratio": 1.006704114799234,
+          "metric_kind": "steady-state-kernel",
+          "min_candidate_over_baseline_throughput_ratio": 0.9933405310451415,
+          "pair_key": "single-infrastructure/interpreter"
+        }
+      ],
+      "host_machine": "aarch64",
+      "host_system": "Linux",
+      "ratio_of_ratios": [
+        {
+          "left": "cancel-points-off",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0011793529826698,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9988220362523891,
+          "pair_key": "cancel-points/hot/1",
+          "right": "cancel-points-on"
+        },
+        {
+          "left": "cancel-points-off",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0013482625662427,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9986535527981164,
+          "pair_key": "cancel-points/hot/2",
+          "right": "cancel-points-on"
+        },
+        {
+          "left": "cancel-points-off",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0017718649141119,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9982312690382223,
+          "pair_key": "cancel-points/hot/4",
+          "right": "cancel-points-on"
+        },
+        {
+          "left": "cancel-points-off",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0015673723082668,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9984350805032178,
+          "pair_key": "cancel-points/hot/8",
+          "right": "cancel-points-on"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0031999959742945,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9968102113365879,
+          "pair_key": "runtime/atomic/1",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0045364533164056,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9954840331563578,
+          "pair_key": "runtime/atomic/2",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0044536495387126,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9955660975090712,
+          "pair_key": "runtime/atomic/4",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.005270736541867,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9947568984649865,
+          "pair_key": "runtime/atomic/8",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0041026276053997,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9959141351764182,
+          "pair_key": "runtime/hot/1",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0061706345804189,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.993867208634058,
+          "pair_key": "runtime/hot/2",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0037633951633804,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9962507148781142,
+          "pair_key": "runtime/hot/4",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.002802693516003,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9972051396210581,
+          "pair_key": "runtime/hot/8",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0273255721198438,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9734012538367385,
+          "pair_key": "runtime/spawn-join/1",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.033637464148028,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9674571933441365,
+          "pair_key": "runtime/spawn-join/2",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0165785345633669,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9836918309803896,
+          "pair_key": "runtime/spawn-join/4",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.025167680607573,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9754501813862713,
+          "pair_key": "runtime/spawn-join/8",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.013707406934835,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9864779453705659,
+          "pair_key": "runtime/wait-notify/1",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.016738636680621,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9835369326228539,
+          "pair_key": "runtime/wait-notify/2",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0265957415120135,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9740932672554803,
+          "pair_key": "runtime/wait-notify/4",
+          "right": "aot"
+        },
+        {
+          "left": "interpreter",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.022160679772262,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9783197688868248,
+          "pair_key": "runtime/wait-notify/8",
+          "right": "aot"
+        },
+        {
+          "left": "threads-disabled",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.0011636980940046,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9988376545252104,
+          "pair_key": "single-infrastructure/aot",
+          "right": "threads-enabled"
+        },
+        {
+          "left": "threads-disabled",
+          "max_candidate_over_baseline_elapsed_ratio_of_ratios": 1.018409867683423,
+          "min_candidate_over_baseline_throughput_ratio_of_ratios": 0.9819229288053736,
+          "pair_key": "single-infrastructure/interpreter",
+          "right": "threads-enabled"
+        }
+      ],
+      "runner_environment": "github-hosted"
+    }
+  },
+  "schema_version": 16
 }

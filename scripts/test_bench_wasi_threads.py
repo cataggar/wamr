@@ -208,6 +208,12 @@ def make_report(
     comparison_purpose: str | None = None,
     samples: int | None = None,
     pilot_base_elapsed_ns: int = 1_500_000_000,
+    warmups: int = 0,
+    modes: list[str] | None = None,
+    thread_counts: list[int] | None = None,
+    timeout_seconds: int | float = 90,
+    fixture_set_sha256: str = "d" * 64,
+    logical_cpus: int = 4,
 ) -> dict:
     baseline_commit = baseline_commit or "b" * 40
     if revision_mode == "paired-revisions":
@@ -218,26 +224,45 @@ def make_report(
         revision_roles = bench.SINGLE_REVISION_ROLES
         comparison_purpose = "single-revision-compatibility"
         samples = 1 if samples is None else samples
+    selected_modes = list(modes or ["aot"])
+    selected_threads = list(thread_counts or [1])
+    if selected_modes == ["interpreter", "aot"] and selected_threads == [
+        1,
+        2,
+        4,
+        8,
+    ]:
+        default_args = bench.parse_args(["--timeout", "90", "--no-budget"])
+        initial_iterations = bench.resolved_iteration_plan(
+            default_args, tuple(selected_modes)
+        )
+    else:
+        initial_iterations = {
+            mode: {
+                "single-hot": 10,
+                "hot": {str(t): 10 for t in selected_threads},
+                "atomic": {str(t): 10 for t in selected_threads},
+                "wait-notify": {str(t): 10 for t in selected_threads},
+                "spawn-join": {str(t): 10 for t in selected_threads},
+                **(
+                    {"cancel-hot": {str(t): 10 for t in selected_threads}}
+                    if mode == "aot"
+                    else {}
+                ),
+            }
+            for mode in selected_modes
+        }
     plan = {
         "profile": "authoritative",
-        "warmups": 0,
+        "warmups": warmups,
         "samples": samples,
         "revision_mode": revision_mode,
         "comparison_purpose": comparison_purpose,
         "revision_roles": list(revision_roles),
-        "modes": ["aot"],
-        "thread_counts": [1],
-        "iterations": {
-            "aot": {
-                "single-hot": 10,
-                "hot": {"1": 10},
-                "atomic": {"1": 10},
-                "wait-notify": {"1": 10},
-                "spawn-join": {"1": 10},
-                "cancel-hot": {"1": 10},
-            }
-        },
-        "timeout_seconds": 90,
+        "modes": selected_modes,
+        "thread_counts": selected_threads,
+        "iterations": initial_iterations,
+        "timeout_seconds": timeout_seconds,
         "minimum_timed_interval_ns": 1_250_000_000,
         "atomic_wait_preflight_runs": 64,
         "atomic_wait_preflight_iterations": 1_000_000,
@@ -290,7 +315,7 @@ def make_report(
         "system": "Linux",
         "machine": machine,
         "cpu": cpu,
-        "logical_cpus": 4,
+        "logical_cpus": logical_cpus,
         "runner_environment": runner_environment,
         "runner_image": runner_image,
         "runner_os": "Linux",
@@ -303,7 +328,7 @@ def make_report(
             "commit": baseline_commit,
             "tracked_diff_sha256": "b" * 64,
             "build_source_sha256": baseline_source,
-            "fixture_set_sha256": "d" * 64,
+            "fixture_set_sha256": fixture_set_sha256,
             "plan_sha256": plan_sha256,
             "host_pair_id": host_pair_id,
             "host_fingerprint_sha256": host_fingerprint,
@@ -312,7 +337,7 @@ def make_report(
             "commit": commit,
             "tracked_diff_sha256": "b" * 64,
             "build_source_sha256": candidate_source,
-            "fixture_set_sha256": "d" * 64,
+            "fixture_set_sha256": fixture_set_sha256,
             "plan_sha256": plan_sha256,
             "host_pair_id": host_pair_id,
             "host_fingerprint_sha256": host_fingerprint,
@@ -472,7 +497,7 @@ def make_report(
                 pair_key=pair["pair_key"],
                 left=pair["left"],
                 right=pair["right"],
-                warmups=0,
+                warmups=warmups,
                 samples=samples,
                 revision_roles=revision_roles,
                 revision_fields=revision_fields,
@@ -501,7 +526,7 @@ def make_report(
             },
             "collected_at": "2026-09-02T00:00:00+00:00",
             "platform_id": platform_id,
-            "fixture_set_sha256": "d" * 64,
+            "fixture_set_sha256": fixture_set_sha256,
             "plan_sha256": plan_sha256,
             "measurement_plan_version": (
                 bench.MEASUREMENT_PLAN_IDENTITY_VERSION
@@ -578,7 +603,7 @@ def make_report(
             "iteration_multiplier": (
                 bench.TRUSTED_BARRIER_PREFLIGHT_ITERATION_MULTIPLIER
             ),
-            "thread_counts": [1],
+            "thread_counts": list(plan["thread_counts"]),
             "minimum_timed_interval_ns": 1_250_000_000,
             "timing_overhead_ratio_limit": (
                 bench.TIMING_OVERHEAD_RATIO_LIMIT
@@ -6354,20 +6379,123 @@ class ThreadBenchmarkTests(unittest.TestCase):
         )
         calibrated = complete_budget(make_report())
         self.assertEqual(set(calibrated), set(budget_schema["required"]))
-        uncalibrated = json.loads(
-            (
-                ROOT
-                / "tests"
-                / "benchmarks"
-                / "wasi-threads"
-                / "budget.json"
-            ).read_text(encoding="UTF-8")
+        budget_path = (
+            ROOT
+            / "tests"
+            / "benchmarks"
+            / "wasi-threads"
+            / "budget.json"
         )
-        self.assertEqual(set(uncalibrated), set(budget_schema["required"]))
-        self.assertFalse(uncalibrated["calibrated"])
-        self.assertFalse(uncalibrated["enforcement"])
-        self.assertIsNone(uncalibrated["calibration_provenance"])
-        self.assertEqual(uncalibrated["platforms"], {})
+        checked_in = json.loads(budget_path.read_text(encoding="UTF-8"))
+        self.assertEqual(set(checked_in), set(budget_schema["required"]))
+        self.assertTrue(checked_in["calibrated"])
+        self.assertTrue(checked_in["enforcement"])
+        provenance = checked_in["calibration_provenance"]
+        self.assertIsInstance(provenance, dict)
+        self.assertEqual(
+            set(provenance),
+            set(budget_schema["$defs"]["calibration_provenance"]["required"]),
+        )
+        self.assertEqual(
+            set(checked_in["platforms"]),
+            {"ubuntu-22.04-x86_64", "ubuntu-24.04-aarch64"},
+        )
+        for platform_id, machine, cpu_class in (
+            (
+                "ubuntu-22.04-x86_64",
+                "x86_64",
+                "AMD EPYC 7763 64-Core Processor",
+            ),
+            ("ubuntu-24.04-aarch64", "aarch64", "Neoverse-N2"),
+        ):
+            with self.subTest(platform_id=platform_id):
+                candidate_report = flatten_report_ratios(
+                    make_report(
+                        platform_id=platform_id,
+                        machine=machine,
+                        cpu=cpu_class,
+                        baseline_commit=provenance["baseline_revision"][
+                            "commit"
+                        ],
+                        commit="e" * 40,
+                        baseline_source=provenance["baseline_revision"][
+                            "build_source_sha256"
+                        ],
+                        candidate_source="f" * 64,
+                        comparison_purpose="candidate-evaluation",
+                        warmups=2,
+                        samples=12,
+                        modes=["interpreter", "aot"],
+                        thread_counts=[1, 2, 4, 8],
+                        timeout_seconds=90.0,
+                        fixture_set_sha256=provenance["fixture_set_sha256"],
+                        logical_cpus=4,
+                    )
+                )
+                loaded = bench.load_budget(budget_path, candidate_report)
+                self.assertEqual(
+                    bench.evaluate_budget(loaded, candidate_report), []
+                )
+
+                regressed = copy.deepcopy(candidate_report)
+                for record in regressed["records"]:
+                    if (
+                        record["revision"] == "candidate"
+                        and record["pair_key"] == "single-infrastructure/aot"
+                        and record["condition"] == "threads-enabled"
+                    ):
+                        record["elapsed_ns"] *= 2
+                        record["guest_elapsed_ns"] = record["elapsed_ns"]
+                        record["raw_guest_elapsed_ns"] = (
+                            record["elapsed_ns"] + record["timing_overhead_ns"]
+                        )
+                        record["throughput_ops_per_second"] = record[
+                            "operations"
+                        ] / (record["elapsed_ns"] / 1e9)
+                        record["per_thread_ops_per_second"] = record[
+                            "throughput_ops_per_second"
+                        ]
+                regressed["summaries"] = bench.summarize(regressed["records"])
+                regressed["paired_summaries"] = bench.paired_summaries(
+                    regressed["records"]
+                )
+                regressed["comparison_summaries"] = bench.comparison_summaries(
+                    regressed["records"]
+                )
+                regressed["ratio_of_ratios_summaries"] = (
+                    bench.ratio_of_ratios_summaries(regressed["records"])
+                )
+                self.assertGreaterEqual(
+                    len(bench.evaluate_budget(loaded, regressed)), 2
+                )
+
+                unseen_report = flatten_report_ratios(
+                    make_report(
+                        platform_id=platform_id,
+                        machine=machine,
+                        cpu=f"uncalibrated-{machine}-cpu",
+                        baseline_commit=provenance["baseline_revision"][
+                            "commit"
+                        ],
+                        commit="e" * 40,
+                        baseline_source=provenance["baseline_revision"][
+                            "build_source_sha256"
+                        ],
+                        candidate_source="f" * 64,
+                        comparison_purpose="candidate-evaluation",
+                        warmups=2,
+                        samples=12,
+                        modes=["interpreter", "aot"],
+                        thread_counts=[1, 2, 4, 8],
+                        timeout_seconds=90.0,
+                        fixture_set_sha256=provenance["fixture_set_sha256"],
+                        logical_cpus=4,
+                    )
+                )
+                with self.assertRaisesRegex(
+                    bench.HarnessError, "is not calibrated"
+                ):
+                    bench.load_budget(budget_path, unseen_report)
 
     def test_cohort_dispatch_resumes_bounded_sequence_waves(self) -> None:
         baseline = "b" * 40

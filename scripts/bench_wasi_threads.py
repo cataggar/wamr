@@ -405,6 +405,33 @@ def measurement_plan_sha256(plan: dict[str, Any]) -> str:
     )
 
 
+def calibration_compatible_measurement_plan_sha256s(
+    plan: dict[str, Any],
+) -> set[str]:
+    """Return canonical measurement plan hashes compatible with a candidate plan.
+
+    Trusted noise-calibration runs enable scheduler_barrier_preflight, whereas
+    candidate-evaluation runs must leave scheduler_barrier_preflight disabled.
+    Both represent the same authoritative measurement contract.
+    """
+
+    compatible = {measurement_plan_sha256(plan)}
+    preflight = plan.get("scheduler_barrier_preflight")
+    if (
+        isinstance(preflight, dict)
+        and preflight.get("enabled") is False
+        and "aot" in plan.get("modes", [])
+    ):
+        calibrated_plan = copy.deepcopy(plan)
+        calibrated_plan["scheduler_barrier_preflight"]["enabled"] = True
+        calibrated_plan["scheduler_barrier_preflight"]["probe_count"] = (
+            TRUSTED_BARRIER_PREFLIGHT_PROBES_PER_THREAD
+            * len(plan.get("thread_counts", []))
+        )
+        compatible.add(measurement_plan_sha256(calibrated_plan))
+    return compatible
+
+
 class HarnessError(RuntimeError):
     pass
 
@@ -4750,6 +4777,15 @@ def load_budget(path: Path, report: dict[str, Any]) -> dict[str, Any]:
             expected = calibration["baseline_revision"][identity_key]
         else:
             expected = calibration[key]
+        if key == "measurement_plan_sha256":
+            if expected not in calibration_compatible_measurement_plan_sha256s(
+                report["plan"]
+            ):
+                raise HarnessError(
+                    f"budget/report calibration mismatch for {key}: "
+                    f"{expected!r} != {actual!r}"
+                )
+            continue
         if expected != actual:
             raise HarnessError(
                 f"budget/report calibration mismatch for {key}: "
