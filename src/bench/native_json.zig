@@ -111,7 +111,7 @@ pub fn equal(allocator: std.mem.Allocator, left: Value, right: Value) !bool {
     return std.mem.eql(u8, a, b);
 }
 
-test "native request canonical JSON matches Python" {
+test "native request canonical JSON matches schema" {
     const allocator = std.testing.allocator;
     const parsed = try std.json.parseFromSlice(Value, allocator, "{\"z\":true,\"a\":[1,null,\"abc\"]}", .{});
     defer parsed.deinit();

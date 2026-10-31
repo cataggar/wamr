@@ -132,12 +132,23 @@ pub fn add(b: *std.Build, wamrc: *std.Build.Step.Compile, optimize: std.builtin.
     guest_protocol_root.addAnonymousImport("fixtures", .{ .root_source_file = embedded });
     const guest_protocol_exe = b.addExecutable(.{ .name = "native-guest-protocol-test", .root_module = guest_protocol_root });
     const guest_protocol = b.step("test-native-aot-guest-protocol", "Validate actual guest payloads using the existing host v2 schema");
-    const guest_python = b.addSystemCommand(&.{ "python3", "-m", "unittest", "scripts.test_native_guest" });
-    @import("environment.zig").setPath(guest_python, "WAMR_NATIVE_GUEST_TEST", .{ .relative = .{ .base = .install_prefix, .sub_path = "native-guest-tests/driver" } });
-    guest_python.setEnvironmentVariable("WAMR_NATIVE_GUEST_TEST_RUNNER", if (b.graph.host.result.cpu.arch == .x86_64) "" else "qemu-x86_64 -cpu max");
-    guest_python.step.dependOn(&b.addInstallFile(guest_protocol_exe.getEmittedBin(), "native-guest-tests/driver").step);
+    const guest_test_exe = b.addTest(.{
+        .name = "native-guest-protocol-host-test",
+        .filters = &.{"NativeGuestProtocolTests"},
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/native_benchmark.zig"),
+            .target = b.graph.host,
+            .optimize = .safe,
+            .link_libc = true,
+        }),
+    });
+    const guest_runner = b.addRunArtifact(guest_test_exe);
+    guest_runner.has_side_effects = true;
+    @import("environment.zig").setPath(guest_runner, "WAMR_NATIVE_GUEST_TEST", .{ .relative = .{ .base = .install_prefix, .sub_path = "native-guest-tests/driver" } });
+    guest_runner.setEnvironmentVariable("WAMR_NATIVE_GUEST_TEST_RUNNER", if (b.graph.host.result.cpu.arch == .x86_64) "" else "qemu-x86_64 -cpu max");
+    guest_runner.step.dependOn(&b.addInstallFile(guest_protocol_exe.getEmittedBin(), "native-guest-tests/driver").step);
     if (b.graph.host.result.os.tag == .linux) {
-        guest_protocol.dependOn(&guest_python.step);
+        guest_protocol.dependOn(&guest_runner.step);
         guest_step.dependOn(guest_protocol);
         check.dependOn(guest_protocol);
     }
@@ -161,16 +172,27 @@ pub fn add(b: *std.Build, wamrc: *std.Build.Step.Compile, optimize: std.builtin.
         unit.dependOn(build_only);
         guest_step.dependOn(build_only);
     }
-    const python = b.addSystemCommand(&.{ "python3", "-m", "unittest", "scripts.test_bench_coremark.NativeLinuxProducerTests" });
-    @import("environment.zig").setPath(python, "WAMR_NATIVE_PRODUCER", .{ .relative = .{ .base = .install_bin, .sub_path = "wamr-native-bench" } });
-    @import("environment.zig").setPath(python, "WAMR_NATIVE_FIXTURE_DIR", .{ .relative = .{ .base = .install_prefix, .sub_path = "native-bench" } });
+    const protocol_test_exe = b.addTest(.{
+        .name = "native-bench-protocol-host-test",
+        .filters = &.{"NativeLinuxProducerTests"},
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/native_benchmark.zig"),
+            .target = b.graph.host,
+            .optimize = .safe,
+            .link_libc = true,
+        }),
+    });
+    const protocol_runner = b.addRunArtifact(protocol_test_exe);
+    protocol_runner.has_side_effects = true;
+    @import("environment.zig").setPath(protocol_runner, "WAMR_NATIVE_PRODUCER", .{ .relative = .{ .base = .install_bin, .sub_path = "wamr-native-bench" } });
+    @import("environment.zig").setPath(protocol_runner, "WAMR_NATIVE_FIXTURE_DIR", .{ .relative = .{ .base = .install_prefix, .sub_path = "native-bench" } });
     if (b.graph.host.result.cpu.arch != .x86_64)
-        python.setEnvironmentVariable("WAMR_NATIVE_PRODUCER_RUNNER", "qemu-x86_64 -cpu max");
-    python.step.dependOn(producer);
-    python.step.dependOn(fixtures);
+        protocol_runner.setEnvironmentVariable("WAMR_NATIVE_PRODUCER_RUNNER", "qemu-x86_64 -cpu max");
+    protocol_runner.step.dependOn(producer);
+    protocol_runner.step.dependOn(fixtures);
     const protocol = b.step("test-native-bench-protocol", "Exercise real Linux producer through existing native protocol tests");
     if (b.graph.host.result.os.tag == .linux) {
-        protocol.dependOn(&python.step);
+        protocol.dependOn(&protocol_runner.step);
         check.dependOn(protocol);
     }
 }

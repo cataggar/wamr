@@ -12,7 +12,7 @@ name: Perf Investigate
 #   1. Back-pressure (this file, "Check for active investigation"): skips
 #      the run while a perf-investigation issue is still OPEN, so at most
 #      one investigation is in progress at a time.
-#   2. Idea selection (scripts/perf_investigate.py): treats every
+#   2. Idea selection (scripts/perf_investigate.zig): treats every
 #      open/closed perf-investigation issue AND every merged `perf:` PR as
 #      "already attempted", and emits `skip=true` (gating issue creation
 #      below) when no un-attempted idea remains — rather than cycling back
@@ -98,7 +98,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           IDEA_INDEX: ${{ github.event.inputs.idea_index || 'auto' }}
-        run: python3 scripts/perf_investigate.py
+        run: zig run scripts/perf_investigate.zig
 
       - name: Upload baseline artifacts
         if: steps.guard.outputs.skip != 'true'

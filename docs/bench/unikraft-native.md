@@ -643,7 +643,7 @@ Linux producer (`wamr-native-bench`, `wamr-native-jit-aot-compare`,
 
 ### Matched AOT / `fast` JIT / `full` JIT sampler (`matched.wasm`)
 
-Both Linux (`scripts.native_jit_benchmark`, `CLOCK_MONOTONIC` `1 ns` resolution)
+Both Linux (`scripts/native_jit_benchmark.zig`, `CLOCK_MONOTONIC` `1 ns` resolution)
 and Unikraft x86_64 KVM (`support/apps/wamr-aot/sampler.zig`, Hyper-V reference
 monotonic `100 ns` resolution) execute the `309` B `matched.wasm` fixture
 (`135511ae68829ab7feeff41de03451ba860906f5fc1cd053ec8d6f3a7e1dd9e5`, workload

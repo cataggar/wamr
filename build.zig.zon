@@ -16,6 +16,10 @@
             .url = "https://github.com/cataggar/wabt/archive/de1b26f7e721aba18f6472437d8d6cde14bfec16.tar.gz",
             .hash = "wasip2-0.1.0-jlr7LXS8AACl3LA77qOp3ckw6PNrPJ543Cl--WBtRKsg",
         },
+        .toml = .{
+            .url = "git+https://github.com/lepton9/zig-toml.git#b78808b5b6889e9abec901462ce0b5355d3255db",
+            .hash = "toml-0.4.0-YDcxktD2AQA1JqOIBreG7fhcOWk9ngjlvJbeImpcJZGD",
+        },
     },
     .paths = .{
         "build.zig",

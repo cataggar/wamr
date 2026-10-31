@@ -15,3 +15,11 @@ Benchmark inputs and harnesses for wamr.
 - [`loop-passes/`](loop-passes/) — checksum-pinned focused AOT fixtures for
   induction-variable simplification and bounded loop unrolling, compared
   across refs by `scripts/bench_loop_passes.py`.
+
+The SIMD comparison also has an experimental native implementation:
+`zig build build-bench-simd` builds `zig-out/bin/bench-simd`. The existing
+`scripts/bench_simd.py` remains authoritative while real-ref and platform
+behavior are validated. SIGINT and SIGTERM cleanup has been exercised with
+mock builds, and interrupted Git checkout cleanup with a small real repository,
+on Linux. Execution on macOS remains unverified; check for leftover worktrees
+after interruption.

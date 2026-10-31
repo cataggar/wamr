@@ -66,7 +66,7 @@ jobs:
           SHOULD_RUN=false
           while IFS= read -r FILE; do
             case "$FILE" in
-              src/compiler/*|src/runtime/*|tests/benchmarks/coremark/*|scripts/bench_coremark.py|scripts/aarch64_instruction_provenance.py|scripts/profile_coremark_aarch64.py|scripts/test_bench_coremark.py|scripts/test_aarch64_instruction_provenance.py|scripts/test_profile_coremark_aarch64.py|scripts/compare_hot_function.py|.github/skills/aot-perf-profile/aot_jit_attr.py|tests/test_aot_jit_attr.py|.github/workflows/coremark-aarch64.yml)
+              src/compiler/*|src/runtime/*|tests/benchmarks/coremark/*|scripts/bench_coremark.zig|scripts/aarch64_instruction_provenance.zig|scripts/profile_coremark_aarch64.zig|scripts/compare_hot_function.zig|scripts/aot_jit_attr.zig|.github/workflows/coremark-aarch64.yml)
                 SHOULD_RUN=true
                 break
                 ;;
@@ -101,11 +101,13 @@ jobs:
 
       - name: Test CoreMark harness
         run: |
-          python3 -m unittest \
-            scripts/test_bench_coremark.py \
-            scripts/test_aarch64_instruction_provenance.py \
-            scripts/test_profile_coremark_aarch64.py \
-            tests/test_aot_jit_attr.py
+          zig build \
+            test-bench-coremark \
+            test-aarch64-instruction-provenance \
+            test-profile-coremark-aarch64 \
+            test-frame-attribution \
+            build-bench-coremark \
+            build-profile-coremark-aarch64
 
       - name: Resolve refs
         id: refs
@@ -144,7 +146,7 @@ jobs:
           BASELINE: ${{ steps.refs.outputs.baseline }}
           TARGET: ${{ steps.refs.outputs.target }}
         run: |
-          python3 scripts/bench_coremark.py \
+          ./zig-out/bin/bench-coremark \
             --baseline "$BASELINE" \
             --target   "$TARGET" \
             --profile  ci \
@@ -162,7 +164,7 @@ jobs:
           BASELINE: ${{ steps.refs.outputs.baseline }}
           TARGET: ${{ steps.refs.outputs.target }}
         run: |
-          python3 scripts/bench_coremark.py \
+          ./zig-out/bin/bench-coremark \
             --baseline "$BASELINE" \
             --target   "$TARGET" \
             --profile  authoritative \
@@ -185,7 +187,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p coremark-paired-profile
-          python3 scripts/bench_coremark.py \
+          ./zig-out/bin/bench-coremark \
             --baseline "$BASELINE" \
             --target   "$TARGET" \
             --profile  authoritative \
@@ -208,7 +210,7 @@ jobs:
           PROFILE_SHA: ${{ steps.refs.outputs.profile }}
         run: |
           mkdir -p coremark-profile
-          python3 scripts/bench_coremark.py \
+          ./zig-out/bin/bench-coremark \
             --baseline "$PROFILE_SHA" \
             --target   "$PROFILE_SHA" \
             --profile  authoritative \
@@ -269,17 +271,13 @@ jobs:
           echo "COREMARK_PERF_PARANOID_INITIAL=${initial_paranoid}" >> "$GITHUB_ENV"
           echo "PERF=${perf_binary}" >> "$GITHUB_ENV"
 
+          zig build-exe scripts/perf_probe.zig -OReleaseSafe \
+            -femit-bin="$root/perf-probe"
           "$perf_binary" record -e cycles:u -F 99 \
-            -o "$root/perf-probe.data" -- \
-            python3 -c 'import time
-          end = time.monotonic() + 0.5
-          value = 1
-          while time.monotonic() < end:
-              value = (value * 1664525 + 1013904223) & 0xffffffff
-          print(value)'
+            -o "$root/perf-probe.data" -- "$root/perf-probe"
           "$perf_binary" report -i "$root/perf-probe.data" \
             --stdio -g none -n >/dev/null
-          rm "$root/perf-probe.data"
+          rm "$root/perf-probe.data" "$root/perf-probe"
           echo "native cycles:u sampling permitted"
 
       - name: Capture matched-host CoreMark profiles
@@ -298,7 +296,7 @@ jobs:
           if [ -n "$FRAME_FUNC" ]; then
             frame_args=(--frame-func "$FRAME_FUNC")
           fi
-          python3 scripts/profile_coremark_aarch64.py \
+          ./zig-out/bin/profile-coremark-aarch64 \
             --out-dir coremark-profile \
             --benchmark-report coremark-profile/benchmark-report.json \
             --benchmark-artifacts "$RUNNER_TEMP/coremark-profile-artifacts" \
@@ -322,7 +320,7 @@ jobs:
           BASELINE: ${{ steps.refs.outputs.baseline }}
           FRAME_FUNC: ${{ github.event.inputs.frame_func }}
         run: |
-          python3 scripts/profile_coremark_aarch64.py \
+          ./zig-out/bin/profile-coremark-aarch64 \
             --out-dir coremark-paired-profile/baseline-profile \
             --benchmark-report coremark-paired-profile/benchmark-report.json \
             --benchmark-role wamr-baseline \
@@ -347,7 +345,7 @@ jobs:
           TARGET: ${{ steps.refs.outputs.target }}
           FRAME_FUNC: ${{ github.event.inputs.frame_func }}
         run: |
-          python3 scripts/profile_coremark_aarch64.py \
+          ./zig-out/bin/profile-coremark-aarch64 \
             --out-dir coremark-paired-profile/target-profile \
             --benchmark-report coremark-paired-profile/benchmark-report.json \
             --benchmark-role wamr-target \

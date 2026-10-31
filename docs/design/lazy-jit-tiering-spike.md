@@ -267,7 +267,7 @@ With the current #862 eligibility rules, CoreMark is mainly a **ceiling/referenc
   - background publish while callers continue succeeding,
   - destroy while work is queued/running,
   - `JitCodeCache` accounting of baseline + upgraded + retired mappings
-- `scripts/bench_jit_coldstart.py` (or equivalent) for the new tiering benchmark rows
+- `scripts/bench_jit_coldstart.zig` (or equivalent) for the new tiering benchmark rows
 
 ## Recommendation
 

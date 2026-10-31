@@ -130,7 +130,17 @@ correspond 1:1 with the WIT functions / methods / `[constructor]` /
 `wasi-p3-testsuite-expectations.toml` currently carries no exclusions.
 The unfiltered P3 contract asserts that all 41 fixtures execute and pass, so
 either expectation file cannot make the P3 result appear green by excluding
-its corpus.
+its corpus. Direct invocations of `scripts/wasi_p3_profile.zig` require
+`zig build build-wasi-p3-unfiltered` first, outside the measured samples.
+
+The experimental native runner (`zig build build-wasi-suite-runner`) can emit
+compatible `WAMR_PROFILE_TIMINGS` JSONL events on Linux and macOS. Its selected
+sampling support is experimental and unverified on macOS: build the launcher
+before measurement with `zig build-exe scripts/wasi_p3_sample_launch.zig -lc
+-OReleaseSafe -femit-bin=zig-out/bin/wasi-p3-sample-launch`, then set
+`WAMR_PROFILE_LAUNCHER` to that executable along with `WAMR_PROFILE_SELECTION`
+and `WAMR_PROFILE_OUTPUT_DIR`. Windows timing output is not supported. The
+native runner is not used by the conformance and profiling gates.
 
 ## Preview 1 / 2 / 3 milestones
 
@@ -690,7 +700,7 @@ gates (`wasi-testsuite`, `wasi-p3-testsuite`).
 
 ### Threaded performance evidence
 
-[`scripts/bench_wasi_threads.py`](../scripts/bench_wasi_threads.py) drives the
+[`scripts/bench_wasi_threads.zig`](../scripts/bench_wasi_threads.zig) drives the
 checked-in real-wasi-libc pthread fixtures under
 [`tests/benchmarks/wasi-threads/`](../tests/benchmarks/wasi-threads/) through
 the interpreter and AOT. It pairs disabled/enabled runtime builds on one

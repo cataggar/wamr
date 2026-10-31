@@ -1,7 +1,7 @@
 name: Cold-start (aarch64)
 
 # Per-PR cold-start latency comparison on a hosted aarch64 runner.
-# Runs `scripts/bench_coldstart.py` against the PR base, posts a sticky
+# Runs `scripts/bench_coldstart.zig` against the PR base, posts a sticky
 # delta table, and fails the job if the wamr CLI's median cold-start time
 # regresses by more than --regression-ratio (default 1.5×).
 #
@@ -53,7 +53,7 @@ on:
       - build.zig
       - build.zig.zon
       - tests/coldstart/**
-      - scripts/bench_coldstart.py
+      - scripts/bench_coldstart.zig
       - .github/workflows/coldstart-aarch64.yml
 
 concurrency:
@@ -117,7 +117,8 @@ jobs:
           WARMUP: ${{ github.event.inputs.warmup || '5' }}
           REGRESSION_RATIO: ${{ github.event.inputs.regression_ratio || '1.5' }}
         run: |
-          python3 scripts/bench_coldstart.py \
+          zig build build-bench-coldstart
+          ./zig-out/bin/bench-coldstart \
             --baseline         "$BASELINE" \
             --target           "$TARGET" \
             --samples          "$SAMPLES" \
@@ -169,7 +170,7 @@ jobs:
               table,
               '',
               '<sub>Self-hosted aarch64 runner. ' +
-                'See [`scripts/bench_coldstart.py`](../tree/main/scripts/bench_coldstart.py) ' +
+                'See [`scripts/bench_coldstart.zig`](../tree/main/scripts/bench_coldstart.zig) ' +
                 'and issue #394 for context.</sub>',
             ].join('\n');
 

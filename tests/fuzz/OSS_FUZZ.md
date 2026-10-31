@@ -16,7 +16,7 @@ question. The repository now matches the technical prerequisites:
 
 1. #248 (corpus minimization and reducer workflow) is closed; reduced
    inputs land under `tests/fuzz/regression/<target>/` per
-   `tests/fuzz/regression/README.md` and `scripts/fuzz_reduce.py`.
+   `tests/fuzz/regression/README.md` and `zig build fuzz-reduce`.
 2. We accept the cost of maintaining a hand-rolled
    `LLVMFuzzerTestOneInput` shim and a pinned Zig toolchain.
    Zig's `std.testing.fuzz` is still moving and OSS-Fuzz's base image

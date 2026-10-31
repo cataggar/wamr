@@ -101,7 +101,7 @@ jobs:
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Test isolated harness
-        run: python3 scripts/test_bench_leaf_cancel_cost.py
+        run: zig test scripts/bench_leaf_cancel_cost.zig -lc
 
       - name: Run leaf-call comparison
         env:
@@ -118,7 +118,7 @@ jobs:
             }
             ARGS+=(--calls "$CALLS")
           fi
-          python3 scripts/bench_leaf_cancel_cost.py \
+          zig run scripts/bench_leaf_cancel_cost.zig -lc -- \
             --platform-id '${{ matrix.platform }}' \
             --runner-environment github-hosted \
             --warmups "$WARMUPS" \

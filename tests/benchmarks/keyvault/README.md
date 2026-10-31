@@ -1,6 +1,7 @@
 # Keyvault SpiderMonkey/TCGC AOT harness
 
-`scripts/bench_keyvault.py` compares precompiled WAMR and Wasmtime execution
+`scripts/bench_keyvault.zig` (`zig build build-bench-keyvault`, producing
+`./zig-out/bin/bench-keyvault`) compares precompiled WAMR and Wasmtime execution
 of the keyvault codegen workload from #798. It is deliberately an orchestrator,
 not an installer: it never clones repositories, downloads runtimes, installs
 `perf`, builds the component, or guesses a floating version.
@@ -29,8 +30,8 @@ tips and call the result the #798 baseline.
 Compute hashes with the harness's canonical algorithm:
 
 ```bash
-python3 scripts/bench_keyvault.py --hash /path/to/file
-python3 scripts/bench_keyvault.py --hash /path/to/tree
+./zig-out/bin/bench-keyvault --hash /path/to/file
+./zig-out/bin/bench-keyvault --hash /path/to/tree
 ```
 
 Directory hashes cover the sorted relative path, exact size, and SHA-256 of
@@ -41,7 +42,7 @@ created separately for every run.
 Validate prerequisites without compiling or executing:
 
 ```bash
-python3 scripts/bench_keyvault.py \
+./zig-out/bin/bench-keyvault \
   --manifest /path/to/keyvault.lock.json \
   --validate-only
 ```
@@ -59,7 +60,7 @@ uses `v46.0.1`), build the component and TCGC stdlib, and prepare the pinned
 spec checkout before invoking it:
 
 ```bash
-python3 scripts/bench_keyvault.py \
+./zig-out/bin/bench-keyvault \
   --manifest /path/to/keyvault.lock.json \
   --work-dir "$PWD/zig-out/keyvault-798" \
   --warmups 2 \
@@ -98,7 +99,7 @@ fabricated baseline.
 Perf is opt-in, never an automatic fallback:
 
 ```bash
-python3 scripts/bench_keyvault.py \
+./zig-out/bin/bench-keyvault \
   --manifest /path/to/keyvault.lock.json \
   --work-dir "$PWD/zig-out/keyvault-798" \
   --warmups 2 --runs 7 --profile
@@ -114,7 +115,7 @@ that precise core image (target ABI, full text and function hash, instruction
 ranges, and spill-count reconciliation); missing or stale metadata is fatal.
 The perf attribution reuses the same sidecar and checks the reported identity.
 The profiled run is checked against the same response byte count and generated
-output tree before `aot_jit_attr.py` maps self samples to `local_func` indices.
+output tree before `aot_jit_attr.zig` maps self samples to `local_func` indices.
 The JSON/Markdown reports record total samples, attributed samples, coverage,
 core/sidecar SHA-256s, proven and unknown frame-origin samples, top functions,
 and instruction-class data. Without a sidecar, the hot-function comparison
@@ -127,7 +128,7 @@ For Azure Linux setup and interpretation details, see
 
 ## Compare the same hot wasm function in WAMR and Wasmtime
 
-`scripts/compare_hot_function.py` turns the WAMR profile into a strict,
+`scripts/compare_hot_function.zig` turns the WAMR profile into a strict,
 archiveable cross-engine code comparison. It does **not** equate WAMR's
 `local_func=N` with Wasmtime's engine-local module/function labels. Native
 capture currently targets the benchmark cohort's Linux x86_64 host.
@@ -136,7 +137,7 @@ First run the benchmark with `--profile`. Then extract the raw core modules
 from the exact pinned component without re-encoding them. For example,
 `wasm-tools component unbundle` can extract embedded modules; composed
 components may need recursive unbundling. Hash candidates with
-`bench_keyvault.py --hash` and select the unique file whose SHA-256 equals the
+`bench-keyvault --hash` and select the unique file whose SHA-256 equals the
 chosen WAMR manifest entry's `core_sha256`. Ambiguous or absent matches are a
 hard error, not a reason to use the core's ordinal.
 
@@ -154,12 +155,12 @@ the component, raw-core, WAMR cwasm, attribution, benchmark report, and
 Wasmtime binary hashes.
 
 ```bash
-python3 scripts/compare_hot_function.py capture \
+zig run scripts/compare_hot_function.zig -lc -- capture \
   --config tests/benchmarks/keyvault/hot-comparison.local.json \
   --work-dir "$PWD/zig-out/keyvault-798/hot-comparison" \
   --output "$PWD/zig-out/keyvault-798/hot-capture.json"
 
-python3 scripts/compare_hot_function.py report \
+zig run scripts/compare_hot_function.zig -lc -- report \
   --capture "$PWD/zig-out/keyvault-798/hot-capture.json" \
   --report-json "$PWD/zig-out/keyvault-798/hot-comparison.json" \
   --report-markdown "$PWD/zig-out/keyvault-798/hot-comparison.md"
@@ -184,7 +185,7 @@ explorer function extent remains the reported code size. This is deliberate:
 - compiling the exact extracted core as standalone `wasm[0]` therefore gives a
   sound module-hash + wasm-index comparison without guessing that ordinal.
 
-`bench_keyvault.py` currently collects WAMR dynamic samples only. Wasmtime
+`bench-keyvault` currently collects WAMR dynamic samples only. Wasmtime
 dynamic columns remain explicitly unavailable unless `wasmtime.profile`
 points to a pinned JSON document with this shape:
 
