@@ -32,6 +32,62 @@ jobs:
       - name: Configure Zig caches
         uses: ./.github/actions/zig-cache
 
+      # This static check covers repository-owned files, not third-party actions.
+      - name: Check automation policy
+        run: |
+          zig test scripts/automation_policy.zig
+          zig test scripts/check_spec_baseline.zig
+          zig test scripts/diff_testsuite_reports.zig
+          zig test scripts/wasi_p3_parity.zig
+          zig test scripts/release_version.zig
+          zig test src/tests/wasi_fixture_runtime.zig
+          zig test src/tests/wasi_fixture_report.zig
+          zig build test-wasi-expectations
+          zig build test-wasi-process
+          zig build test-wasi-execute
+          zig build test-wasi-runtime-meta
+          zig build test-wasi-suite-runner
+          zig build test-wasi-runner-cli
+          zig build build-wasi-suite-runner
+          zig test scripts/wasi_p3_unfiltered.zig
+          zig test scripts/wasi_p3_sample_launch.zig -lc
+          zig test scripts/bench_jit_coldstart.zig
+          zig test scripts/perf_investigate.zig
+          zig test scripts/wasi_p3_profile_aggregate.zig
+          zig test scripts/wasi_p3_profile_collect.zig
+          zig test scripts/wasi_p3_profile_sample.zig -lc
+          zig test scripts/wasi_p3_profile.zig -lc
+          zig test scripts/benchmark_schema.zig
+          zig test scripts/benchmark_stats.zig
+          zig test scripts/bench_simd.zig -lc
+          zig build build-bench-simd
+          SIMD_BENCH="$PWD/zig-out/bin/bench-simd" zig test scripts/bench_simd_cli_test.zig -lc
+          zig build test-bench-coldstart build-bench-coldstart
+          zig build test-frame-attribution build-aot-jit-attr
+          zig build test-keyvault-harness build-bench-keyvault
+          zig build test-hot-function-comparison
+          zig build test-aarch64-instruction-provenance
+          zig build test-bench-coremark build-bench-coremark
+          zig build test-profile-coremark-aarch64 build-profile-coremark-aarch64
+          zig build test-reanalyze-coremark-986 build-reanalyze-coremark-986
+          zig build test-bench-loop-passes build-bench-loop-passes
+          zig build test-wasi-p3-profile build-wasi-p3-profile
+          zig build test-wasi-thread-bench
+          zig build test-leaf-cancel-cost
+          zig test scripts/native_jit_benchmark.zig -lc
+          zig test scripts/native_benchmark.zig -lc
+          zig test scripts/mutation_list.zig
+          zig build test-mutation-run build-mutation-run
+          MUTATION_RUNNER="$PWD/zig-out/bin/mutation-run" zig test scripts/mutation_cli_test.zig -lc
+          zig build test-fuzz-reduce
+          zig test scripts/release_artifacts.zig
+          zig test scripts/release_verify.zig
+          zig test scripts/release_manifest.zig
+          zig test scripts/release_manifest_test.zig
+          zig test tests/malformed/malformed_test.zig
+          zig test .github/scripts/fetch_and_compare_version.zig
+          zig run scripts/automation_policy.zig
+
       - name: Check formatting
         run: |
           find src/ -name '*.zig' | head -1 > /dev/null 2>&1 && echo "Zig sources found" || true

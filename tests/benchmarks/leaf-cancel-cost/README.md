@@ -80,7 +80,7 @@ From the repository root on x86_64 or AArch64 Linux:
 ```sh
 export TMPDIR="$PWD/zig-out/leaf-cancel-cost/tmp"
 export XDG_CACHE_HOME="$PWD/zig-out/leaf-cancel-cost/xdg-cache"
-python3 scripts/bench_leaf_cancel_cost.py \
+zig run scripts/bench_leaf_cancel_cost.zig -lc -- \
   --platform-id local-linux-$(uname -m) \
   --runner-environment local \
   --output-dir "$PWD/zig-out/leaf-cancel-cost"
@@ -101,7 +101,7 @@ so preparation changes do not start remote measurement automatically.
 For the repository's qemu route on an x86_64 host with `qemu-aarch64`:
 
 ```sh
-python3 scripts/bench_leaf_cancel_cost.py \
+zig run scripts/bench_leaf_cancel_cost.zig -lc -- \
   --target aarch64-linux-musl \
   --aot-target aarch64 \
   --runner qemu-aarch64 \

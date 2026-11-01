@@ -1,0 +1,116 @@
+[
+  {
+    "id": "dce-reenable",
+    "title": "re-enable dead code elimination safely",
+    "area": "IR passes",
+    "description": "The DCE pass exists in `passes.zig` but is disabled because it does not track implicit uses of call arguments.  Fix the use-def analysis to count call-arg operands so DCE can be safely enabled in the default pass pipeline.\n\nThis should reduce code size and improve I-cache utilisation by removing instructions whose results are never consumed.",
+    "files": [
+      "src/compiler/ir/passes.zig"
+    ],
+    "reference": "Cranelift DCE: https://github.com/bytecodealliance/wasmtime/blob/main/cranelift/codegen/src/dce.rs",
+    "bench_hint": "The existing atomic bench should show smaller code sizes.  Consider adding a multi-expression benchmark body with several dead intermediate values to make the effect visible."
+  },
+  {
+    "id": "strength-reduction-shift",
+    "title": "strength reduction — multiply by power-of-2 to shift",
+    "area": "IR passes",
+    "description": "Add an IR peephole pass that replaces `mul(x, C)` with `shl(x, log2(C))` when C is a compile-time constant power of two.  `imul` has 3-cycle latency on modern x86-64; `shl` is 1 cycle.\n\nWalk each block's instructions, match `.mul` with one operand defined by `iconst_32` / `iconst_64`, check `std.math.log2`, and rewrite in-place.",
+    "files": [
+      "src/compiler/ir/passes.zig",
+      "src/compiler/ir/ir.zig"
+    ],
+    "reference": "Cranelift algebraic opts: https://github.com/bytecodealliance/wasmtime/blob/main/cranelift/codegen/src/opts/algebraic.isle",
+    "bench_hint": "Add a benchmark body in `bench_codegen.zig` that builds an IR function with `mul(vreg, 8)` to measure the improvement."
+  },
+  {
+    "id": "shift-immediate",
+    "title": "shift-immediate specialisation for constant shift counts",
+    "area": "x86-64 codegen",
+    "description": "x86-64 shift instructions (`shl`, `shr`, `sar`) accept an immediate byte operand (imm8), but the backend may load the shift count into CL unconditionally.  When the shift count is a compile-time constant, emit `shl reg, imm8` directly to save a register and a MOV.\n\nCheck `compile.zig` for the `.shl`, `.shr_s`, `.shr_u` cases and add a constant-operand fast path.",
+    "files": [
+      "src/compiler/codegen/x86_64/compile.zig"
+    ],
+    "reference": "Intel SDM Vol. 2, SHL/SHR instruction encoding: immediate operand form uses opcode /4 ib.",
+    "bench_hint": "Add a benchmark body with `shl(vreg, iconst 3)` to measure code-size and cycle reduction."
+  },
+  {
+    "id": "bounds-check-hoist",
+    "title": "hoist redundant memory bounds checks",
+    "area": "x86-64 codegen",
+    "description": "Every wasm load/store emits a bounds check against the linear memory size.  When multiple loads/stores access the same base with increasing offsets, only the largest offset needs a check.  Group adjacent memory accesses by base register and emit a single check for the maximum offset.\n\nWasmtime's Cranelift and V8 TurboFan both perform bounds-check elimination for memory-intensive wasm code.",
+    "files": [
+      "src/compiler/codegen/x86_64/compile.zig",
+      "src/compiler/ir/passes.zig"
+    ],
+    "reference": "Cranelift heap access: https://github.com/bytecodealliance/wasmtime/blob/main/cranelift/wasm/src/heap.rs",
+    "bench_hint": "Add a benchmark body with three consecutive loads from base+0, base+4, base+8 to measure the check reduction."
+  },
+  {
+    "id": "bench-expansion",
+    "title": "expand benchmark coverage beyond atomics",
+    "area": "benchmarks",
+    "description": "The current `bench_codegen.zig` only measures atomic operations.  Many codegen optimisations (register allocation, instruction selection, constant folding) are invisible to these benchmarks.\n\nAdd benchmark bodies for:\n- Binary arithmetic (`add`, `sub`, `mul`, `div_u`)\n- Comparisons + branches (`br_if` with a condition chain)\n- Memory load/store sequences\n- Function calls (`call` + `ret` round-trip)\n- Mixed integer/float pipelines\n\nKeep the existing RDTSC-based harness; just add new `bodyXxx` functions and entries in the benchmarks array.",
+    "files": [
+      "src/compiler/bench_codegen.zig"
+    ],
+    "reference": "Sightglass benchmark suite: https://github.com/bytecodealliance/sightglass",
+    "bench_hint": "This IS the benchmark improvement — verify that the new bodies compile and produce plausible cycle counts."
+  },
+  {
+    "id": "small-memcpy-inline",
+    "title": "inline small fixed-size memory.copy and memory.fill",
+    "area": "x86-64 codegen",
+    "description": "When `memory.copy` or `memory.fill` is called with a compile-time-known small size (≤ 64 bytes), emit inline MOV/MOVS sequences instead of calling the runtime helper.  This avoids function-call overhead and lets the CPU pipeline the stores.\n\nLLVM and Cranelift both inline small memcpy/memset.  The threshold can be tuned; 64 bytes (8 qwords) is typical.",
+    "files": [
+      "src/compiler/codegen/x86_64/compile.zig"
+    ],
+    "reference": "LLVM SelectionDAG memcpy lowering: uses REP MOVSB for large copies, unrolled MOV for small.",
+    "bench_hint": "Add a benchmark with `memory.copy` of 8, 16, 32, 64 bytes to measure call-vs-inline trade-off."
+  },
+  {
+    "id": "branch-threading",
+    "title": "branch threading for chained conditional jumps",
+    "area": "IR passes",
+    "description": "If block A branches to block B, and block B's only instruction is another branch on the same condition, rewrite A to jump directly to B's target.  This eliminates one branch and one basic-block transition.\n\nThis pattern is especially common after other optimisation passes simplify blocks down to just a terminator.",
+    "files": [
+      "src/compiler/ir/passes.zig"
+    ],
+    "reference": "LLVM JumpThreading: https://llvm.org/docs/Passes.html#jump-threading",
+    "bench_hint": "Add a benchmark body with a chain of `br_if` instructions on the same condition to measure the effect."
+  },
+  {
+    "id": "regalloc-hints",
+    "title": "register hints for calling-convention constraints",
+    "area": "register allocation",
+    "description": "x86-64 division requires the dividend in RAX and produces the quotient in RAX.  The register allocator can avoid unnecessary MOVs by hinting that div operands/results should prefer RAX/RDX.\n\nSimilarly, function return values should prefer RAX, and call arguments should prefer the SysV ABI registers (RDI, RSI, RDX, RCX, R8, R9).  Adding hints to the regalloc reduces move-insertion overhead.",
+    "files": [
+      "src/compiler/ir/regalloc.zig",
+      "src/compiler/codegen/x86_64/compile.zig"
+    ],
+    "reference": "Cranelift regalloc2 hints: https://github.com/bytecodealliance/regalloc2",
+    "bench_hint": "The existing `atomic_cmpxchg` benchmark exercises the RAX constraint path — check if cycles/op drops."
+  },
+  {
+    "id": "loop-invariant-motion",
+    "title": "loop-invariant code motion (LICM)",
+    "area": "IR passes",
+    "description": "Move computations that produce the same result on every loop iteration into the loop's preheader block.  This requires loop detection (identify back-edges via DFS on the CFG) and a dominator-tree query to verify safety.\n\nLICM is one of the highest-impact optimisations for numerical wasm workloads (PolyBench, CoreMark).",
+    "files": [
+      "src/compiler/ir/passes.zig",
+      "src/compiler/ir/analysis.zig"
+    ],
+    "reference": "Cranelift LICM: https://github.com/bytecodealliance/wasmtime/blob/main/cranelift/codegen/src/licm.rs",
+    "bench_hint": "This optimisation is hard to benchmark with the current micro-bench.  Consider using the spec-test pass rate as the primary metric, or adding a loop-heavy benchmark body."
+  },
+  {
+    "id": "lea-compound-addr",
+    "title": "peephole — LEA for compound address computation",
+    "area": "x86-64 codegen",
+    "description": "x86-64 LEA can compute `base + index*scale + displacement` in a single µop.  When the IR has a chain of `add(add(base, shl(index, 2)), const_offset)`, the backend can fuse this into one LEA instead of separate ADD and SHL instructions.\n\nThis pattern appears frequently in array indexing and struct field access in wasm linear memory.",
+    "files": [
+      "src/compiler/codegen/x86_64/compile.zig"
+    ],
+    "reference": "Intel Optimization Manual §3.5.1.3: LEA instruction for address generation.",
+    "bench_hint": "Add a benchmark body with `add(add(base, shl(idx, 2)), 16)` to measure LEA fusion."
+  }
+]

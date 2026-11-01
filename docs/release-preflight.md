@@ -62,9 +62,9 @@ checksums themselves. Download only the evidence unless binary replay is needed.
 
 Version-specific notes are read from `docs/releases/v<version>.md` when present;
 the source SHA and installation command are appended automatically.
-`3.0.0-dev.14` maps to Python `3.0.0.dev14` through the same helper used by the wheel
-builders. Existing PyPI workflows remain stable-only and cannot publish from a
-manual preflight. This preflight does not build or validate Python wheels.
+The manifest retains its existing `pep440` version field for compatibility.
+PyPI packages are no longer maintained; this preflight does not build or
+validate Python wheels.
 
 Review the exact-candidate CI, artifact evidence, and any unexecuted platforms
 before authorizing publication. A preflight never creates a tag or release.

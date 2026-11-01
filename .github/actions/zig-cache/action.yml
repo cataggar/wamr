@@ -3,7 +3,7 @@ description: >-
   Configure separate ZIG_GLOBAL_CACHE_DIR and ZIG_LOCAL_CACHE_DIR paths
   outside $GITHUB_WORKSPACE. Keeping the caches distinct and outside the
   checkout avoids collisions between worktrees spawned by perf scripts
-  (scripts/bench_coremark.py and scripts/bench_simd.py, which already adjust
+  (scripts/bench_coremark.zig and scripts/bench_simd.zig, which already adjust
   these variables). This composite action runs after Zig is installed and
   exports worktree-safe values:
     * ZIG_GLOBAL_CACHE_DIR -> a stable path outside the workspace.

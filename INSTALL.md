@@ -1,6 +1,6 @@
 # Installing WAMR
 
-Pre-built binaries are published to [GitHub Releases](https://github.com/cataggar/wamr/releases) and [PyPI](https://pypi.org/project/wamr-bin/).
+Pre-built binaries are published to [GitHub Releases](https://github.com/cataggar/wamr/releases). PyPI packages are no longer maintained.
 
 ## ghr (recommended)
 
@@ -20,28 +20,6 @@ Upgrade to the latest release:
 
 ```sh
 ghr upgrade wamr
-```
-
-## uv
-
-```sh
-uv tool install wamr-bin
-```
-
-The AOT compiler is published separately:
-
-```sh
-uv tool install wamrc-bin
-```
-
-## pip
-
-```sh
-python3 -m pip install wamr-bin
-```
-
-```sh
-python3 -m pip install wamrc-bin
 ```
 
 ## dist
@@ -66,8 +44,8 @@ Binaries are written to `zig-out/bin/`.
 
 ### JIT mode
 
-The pre-built binaries above (GitHub Releases, PyPI, `ghr`, `uv`, `pip`,
-`dist`) are all **AOT-only** — the release workflow does not pass
+The pre-built binaries above (GitHub Releases, `ghr`, `dist`) are all
+**AOT-only** — the release workflow does not pass
 `-Djit`. To get a `wamr` that compiles and runs a plain `.wasm` module
 directly in one step (no separate `wamrc` precompile), build from
 source with the flag added:

@@ -1,7 +1,7 @@
 # Regression seeds
 
 Each subdirectory `<target>/` holds minimized fuzz inputs that previously
-exposed a real bug, were reduced with `scripts/fuzz_reduce.py`, fixed in
+exposed a real bug, were reduced with the repository's fuzz reducer, fixed in
 the relevant code path, and locked in here as a permanent regression seed
 for `fuzz-<target>`.
 

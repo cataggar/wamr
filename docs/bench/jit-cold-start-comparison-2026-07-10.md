@@ -1,5 +1,8 @@
 # JIT cold-start comparison — 2026-07-10
 
+This is a historical record; the commands and output below are unchanged.
+For new runs, use `zig run scripts/bench_jit_coldstart.zig -- --help`.
+
 Host: Azure VM worktree `/work/wamr-861-jit-bench-docs`, commit `329c29b5`, branch `861-jit-bench-docs`. Commands were run with `ZIG_LOCAL_CACHE_DIR` unset and `ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache`.
 
 _Host: arch `x86_64` · 8 vCPU · `AMD EPYC 9V74 80-Core Processor`_

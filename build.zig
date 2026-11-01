@@ -55,6 +55,192 @@ pub fn build(b: *std.Build) void {
     minimal_wasi_test_step.dependOn(&b.addRunArtifact(minimal_wasi_context_tests).step);
     minimal_wasi_test_step.dependOn(&b.addRunArtifact(native_wasi_adapter_tests).step);
 
+    const wasi_expectations_module = b.createModule(.{
+        .root_source_file = b.path("src/tests/wasi_expectations.zig"),
+        .target = b.graph.host,
+        .optimize = .safe,
+    });
+    const toml_dependency = b.dependency("toml", .{ .target = b.graph.host, .optimize = .safe });
+    wasi_expectations_module.addImport("toml", toml_dependency.module("toml"));
+    const wasi_expectations_tests = b.addTest(.{ .root_module = wasi_expectations_module });
+    b.step("test-wasi-expectations", "Test WASI expectation-file parsing").dependOn(&b.addRunArtifact(wasi_expectations_tests).step);
+
+    const wasi_process_module = b.createModule(.{
+        .root_source_file = b.path("src/tests/wasi_fixture_process.zig"),
+        .target = b.graph.host,
+        .optimize = .safe,
+        .link_libc = if (b.graph.host.result.os.tag == .linux) true else null,
+    });
+    wasi_process_module.addImport("process_control", b.createModule(.{
+        .root_source_file = b.path("scripts/process_control.zig"),
+        .target = b.graph.host,
+        .optimize = .safe,
+    }));
+    const wasi_process_tests = b.addTest(.{ .root_module = wasi_process_module });
+    b.step("test-wasi-process", "Test WASI fixture subprocess streams and deadlines").dependOn(&b.addRunArtifact(wasi_process_tests).step);
+
+    const wasi_execute_module = b.createModule(.{
+        .root_source_file = b.path("src/tests/wasi_fixture_execute.zig"),
+        .target = b.graph.host,
+        .optimize = .safe,
+        .link_libc = if (b.graph.host.result.os.tag == .linux or b.graph.host.result.os.tag == .macos) true else null,
+    });
+    wasi_execute_module.addImport("process_control", b.createModule(.{
+        .root_source_file = b.path("scripts/process_control.zig"),
+        .target = b.graph.host,
+        .optimize = .safe,
+    }));
+    const wasi_execute_tests = b.addTest(.{ .root_module = wasi_execute_module });
+    b.step("test-wasi-execute", "Test WASI fixture operation execution").dependOn(&b.addRunArtifact(wasi_execute_tests).step);
+
+    const wasi_meta_module = b.createModule(.{
+        .root_source_file = b.path("src/tests/wasi_runtime_meta.zig"),
+        .target = b.graph.host,
+        .optimize = .safe,
+        .link_libc = if (b.graph.host.result.os.tag == .linux) true else null,
+    });
+    wasi_meta_module.addImport("process_control", b.createModule(.{
+        .root_source_file = b.path("scripts/process_control.zig"),
+        .target = b.graph.host,
+        .optimize = .safe,
+    }));
+    const wasi_meta_tests = b.addTest(.{ .root_module = wasi_meta_module });
+    b.step("test-wasi-runtime-meta", "Test WASI runtime metadata queries").dependOn(&b.addRunArtifact(wasi_meta_tests).step);
+
+    const wasi_suite_module = b.createModule(.{
+        .root_source_file = b.path("src/tests/wasi_fixture_suite_runner.zig"),
+        .target = b.graph.host,
+        .optimize = .safe,
+        .link_libc = if (b.graph.host.result.os.tag == .linux or b.graph.host.result.os.tag == .macos) true else null,
+    });
+    wasi_suite_module.addImport("toml", toml_dependency.module("toml"));
+    wasi_suite_module.addImport("process_control", b.createModule(.{
+        .root_source_file = b.path("scripts/process_control.zig"),
+        .target = b.graph.host,
+        .optimize = .safe,
+    }));
+    const wasi_suite_tests = b.addTest(.{ .root_module = wasi_suite_module });
+    b.step("test-wasi-suite-runner", "Test WASI suite execution").dependOn(&b.addRunArtifact(wasi_suite_tests).step);
+
+    const wasi_runner_module = b.createModule(.{
+        .root_source_file = b.path("src/tests/wasi_runner_main.zig"),
+        .target = b.graph.host,
+        .optimize = .safe,
+        .link_libc = if (b.graph.host.result.os.tag == .linux or b.graph.host.result.os.tag == .macos) true else null,
+    });
+    wasi_runner_module.addImport("toml", toml_dependency.module("toml"));
+    wasi_runner_module.addImport("temp_root", b.createModule(.{
+        .root_source_file = b.path("scripts/temp_root.zig"),
+        .target = b.graph.host,
+        .optimize = .safe,
+    }));
+    wasi_runner_module.addImport("process_control", b.createModule(.{
+        .root_source_file = b.path("scripts/process_control.zig"),
+        .target = b.graph.host,
+        .optimize = .safe,
+    }));
+    const wasi_runner_exe = b.addExecutable(.{ .name = "wasi-suite-runner", .root_module = wasi_runner_module });
+    const wasi_runner_tests = b.addTest(.{ .root_module = wasi_runner_module });
+    b.step("test-wasi-runner-cli", "Test native WASI runner options")
+        .dependOn(&b.addRunArtifact(wasi_runner_tests).step);
+    b.step("build-wasi-suite-runner", "Build the experimental native WASI suite runner")
+        .dependOn(&b.addInstallArtifact(wasi_runner_exe, .{}).step);
+
+    if (b.graph.host.result.os.tag == .linux or b.graph.host.result.os.tag == .macos) {
+        const simd_bench_module = b.createModule(.{
+            .root_source_file = b.path("scripts/bench_simd.zig"),
+            .target = b.graph.host,
+            .optimize = .safe,
+            .link_libc = true,
+        });
+        const simd_bench_exe = b.addExecutable(.{ .name = "bench-simd", .root_module = simd_bench_module });
+        b.step("build-bench-simd", "Build the experimental native SIMD benchmark")
+            .dependOn(&b.addInstallArtifact(simd_bench_exe, .{}).step);
+
+        const coldstart_bench_module = b.createModule(.{
+            .root_source_file = b.path("scripts/bench_coldstart.zig"),
+            .target = b.graph.host,
+            .optimize = .safe,
+            .link_libc = true,
+        });
+        const coldstart_bench_exe = b.addExecutable(.{ .name = "bench-coldstart", .root_module = coldstart_bench_module });
+        b.step("build-bench-coldstart", "Build the experimental native cold-start benchmark")
+            .dependOn(&b.addInstallArtifact(coldstart_bench_exe, .{}).step);
+        b.step("test-bench-coldstart", "Test the native cold-start benchmark")
+            .dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = coldstart_bench_module })).step);
+
+        const mutation_module = b.createModule(.{
+            .root_source_file = b.path("scripts/mutation_run.zig"),
+            .target = b.graph.host,
+            .optimize = .safe,
+            .link_libc = true,
+        });
+        const mutation_exe = b.addExecutable(.{ .name = "mutation-run", .root_module = mutation_module });
+        b.step("build-mutation-run", "Build the experimental native mutation helper")
+            .dependOn(&b.addInstallArtifact(mutation_exe, .{}).step);
+        b.step("test-mutation-run", "Test the native mutation helper")
+            .dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mutation_module })).step);
+
+        const wasi_p3_sample_launch_module = b.createModule(.{
+            .root_source_file = b.path("scripts/wasi_p3_sample_launch.zig"),
+            .target = b.graph.host,
+            .optimize = .safe,
+            .link_libc = true,
+        });
+        const wasi_p3_sample_launch_exe = b.addExecutable(.{
+            .name = "wasi-p3-sample-launch",
+            .root_module = wasi_p3_sample_launch_module,
+        });
+        const wasi_p3_profile_module = b.createModule(.{
+            .root_source_file = b.path("scripts/wasi_p3_profile.zig"),
+            .target = b.graph.host,
+            .optimize = .safe,
+            .link_libc = true,
+        });
+        const wasi_p3_profile_exe = b.addExecutable(.{
+            .name = "wasi-p3-profile",
+            .root_module = wasi_p3_profile_module,
+        });
+        const wasi_p3_profile_aggregate_module = b.createModule(.{
+            .root_source_file = b.path("scripts/wasi_p3_profile_aggregate.zig"),
+            .target = b.graph.host,
+            .optimize = .safe,
+        });
+        const wasi_p3_profile_aggregate_exe = b.addExecutable(.{
+            .name = "wasi-p3-profile-aggregate",
+            .root_module = wasi_p3_profile_aggregate_module,
+        });
+        const build_wasi_p3_profile_step = b.step(
+            "build-wasi-p3-profile",
+            "Build native WASI P3 profiling and aggregation tools",
+        );
+        build_wasi_p3_profile_step.dependOn(&b.addInstallArtifact(wasi_runner_exe, .{}).step);
+        build_wasi_p3_profile_step.dependOn(&b.addInstallArtifact(wasi_p3_sample_launch_exe, .{}).step);
+        build_wasi_p3_profile_step.dependOn(&b.addInstallArtifact(wasi_p3_profile_exe, .{}).step);
+        build_wasi_p3_profile_step.dependOn(&b.addInstallArtifact(wasi_p3_profile_aggregate_exe, .{}).step);
+        const test_wasi_p3_profile_step = b.step(
+            "test-wasi-p3-profile",
+            "Test native WASI P3 profiling and aggregation tools",
+        );
+        test_wasi_p3_profile_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = wasi_p3_sample_launch_module })).step);
+        test_wasi_p3_profile_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = wasi_p3_profile_module })).step);
+        test_wasi_p3_profile_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = wasi_p3_profile_aggregate_module })).step);
+    }
+
+    const fuzz_reduce_module = b.createModule(.{
+        .root_source_file = b.path("scripts/fuzz_reduce.zig"),
+        .target = b.graph.host,
+        .optimize = .safe,
+    });
+    const fuzz_reduce_exe = b.addExecutable(.{ .name = "fuzz-reduce", .root_module = fuzz_reduce_module });
+    const fuzz_reduce_runner = b.addRunArtifact(fuzz_reduce_exe);
+    fuzz_reduce_runner.addArg("--repo-root");
+    fuzz_reduce_runner.addDirectoryArg(b.path("."));
+    fuzz_reduce_runner.addPassthruArgs();
+    b.step("fuzz-reduce", "Reduce a fuzz reproducer with a native harness").dependOn(&fuzz_reduce_runner.step);
+    b.step("test-fuzz-reduce", "Test fuzz reproducer reduction")
+        .dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = fuzz_reduce_module })).step);
+
     // Whether the selected target CPU can execute AOT code natively.
     // Test/bench binaries tied to native AOT support are only installed on
     // these arches so cross-compiled release builds for e.g. riscv64 don't
@@ -852,41 +1038,49 @@ pub fn build(b: *std.Build) void {
     // assertions) from the vendored `third_party/testsuite` submodule,
     // gated against `tests/spec-baseline.tsv` so any regression fails CI.
     // Requires: git submodule update --init third_party/testsuite
-    const run_spec_baseline = b.addSystemCommand(&.{
-        "python3",
-        "scripts/check_spec_baseline.py",
+    const spec_baseline_checker = b.addExecutable(.{
+        .name = "spec-baseline-checker",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/check_spec_baseline.zig"),
+            .target = b.graph.host,
+            .optimize = .safe,
+        }),
     });
+    const run_spec_baseline = b.addRunArtifact(spec_baseline_checker);
+    run_spec_baseline.addArg("--runner");
+    run_spec_baseline.addFileArg(spec_runner_exe.getEmittedBin());
     run_spec_baseline.step.dependOn(b.getInstallStep());
     const spec_baseline_step = b.step(
         "spec-testsuite",
         "Run the full WebAssembly/spec suite and check it against tests/spec-baseline.tsv",
     );
     spec_baseline_step.dependOn(&run_spec_baseline.step);
+    const update_spec_baseline = b.addRunArtifact(spec_baseline_checker);
+    update_spec_baseline.addArg("--runner");
+    update_spec_baseline.addFileArg(spec_runner_exe.getEmittedBin());
+    update_spec_baseline.addArg("--update");
+    update_spec_baseline.step.dependOn(b.getInstallStep());
+    b.step("update-spec-baseline", "Regenerate tests/spec-baseline.tsv").dependOn(&update_spec_baseline.step);
 
     // ── WASI conformance suite ────────────────────────────────────────
     // Drives the vendored `WebAssembly/wasi-testsuite` against the just-built
-    // `wamr` CLI through the in-tree adapter. Skiplist entries must each
+    // `wamr` CLI through the native suite runner. Skiplist entries must each
     // carry a rationale + follow-up issue number — see
     // `tests/wasi-testsuite-expectations.toml`. Not wired into the default `test`
-    // aggregate (it requires Python 3 + the runner's deps), but the CI job
-    // gates regressions on every PR. Run locally with `zig build wasi-testsuite`.
-    // The runner entry point is launched through
-    // `tests/wasi-testsuite-runner-patch/wasi_test_runner.py`, which
-    // imports the upstream package without requiring installation.
-    // The wamr adapter's `get_timeout_seconds` hook honours the
-    // `WAMR_TESTSUITE_TIMEOUT` env var (seconds; defaults to 5s when
-    // unset). Without that override, slow developer VMs flake on
-    // `http-fields` and other fixtures whose runtime drifts past 5s.
-    // See #583 A7 + the wrapper's module docstring for rationale.
-    const wasi_runner = b.addSystemCommand(&.{
-        "python3",
-        "tests/wasi-testsuite-runner-patch/wasi_test_runner.py",
+    // aggregate, but the CI job gates regressions on every PR.
+    // Run locally with `zig build wasi-testsuite`.
+    // The wamr adapter honours the `WAMR_TESTSUITE_TIMEOUT` env var
+    // (seconds; defaults to 5s when unset). Without that override, slow
+    // developer VMs flake on `http-fields` and other fixtures whose runtime
+    // drifts past 5s. See #583 A7 for rationale.
+    const wasi_runner = b.addRunArtifact(wasi_runner_exe);
+    wasi_runner.addArgs(&.{
         "--test-suite",
         "tests/wasi-testsuite/tests/c/testsuite/wasm32-wasip1",
         "tests/wasi-testsuite/tests/rust/testsuite/wasm32-wasip1",
         "tests/wasi-testsuite/tests/assemblyscript/testsuite/wasm32-wasip1",
         "--runtime-adapter",
-        "tests/wasi-testsuite-adapter/wamr-zig.py",
+        "wamr-zig",
         "--expectations",
         "tests/wasi-testsuite-expectations.toml",
     });
@@ -904,21 +1098,17 @@ pub fn build(b: *std.Build) void {
     // ── WASI Preview 3 conformance gate (#489) ────────────────────────
     // Drives the vendored `wasm32-wasip3` fixtures at
     // `tests/wasi-testsuite/tests/rust/testsuite/wasm32-wasip3/` through
-    // the just-built `wamr` CLI via the same in-tree adapter as the
-    // Preview 1 gate. Acts as a CI gate against regressions in the WASI
-    // Preview 3 adapter surface (`src/component/wasi_cli_adapter.zig`,
-    // P3 wave A–C: #481–#487). The expectations file is currently empty;
-    // every one of the 41 fixtures is required to pass.
-    // Not wired into the default `test` aggregate (it requires Python 3
-    // + the runner's deps); CI gates regressions on every PR. Run
-    // locally with `zig build wasi-p3-testsuite`.
-    const wasi_p3_runner = b.addSystemCommand(&.{
-        "python3",
-        "tests/wasi-testsuite-runner-patch/wasi_test_runner.py",
+    // the just-built `wamr` CLI via the native suite runner. Acts as a CI
+    // gate against regressions in the WASI Preview 3 adapter surface
+    // (`src/component/wasi_cli_adapter.zig`, P3 wave A–C: #481–#487).
+    // The expectations file is currently empty; every one of the 41
+    // fixtures is required to pass. Run locally with `zig build wasi-p3-testsuite`.
+    const wasi_p3_runner = b.addRunArtifact(wasi_runner_exe);
+    wasi_p3_runner.addArgs(&.{
         "--test-suite",
         "tests/wasi-testsuite/tests/rust/testsuite/wasm32-wasip3",
         "--runtime-adapter",
-        "tests/wasi-testsuite-adapter/wamr-zig.py",
+        "wamr-zig",
         "--expectations",
         "tests/wasi-p3-testsuite-expectations.toml",
     });
@@ -931,13 +1121,23 @@ pub fn build(b: *std.Build) void {
     );
     wasi_p3_testsuite_step.dependOn(&wasi_p3_runner.step);
 
-    // This is intentionally a separate no-filter path. Its Python harness
+    // This is intentionally a separate no-filter path. Its harness
     // asserts every fixture executed and passed, so a future all-skipped
     // filter cannot make the P3 gate look green.
-    const wasi_p3_unfiltered_runner = b.addSystemCommand(&.{
-        "python3",
-        "tests/wasi-p3-unfiltered.py",
+    const wasi_p3_unfiltered_exe = b.addExecutable(.{
+        .name = "wasi-p3-unfiltered",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/wasi_p3_unfiltered.zig"),
+            .target = b.graph.host,
+            .optimize = .safe,
+        }),
     });
+    const build_wasi_p3_unfiltered_step = b.step("build-wasi-p3-unfiltered", "Build the unfiltered Preview 3 orchestrator");
+    build_wasi_p3_unfiltered_step.dependOn(&b.addInstallArtifact(wasi_p3_unfiltered_exe, .{}).step);
+    build_wasi_p3_unfiltered_step.dependOn(&b.addInstallArtifact(wasi_runner_exe, .{}).step);
+    const wasi_p3_unfiltered_runner = b.addRunArtifact(wasi_p3_unfiltered_exe);
+    wasi_p3_unfiltered_runner.addDirectoryArg(b.path("."));
+    wasi_p3_unfiltered_runner.addFileArg(wasi_runner_exe.getEmittedBin());
     @import("build/environment.zig").setPath(wasi_p3_unfiltered_runner, "WAMR", .{ .relative = .{ .base = .install_bin, .sub_path = "wamr" } });
     @import("build/environment.zig").setPath(wasi_p3_unfiltered_runner, "WAMRC", .{ .relative = .{ .base = .install_bin, .sub_path = "wamrc" } });
     wasi_p3_unfiltered_runner.setEnvironmentVariable("WAMR_TESTSUITE_TIMEOUT", "30");
@@ -966,15 +1166,14 @@ pub fn build(b: *std.Build) void {
     // build — running them there would just hard-error on every
     // fixture (issue #644/#680's AOT-only policy has no JIT fallback).
     if (jit) {
-        const wasi_runner_jit = b.addSystemCommand(&.{
-            "python3",
-            "tests/wasi-testsuite-runner-patch/wasi_test_runner.py",
+        const wasi_runner_jit = b.addRunArtifact(wasi_runner_exe);
+        wasi_runner_jit.addArgs(&.{
             "--test-suite",
             "tests/wasi-testsuite/tests/c/testsuite/wasm32-wasip1",
             "tests/wasi-testsuite/tests/rust/testsuite/wasm32-wasip1",
             "tests/wasi-testsuite/tests/assemblyscript/testsuite/wasm32-wasip1",
             "--runtime-adapter",
-            "tests/wasi-testsuite-adapter/wamr-zig.py",
+            "wamr-zig",
             "--expectations",
             "tests/wasi-testsuite-expectations.toml",
         });
@@ -988,13 +1187,12 @@ pub fn build(b: *std.Build) void {
         );
         wasi_testsuite_jit_step.dependOn(&wasi_runner_jit.step);
 
-        const wasi_p3_runner_jit = b.addSystemCommand(&.{
-            "python3",
-            "tests/wasi-testsuite-runner-patch/wasi_test_runner.py",
+        const wasi_p3_runner_jit = b.addRunArtifact(wasi_runner_exe);
+        wasi_p3_runner_jit.addArgs(&.{
             "--test-suite",
             "tests/wasi-testsuite/tests/rust/testsuite/wasm32-wasip3",
             "--runtime-adapter",
-            "tests/wasi-testsuite-adapter/wamr-zig.py",
+            "wamr-zig",
             "--expectations",
             "tests/wasi-p3-testsuite-expectations.toml",
         });
@@ -1016,10 +1214,9 @@ pub fn build(b: *std.Build) void {
         );
         wasi_p3_testsuite_jit_step.dependOn(&wasi_p3_runner_jit.step);
 
-        const wasi_p3_unfiltered_runner_jit = b.addSystemCommand(&.{
-            "python3",
-            "tests/wasi-p3-unfiltered.py",
-        });
+        const wasi_p3_unfiltered_runner_jit = b.addRunArtifact(wasi_p3_unfiltered_exe);
+        wasi_p3_unfiltered_runner_jit.addDirectoryArg(b.path("."));
+        wasi_p3_unfiltered_runner_jit.addFileArg(wasi_runner_exe.getEmittedBin());
         @import("build/environment.zig").setPath(wasi_p3_unfiltered_runner_jit, "WAMR", .{ .relative = .{ .base = .install_bin, .sub_path = "wamr" } });
         @import("build/environment.zig").setPath(wasi_p3_unfiltered_runner_jit, "WAMRC", .{ .relative = .{ .base = .install_bin, .sub_path = "wamrc" } });
         wasi_p3_unfiltered_runner_jit.setEnvironmentVariable("WAMR_JIT_TESTSUITE", "1");
@@ -1038,7 +1235,7 @@ pub fn build(b: *std.Build) void {
     // `examples-wasmtime` job in `.github/workflows/ci.yml`).
     // The wasm test corpus is identical, so a wamr regression that
     // Wasmtime *also* exhibits flags as a fixture bug rather than a
-    // wamr bug (see `scripts/diff-testsuite-reports.py`).
+    // wamr bug (see `scripts/diff_testsuite_reports.zig`).
     //
     // Resolves the Wasmtime binary from the `WASMTIME` env var (set by
     // CI; defaults to `wasmtime` on `PATH`). The `WASMTIME` env var is
@@ -1046,13 +1243,12 @@ pub fn build(b: *std.Build) void {
     // step at a locally-built wasmtime for triage. The CI workflow at
     // `.github/workflows/wasi-p3-parity.yml` is the source of truth
     // for the pinned version.
-    const wasi_p3_runner_wasmtime = b.addSystemCommand(&.{
-        "python3",
-        "tests/wasi-testsuite-runner-patch/wasi_test_runner.py",
+    const wasi_p3_runner_wasmtime = b.addRunArtifact(wasi_runner_exe);
+    wasi_p3_runner_wasmtime.addArgs(&.{
         "--test-suite",
         "tests/wasi-testsuite/tests/rust/testsuite/wasm32-wasip3",
         "--runtime-adapter",
-        "tests/wasi-testsuite-adapter/wasmtime.py",
+        "wasmtime",
         "--expectations",
         "tests/wasi-p3-testsuite-expectations.toml",
     });
@@ -1067,20 +1263,30 @@ pub fn build(b: *std.Build) void {
 
     // ── Wasmtime parity diff ──────────────────────────────────────────
     // Convenience step that runs both runtimes through
-    // `scripts/wasi-p3-parity.py` (which writes JSON reports + a
+    // `scripts/wasi_p3_parity.zig` (which writes JSON reports + a
     // classifier summary, then forwards the diff exit code). The
-    // orchestrator is a Python script so both runtime reports are
+    // orchestrator ensures both runtime reports are
     // produced even if either runner exits non-zero; the diff step
     // then classifies deltas as regressions vs fixture/runtime bugs.
     // Output JSONs live under `zig-out/test-reports/` so CI can upload
     // them as artifacts on failure.
-    const parity_orchestrator = b.addSystemCommand(&.{
-        "python3",
-        "scripts/wasi-p3-parity.py",
-        "--output-dir",
+    const parity_exe = b.addExecutable(.{
+        .name = "wasi-p3-parity",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/wasi_p3_parity.zig"),
+            .target = b.graph.host,
+            .optimize = .safe,
+        }),
     });
+    const parity_orchestrator = b.addRunArtifact(parity_exe);
+    parity_orchestrator.addArg("--root");
+    parity_orchestrator.addDirectoryArg(b.path("."));
+    parity_orchestrator.addArg("--runner");
+    parity_orchestrator.addFileArg(wasi_runner_exe.getEmittedBin());
+    parity_orchestrator.addArg("--output-dir");
     parity_orchestrator.addDirectoryArg(.{ .relative = .{ .base = .install_prefix, .sub_path = "test-reports" } });
     @import("build/environment.zig").setPath(parity_orchestrator, "WAMR", .{ .relative = .{ .base = .install_bin, .sub_path = "wamr" } });
+    @import("build/environment.zig").setPath(parity_orchestrator, "WAMRC", .{ .relative = .{ .base = .install_bin, .sub_path = "wamrc" } });
     parity_orchestrator.step.dependOn(b.getInstallStep());
     const wasi_p3_parity_step = b.step(
         "wasi-p3-parity",
@@ -1265,35 +1471,311 @@ pub fn build(b: *std.Build) void {
     });
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 
-    const keyvault_harness_tests = b.addSystemCommand(&.{
-        "python3",
-        "tests/test_bench_keyvault.py",
+    const keyvault_harness_test_exe = b.addTest(.{
+        .name = "keyvault-harness-tests",
+        .filters = &.{"bench_keyvault"},
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/bench_keyvault.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
     });
-    const thread_benchmark_harness_tests = b.addSystemCommand(&.{
-        "python3",
-        "scripts/test_bench_wasi_threads.py",
+    const keyvault_harness_tests = b.addRunArtifact(keyvault_harness_test_exe);
+    const test_keyvault_harness_step = b.step(
+        "test-keyvault-harness",
+        "Run keyvault benchmark harness unit tests",
+    );
+    test_keyvault_harness_step.dependOn(&keyvault_harness_tests.step);
+    const bench_keyvault_exe = b.addExecutable(.{
+        .name = "bench-keyvault",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/bench_keyvault.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
     });
-    const leaf_cancel_cost_harness_tests = b.addSystemCommand(&.{
-        "python3",
-        "scripts/test_bench_leaf_cancel_cost.py",
+    const build_bench_keyvault = b.addInstallArtifact(bench_keyvault_exe, .{});
+    const build_bench_keyvault_step = b.step(
+        "build-bench-keyvault",
+        "Build native keyvault benchmark harness CLI",
+    );
+    build_bench_keyvault_step.dependOn(&build_bench_keyvault.step);
+    const thread_benchmark_harness_test_exe = b.addTest(.{
+        .name = "wasi-thread-benchmark-harness-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/bench_wasi_threads.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
     });
-    const native_benchmark_harness_tests = b.addSystemCommand(&.{
-        "python3",
-        "scripts/test_bench_coremark.py",
-        "NativeBenchmarkTests",
+    const thread_benchmark_harness_tests = b.addRunArtifact(thread_benchmark_harness_test_exe);
+    const thread_cohort_test_exe = b.addTest(.{
+        .name = "wasi-thread-cohort-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/wasi_thread_cohort.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
     });
-    const thread_budget_derivation_tests = b.addSystemCommand(&.{
-        "python3",
-        "scripts/test_wasi_thread_budget_derivation.py",
+    const thread_cohort_tests = b.addRunArtifact(thread_cohort_test_exe);
+    const thread_duration_cross_test_exe = b.addTest(.{
+        .name = "wasi-thread-duration-cross-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/wasi_thread_duration_cross.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
     });
-    const frame_attribution_tests = b.addSystemCommand(&.{
-        "python3",
-        "tests/test_aot_jit_attr.py",
+    const thread_duration_cross_tests = b.addRunArtifact(thread_duration_cross_test_exe);
+    const test_wasi_thread_bench_step = b.step(
+        "test-wasi-thread-bench",
+        "Run WASI thread benchmark and duration-cross harness unit tests",
+    );
+    test_wasi_thread_bench_step.dependOn(&thread_benchmark_harness_tests.step);
+    test_wasi_thread_bench_step.dependOn(&thread_cohort_tests.step);
+    test_wasi_thread_bench_step.dependOn(&thread_duration_cross_tests.step);
+    const automation_policy_test_exe = b.addTest(.{
+        .name = "automation-policy-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/automation_policy.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
     });
-    const hot_function_comparison_tests = b.addSystemCommand(&.{
-        "python3",
-        "tests/test_compare_hot_function.py",
+    const automation_policy_tests = b.addRunArtifact(automation_policy_test_exe);
+    const automation_policy_exe = b.addExecutable(.{
+        .name = "automation-policy",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/automation_policy.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
     });
+    const run_automation_policy = b.addRunArtifact(automation_policy_exe);
+    const check_automation_policy_step = b.step(
+        "check-automation-policy",
+        "Verify repository-owned automation policy",
+    );
+    check_automation_policy_step.dependOn(&automation_policy_tests.step);
+    check_automation_policy_step.dependOn(&run_automation_policy.step);
+    const leaf_cancel_cost_harness_test_exe = b.addTest(.{
+        .name = "leaf-cancel-cost-harness-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/bench_leaf_cancel_cost.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const leaf_cancel_cost_harness_tests = b.addRunArtifact(leaf_cancel_cost_harness_test_exe);
+    const test_leaf_cancel_cost_step = b.step(
+        "test-leaf-cancel-cost",
+        "Run leaf cancel-poll cost benchmark unit tests",
+    );
+    test_leaf_cancel_cost_step.dependOn(&leaf_cancel_cost_harness_tests.step);
+    const native_benchmark_harness_test_exe = b.addTest(.{
+        .name = "native-benchmark-harness-tests",
+        .filters = &.{"NativeBenchmarkTests"},
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/native_benchmark.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const native_benchmark_harness_tests = b.addRunArtifact(native_benchmark_harness_test_exe);
+    const thread_budget_derivation_test_exe = b.addTest(.{
+        .name = "wasi-thread-budget-derivation-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/wasi_thread_duration_cross_cohort.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const thread_budget_derivation_tests = b.addRunArtifact(thread_budget_derivation_test_exe);
+    const frame_attribution_test_exe = b.addTest(.{
+        .name = "frame-attribution-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/aot_jit_attr.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const frame_attribution_tests = b.addRunArtifact(frame_attribution_test_exe);
+    const test_frame_attribution_step = b.step(
+        "test-frame-attribution",
+        "Run frame attribution unit tests",
+    );
+    test_frame_attribution_step.dependOn(&frame_attribution_tests.step);
+    const aot_jit_attr_exe = b.addExecutable(.{
+        .name = "aot-jit-attr",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/aot_jit_attr.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const build_aot_jit_attr = b.addInstallArtifact(aot_jit_attr_exe, .{});
+    const build_aot_jit_attr_step = b.step(
+        "build-aot-jit-attr",
+        "Build native AOT/JIT attribution CLI",
+    );
+    build_aot_jit_attr_step.dependOn(&build_aot_jit_attr.step);
+    const hot_function_comparison_test_exe = b.addTest(.{
+        .name = "hot-function-comparison-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/compare_hot_function.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const hot_function_comparison_tests = b.addRunArtifact(hot_function_comparison_test_exe);
+    const test_hot_function_comparison_step = b.step(
+        "test-hot-function-comparison",
+        "Run hot-function comparison unit tests",
+    );
+    test_hot_function_comparison_step.dependOn(&hot_function_comparison_tests.step);
+    const aarch64_provenance_test_exe = b.addTest(.{
+        .name = "aarch64-instruction-provenance-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/aarch64_instruction_provenance.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const aarch64_provenance_tests = b.addRunArtifact(aarch64_provenance_test_exe);
+    const test_aarch64_provenance_step = b.step(
+        "test-aarch64-instruction-provenance",
+        "Run AArch64 instruction provenance unit tests",
+    );
+    test_aarch64_provenance_step.dependOn(&aarch64_provenance_tests.step);
+    const bench_coremark_test_exe = b.addTest(.{
+        .name = "bench-coremark-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/bench_coremark.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const bench_coremark_tests = b.addRunArtifact(bench_coremark_test_exe);
+    const test_bench_coremark_step = b.step(
+        "test-bench-coremark",
+        "Run CoreMark benchmark harness unit tests",
+    );
+    test_bench_coremark_step.dependOn(&bench_coremark_tests.step);
+    const bench_coremark_exe = b.addExecutable(.{
+        .name = "bench-coremark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/bench_coremark.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const build_bench_coremark = b.addInstallArtifact(bench_coremark_exe, .{});
+    const build_bench_coremark_step = b.step(
+        "build-bench-coremark",
+        "Build native CoreMark benchmark harness CLI",
+    );
+    build_bench_coremark_step.dependOn(&build_bench_coremark.step);
+    const profile_coremark_aarch64_test_exe = b.addTest(.{
+        .name = "profile-coremark-aarch64-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/profile_coremark_aarch64.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const profile_coremark_aarch64_tests = b.addRunArtifact(profile_coremark_aarch64_test_exe);
+    const test_profile_coremark_aarch64_step = b.step(
+        "test-profile-coremark-aarch64",
+        "Run CoreMark AArch64 profiler unit tests",
+    );
+    test_profile_coremark_aarch64_step.dependOn(&profile_coremark_aarch64_tests.step);
+    const profile_coremark_aarch64_exe = b.addExecutable(.{
+        .name = "profile-coremark-aarch64",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/profile_coremark_aarch64.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const build_profile_coremark_aarch64 = b.addInstallArtifact(profile_coremark_aarch64_exe, .{});
+    const build_profile_coremark_aarch64_step = b.step(
+        "build-profile-coremark-aarch64",
+        "Build native CoreMark AArch64 profiler CLI",
+    );
+    build_profile_coremark_aarch64_step.dependOn(&build_profile_coremark_aarch64.step);
+    const reanalyze_coremark_986_test_exe = b.addTest(.{
+        .name = "reanalyze-coremark-986-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/reanalyze_coremark_986.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const reanalyze_coremark_986_tests = b.addRunArtifact(reanalyze_coremark_986_test_exe);
+    const test_reanalyze_coremark_986_step = b.step(
+        "test-reanalyze-coremark-986",
+        "Run CoreMark #986 retained-evidence re-analysis unit tests",
+    );
+    test_reanalyze_coremark_986_step.dependOn(&reanalyze_coremark_986_tests.step);
+    const reanalyze_coremark_986_exe = b.addExecutable(.{
+        .name = "reanalyze-coremark-986",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/reanalyze_coremark_986.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const build_reanalyze_coremark_986 = b.addInstallArtifact(reanalyze_coremark_986_exe, .{});
+    const build_reanalyze_coremark_986_step = b.step(
+        "build-reanalyze-coremark-986",
+        "Build native CoreMark #986 retained-evidence re-analyzer CLI",
+    );
+    build_reanalyze_coremark_986_step.dependOn(&build_reanalyze_coremark_986.step);
+    const bench_loop_passes_test_exe = b.addTest(.{
+        .name = "bench-loop-passes-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/bench_loop_passes.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const bench_loop_passes_tests = b.addRunArtifact(bench_loop_passes_test_exe);
+    const test_bench_loop_passes_step = b.step(
+        "test-bench-loop-passes",
+        "Run loop-passes benchmark harness unit tests",
+    );
+    test_bench_loop_passes_step.dependOn(&bench_loop_passes_tests.step);
+    const bench_loop_passes_exe = b.addExecutable(.{
+        .name = "bench-loop-passes",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/bench_loop_passes.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const build_bench_loop_passes = b.addInstallArtifact(bench_loop_passes_exe, .{});
+    const build_bench_loop_passes_step = b.step(
+        "build-bench-loop-passes",
+        "Build native loop-passes benchmark harness CLI",
+    );
+    build_bench_loop_passes_step.dependOn(&build_bench_loop_passes.step);
     const test_jit_step = b.step(
         "test-jit",
         "Run in-process JIT unit, smoke, and regression tests",
@@ -1315,16 +1797,16 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(wasi_threads_test_step);
     test_step.dependOn(&keyvault_harness_tests.step);
     test_step.dependOn(&thread_benchmark_harness_tests.step);
+    test_step.dependOn(&thread_cohort_tests.step);
+    test_step.dependOn(&thread_duration_cross_tests.step);
     test_step.dependOn(&leaf_cancel_cost_harness_tests.step);
     test_step.dependOn(&native_benchmark_harness_tests.step);
     test_step.dependOn(&thread_budget_derivation_tests.step);
+    test_wasi_thread_bench_step.dependOn(&thread_budget_derivation_tests.step);
     test_step.dependOn(&frame_attribution_tests.step);
     if (target_arch == .x86_64 and target.result.os.tag == .linux) {
-        const frame_attribution_smoke = b.addSystemCommand(&.{
-            "python3",
-            "tests/test_aot_jit_attr.py",
-            "--wamrc",
-        });
+        const frame_attribution_smoke = b.addRunArtifact(aot_jit_attr_exe);
+        frame_attribution_smoke.addArg("--wamrc");
         frame_attribution_smoke.addFileArg(wamrc.getEmittedBin());
         test_step.dependOn(&frame_attribution_smoke.step);
     }

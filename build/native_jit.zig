@@ -90,7 +90,16 @@ fn addBenchmark(b: *std.Build, wamrc: *std.Build.Step.Compile, wasm: std.Build.L
     }
     step.dependOn(&b.addInstallFile(wasm, "native-jit-bench/matched.wasm").step);
     step.dependOn(&b.addInstallFile(aot, "native-jit-bench/matched.cwasm").step);
-    const tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "scripts.test_native_jit_benchmark" });
+    const test_exe = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/native_jit_benchmark.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const tests = b.addRunArtifact(test_exe);
+    tests.has_side_effects = true;
     @import("environment.zig").setPath(tests, "WAMR_JIT_BENCH_AOT", .{ .relative = .{ .base = .install_bin, .sub_path = "wamr-native-jit-aot-compare" } });
     @import("environment.zig").setPath(tests, "WAMR_JIT_BENCH_JIT", .{ .relative = .{ .base = .install_bin, .sub_path = "wamr-native-jit-bench" } });
     if (b.graph.host.result.cpu.arch != .x86_64)
@@ -189,7 +198,17 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         _ = audit.getEmittedBin();
         step.dependOn(&audit.step);
     }
-    const archive_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "scripts.test_native_jit_benchmark.NativeEmbeddingArchiveTests" });
+    const archive_test_exe = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/native_jit_benchmark.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+        .filters = &.{"NativeEmbeddingArchiveTests"},
+    });
+    const archive_tests = b.addRunArtifact(archive_test_exe);
+    archive_tests.has_side_effects = true;
     @import("environment.zig").setPath(archive_tests, "WAMR_JIT_NATIVE_ARCHIVES", .{ .relative = .{ .base = .install_lib, .sub_path = "" } });
     archive_tests.step.dependOn(&install_library.step);
     archive_tests.step.dependOn(&install_compare.step);

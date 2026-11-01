@@ -147,7 +147,6 @@
         "processor",
         "cpu",
         "logical_cpus",
-        "python",
         "runner_name",
         "runner_image",
         "runner_os",
@@ -169,7 +168,6 @@
           "type": ["integer", "null"],
           "minimum": 1
         },
-        "python": { "type": "string", "minLength": 1 },
         "runner_name": { "type": "string" },
         "runner_image": { "type": "string" },
         "runner_os": { "type": "string" },
@@ -240,10 +238,9 @@
     "tools": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["zig", "python", "objdump", "compiler", "runtime"],
+      "required": ["zig", "objdump", "compiler", "runtime"],
       "properties": {
         "zig": { "type": "string", "minLength": 1 },
-        "python": { "type": "string", "minLength": 1 },
         "objdump": { "type": "string", "minLength": 1 },
         "compiler": { "$ref": "#/$defs/build_tool" },
         "runtime": { "$ref": "#/$defs/runtime_tool" }

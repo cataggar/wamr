@@ -16,7 +16,7 @@ Install pre-built binaries from GitHub Releases with [ghr](https://github.com/ca
 $ ghr install cataggar/wamr
 ```
 
-See [INSTALL.md](INSTALL.md) for alternative installation methods (winget, uv, pip) and detailed instructions.
+See [INSTALL.md](INSTALL.md) for alternative installation methods and detailed instructions.
 
 ## Tools
 
@@ -145,7 +145,7 @@ C1](https://github.com/cataggar/wamr/issues/583)): it runs the same
 `wasm32-wasip3` corpus through wamr **and** upstream
 [Wasmtime](https://wasmtime.dev/) (CI pin `v46.0.1`, matching the
 updated upstream suite) and diffs the JSON reports via
-[`scripts/diff-testsuite-reports.py`](scripts/diff-testsuite-reports.py).
+[`scripts/diff_testsuite_reports.zig`](scripts/diff_testsuite_reports.zig).
 The classifier exits non-zero on:
 
 * *Regressions* — wamr fails a fixture that Wasmtime still passes

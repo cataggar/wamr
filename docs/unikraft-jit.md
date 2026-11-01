@@ -183,7 +183,7 @@ bound this comparator experiment; do not generalize that to arbitrary AOT.
 
 ```sh
 zig build native-jit-bench test-native-jit-bench -Doptimize=safe -j2
-python3 -m scripts.native_jit_benchmark \
+zig run scripts/native_jit_benchmark.zig -lc -- \
   --aot zig-out/bin/wamr-native-jit-aot-compare \
   --jit zig-out/bin/wamr-native-jit-bench \
   --output /path/to/new-correctness-capture
@@ -363,7 +363,7 @@ hashes the **actual files** for both application executables and complete images
 an executable cannot stand in for a complete image. Prepare the challenge:
 
 ```sh
-python3 -m scripts.native_jit_benchmark \
+zig run scripts/native_jit_benchmark.zig -lc -- \
   --native-prepare --aot /private/aot-app.elf --jit /private/jit-app.elf \
   --aot-image /private/aot-complete-image --jit-image /private/jit-complete-image \
   --receipt /private/independent-image-receipt.json \
@@ -383,7 +383,7 @@ is required **in addition** to the image receipt hash. Import with the same
 image/executable files and image receipt arguments:
 
 ```sh
-python3 -m scripts.native_jit_benchmark \
+zig run scripts/native_jit_benchmark.zig -lc -- \
   --native-import /private/adapter-output \
   --aot /private/aot-app.elf --jit /private/jit-app.elf \
   --aot-image /private/aot-complete-image --jit-image /private/jit-complete-image \
@@ -409,8 +409,8 @@ unknown fields are rejected. No sample successful deployment receipt is supplied
 | `issuer`, `source_commit`, `deployment_receipt_sha256` | Independent issuer token, exact WAMR commit and prior independent deployment/qualification evidence digest |
 | `platform`, `executables`, `images`, `wasm`, `aot_module` | Existing platform identity shape and SHA256/positive byte counts of actual qualified artifacts |
 | `compiler_embedded`, `runtime_linkage`, `safety`, `lifecycle`, `allocator`, `page_policy` | Same strict bindings as version 1, but describing the actual native image implementation |
-| `target`, `options` | Exactly `NATIVE_TARGET` and `NATIVE_OPTIONS` in `scripts/native_jit_benchmark.py`: native contract/subprofiles, both presets, after-each-pass verification, every compiler/runtime cap and fixed workload lifecycle |
-| `build_options` | One shared `optimize` (`Debug`, `ReleaseSafe`, `ReleaseFast`, or `ReleaseSmall`) for both images, plus exactly `NATIVE_BUILD_OPTIONS`: PIC, single-threaded, no red zone/libc/stack checker/stack protector/unwind tables/error tracing |
+| `target`, `options` | Exactly `nativeTarget` and `nativeOptions` in `scripts/native_jit_benchmark.zig`: native contract/subprofiles, both presets, after-each-pass verification, every compiler/runtime cap and fixed workload lifecycle |
+| `build_options` | One shared `optimize` (`Debug`, `ReleaseSafe`, `ReleaseFast`, or `ReleaseSmall`) for both images, plus exactly `nativeBuildOptions`: PIC, single-threaded, no red zone/libc/stack checker/stack protector/unwind tables/error tracing |
 | `adapter` | `name`, `source_commit`, `qualification_receipt_sha256`; independently qualified native adapter, not a Linux adapter name |
 | `clock` | `method` token, positive `resolution_ns`, `scope` exactly `guest-monotonic-execution` |
 | `native_stack` | `generated_frames_bytes` at least 256 KiB, positive separately qualified `compiler_embedder_callbacks_bytes`, and `provisioned_bytes` covering their sum |

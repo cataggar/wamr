@@ -1,7 +1,7 @@
 name: CoreMark (x86_64)
 
 # Per-PR CoreMark comparison on a GitHub-hosted x86_64 runner.
-# Runs `scripts/bench_coremark.py` against the PR base, posts a delta table.
+# Runs `scripts/bench_coremark.zig` against the PR base, posts a delta table.
 
 on:
   workflow_dispatch:
@@ -57,7 +57,7 @@ jobs:
           SHOULD_RUN=false
           while IFS= read -r FILE; do
             case "$FILE" in
-              src/compiler/*|src/runtime/*|tests/benchmarks/coremark/*|tests/benchmarks/loop-passes/*|scripts/bench_coremark.py|scripts/bench_loop_passes.py|scripts/test_bench_coremark.py|scripts/test_bench_loop_passes.py|.github/workflows/coremark-x86_64.yml)
+              src/compiler/*|src/runtime/*|tests/benchmarks/coremark/*|tests/benchmarks/loop-passes/*|scripts/bench_coremark.zig|scripts/bench_loop*.zig|.github/workflows/coremark-x86_64.yml)
                 SHOULD_RUN=true
                 break
                 ;;
@@ -92,9 +92,11 @@ jobs:
 
       - name: Test benchmark harnesses
         run: |
-          python3 -m unittest \
-            scripts/test_bench_coremark.py \
-            scripts/test_bench_loop_passes.py
+          zig build \
+            test-bench-coremark \
+            test-bench-loop-passes \
+            build-bench-coremark \
+            build-bench-loop-passes
 
       - name: Resolve refs
         id: refs
@@ -126,7 +128,7 @@ jobs:
         run: |
           # Match the aarch64 gate's tolerance band; CoreMark variance on
           # GitHub-hosted runners is comfortably wider than 0%.
-          python3 scripts/bench_coremark.py \
+          ./zig-out/bin/bench-coremark \
             --baseline "$BASELINE" \
             --target   "$TARGET" \
             --profile  ci \
@@ -145,7 +147,7 @@ jobs:
           BASELINE: ${{ steps.refs.outputs.loop_baseline }}
           TARGET: ${{ steps.refs.outputs.target }}
         run: |
-          python3 scripts/bench_loop_passes.py \
+          ./zig-out/bin/bench-loop-passes \
             --baseline "$BASELINE" \
             --target   "$TARGET" \
             --profile  ci \

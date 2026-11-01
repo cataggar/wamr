@@ -140,16 +140,16 @@ To reproduce a crash:
 
 ## Reducing a crasher
 
-Use `scripts/fuzz_reduce.py` to shrink a reproducer to a small deterministic
+Use `zig build fuzz-reduce` to shrink a reproducer to a small deterministic
 form before triage:
 
 ```sh
 zig build fuzz -Doptimize=safe
-scripts/fuzz_reduce.py <target> <crasher.wasm> [--duration 2] [--extra --fuel --extra 100000]
+zig build fuzz-reduce -- <target> <crasher.wasm> --duration 2 --extra --fuel --extra 100000
 ```
 
-The script verifies the input still reproduces, optionally invokes
-`wabt shrink` (or `wasm-tools shrink`) if either is on `PATH`, then runs
+The reducer verifies the input still reproduces, optionally invokes
+`wabt module shrink` if it is on `PATH`, then runs
 a built-in byte-level delta-debug pass. The smallest reproducer is
 written next to the input as `<crasher>.reduced.wasm` (override with
 `--out`).
@@ -238,7 +238,7 @@ host-protection mechanism.
   model for resource tables, paths, descriptors, sockets, HTTP streams, and
   guest-memory pointer/length pairs (#247).
 - Corpus minimization should preserve a small checked-in seed set while storing
-  larger evolving corpora as workflow artifacts (#248). See `scripts/fuzz_reduce.py`
+  larger evolving corpora as workflow artifacts (#248). See `zig build fuzz-reduce`
   and `tests/fuzz/regression/README.md`.
 - OSS-Fuzz integration was evaluated in [`OSS_FUZZ.md`](OSS_FUZZ.md). The
   prerequisites tracked in #249 and #262 are met for repository-local use,

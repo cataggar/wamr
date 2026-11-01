@@ -87,7 +87,7 @@ continues to run x86 followed by Arm for a full diagnostic.
 Create the immutable 20-workflow/40-report plan without dispatching:
 
 ```sh
-python3 scripts/wasi_thread_duration_cross_cohort.py plan \
+zig run scripts/wasi_thread_duration_cross_cohort.zig -- plan \
   --source-sha "$SOURCE_SHA" \
   --workflow-ref "$DIAGNOSTIC_TAG" \
   --output /d/wasi-thread-duration-cross-dispatch.json
@@ -104,18 +104,18 @@ or if any run's exact artifact ID, name, size, ZIP digest, availability, or run
 association differs from the completed dispatch:
 
 ```sh
-python3 scripts/wasi_thread_duration_cross_cohort.py download \
+zig run scripts/wasi_thread_duration_cross_cohort.zig -- download \
   --dispatch /d/wasi-thread-duration-cross-dispatch.completed.json \
   --output-dir /d/wasi-thread-duration-cross-reports \
   --manifest /d/wasi-thread-duration-cross-download-manifest.json
 
-python3 scripts/wasi_thread_duration_cross_cohort.py validate \
+zig run scripts/wasi_thread_duration_cross_cohort.zig -- validate \
   --input-dir /d/wasi-thread-duration-cross-reports \
   --dispatch /d/wasi-thread-duration-cross-dispatch.completed.json \
   --manifest /d/wasi-thread-duration-cross-download-manifest.json \
   --output /d/wasi-thread-duration-cross-cohort.json
 
-python3 scripts/wasi_thread_duration_cross_cohort.py analyze \
+zig run scripts/wasi_thread_duration_cross_cohort.zig -- analyze \
   --cohort /d/wasi-thread-duration-cross-cohort.json \
   --input-dir /d/wasi-thread-duration-cross-reports \
   --dispatch /d/wasi-thread-duration-cross-dispatch.completed.json \
@@ -520,7 +520,7 @@ fixture set and plan, and tags every warmup and measured sample with its
 revision commit and build-source hash:
 
 ```sh
-python3 scripts/bench_wasi_threads.py \
+zig run scripts/bench_wasi_threads.zig -- \
   --baseline-repo /path/to/immutable-baseline \
   --candidate-repo /path/to/immutable-candidate \
   --comparison-purpose candidate-evaluation \
@@ -535,7 +535,7 @@ The workflow always supplies two checkouts. The single-revision CLI remains
 available only for local and required-check compatibility:
 
 ```sh
-python3 scripts/bench_wasi_threads.py \
+zig run scripts/bench_wasi_threads.zig -- \
   --profile authoritative \
   --output-dir "$PWD/zig-out/wasi-thread-bench" \
   --no-budget
@@ -660,7 +660,7 @@ for budget enforcement. A same-revision A/A run is allowed only as explicit
 `noise-calibration`, from two distinct checkout paths:
 
 ```sh
-python3 scripts/bench_wasi_threads.py \
+zig run scripts/bench_wasi_threads.zig -- \
   --baseline-repo /path/to/calibration-a \
   --candidate-repo /path/to/calibration-b \
   --comparison-purpose noise-calibration \
@@ -693,7 +693,7 @@ initialization polls no longer enter the metric.
 For local AArch64 validation on x86_64:
 
 ```sh
-python3 scripts/bench_wasi_threads.py \
+zig run scripts/bench_wasi_threads.zig -- \
   --profile smoke --samples 1 --warmups 0 \
   --modes aot --thread-counts 1 \
   --single-iterations 100000 --hot-iterations 100000 \
@@ -807,7 +807,7 @@ the calibration is abandoned or finally closed. Benchmark jobs have only
 `contents: read`; the separate hosted PR-comment job alone receives
 `pull-requests: write`.
 
-`scripts/wasi_thread_cohort.py` resolves and records the workflow ref's exact
+`scripts/wasi_thread_cohort.zig` resolves and records the workflow ref's exact
 head before dispatch, sends all paired inputs unchanged, retains failed run
 metadata without retrying, and predeclares a sequence-based training/holdout
 split before results exist. Trusted calibration requires an immutable
@@ -833,7 +833,7 @@ that remain held open by a cancelled compiler process even when directory
 inspection appears clean.
 
 ```sh
-python3 scripts/wasi_thread_cohort.py dispatch \
+zig run scripts/wasi_thread_cohort.zig -- dispatch \
   --workflow-ref wasi-thread-calibration-966-vN \
   --baseline-sha <40-char-tagged-main-commit> \
   --candidate-sha <same-40-char-tagged-main-commit> \
@@ -860,7 +860,7 @@ After downloading every retained report artifact, validate against the exact
 dispatch manifest:
 
 ```sh
-python3 scripts/wasi_thread_cohort.py validate \
+zig run scripts/wasi_thread_cohort.zig -- validate \
   --input-dir /d/wasi-thread-reports \
   --dispatch-state /d/wasi-thread-cohort-dispatch.json \
   --output /d/wasi-thread-cohort.json
@@ -907,7 +907,7 @@ data only and must not be treated as a production policy. Production policy
 ceilings and the rounding cushion must be declared before derivation:
 
 ```sh
-python3 scripts/wasi_thread_cohort.py derive \
+zig run scripts/wasi_thread_cohort.zig -- derive \
   --cohort /d/wasi-thread-cohort.json \
   --policy /path/to/reviewed-derivation-policy.json \
   --budget-output /d/wasi-thread-budget.candidate.json \

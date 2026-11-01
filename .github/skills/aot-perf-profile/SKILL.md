@@ -35,7 +35,7 @@ Do **not** use this skill for:
 
 ## Pinned keyvault harness (preferred)
 
-For #798 comparisons, use `scripts/bench_keyvault.py` and a completed
+For #798 comparisons, use `scripts/bench_keyvault.zig` (`zig build build-bench-keyvault`) and a completed
 `tests/benchmarks/keyvault/manifest.example.json` rather than assembling
 commands ad hoc. The harness validates full source revisions and SHA-256 values
 for every binary/input/mounted tree, precompiles both runtimes outside measured
@@ -44,7 +44,7 @@ generated-file drift. It also records host/tool/input identity and the
 Wasmtime-time/WAMR-time ratio:
 
 ```sh
-python3 scripts/bench_keyvault.py \
+./zig-out/bin/bench-keyvault \
   --manifest /path/to/keyvault.lock.json \
   --work-dir "$PWD/zig-out/keyvault-798" \
   --warmups 2 --runs 7
@@ -182,14 +182,14 @@ For a **single core module** (not a component) — CoreMark, a microbench,
 any `.wasm` core — use `wamrc compile` instead of `compile-component`,
 and run it with `wamr run <m>.cwasm` directly (the CLI runs `.cwasm`
 core modules). Everything else (Steps 4–6) is identical; pass that one
-`.cwasm` to `aot_jit_attr.py` — its function indices are module-local.
+`.cwasm` to `./zig-out/bin/aot-jit-attr` (`zig build build-aot-jit-attr`) — its function indices are module-local.
 
 ```sh
 ./zig-out/bin/wamrc compile tests/benchmarks/coremark/coremark_wasi.wasm \
   -o /work/cm/coremark.cwasm
 perf record -g --call-graph=dwarf -F 999 -o /work/cm/cm.perf -- \
   ./zig-out/bin/wamr run /work/cm/coremark.cwasm
-python3 .github/skills/aot-perf-profile/aot_jit_attr.py \
+./zig-out/bin/aot-jit-attr \
   --perf /work/cm/cm.perf --cwasm /work/cm/coremark.cwasm --func 10
 ```
 
@@ -231,15 +231,15 @@ host-page-rounded core text size), buckets IPs per `local_func`, and classifies 
 instruction mix.
 
 ```sh
-SKILL=.github/skills/aot-perf-profile
+zig build build-aot-jit-attr
 # Per-function runtime ranking (which function is actually hot):
-python3 $SKILL/aot_jit_attr.py --perf wamr.perf --cwasm comp.4.cwasm
+./zig-out/bin/aot-jit-attr --perf wamr.perf --cwasm comp.4.cwasm
 
 # Add --func <N> to classify the hot function's instruction mix:
-python3 $SKILL/aot_jit_attr.py --perf wamr.perf --cwasm comp.4.cwasm --func 6145
+./zig-out/bin/aot-jit-attr --perf wamr.perf --cwasm comp.4.cwasm --func 6145
 
 # Machine-readable output + a minimum useful sample gate:
-python3 $SKILL/aot_jit_attr.py --perf wamr.perf --cwasm comp.4.cwasm \
+./zig-out/bin/aot-jit-attr --perf wamr.perf --cwasm comp.4.cwasm \
   --func 6145 \
   --frame-metadata /work/perf/frame/keyvault.mod4.func6145.json \
   --min-samples 5000 --json-out attribution.json
@@ -295,7 +295,7 @@ non-authoritative and `--authoritative` rejects the override. Get candidates fro
 Static sidecar/cwasm validation (no perf needed) is useful before a long run:
 
 ```sh
-python3 $SKILL/aot_jit_attr.py \
+./zig-out/bin/aot-jit-attr \
   --cwasm /work/perf/comp.4.cwasm --func 6145 \
   --frame-metadata /work/perf/frame/keyvault.mod4.func6145.json \
   --validate-frame-metadata
@@ -314,7 +314,7 @@ the newly retained `.cwasm` code hash exactly matches that capture; otherwise
 take a fresh perf capture before reporting current-release percentages.
 
 The tracked `tests/benchmarks/frame_attribution/frame_origins.wasm` fixture is
-the small end-to-end smoke module used by `tests/test_aot_jit_attr.py`; it
+the small end-to-end smoke module used by `scripts/aot_jit_attr.zig`; it
 contains both lowered-local frame traffic and allocator spills across a call.
 
 ## Step 6 (optional) — register-supply sensitivity sweep
@@ -384,7 +384,7 @@ distinguishes the two workload classes directly.
   final-emission native ranges behind `WAMR_AOT_FRAME_ATTRIBUTION*`.
 - `src/runtime/aot/loader.zig:parseFunctionSection` — the `.cwasm`
   function section (`type=3`: count then `(offset:u32, type_idx:u32)`)
-  that `aot_jit_attr.py` parses for `func_offsets[]`. Text section is
+  that `scripts/aot_jit_attr.zig` parses for `func_offsets[]`. Text section is
   `type=2`; magic `\0aot` (`0x746f6100`), current version 10. The helper
   also accepts version 9 so profiles can be attributed to the exact #973
   benchmark commit measured before #979 advanced the format.

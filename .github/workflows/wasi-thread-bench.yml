@@ -16,11 +16,14 @@ on:
       - src/platform/**
       - src/runtime/**
       - src/wasi/**
-      - scripts/benchmark_schema.py
-      - scripts/bench_wasi_threads.py
-      - scripts/test_bench_wasi_threads.py
-      - scripts/test_wasi_thread_budget_derivation.py
-      - scripts/wasi_thread_cohort.py
+      - scripts/benchmark_schema.zig
+      - scripts/benchmark_stats.zig
+      - scripts/bench_wasi_threads.zig
+      - scripts/wasi_thread_bench_spec.zig
+      - scripts/wasi_thread_bench_sizing.zig
+      - scripts/wasi_thread_bench_runner.zig
+      - scripts/wasi_thread_bench_report.zig
+      - scripts/wasi_thread_cohort.zig
       - tests/benchmarks/wasi-threads/**
       - .github/workflows/wasi-thread-bench.yml
   workflow_dispatch:
@@ -135,7 +138,7 @@ jobs:
               SHOULD_RUN=false
               while IFS= read -r FILE; do
                 case "$FILE" in
-                  build.zig|src/main.zig|src/compiler/*|src/platform/*|src/runtime/*|src/wasi/*|scripts/benchmark_schema.py|scripts/bench_wasi_threads.py|scripts/test_bench_wasi_threads.py|scripts/test_wasi_thread_budget_derivation.py|scripts/wasi_thread_cohort.py|tests/benchmarks/wasi-threads/*|.github/workflows/wasi-thread-bench.yml)
+                  build.zig|src/main.zig|src/compiler/*|src/platform/*|src/runtime/*|src/wasi/*|scripts/benchmark_schema.zig|scripts/benchmark_stats.zig|scripts/bench_wasi_threads.zig|scripts/wasi_thread_bench_*.zig|scripts/wasi_thread_cohort.zig|tests/benchmarks/wasi-threads/*|.github/workflows/wasi-thread-bench.yml)
                     SHOULD_RUN=true
                     break
                     ;;
@@ -317,10 +320,10 @@ jobs:
 
       - name: Test benchmark and cohort harness
         if: matrix.platform == 'ubuntu-22.04-x86_64'
+        working-directory: candidate
         run: >-
-          python3 -m unittest
-          candidate/scripts/test_bench_wasi_threads.py
-          candidate/scripts/test_wasi_thread_budget_derivation.py
+          zig test -lc scripts/bench_wasi_threads.zig &&
+          zig test -lc scripts/wasi_thread_cohort.zig
 
       - name: Verify pinned wasi-libc fixtures
         if: matrix.platform == 'ubuntu-22.04-x86_64'
@@ -356,7 +359,7 @@ jobs:
             BUDGET_ARGS=(--budget "$PWD/candidate/tests/benchmarks/wasi-threads/budget.json")
             SUMMARY_BANNER="> **Enforcing (\`tests/benchmarks/wasi-threads/budget.json\`):** calibrated v34 budget enforced."
           fi
-          python3 candidate/scripts/bench_wasi_threads.py \
+          zig run candidate/scripts/bench_wasi_threads.zig -- \
             --baseline-repo "$PWD/baseline" \
             --candidate-repo "$PWD/candidate" \
             --comparison-purpose "$PURPOSE" \
@@ -508,9 +511,8 @@ jobs:
       - name: Test benchmark and cohort harness
         if: ${{ steps.acquire.outputs.should_run == 'true' }}
         run: >-
-          python3 -m unittest
-          candidate/scripts/test_bench_wasi_threads.py
-          candidate/scripts/test_wasi_thread_budget_derivation.py
+          zig test candidate/scripts/bench_wasi_threads.zig &&
+          zig test candidate/scripts/wasi_thread_cohort.zig
 
       - name: Verify pinned wasi-libc fixtures
         if: ${{ steps.acquire.outputs.should_run == 'true' }}
@@ -541,7 +543,7 @@ jobs:
           SAMPLES: ${{ needs.prepare.outputs.samples }}
         run: |
           set -euo pipefail
-          python3 candidate/scripts/bench_wasi_threads.py \
+          zig run candidate/scripts/bench_wasi_threads.zig -- \
             --baseline-repo "$PWD/baseline" \
             --candidate-repo "$PWD/candidate" \
             --comparison-purpose "$PURPOSE" \
@@ -659,7 +661,7 @@ jobs:
           SAMPLES: ${{ needs.prepare.outputs.samples }}
         run: |
           set -euo pipefail
-          python3 candidate/scripts/bench_wasi_threads.py \
+          zig run candidate/scripts/bench_wasi_threads.zig -- \
             --baseline-repo "$PWD/baseline" \
             --candidate-repo "$PWD/candidate" \
             --comparison-purpose "$PURPOSE" \

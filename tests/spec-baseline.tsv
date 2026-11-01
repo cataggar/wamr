@@ -2,7 +2,7 @@
 # for one .wast file under third_party/testsuite/, as produced by
 # zig-out/bin/spec-test-runner. CI compares live output against this file
 # and fails on any drift. Regenerate with:
-#     python3 scripts/check_spec_baseline.py --update
+#     zig build update-spec-baseline
 address.wast	260	0	0
 address0.wast	92	0	0
 address1.wast	127	0	0

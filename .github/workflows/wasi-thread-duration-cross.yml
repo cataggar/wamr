@@ -158,7 +158,9 @@ jobs:
 
       - name: Test diagnostic harness
         if: ${{ steps.acquire.outputs.should_run == 'true' }}
-        run: python3 "$ROOT/source/scripts/test_wasi_thread_duration_cross.py"
+        run: >-
+          zig test "$ROOT/source/scripts/wasi_thread_duration_cross.zig" &&
+          zig test "$ROOT/source/scripts/wasi_thread_duration_cross_cohort.zig"
 
       - name: Run x86 duration-cross report
         if: ${{ steps.acquire.outputs.should_run == 'true' && !inputs.preflight_only }}
@@ -168,7 +170,7 @@ jobs:
           REPORT_SEQUENCE: ${{ inputs.report_sequence }}
         run: |
           set -euo pipefail
-          python3 "$ROOT/source/scripts/wasi_thread_duration_cross.py" \
+          zig run "$ROOT/source/scripts/wasi_thread_duration_cross.zig" -- \
             --repo "$ROOT/source" \
             --output-dir "$ROOT/output" \
             --source-sha "$SOURCE_SHA" \
@@ -187,7 +189,7 @@ jobs:
           COHORT_ID: ${{ inputs.cohort_id }}
         run: |
           set -euo pipefail
-          python3 "$ROOT/source/scripts/wasi_thread_duration_cross.py" \
+          zig run "$ROOT/source/scripts/wasi_thread_duration_cross.zig" -- \
             --repo "$ROOT/source" \
             --output-dir "$ROOT/output" \
             --source-sha "$SOURCE_SHA" \
@@ -321,7 +323,9 @@ jobs:
 
       - name: Test diagnostic harness
         if: ${{ inputs.preflight_only }}
-        run: python3 "$ROOT/source/scripts/test_wasi_thread_duration_cross.py"
+        run: >-
+          zig test "$ROOT/source/scripts/wasi_thread_duration_cross.zig" &&
+          zig test "$ROOT/source/scripts/wasi_thread_duration_cross_cohort.zig"
 
       - name: Run Arm duration-cross report
         if: ${{ !inputs.preflight_only }}
@@ -331,7 +335,7 @@ jobs:
           REPORT_SEQUENCE: ${{ inputs.report_sequence }}
         run: |
           set -euo pipefail
-          python3 "$ROOT/source/scripts/wasi_thread_duration_cross.py" \
+          zig run "$ROOT/source/scripts/wasi_thread_duration_cross.zig" -- \
             --repo "$ROOT/source" \
             --output-dir "$ROOT/output" \
             --source-sha "$SOURCE_SHA" \
@@ -350,7 +354,7 @@ jobs:
           COHORT_ID: ${{ inputs.cohort_id }}
         run: |
           set -euo pipefail
-          python3 "$ROOT/source/scripts/wasi_thread_duration_cross.py" \
+          zig run "$ROOT/source/scripts/wasi_thread_duration_cross.zig" -- \
             --repo "$ROOT/source" \
             --output-dir "$ROOT/output" \
             --source-sha "$SOURCE_SHA" \

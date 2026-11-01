@@ -8,6 +8,17 @@ next mutant.
 The script has no runtime dependencies beyond Python 3 and the existing Zig
 toolchain.
 
+An experimental native implementation is available on Linux and macOS:
+
+```sh
+zig build build-mutation-run
+zig-out/bin/mutation-run src/compiler/ir/verifier.zig --list --seed 737 --limit 10
+```
+
+The native tool supports mutation runs, reports, timeouts, and interruption
+cleanup, but the Python tool remains authoritative while CLI and platform
+parity are validated. Some Unicode word boundaries are rejected explicitly.
+
 ## Quick start
 
 Run from the repository root:

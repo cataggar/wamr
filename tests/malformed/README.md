@@ -5,14 +5,13 @@ This folder contains malformed test cases collected from github and peach fuzzer
 Malformed tests are currently for testing running mode of interpreter including classic interpreter and fast interpreter.
 
 # Test
-Use the provided python script to test a wasm runtime:
+Use the provided Zig tool to test a wasm runtime from this directory:
 ``` shell
-python malformed_test.py -r "path/to/runtime"
+zig run malformed_test.zig -- -r "path/to/runtime"
 ```
 
 For example you can test wasmtime with:
 ``` shell
-python malformed_test.py -r "/usr/bin/wasmtime"
+zig run malformed_test.zig -- -r "/usr/bin/wasmtime"
 ```
-If no args is passed to the script, the default runtime `/usr/bin/iwasm` will be used.
-
+If no args are passed to the tool, the default runtime `iwasm` will be used.
