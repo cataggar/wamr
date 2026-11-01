@@ -195,15 +195,16 @@ Each target configuration has:
 Sources, compiler identities, options, architecture, CPU model, active CPU count,
 SKU and region must match. Source/build settings or guest CPU counts that cannot
 be established are pending evidence, not `"unknown"` measurements.
-For measurement plans, both targets must use the currently supported native
-Unikraft SDK WAMR source commit
+For measurement plans, both targets must use a currently supported native
+Unikraft SDK WAMR source commit:
 `bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20` (the Zig 0.17.0 compatibility pin
 published by `cataggar/wamr#1081` and consumed by `cataggar/unikraft#270`
-`support/apps/wamr-aot/build-tool-contract.zig`), or the preserved historical
+`support/apps/wamr-aot/build-tool-contract.zig`),
+`578b5619c61c93742e9bcba0af550c0fe675acb7` (the post-Wave-12 / Zig CLI pin
+published by `cataggar/wamr#1130`), or the preserved historical
 Zig 0.16.0 pin `a53205d77be3b880eb8f8b96679512ba58e2331a` (the pin consumed by
 cataggar/unikraft#163). Both targets and both compilers in a campaign must
-still report the exact same commit; mixing the current Zig 0.17.0 and
-historical Zig 0.16.0 pins across targets is rejected. A different WAMR revision requires a separately qualified
+still report the exact same commit; mixing supported pins across targets is rejected. A different WAMR revision requires a separately qualified
 native image integration and an explicit adapter pin update; matching two
 unsupported revisions is not sufficient. The commit check validates a declared
 source identity against the supported SDK, not the actual build or deployed image:

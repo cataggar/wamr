@@ -10,9 +10,11 @@ const Value = std.json.Value;
 pub const version: i64 = 2;
 pub const phase_contract = "wamr-embedding-v2";
 pub const unikraft_native_sdk_commit = "bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20";
+pub const post_wave12_unikraft_native_sdk_commit = "578b5619c61c93742e9bcba0af550c0fe675acb7";
 pub const historical_unikraft_native_sdk_commit = "a53205d77be3b880eb8f8b96679512ba58e2331a";
 pub const supported_unikraft_native_sdk_commits = [_][]const u8{
     unikraft_native_sdk_commit,
+    post_wave12_unikraft_native_sdk_commit,
     historical_unikraft_native_sdk_commit,
 };
 pub const unikraft_tiny_correctness_profile = "qcow2-derived-vhd";
@@ -3228,6 +3230,16 @@ test "NativeBenchmarkTests" {
         try std.testing.expectEqualStrings(
             historical_unikraft_native_sdk_commit,
             hist_fix.manifest.object.get("targets").?.object.get("unikraft").?.object.get("source").?.object.get("commit").?.string,
+        );
+
+        const sub_post_wave12 = try std.fs.path.join(allocator, &.{ root, "t1_post_wave12" });
+        try std.Io.Dir.cwd().createDirPath(io, sub_post_wave12);
+        const post_wave12_fix = try makeSyntheticPlanFixture(allocator, io, sub_post_wave12, .{
+            .commit = post_wave12_unikraft_native_sdk_commit,
+        });
+        try std.testing.expectEqualStrings(
+            post_wave12_unikraft_native_sdk_commit,
+            post_wave12_fix.manifest.object.get("targets").?.object.get("unikraft").?.object.get("source").?.object.get("commit").?.string,
         );
 
         var wrong_commit = try testCloneValue(allocator, fix.manifest);
