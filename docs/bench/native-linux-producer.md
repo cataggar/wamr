@@ -60,10 +60,12 @@ is not a valid throughput result**, and those diagnostics are never removed.
 `test-native-bench` tests actual Linux page/clock callbacks, real WASI argv/env
 copying and stdout/stderr, returned/proc_exit(0)/proc_exit(23)/trap outcomes,
 partial-output failures, allocation rollback, staged lifecycle, memory reset,
-both CoreMarks, and repeated no-import computation/memory checks. Its existing
-Python unittest integration exercises both pinned no-import workloads and the
-native validator using explicitly synthetic metadata around actual execution
-payloads. That test envelope never becomes measurement evidence.
+both CoreMarks, and repeated no-import computation/memory checks. Its Zig test
+integration (`scripts/native_benchmark.zig` `NativeLinuxProducerTests`) exercises
+both pinned no-import workloads, deterministic `native-linux-receipt` /
+`native-abi-proof` generation, and the native validator using explicitly
+synthetic metadata around actual execution payloads. That test envelope never
+becomes measurement evidence.
 `test-native-bench-build` does not execute x86 code. CI executes the native suite
 only on Linux x86_64; Windows/ARM hosted CI is not forced to execute native code.
 
@@ -190,10 +192,15 @@ not values copied from the incoming request. Its fields are:
 | `environment` | Empty array for these matched pinned measurements |
 
 All paths are relative to the producer's working directory unless absolute.
+Use `zig-out/bin/bench-coremark native-linux-receipt --config RECEIPT_CONFIG --out RECEIPT_PATH`
+and `zig-out/bin/bench-coremark native-abi-proof --config ABI_PROOF_CONFIG --out ABI_PROOF_PATH`
+(built via `zig build build-bench-coremark`) to assemble deterministic v2 image receipts
+and AOT ABI compatibility proofs from real local artifacts before running `native-plan`.
 The host sets `WAMR_BENCH_REQUEST` and `WAMR_BENCH_CONFIG_SHA256`:
 
 ```sh
-python3 scripts/bench_coremark.py native-capture \
+zig build build-bench-coremark
+zig-out/bin/bench-coremark native-capture \
   --manifest PRIVATE_PLAN --run-id RUN_ID --out NEW_PRIVATE_CAPTURE --timeout 900 \
   -- zig-out/bin/wamr-native-bench --deployment PRIVATE_DEPLOYMENT_CONFIG
 ```

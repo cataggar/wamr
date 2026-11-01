@@ -12,18 +12,19 @@ peak-memory coverage or paired Linux/Unikraft comparison. The earlier
 pipeline may be reused externally; these commands do not create cloud
 resources, dispatch jobs, download serial logs, or publish evidence.
 
-The existing `scripts/bench_coremark.py` entry point provides `native-plan`,
-`native-request`, `native-capture`, `native-import`, and `native-report`, implemented
-by its `native_benchmark.py` adapter. Its existing hosted benchmarks are unchanged.
-Python runs **only on the external host**. Neither that hosted CLI nor Python is
-assumed to exist inside Unikraft.
+The `zig-out/bin/bench-coremark` CLI (built via `zig build build-bench-coremark` from
+`scripts/bench_coremark.zig`) provides `native-abi-proof`, `native-linux-receipt`,
+`native-plan`, `native-request`, `native-capture`, `native-import`, and
+`native-report`, implemented by its `scripts/native_benchmark.zig` adapter. Its
+existing hosted benchmarks are unchanged. This host CLI runs **only on the external
+host** and is never assumed to exist inside Unikraft.
 
 ## What is runnable now, and what is not
 
 The host can verify local artifact bytes and image receipts, generate a counterbalanced
 plan, export per-run requests, launch a supplied **Linux embedding producer**, import
 native serial evidence, validate every result, and produce a paired JSON report.
-The Python adapter does not implement an embedding runner or obtain native runtime
+The `scripts/native_benchmark.zig` host adapter does not implement an embedding runner or obtain native runtime
 phase timers by timing a subprocess. The separate
 [compiler-free Linux embedding producer](native-linux-producer.md) supplies real
 API phase clocks and qualified same-instance snapshot-reset execution. Native
@@ -70,8 +71,8 @@ All kernel components share a protection domain: bounds checks, W^X, import chec
 and trap isolation remain mandatory. No network/storage scope is introduced here.
 
 The unit tests use explicitly `synthetic` artifacts, clocks, outputs, CPU descriptions
-and receipts. A test-only Python keyword enables them; **no CLI option accepts
-synthetic measurement evidence**. Relabeling test data as real is not evidence.
+and receipts. A test-only Zig parameter (`allow_synthetic`) enables them; **measurement
+validation rejects synthetic evidence**. Relabeling test data as real is not evidence.
 Receipts are trusted attestations supplied by the image/guest integrator, not digital
 signatures or an automatic proof of their truth. Review their origin privately.
 
@@ -139,8 +140,8 @@ invoking host's working directory.
   per attempt. A capture timeout must fit inside the remaining validity window.
 * `workloads`: unique list of the keys above.
 * `producer_source`: source identity of the host tooling; its commit must match the
-  executing tooling checkout. The adapter also hashes the actual executing
-  `bench_coremark.py`, `native_benchmark.py`, and shared `benchmark_schema.py`.
+  executing tooling checkout. The adapter also hashes the actual
+  `scripts/bench_coremark.zig`, `scripts/native_benchmark.zig`, and shared `scripts/benchmark_schema.zig`.
 * `targets`: exactly `linux` and `unikraft`, each described below.
 * `abi_proofs`: map from every selected workload to a local proof file path for
   identical AOT bytes, or JSON `null` for target-specific AOT bytes.
@@ -277,17 +278,42 @@ Identical bytes must also have identical `compile_profile` declarations.
 
 ## Exact invocation
 
-Prepare the config/receipts from actual local image evidence, then:
+Build the host CLI and prepare the receipts/ABI proofs from actual local image evidence:
 
 ```sh
-python3 scripts/bench_coremark.py native-plan \
+zig build build-bench-coremark
+
+zig-out/bin/bench-coremark native-linux-receipt \
+  --config .bench-coremark/native/linux-receipt-config.json \
+  --out .bench-coremark/native/linux-receipt.json
+
+zig-out/bin/bench-coremark native-abi-proof \
+  --config .bench-coremark/native/coremark-abi-proof-config.json \
+  --out .bench-coremark/native/coremark-abi-proof.json
+# Or directly with CLI flags:
+# zig-out/bin/bench-coremark native-abi-proof \
+#   --aot zig-out/native-bench/coremark.cwasm \
+#   --source-repo . --source-commit "$WAMR_SOURCE_COMMIT" \
+#   --linux-target-abi x86_64-unknown-none-elf \
+#   --unikraft-target-abi x86_64-unknown-none-elf \
+#   --out .bench-coremark/native/coremark-abi-proof.json
+
+zig-out/bin/bench-coremark native-plan \
   --config .bench-coremark/native/config.json \
   --out .bench-coremark/native/plan.json
 
-python3 scripts/bench_coremark.py native-request \
+zig-out/bin/bench-coremark native-request \
   --manifest .bench-coremark/native/plan.json --run-id run-0001 \
   --out .bench-coremark/native/request-0001.json
 ```
+
+`native-linux-receipt` hashes `image_path`, `runtime_path`, `compiler_path`, and every
+entry in `aot_paths`, builds a deterministic v2 `wamr-native-image-receipt` (`os`
+defaults to `"linux"`, `compiler_embedded` to `false`, and `runtime_linkage` to
+`"static"`), and validates it with `validateImageReceipt` before writing `--out`.
+`native-abi-proof` hashes the `.cwasm` artifact, validates `source` (`validateSource`)
+and `target_abis` (`[linux_target_abi, unikraft_target_abi]`), and emits the exact v2
+`wamr-aot-abi-proof` object checked by `native-plan`.
 
 The plan contains a fresh **public random campaign UUID**, validity interval,
 source/tool hashes, full artifact identities, workload settings and a forward/reverse
@@ -295,7 +321,7 @@ counterbalanced schedule. Run IDs are public `run-NNNN` ordinals, not cloud exec
 IDs. Every scheduled warmup and measured run is a new load/instance.
 
 The request is `{"config": CONFIG, "config_sha256": HASH}`. `HASH` is SHA-256 of
-`json.dumps(CONFIG, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("UTF-8")`.
+canonical UTF-8 JSON (`CONFIG` serialized with sorted object keys and compact `,`/`:` separators).
 `CONFIG` contains `campaign_id`, the exact schedule `run` object, `target`, `workload`,
 `steady_invocations`, `execution_lifecycle`, and `phase_contract: "wamr-embedding-v2"`.
 Run objects contain `run_id`, `target`, `workload`, `phase`, `attempt: 1`, `position`.
@@ -303,14 +329,14 @@ Run objects contain `run_id`, `target`, `workload`, `phase`, `attempt: 1`, `posi
 For a Linux producer implementing this contract:
 
 ```sh
-python3 scripts/bench_coremark.py native-capture \
+zig-out/bin/bench-coremark native-capture \
   --manifest .bench-coremark/native/plan.json --run-id run-0001 \
   --out .bench-coremark/native/run-0001 --timeout 900 \
   -- /path/to/qualified-linux-embedding-producer
 ```
 
 The host sets `WAMR_BENCH_REQUEST` to the private absolute request filename and
-`WAMR_BENCH_CONFIG_SHA256` to its configuration digest. The producer, not Python,
+`WAMR_BENCH_CONFIG_SHA256` to its configuration digest. The producer, not the host CLI,
 uses the embedding APIs and guest/native timers. This command refuses a Unikraft
 target: it must not accidentally launch a hosted CLI in place of a native guest.
 
@@ -318,7 +344,7 @@ For externally collected Unikraft stdout/serial data, use `native-import`. Suppl
 actual host-side observation boundaries/monotonic duration from the collector:
 
 ```sh
-python3 scripts/bench_coremark.py native-import \
+zig-out/bin/bench-coremark native-import \
   --manifest .bench-coremark/native/plan.json --run-id run-0002 \
   --stdout .bench-coremark/native/serial.bin \
   --stderr .bench-coremark/native/collector-stderr.bin \
@@ -571,7 +597,7 @@ not infer allocator call counts or attribute performance to a policy label.
 Pass every planned capture directory, including warmups and failures:
 
 ```sh
-python3 scripts/bench_coremark.py native-report \
+zig-out/bin/bench-coremark native-report \
   --manifest .bench-coremark/native/plan.json \
   --capture .bench-coremark/native/run-0001 \
   --capture .bench-coremark/native/run-0002 \
@@ -619,14 +645,19 @@ Native JIT APIs and qualification are not prerequisites for these host/parser te
 ## Validation
 
 ```sh
-python3 -m unittest discover -s scripts -p test_bench_coremark.py
+zig build test-bench-coremark
+zig build test-native-bench
+zig build test-native-aot-guest
+zig build test-native-jit-bench
 ```
 
-`zig build test` also runs the portable `NativeBenchmarkTests` class through the
-existing Python harness-command mechanism on ordinary Linux, ARM and Windows CI.
-The existing hosted CoreMark tests continue to run in the CoreMark workflows.
+`zig build test` also runs the portable `NativeBenchmarkTests` suite in
+`scripts/native_benchmark.zig` on ordinary Linux, ARM and Windows CI.
+The existing hosted CoreMark tests (`scripts/bench_coremark.zig`) continue to run in
+`zig build test-bench-coremark` and the CoreMark workflows.
 
-The tests pin all four tracked fixtures, execute an explicitly synthetic Linux
+The tests pin all four tracked fixtures, exercise `native-abi-proof`,
+`native-linux-receipt`, and `native-plan` round-trips, execute a synthetic Linux
 producer subprocess, exercise timeouts and retained raw evidence, and reject
 duplicate/stale/partial records, mode/identity/clock/memory mismatches and ambiguous
 CoreMark output. They are software validation, not native measurements.
@@ -715,7 +746,7 @@ profile (`ProductionProfile.coremark_exact_v2` /
   stdout fields (`Iterations: 100`, `seedcrc: 0xe9f5`, `[0]crclist: 0xe714`,
   `[0]crcmatrix: 0x1fd7`, `[0]crcstate: 0x8e3a`, `[0]crcfinal: 0x988c`, plus the
   short-duration warning markers, mirrored on the host by
-  `native_benchmark.validate_coremark_short_crc_output`), and zero post-teardown
+  `native_benchmark.validateCoremarkShortCrcOutput`), and zero post-teardown
   counters (`teardown: 0`).
 * **Boundary with #1046 measurement campaigns**: `coremark-qcow2-derived-vhd`
   closes six-mode native Unikraft image-lineage and 100-iteration WASI CoreMark
@@ -725,7 +756,7 @@ profile (`ProductionProfile.coremark_exact_v2` /
   It does **not** emit `WAMR_BENCH_RESULT=` (`wamr-embedding-v2`), does **not**
   run the authoritative `400,000`-iteration (`>= 10 s`) CoreMark benchmark
   configuration (`coremark 0 0 0 400000 0`, `[0]crcfinal: 0x382f`), and is
-  rejected by `native_benchmark.coremark_correctness` / `validate_result` if
+  rejected by `native_benchmark.coremarkCorrectness` / `validateResult` if
   presented as a successful v2 measurement record. An authorized paired Linux vs
   Azure Unikraft hardware campaign (`Standard_D2s_v5`) remains separate; no cloud
   resources were provisioned and no speedup is claimed.
