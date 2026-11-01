@@ -196,7 +196,7 @@ raw stdout/stderr and statuses, including failures/timeouts. Strict revalidation
 checks raw hashes, request identity, actual matching wasm identities, exact
 results, every phase, growth and complete teardown before writing a comparison.
 The separate `WAMR_JIT_SAMPLE=` marker cannot be consumed as the existing
-`WAMR_BENCH_RESULT=` protocol. `scripts/native_benchmark.py` remains strict v2
+`WAMR_BENCH_RESULT=` protocol. `scripts/native_benchmark.zig` remains strict v2
 compiler-free AOT by default, unchanged.
 
 Without independent evidence the capture is **correctness-only**, has no image

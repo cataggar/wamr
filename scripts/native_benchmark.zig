@@ -752,6 +752,359 @@ fn hashFirstExisting(allocator: Allocator, io: std.Io, repo: []const u8, candida
     return error.ValidationFailed;
 }
 
+fn resolveGitRepoDir(io: std.Io, repo_arg: []const u8) []const u8 {
+    if (std.Io.Dir.cwd().openDir(io, repo_arg, .{})) |dir_val| {
+        var dir = dir_val;
+        dir.close(io);
+        return repo_arg;
+    } else |_| {
+        return ".";
+    }
+}
+
+fn resolveSourceFromConfig(allocator: Allocator, io: std.Io, cfg: std.json.ObjectMap) !Value {
+    if (cfg.get("source")) |source_val| {
+        try validateSource(source_val);
+        if (cfg.get("source_commit")) |sc| {
+            try require(sc == .string and std.mem.eql(u8, sc.string, source_val.object.get("commit").?.string));
+        }
+        if (cfg.get("source_tree_sha256")) |st| {
+            try require(st == .string and std.mem.eql(u8, st.string, source_val.object.get("tree_sha256").?.string));
+        }
+        if (cfg.get("source_tracked_diff_sha256")) |sd| {
+            try require(sd == .string and std.mem.eql(u8, sd.string, source_val.object.get("tracked_diff_sha256").?.string));
+        }
+        return source_val;
+    }
+
+    const repo_dir: ?[]const u8 = if (cfg.get("source_repo")) |sr| blk: {
+        try require(sr == .string and sr.string.len > 0);
+        break :blk resolveGitRepoDir(io, sr.string);
+    } else null;
+
+    const commit_str: []const u8 = if (cfg.get("source_commit")) |sc|
+        try requireDigest(sc, 40)
+    else if (repo_dir) |rdir|
+        try resolveRefSha(allocator, io, rdir, "HEAD")
+    else
+        return error.ValidationFailed;
+
+    const tree_sha: []const u8 = if (cfg.get("source_tree_sha256")) |st|
+        try requireDigest(st, 64)
+    else if (repo_dir) |rdir| blk: {
+        const res = try std.process.run(allocator, io, .{
+            .argv = &.{ "git", "ls-tree", "-r", commit_str },
+            .cwd = .{ .path = rdir },
+        });
+        if (res.term != .exited or res.term.exited != 0) return error.ValidationFailed;
+        break :blk try sha256BytesAlloc(allocator, res.stdout);
+    } else return error.ValidationFailed;
+
+    const diff_sha: []const u8 = if (cfg.get("source_tracked_diff_sha256")) |sd|
+        try requireDigest(sd, 64)
+    else if (repo_dir) |rdir| blk: {
+        const res = try std.process.run(allocator, io, .{
+            .argv = &.{ "git", "diff", "--binary", commit_str },
+            .cwd = .{ .path = rdir },
+        });
+        if (res.term != .exited or res.term.exited != 0) return error.ValidationFailed;
+        break :blk try sha256BytesAlloc(allocator, res.stdout);
+    } else return error.ValidationFailed;
+
+    var source_map: std.json.ObjectMap = .empty;
+    try source_map.put(allocator, "commit", .{ .string = commit_str });
+    try source_map.put(allocator, "tree_sha256", .{ .string = tree_sha });
+    try source_map.put(allocator, "tracked_diff_sha256", .{ .string = diff_sha });
+    const source_val: Value = .{ .object = source_map };
+    try validateSource(source_val);
+    return source_val;
+}
+
+pub fn createAbiProof(
+    allocator: Allocator,
+    io: std.Io,
+    config: Value,
+    allow_synthetic: bool,
+) !Value {
+    try require(config == .object);
+    const cfg = config.object;
+    const allowed_keys = [_][]const u8{
+        "aot_path",
+        "aot_sha256",
+        "source",
+        "source_repo",
+        "source_commit",
+        "source_tree_sha256",
+        "source_tracked_diff_sha256",
+        "target_abis",
+        "linux_target_abi",
+        "unikraft_target_abi",
+        "compatible",
+        "evidence_kind",
+    };
+    var it = cfg.iterator();
+    while (it.next()) |entry| {
+        var known = false;
+        for (allowed_keys) |ak| {
+            if (std.mem.eql(u8, entry.key_ptr.*, ak)) {
+                known = true;
+                break;
+            }
+        }
+        try require(known);
+    }
+
+    const ek_str: []const u8 = if (cfg.get("evidence_kind")) |ek_val| blk: {
+        try require(ek_val == .string);
+        if (allow_synthetic) {
+            try require(std.mem.eql(u8, ek_val.string, "measurement") or std.mem.eql(u8, ek_val.string, "synthetic"));
+        } else {
+            try require(std.mem.eql(u8, ek_val.string, "measurement"));
+        }
+        break :blk ek_val.string;
+    } else if (allow_synthetic) "synthetic" else "measurement";
+
+    if (cfg.get("compatible")) |compat_val| {
+        try require(compat_val == .bool and compat_val.bool);
+    }
+
+    const source_val = try resolveSourceFromConfig(allocator, io, cfg);
+
+    var linux_abi_opt: ?[]const u8 = null;
+    var unikraft_abi_opt: ?[]const u8 = null;
+    if (cfg.get("target_abis")) |abis_val| {
+        try require(abis_val == .array and abis_val.array.items.len == 2);
+        linux_abi_opt = try requirePublicToken(abis_val.array.items[0]);
+        unikraft_abi_opt = try requirePublicToken(abis_val.array.items[1]);
+    }
+    if (cfg.get("linux_target_abi")) |labi| {
+        const s = try requirePublicToken(labi);
+        if (linux_abi_opt) |existing| try require(std.mem.eql(u8, existing, s));
+        linux_abi_opt = s;
+    }
+    if (cfg.get("unikraft_target_abi")) |uabi| {
+        const s = try requirePublicToken(uabi);
+        if (unikraft_abi_opt) |existing| try require(std.mem.eql(u8, existing, s));
+        unikraft_abi_opt = s;
+    }
+    const linux_abi = linux_abi_opt orelse return error.ValidationFailed;
+    const unikraft_abi = unikraft_abi_opt orelse return error.ValidationFailed;
+
+    var aot_sha_opt: ?[]const u8 = null;
+    if (cfg.get("aot_path")) |aot_path_val| {
+        try require(aot_path_val == .string and aot_path_val.string.len > 0);
+        const aot_art = try artifact(allocator, io, aot_path_val.string);
+        aot_sha_opt = aot_art.object.get("sha256").?.string;
+    }
+    if (cfg.get("aot_sha256")) |aot_sha_val| {
+        const expected = try requireDigest(aot_sha_val, 64);
+        if (aot_sha_opt) |actual| try require(std.mem.eql(u8, actual, expected));
+        aot_sha_opt = expected;
+    }
+    const aot_sha = aot_sha_opt orelse return error.ValidationFailed;
+
+    var abis: std.json.Array = .init(allocator);
+    try abis.append(.{ .string = linux_abi });
+    try abis.append(.{ .string = unikraft_abi });
+
+    var proof: std.json.ObjectMap = .empty;
+    try proof.put(allocator, "schema_version", .{ .integer = version });
+    try proof.put(allocator, "kind", .{ .string = "wamr-aot-abi-proof" });
+    try proof.put(allocator, "evidence_kind", .{ .string = ek_str });
+    try proof.put(allocator, "compatible", .{ .bool = true });
+    try proof.put(allocator, "source", source_val);
+    try proof.put(allocator, "target_abis", .{ .array = abis });
+    try proof.put(allocator, "aot_sha256", .{ .string = aot_sha });
+    return .{ .object = proof };
+}
+
+pub fn createImageReceipt(
+    allocator: Allocator,
+    io: std.Io,
+    config: Value,
+    allow_synthetic: bool,
+) !Value {
+    try require(config == .object);
+    const cfg = config.object;
+    const required_keys = [_][]const u8{
+        "image_path",
+        "runtime_path",
+        "compiler_path",
+        "compiler_version",
+        "source",
+        "target_abi",
+        "platform",
+        "options",
+        "compile_profile",
+        "memory_policy",
+        "execution_lifecycle",
+        "configured_vm_ram_bytes",
+        "aot_paths",
+    };
+    const optional_keys = [_][]const u8{
+        "os",
+        "compiler_embedded",
+        "runtime_linkage",
+        "evidence_kind",
+    };
+    for (required_keys) |rk| {
+        try require(cfg.contains(rk));
+    }
+    var it = cfg.iterator();
+    while (it.next()) |entry| {
+        var known = false;
+        for (required_keys) |rk| {
+            if (std.mem.eql(u8, entry.key_ptr.*, rk)) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) {
+            for (optional_keys) |ok| {
+                if (std.mem.eql(u8, entry.key_ptr.*, ok)) {
+                    known = true;
+                    break;
+                }
+            }
+        }
+        try require(known);
+    }
+
+    const os_str: []const u8 = if (cfg.get("os")) |os_val| blk: {
+        try require(os_val == .string and (std.mem.eql(u8, os_val.string, "linux") or std.mem.eql(u8, os_val.string, "unikraft")));
+        break :blk os_val.string;
+    } else "linux";
+
+    const ek_str: []const u8 = if (cfg.get("evidence_kind")) |ek_val| blk: {
+        try require(ek_val == .string);
+        if (allow_synthetic) {
+            try require(std.mem.eql(u8, ek_val.string, "measurement") or std.mem.eql(u8, ek_val.string, "synthetic"));
+        } else {
+            try require(std.mem.eql(u8, ek_val.string, "measurement"));
+        }
+        break :blk ek_val.string;
+    } else if (allow_synthetic) "synthetic" else "measurement";
+
+    const compiler_embedded: bool = if (cfg.get("compiler_embedded")) |ce_val| blk: {
+        try require(ce_val == .bool and !ce_val.bool);
+        break :blk ce_val.bool;
+    } else false;
+
+    const runtime_linkage: []const u8 = if (cfg.get("runtime_linkage")) |rl_val| blk: {
+        try require(rl_val == .string and std.mem.eql(u8, rl_val.string, "static"));
+        break :blk rl_val.string;
+    } else "static";
+
+    const source_val = cfg.get("source").?;
+    try validateSource(source_val);
+    if (std.mem.eql(u8, ek_str, "measurement") and std.mem.eql(u8, os_str, "unikraft")) {
+        const commit = source_val.object.get("commit").?.string;
+        var ok_commit = false;
+        for (supported_unikraft_native_sdk_commits) |sc| {
+            if (std.mem.eql(u8, commit, sc)) ok_commit = true;
+        }
+        try require(ok_commit);
+    }
+
+    const platform_val = cfg.get("platform").?;
+    try validatePlatform(platform_val);
+    if (std.mem.eql(u8, ek_str, "measurement")) {
+        var p_it = platform_val.object.iterator();
+        while (p_it.next()) |pe| {
+            if (pe.value_ptr.* == .string) {
+                try require(!containsIgnoreCase(pe.value_ptr.*.string, "synthetic"));
+            }
+        }
+    }
+
+    const options_val = cfg.get("options").?;
+    try validateOptions(options_val);
+    const memory_policy_val = cfg.get("memory_policy").?;
+    try validateMemoryPolicy(memory_policy_val);
+    const lifecycle_val = cfg.get("execution_lifecycle").?;
+    try validateLifecycle(lifecycle_val);
+    const target_abi_val = cfg.get("target_abi").?;
+    _ = try requirePublicToken(target_abi_val);
+    const compiler_version_val = cfg.get("compiler_version").?;
+    _ = try requirePublicToken(compiler_version_val);
+
+    const cp_val = cfg.get("compile_profile").?;
+    try require(cp_val == .null or (cp_val == .string and std.mem.eql(u8, cp_val.string, "unikraft-x86_64")));
+    if (std.mem.eql(u8, os_str, "unikraft")) {
+        try require(cp_val == .string and std.mem.eql(u8, cp_val.string, "unikraft-x86_64"));
+    }
+    if (cp_val == .string and std.mem.eql(u8, cp_val.string, "unikraft-x86_64")) {
+        try require(std.mem.eql(u8, platform_val.object.get("arch").?.string, "x86_64"));
+    }
+
+    const ram_val = cfg.get("configured_vm_ram_bytes").?;
+    _ = try requireIntMin(ram_val, 1);
+
+    const image_path_val = cfg.get("image_path").?;
+    const runtime_path_val = cfg.get("runtime_path").?;
+    const compiler_path_val = cfg.get("compiler_path").?;
+    try require(image_path_val == .string and runtime_path_val == .string and compiler_path_val == .string);
+
+    const image_art = try artifact(allocator, io, image_path_val.string);
+    const runtime_art = try artifact(allocator, io, runtime_path_val.string);
+    const compiler_bin_art = try artifact(allocator, io, compiler_path_val.string);
+
+    const aot_paths_val = cfg.get("aot_paths").?;
+    try require(aot_paths_val == .object and aot_paths_val.object.count() > 0);
+    var aot_modules: std.json.ObjectMap = .empty;
+    var aot_it = aot_paths_val.object.iterator();
+    while (aot_it.next()) |entry| {
+        const wname = entry.key_ptr.*;
+        try require(findFixture(wname) != null);
+        try require(entry.value_ptr.* == .string);
+        try aot_modules.put(allocator, wname, try artifact(allocator, io, entry.value_ptr.*.string));
+    }
+
+    var comp_map: std.json.ObjectMap = .empty;
+    try comp_map.put(allocator, "binary", compiler_bin_art);
+    try comp_map.put(allocator, "source", source_val);
+    try comp_map.put(allocator, "version", compiler_version_val);
+    const compiler_val: Value = .{ .object = comp_map };
+
+    var receipt: std.json.ObjectMap = .empty;
+    try receipt.put(allocator, "schema_version", .{ .integer = version });
+    try receipt.put(allocator, "kind", .{ .string = "wamr-native-image-receipt" });
+    try receipt.put(allocator, "evidence_kind", .{ .string = ek_str });
+    try receipt.put(allocator, "os", .{ .string = os_str });
+    try receipt.put(allocator, "image", image_art);
+    try receipt.put(allocator, "runtime", runtime_art);
+    try receipt.put(allocator, "source", source_val);
+    try receipt.put(allocator, "target_abi", target_abi_val);
+    try receipt.put(allocator, "platform", platform_val);
+    try receipt.put(allocator, "options", options_val);
+    try receipt.put(allocator, "compiler", compiler_val);
+    try receipt.put(allocator, "compile_profile", cp_val);
+    try receipt.put(allocator, "configured_vm_ram_bytes", ram_val);
+    try receipt.put(allocator, "compiler_embedded", .{ .bool = compiler_embedded });
+    try receipt.put(allocator, "runtime_linkage", .{ .string = runtime_linkage });
+    try receipt.put(allocator, "memory_policy", memory_policy_val);
+    try receipt.put(allocator, "aot_modules", .{ .object = aot_modules });
+    try receipt.put(allocator, "execution_lifecycle", lifecycle_val);
+    const receipt_val: Value = .{ .object = receipt };
+
+    var target_map: std.json.ObjectMap = .empty;
+    try target_map.put(allocator, "os", .{ .string = os_str });
+    try target_map.put(allocator, "image", image_art);
+    try target_map.put(allocator, "runtime", runtime_art);
+    try target_map.put(allocator, "source", source_val);
+    try target_map.put(allocator, "target_abi", target_abi_val);
+    try target_map.put(allocator, "platform", platform_val);
+    try target_map.put(allocator, "options", options_val);
+    try target_map.put(allocator, "compiler", compiler_val);
+    try target_map.put(allocator, "compile_profile", cp_val);
+    try target_map.put(allocator, "memory_policy", memory_policy_val);
+    try target_map.put(allocator, "execution_lifecycle", lifecycle_val);
+    try target_map.put(allocator, "aot_modules", .{ .object = aot_modules });
+
+    try validateImageReceipt(allocator, receipt_val, .{ .object = target_map }, ek_str);
+    return receipt_val;
+}
+
 pub fn createPlan(
     allocator: Allocator,
     io: std.Io,
@@ -2069,13 +2422,106 @@ fn runCliInner(
     const cmd = argv[0];
     const rest = argv[1..];
 
-    if (std.mem.eql(u8, cmd, "native-plan")) {
+    if (std.mem.eql(u8, cmd, "native-abi-proof")) {
         var config_path: ?[]const u8 = null;
-        var repo_path: []const u8 = ".";
+        var aot_path: ?[]const u8 = null;
+        var aot_sha256: ?[]const u8 = null;
+        var source_repo: ?[]const u8 = null;
+        var source_commit: ?[]const u8 = null;
+        var source_tree_sha256: ?[]const u8 = null;
+        var source_tracked_diff_sha256: ?[]const u8 = null;
+        var linux_target_abi: ?[]const u8 = null;
+        var unikraft_target_abi: ?[]const u8 = null;
         var out_path: ?[]const u8 = null;
+        var allow_synthetic = false;
         var i: usize = 0;
         while (i < rest.len) : (i += 1) {
             const arg = rest[i];
+            if (std.mem.eql(u8, arg, "--allow-synthetic")) {
+                allow_synthetic = true;
+                continue;
+            }
+            if (i + 1 >= rest.len) return error.InvalidCliArguments;
+            i += 1;
+            const val = rest[i];
+            if (std.mem.eql(u8, arg, "--config")) {
+                config_path = val;
+            } else if (std.mem.eql(u8, arg, "--aot") or std.mem.eql(u8, arg, "--aot-path")) {
+                aot_path = val;
+            } else if (std.mem.eql(u8, arg, "--aot-sha256")) {
+                aot_sha256 = val;
+            } else if (std.mem.eql(u8, arg, "--source-repo")) {
+                source_repo = val;
+            } else if (std.mem.eql(u8, arg, "--source-commit")) {
+                source_commit = val;
+            } else if (std.mem.eql(u8, arg, "--source-tree-sha256")) {
+                source_tree_sha256 = val;
+            } else if (std.mem.eql(u8, arg, "--source-tracked-diff-sha256")) {
+                source_tracked_diff_sha256 = val;
+            } else if (std.mem.eql(u8, arg, "--linux-target-abi")) {
+                linux_target_abi = val;
+            } else if (std.mem.eql(u8, arg, "--unikraft-target-abi")) {
+                unikraft_target_abi = val;
+            } else if (std.mem.eql(u8, arg, "--out")) {
+                out_path = val;
+            } else return error.InvalidCliArguments;
+        }
+        var cfg_map: std.json.ObjectMap = if (config_path) |cpath| blk: {
+            const parsed = try readJson(allocator, io, cpath);
+            try require(parsed == .object);
+            break :blk parsed.object;
+        } else .empty;
+        if (aot_path) |v| try cfg_map.put(allocator, "aot_path", .{ .string = v });
+        if (aot_sha256) |v| try cfg_map.put(allocator, "aot_sha256", .{ .string = v });
+        if (source_repo) |v| try cfg_map.put(allocator, "source_repo", .{ .string = v });
+        if (source_commit) |v| try cfg_map.put(allocator, "source_commit", .{ .string = v });
+        if (source_tree_sha256) |v| try cfg_map.put(allocator, "source_tree_sha256", .{ .string = v });
+        if (source_tracked_diff_sha256) |v| try cfg_map.put(allocator, "source_tracked_diff_sha256", .{ .string = v });
+        if (linux_target_abi) |v| try cfg_map.put(allocator, "linux_target_abi", .{ .string = v });
+        if (unikraft_target_abi) |v| try cfg_map.put(allocator, "unikraft_target_abi", .{ .string = v });
+        const doc = try createAbiProof(allocator, io, .{ .object = cfg_map }, allow_synthetic);
+        try writeJsonDocument(allocator, io, out_path orelse return error.InvalidCliArguments, doc);
+        return 0;
+    } else if (std.mem.eql(u8, cmd, "native-linux-receipt")) {
+        var config_path: ?[]const u8 = null;
+        var out_path: ?[]const u8 = null;
+        var allow_synthetic = false;
+        var i: usize = 0;
+        while (i < rest.len) : (i += 1) {
+            const arg = rest[i];
+            if (std.mem.eql(u8, arg, "--allow-synthetic")) {
+                allow_synthetic = true;
+                continue;
+            }
+            if (i + 1 >= rest.len) return error.InvalidCliArguments;
+            i += 1;
+            const val = rest[i];
+            if (std.mem.eql(u8, arg, "--config")) {
+                config_path = val;
+            } else if (std.mem.eql(u8, arg, "--out")) {
+                out_path = val;
+            } else return error.InvalidCliArguments;
+        }
+        const doc = try createImageReceipt(
+            allocator,
+            io,
+            try readJson(allocator, io, config_path orelse return error.InvalidCliArguments),
+            allow_synthetic,
+        );
+        try writeJsonDocument(allocator, io, out_path orelse return error.InvalidCliArguments, doc);
+        return 0;
+    } else if (std.mem.eql(u8, cmd, "native-plan")) {
+        var config_path: ?[]const u8 = null;
+        var repo_path: []const u8 = ".";
+        var out_path: ?[]const u8 = null;
+        var allow_synthetic = false;
+        var i: usize = 0;
+        while (i < rest.len) : (i += 1) {
+            const arg = rest[i];
+            if (std.mem.eql(u8, arg, "--allow-synthetic")) {
+                allow_synthetic = true;
+                continue;
+            }
             if (std.mem.eql(u8, arg, "--config")) {
                 i += 1;
                 if (i >= rest.len) return error.InvalidCliArguments;
@@ -2096,7 +2542,7 @@ fn runCliInner(
             try readJson(allocator, io, config_path orelse return error.InvalidCliArguments),
             repo_path,
             null,
-            false,
+            allow_synthetic,
         );
         try writeJsonDocument(allocator, io, out_path orelse return error.InvalidCliArguments, doc);
         return 0;
@@ -2399,16 +2845,8 @@ fn makeSyntheticPlanFixture(
     const lifecycle_val = try testLifecycleSpec(allocator, opts.lifecycle_mode);
     const compiler_path = try std.fs.path.join(allocator, &.{ root, "wamrc" });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = compiler_path, .data = "compiler-binary" });
-    const compiler_art = try artifact(allocator, io, compiler_path);
-
-    var comp_obj: std.json.ObjectMap = .empty;
-    try comp_obj.put(allocator, "binary", compiler_art);
-    try comp_obj.put(allocator, "source", source_val);
-    try comp_obj.put(allocator, "version", .{ .string = "wamrc-2.4.1" });
-    const compiler_val: Value = .{ .object = comp_obj };
 
     var targets_cfg: std.json.ObjectMap = .empty;
-    var aot_art_by_os: std.json.ObjectMap = .empty;
     for ([_][]const u8{ "linux", "unikraft" }) |os_name| {
         const runtime_path = try std.fs.path.join(allocator, &.{ root, try std.fmt.allocPrint(allocator, "{s}-runtime.a", .{os_name}) });
         const image_path = try std.fs.path.join(allocator, &.{ root, try std.fmt.allocPrint(allocator, "{s}.img", .{os_name}) });
@@ -2416,15 +2854,12 @@ fn makeSyntheticPlanFixture(
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = image_path, .data = try std.fmt.allocPrint(allocator, "{s}-image", .{os_name}) });
 
         var aot_paths_map: std.json.ObjectMap = .empty;
-        var aot_arts_map: std.json.ObjectMap = .empty;
         for (opts.workloads) |wname| {
             const suffix = if (opts.same_aot) "shared" else os_name;
             const aot_path = try std.fs.path.join(allocator, &.{ root, try std.fmt.allocPrint(allocator, "{s}-{s}.aot", .{ wname, suffix }) });
             try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = aot_path, .data = try std.fmt.allocPrint(allocator, "aot-{s}-{s}", .{ wname, suffix }) });
             try aot_paths_map.put(allocator, wname, .{ .string = aot_path });
-            try aot_arts_map.put(allocator, wname, try artifact(allocator, io, aot_path));
         }
-        try aot_art_by_os.put(allocator, os_name, .{ .object = aot_arts_map });
 
         const target_abi: []const u8 = if (!opts.same_aot and std.mem.eql(u8, os_name, "linux"))
             "x86_64-unknown-linux-gnu"
@@ -2436,29 +2871,25 @@ fn makeSyntheticPlanFixture(
             .null;
         const mem_policy = try testMemoryPolicySpec(allocator, os_name);
 
-        const ek_str = if (opts.allow_synthetic) "synthetic" else "measurement";
-        var receipt: std.json.ObjectMap = .empty;
-        try receipt.put(allocator, "schema_version", .{ .integer = version });
-        try receipt.put(allocator, "kind", .{ .string = "wamr-native-image-receipt" });
-        try receipt.put(allocator, "evidence_kind", .{ .string = ek_str });
-        try receipt.put(allocator, "os", .{ .string = os_name });
-        try receipt.put(allocator, "image", try artifact(allocator, io, image_path));
-        try receipt.put(allocator, "runtime", try artifact(allocator, io, runtime_path));
-        try receipt.put(allocator, "source", source_val);
-        try receipt.put(allocator, "target_abi", .{ .string = target_abi });
-        try receipt.put(allocator, "platform", platform_val);
-        try receipt.put(allocator, "options", options_val);
-        try receipt.put(allocator, "compiler", compiler_val);
-        try receipt.put(allocator, "compile_profile", compile_profile);
-        try receipt.put(allocator, "configured_vm_ram_bytes", .{ .integer = 536870912 });
-        try receipt.put(allocator, "compiler_embedded", .{ .bool = false });
-        try receipt.put(allocator, "runtime_linkage", .{ .string = "static" });
-        try receipt.put(allocator, "memory_policy", mem_policy);
-        try receipt.put(allocator, "aot_modules", .{ .object = aot_arts_map });
-        try receipt.put(allocator, "execution_lifecycle", lifecycle_val);
+        var receipt_cfg: std.json.ObjectMap = .empty;
+        try receipt_cfg.put(allocator, "os", .{ .string = os_name });
+        try receipt_cfg.put(allocator, "image_path", .{ .string = image_path });
+        try receipt_cfg.put(allocator, "runtime_path", .{ .string = runtime_path });
+        try receipt_cfg.put(allocator, "compiler_path", .{ .string = compiler_path });
+        try receipt_cfg.put(allocator, "compiler_version", .{ .string = "wamrc-2.4.1" });
+        try receipt_cfg.put(allocator, "source", source_val);
+        try receipt_cfg.put(allocator, "target_abi", .{ .string = target_abi });
+        try receipt_cfg.put(allocator, "platform", platform_val);
+        try receipt_cfg.put(allocator, "options", options_val);
+        try receipt_cfg.put(allocator, "compile_profile", compile_profile);
+        try receipt_cfg.put(allocator, "configured_vm_ram_bytes", .{ .integer = 536870912 });
+        try receipt_cfg.put(allocator, "memory_policy", mem_policy);
+        try receipt_cfg.put(allocator, "aot_paths", .{ .object = aot_paths_map });
+        try receipt_cfg.put(allocator, "execution_lifecycle", lifecycle_val);
+        const receipt_val = try createImageReceipt(allocator, io, .{ .object = receipt_cfg }, opts.allow_synthetic);
 
         const receipt_path = try std.fs.path.join(allocator, &.{ root, try std.fmt.allocPrint(allocator, "{s}-receipt.json", .{os_name}) });
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = receipt_path, .data = try encoded(allocator, .{ .object = receipt }) });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = receipt_path, .data = try encoded(allocator, receipt_val) });
 
         var t_spec: std.json.ObjectMap = .empty;
         try t_spec.put(allocator, "runtime_path", .{ .string = runtime_path });
@@ -2481,18 +2912,14 @@ fn makeSyntheticPlanFixture(
     for (opts.workloads) |wname| {
         if (opts.same_aot) {
             const proof_path = try std.fs.path.join(allocator, &.{ root, try std.fmt.allocPrint(allocator, "{s}-abi-proof.json", .{wname}) });
-            var abis: std.json.Array = .init(allocator);
-            try abis.append(targets_cfg.get("linux").?.object.get("target_abi").?);
-            try abis.append(targets_cfg.get("unikraft").?.object.get("target_abi").?);
-            var proof_obj: std.json.ObjectMap = .empty;
-            try proof_obj.put(allocator, "schema_version", .{ .integer = version });
-            try proof_obj.put(allocator, "kind", .{ .string = "wamr-aot-abi-proof" });
-            try proof_obj.put(allocator, "evidence_kind", .{ .string = if (opts.allow_synthetic) "synthetic" else "measurement" });
-            try proof_obj.put(allocator, "compatible", .{ .bool = true });
-            try proof_obj.put(allocator, "source", source_val);
-            try proof_obj.put(allocator, "target_abis", .{ .array = abis });
-            try proof_obj.put(allocator, "aot_sha256", aot_art_by_os.get("linux").?.object.get(wname).?.object.get("sha256").?);
-            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = proof_path, .data = try encoded(allocator, .{ .object = proof_obj }) });
+            const aot_path = targets_cfg.get("linux").?.object.get("aot_paths").?.object.get(wname).?;
+            var proof_cfg: std.json.ObjectMap = .empty;
+            try proof_cfg.put(allocator, "aot_path", aot_path);
+            try proof_cfg.put(allocator, "source", source_val);
+            try proof_cfg.put(allocator, "linux_target_abi", targets_cfg.get("linux").?.object.get("target_abi").?);
+            try proof_cfg.put(allocator, "unikraft_target_abi", targets_cfg.get("unikraft").?.object.get("target_abi").?);
+            const proof_val = try createAbiProof(allocator, io, .{ .object = proof_cfg }, opts.allow_synthetic);
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = proof_path, .data = try encoded(allocator, proof_val) });
             try proofs_map.put(allocator, wname, .{ .string = proof_path });
         } else {
             try proofs_map.put(allocator, wname, .null);
@@ -2925,6 +3352,125 @@ test "NativeBenchmarkTests" {
             }
         }
     }
+
+    // 6. Deterministic native-abi-proof and native-linux-receipt CLI + round-trip into native-plan
+    {
+        const sub = try std.fs.path.join(allocator, &.{ root, "t6_cli_roundtrip" });
+        try std.Io.Dir.cwd().createDirPath(io, sub);
+        const fix = try makeSyntheticPlanFixture(allocator, io, sub, .{
+            .workloads = &.{ "coremark", "compute" },
+            .same_aot = true,
+            .lifecycle_mode = "snapshot-replay",
+        });
+
+        var empty_env: std.process.Environ.Map = .init(allocator);
+        const linux_spec = fix.config.object.get("targets").?.object.get("linux").?.object;
+        const unikraft_spec = fix.config.object.get("targets").?.object.get("unikraft").?.object;
+
+        var linux_rcfg: std.json.ObjectMap = .empty;
+        for ([_][]const u8{
+            "runtime_path",       "compiler_path", "compiler_version", "source",
+            "target_abi",         "platform",      "options",          "image_path",
+            "aot_paths",          "compile_profile", "memory_policy",  "execution_lifecycle",
+        }) |k| {
+            try linux_rcfg.put(allocator, k, linux_spec.get(k).?);
+        }
+        try linux_rcfg.put(allocator, "configured_vm_ram_bytes", .{ .integer = 536870912 });
+        const linux_rcfg_path = try std.fs.path.join(allocator, &.{ sub, "cli-linux-rcfg.json" });
+        const cli_linux_receipt = try std.fs.path.join(allocator, &.{ sub, "cli-linux-receipt.json" });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = linux_rcfg_path, .data = try encoded(allocator, .{ .object = linux_rcfg }) });
+        try std.testing.expectEqual(
+            @as(u8, 0),
+            runCli(allocator, io, &empty_env, &.{ "native-linux-receipt", "--config", linux_rcfg_path, "--out", cli_linux_receipt }),
+        );
+        // Existing output file must be rejected
+        try std.testing.expectEqual(
+            @as(u8, 2),
+            runCli(allocator, io, &empty_env, &.{ "native-linux-receipt", "--config", linux_rcfg_path, "--out", cli_linux_receipt }),
+        );
+
+        var unikraft_rcfg = try testCloneValue(allocator, .{ .object = linux_rcfg });
+        try unikraft_rcfg.object.put(allocator, "os", .{ .string = "unikraft" });
+        for ([_][]const u8{ "runtime_path", "image_path", "target_abi", "compile_profile", "memory_policy", "aot_paths" }) |k| {
+            try unikraft_rcfg.object.put(allocator, k, unikraft_spec.get(k).?);
+        }
+        const unikraft_rcfg_path = try std.fs.path.join(allocator, &.{ sub, "cli-unikraft-rcfg.json" });
+        const cli_unikraft_receipt = try std.fs.path.join(allocator, &.{ sub, "cli-unikraft-receipt.json" });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = unikraft_rcfg_path, .data = try encoded(allocator, unikraft_rcfg) });
+        try std.testing.expectEqual(
+            @as(u8, 0),
+            runCli(allocator, io, &empty_env, &.{ "native-linux-receipt", "--config", unikraft_rcfg_path, "--out", cli_unikraft_receipt }),
+        );
+
+        // Generate ABI proofs via CLI: one using --config JSON, one using direct CLI flags
+        const cm_aot = linux_spec.get("aot_paths").?.object.get("coremark").?.string;
+        const comp_aot = linux_spec.get("aot_paths").?.object.get("compute").?.string;
+        const src_obj = linux_spec.get("source").?.object;
+
+        var cm_pcfg: std.json.ObjectMap = .empty;
+        try cm_pcfg.put(allocator, "aot_path", .{ .string = cm_aot });
+        try cm_pcfg.put(allocator, "source", linux_spec.get("source").?);
+        var abis_arr: std.json.Array = .init(allocator);
+        try abis_arr.append(linux_spec.get("target_abi").?);
+        try abis_arr.append(unikraft_spec.get("target_abi").?);
+        try cm_pcfg.put(allocator, "target_abis", .{ .array = abis_arr });
+        const cm_pcfg_path = try std.fs.path.join(allocator, &.{ sub, "cli-cm-pcfg.json" });
+        const cli_cm_proof = try std.fs.path.join(allocator, &.{ sub, "cli-cm-proof.json" });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = cm_pcfg_path, .data = try encoded(allocator, .{ .object = cm_pcfg }) });
+        try std.testing.expectEqual(
+            @as(u8, 0),
+            runCli(allocator, io, &empty_env, &.{ "native-abi-proof", "--config", cm_pcfg_path, "--out", cli_cm_proof }),
+        );
+
+        const cli_comp_proof = try std.fs.path.join(allocator, &.{ sub, "cli-comp-proof.json" });
+        try std.testing.expectEqual(
+            @as(u8, 0),
+            runCli(allocator, io, &empty_env, &.{
+                "native-abi-proof",
+                "--aot",
+                comp_aot,
+                "--source-repo",
+                "cataggar/wamr",
+                "--source-commit",
+                src_obj.get("commit").?.string,
+                "--source-tree-sha256",
+                src_obj.get("tree_sha256").?.string,
+                "--source-tracked-diff-sha256",
+                src_obj.get("tracked_diff_sha256").?.string,
+                "--linux-target-abi",
+                linux_spec.get("target_abi").?.string,
+                "--unikraft-target-abi",
+                unikraft_spec.get("target_abi").?.string,
+                "--out",
+                cli_comp_proof,
+            }),
+        );
+
+        // Round-trip both CLI-generated receipts and CLI-generated ABI proofs into native-plan
+        var plan_cfg = try testCloneValue(allocator, fix.config);
+        try plan_cfg.object.getPtr("targets").?.object.getPtr("linux").?.object.put(allocator, "image_receipt_path", .{ .string = cli_linux_receipt });
+        try plan_cfg.object.getPtr("targets").?.object.getPtr("unikraft").?.object.put(allocator, "image_receipt_path", .{ .string = cli_unikraft_receipt });
+        try plan_cfg.object.getPtr("abi_proofs").?.object.put(allocator, "coremark", .{ .string = cli_cm_proof });
+        try plan_cfg.object.getPtr("abi_proofs").?.object.put(allocator, "compute", .{ .string = cli_comp_proof });
+        const cli_plan_cfg_path = try std.fs.path.join(allocator, &.{ sub, "cli-plan-config.json" });
+        const cli_plan_out = try std.fs.path.join(allocator, &.{ sub, "cli-plan-manifest.json" });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = cli_plan_cfg_path, .data = try encoded(allocator, plan_cfg) });
+        try std.testing.expectEqual(
+            @as(u8, 0),
+            runCli(allocator, io, &empty_env, &.{ "native-plan", "--config", cli_plan_cfg_path, "--repo", ".", "--out", cli_plan_out }),
+        );
+        const parsed_plan = try readJson(allocator, io, cli_plan_out);
+        try validateManifest(allocator, parsed_plan, false);
+
+        // Negative validation tests for createAbiProof and createImageReceipt
+        var bad_proof_cfg = try testCloneValue(allocator, .{ .object = cm_pcfg });
+        try bad_proof_cfg.object.put(allocator, "aot_sha256", .{ .string = "0000000000000000000000000000000000000000000000000000000000000000" });
+        try std.testing.expectError(error.ValidationFailed, createAbiProof(allocator, io, bad_proof_cfg, false));
+
+        var bad_receipt_cfg = try testCloneValue(allocator, .{ .object = linux_rcfg });
+        try bad_receipt_cfg.object.put(allocator, "compiler_embedded", .{ .bool = true });
+        try std.testing.expectError(error.ValidationFailed, createImageReceipt(allocator, io, bad_receipt_cfg, false));
+    }
 }
 
 fn checkProducer(
@@ -3209,5 +3755,103 @@ test "NativeLinuxProducerTests" {
         try std.testing.expect(dep_res.term != .exited or dep_res.term.exited != 0);
         try std.testing.expect(std.mem.indexOf(u8, dep_res.stderr, "InvalidConfiguration") != null);
         try std.testing.expect(std.mem.indexOf(u8, dep_res.stdout, prefix) == null);
+    }
+
+    // 4. Deterministic native-abi-proof and native-linux-receipt CLI round-trip with real producer & .cwasm fixtures
+    {
+        const sub = try std.fs.path.join(allocator, &.{ root, "receipt_proof_roundtrip" });
+        try std.Io.Dir.cwd().createDirPath(io, sub);
+        const fix = try makeSyntheticPlanFixture(allocator, io, sub, .{
+            .workloads = &.{"coremark"},
+            .lifecycle_mode = "snapshot-replay",
+        });
+
+        const cwasm = try std.fs.path.join(allocator, &.{ fixture_dir, "coremark.cwasm" });
+        const linux_spec = fix.config.object.get("targets").?.object.get("linux").?.object;
+        const unikraft_spec = fix.config.object.get("targets").?.object.get("unikraft").?.object;
+        const src_obj = linux_spec.get("source").?.object;
+
+        var aot_paths: std.json.ObjectMap = .empty;
+        try aot_paths.put(allocator, "coremark", .{ .string = cwasm });
+
+        var linux_rcfg: std.json.ObjectMap = .empty;
+        for ([_][]const u8{
+            "compiler_path",   "compiler_version",    "source",
+            "target_abi",      "platform",            "options",
+            "compile_profile", "memory_policy",       "execution_lifecycle",
+        }) |k| {
+            try linux_rcfg.put(allocator, k, linux_spec.get(k).?);
+        }
+        try linux_rcfg.put(allocator, "image_path", .{ .string = producer });
+        try linux_rcfg.put(allocator, "runtime_path", .{ .string = producer });
+        try linux_rcfg.put(allocator, "aot_paths", .{ .object = aot_paths });
+        try linux_rcfg.put(allocator, "configured_vm_ram_bytes", .{ .integer = 536870912 });
+
+        const linux_rcfg_path = try std.fs.path.join(allocator, &.{ sub, "real-linux-rcfg.json" });
+        const linux_receipt_out = try std.fs.path.join(allocator, &.{ sub, "real-linux-receipt.json" });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = linux_rcfg_path, .data = try encoded(allocator, .{ .object = linux_rcfg }) });
+        try std.testing.expectEqual(
+            @as(u8, 0),
+            runCli(allocator, io, &base_env, &.{ "native-linux-receipt", "--config", linux_rcfg_path, "--out", linux_receipt_out }),
+        );
+
+        var unikraft_rcfg = try testCloneValue(allocator, .{ .object = linux_rcfg });
+        try unikraft_rcfg.object.put(allocator, "os", .{ .string = "unikraft" });
+        for ([_][]const u8{ "runtime_path", "image_path", "target_abi", "compile_profile", "memory_policy" }) |k| {
+            try unikraft_rcfg.object.put(allocator, k, unikraft_spec.get(k).?);
+        }
+        const unikraft_rcfg_path = try std.fs.path.join(allocator, &.{ sub, "real-unikraft-rcfg.json" });
+        const unikraft_receipt_out = try std.fs.path.join(allocator, &.{ sub, "real-unikraft-receipt.json" });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = unikraft_rcfg_path, .data = try encoded(allocator, unikraft_rcfg) });
+        try std.testing.expectEqual(
+            @as(u8, 0),
+            runCli(allocator, io, &base_env, &.{ "native-linux-receipt", "--config", unikraft_rcfg_path, "--out", unikraft_receipt_out }),
+        );
+
+        const abi_proof_out = try std.fs.path.join(allocator, &.{ sub, "real-coremark-abi-proof.json" });
+        try std.testing.expectEqual(
+            @as(u8, 0),
+            runCli(allocator, io, &base_env, &.{
+                "native-abi-proof",
+                "--aot",
+                cwasm,
+                "--source-repo",
+                "cataggar/wamr",
+                "--source-commit",
+                src_obj.get("commit").?.string,
+                "--source-tree-sha256",
+                src_obj.get("tree_sha256").?.string,
+                "--source-tracked-diff-sha256",
+                src_obj.get("tracked_diff_sha256").?.string,
+                "--linux-target-abi",
+                linux_spec.get("target_abi").?.string,
+                "--unikraft-target-abi",
+                unikraft_spec.get("target_abi").?.string,
+                "--out",
+                abi_proof_out,
+            }),
+        );
+
+        var plan_cfg = try testCloneValue(allocator, fix.config);
+        var l_target = plan_cfg.object.getPtr("targets").?.object.getPtr("linux").?;
+        try l_target.object.put(allocator, "image_path", .{ .string = producer });
+        try l_target.object.put(allocator, "runtime_path", .{ .string = producer });
+        try l_target.object.put(allocator, "aot_paths", .{ .object = aot_paths });
+        try l_target.object.put(allocator, "image_receipt_path", .{ .string = linux_receipt_out });
+
+        var u_target = plan_cfg.object.getPtr("targets").?.object.getPtr("unikraft").?;
+        try u_target.object.put(allocator, "aot_paths", .{ .object = aot_paths });
+        try u_target.object.put(allocator, "image_receipt_path", .{ .string = unikraft_receipt_out });
+
+        try plan_cfg.object.getPtr("abi_proofs").?.object.put(allocator, "coremark", .{ .string = abi_proof_out });
+        const plan_cfg_path = try std.fs.path.join(allocator, &.{ sub, "real-plan-config.json" });
+        const plan_out = try std.fs.path.join(allocator, &.{ sub, "real-plan.json" });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = plan_cfg_path, .data = try encoded(allocator, plan_cfg) });
+        try std.testing.expectEqual(
+            @as(u8, 0),
+            runCli(allocator, io, &base_env, &.{ "native-plan", "--config", plan_cfg_path, "--repo", ".", "--out", plan_out }),
+        );
+        const plan_doc = try readJson(allocator, io, plan_out);
+        try validateManifest(allocator, plan_doc, false);
     }
 }

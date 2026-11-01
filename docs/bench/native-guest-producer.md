@@ -215,7 +215,7 @@ descriptor state, full-u32 exit, traps, known binary output prefixes, reset
 domains, clock faults/overflow, every runtime allocator failure, late report OOM,
 and transport failure. Existing short CoreMark CRC checks remain correctness-only.
 `test-native-aot-guest-protocol` additionally feeds real execution payloads under
-explicitly synthetic test-only metadata through the **unchanged Python v2
-validator**, including failed/untimed calls and uncalled resets. Linux behavior is
+explicitly synthetic test-only metadata through the **unchanged Zig v2
+validator** (`scripts/native_benchmark.zig`), including failed/untimed calls and uncalled resets. Linux behavior is
 covered by the existing producer tests. None supplies native Unikraft boot,
 Azure performance, whole-guest RAM, paired campaign or EEMBC qualification.
