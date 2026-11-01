@@ -3044,59 +3044,54 @@ fn buildSyntheticCoreAndSidecar(
         try cwasm.appendSlice(allocator, sec.payload);
     }
 
-    const code_sha = try sha256BytesHex(allocator, code);
-    const parsed_meta = try json.parseFromSliceLeaky(
+    var parsed_meta = try json.parseFromSliceLeaky(
         Value,
         allocator,
-        try std.fmt.allocPrint(
-            allocator,
-            \\{{
-            \\  "schema": "wamr-aot-frame-attribution-v1",
-            \\  "target": "x86_64",
-            \\  "abi": "sysv",
-            \\  "module": 4,
-            \\  "local_func": {d},
-            \\  "code_size": {d},
-            \\  "module_text_size": {d},
-            \\  "module_text_sha256": "{s}",
-            \\  "normalized_code_sha256": "{s}",
-            \\  "normalized_relocations": [],
-            \\  "spill_metric": {{"spill_ld": 1, "spill_st": 1}},
-            \\  "frame_regions": [{{"name": "spill_area", "base_reg": "rbp", "min_disp": -56, "max_disp": -49}}],
-            \\  "slots": [{{
-            \\    "slot_id": "spill:0", "origin": "allocator_spill", "region": "spill_area",
-            \\    "base_reg": "rbp", "disp": -56, "size": 8,
-            \\    "contributors": [{{"vreg": 3, "type": "i64", "source_kind": "ssa_value", "local_index": null, "ir_op": "add"}}]
-            \\  }}],
-            \\  "allocator_values": [{{
-            \\    "vreg": 3, "slot_id": "spill:0", "disp": -56, "size": 8, "type": "i64",
-            \\    "source_kind": "ssa_value", "local_index": null, "ir_op": "add",
-            \\    "spill_loads": 1, "spill_stores": 1
-            \\  }}],
-            \\  "accesses": [
-            \\    {{
-            \\      "start_offset": 0, "end_offset": 4, "direction": "load", "width": 8,
-            \\      "addressing_mode": "base_disp", "base_reg": "rbp", "disp": -56,
-            \\      "slot_id": "spill:0", "origin": "allocator_spill",
-            \\      "vreg": 3, "source_kind": "ssa_value", "local_index": null, "ir_op": "add"
-            \\    }},
-            \\    {{
-            \\      "start_offset": 4, "end_offset": 8, "direction": "store", "width": 8,
-            \\      "addressing_mode": "base_disp", "base_reg": "rbp", "disp": -56,
-            \\      "slot_id": "spill:0", "origin": "allocator_spill",
-            \\      "vreg": 3, "source_kind": "ssa_value", "local_index": null, "ir_op": "add"
-            \\    }}
-            \\  ]
-            \\}}
-        ,
-            .{ local_func, code.len, code.len, code_sha, code_sha },
-        ),
+        try aot_jit_attr.makeDefaultX86MetadataJson(allocator, code),
         .{},
     );
+    try parsed_meta.object.put(allocator, "local_func", .{ .integer = local_func });
     return .{
         .cwasm_bytes = try cwasm.toOwnedSlice(allocator),
         .sidecar_json = parsed_meta,
     };
+}
+
+test "synthetic core and sidecar pass loadFrameMetadata" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+
+    const fx = try TestFixture.init(allocator, io, "synthetic-sidecar");
+    defer fx.deinit(io);
+
+    const code = aot_jit_attr.TEST_LOAD_STORE_X86;
+    const built = try buildSyntheticCoreAndSidecar(allocator, &code, 0);
+    const core = try std.fs.path.join(allocator, &.{ fx.scratch, "keyvault.4.cwasm" });
+    const sidecar = try std.fs.path.join(allocator, &.{ fx.scratch, "sidecar.json" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = core, .data = built.cwasm_bytes });
+    var s_buf: Io.Writer.Allocating = .init(allocator);
+    try writeCanonicalJson(&s_buf.writer, built.sidecar_json);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = sidecar, .data = s_buf.written() });
+
+    const info = try aot_jit_attr.parseCwasm(allocator, io, core);
+    const bounds = try aot_jit_attr.functionBounds(info, 0);
+    const text = info.data[info.text_file_offset .. info.text_file_offset + info.text_size];
+    const fn_code = text[bounds.start..bounds.end];
+    const meta = try aot_jit_attr.loadFrameMetadata(
+        allocator,
+        io,
+        sidecar,
+        0,
+        fn_code,
+        info.version,
+        text,
+        bounds.start,
+        info,
+    );
+    try std.testing.expectEqual(@as(i64, 0), meta.local_func);
+    try std.testing.expectEqualStrings("x86_64", meta.architecture);
 }
 
 test "frame artifact binds exact core and fails closed" {
@@ -3120,7 +3115,7 @@ test "frame artifact binds exact core and fails closed" {
     );
     try std.testing.expect(std.mem.indexOf(u8, diag.message, "exact core and sidecar") != null);
 
-    const code = [_]u8{ 0x48, 0x8b, 0x45, 0xc8, 0x48, 0x89, 0x45, 0xc8 };
+    const code = aot_jit_attr.TEST_LOAD_STORE_X86;
     const core = try std.fs.path.join(allocator, &.{ artifacts, "keyvault.4.cwasm" });
     const built_bad = try buildSyntheticCoreAndSidecar(allocator, &code, config.perf.hot_func.?);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = core, .data = built_bad.cwasm_bytes });
@@ -3154,7 +3149,7 @@ test "frame artifact binds exact core and fails closed" {
         validated.object.get("sidecar_sha256").?.string,
     );
 
-    const nops = [_]u8{ 0x90, 0x90, 0x90, 0x90, 0x48, 0x89, 0x45, 0xc8 };
+    const nops = [_]u8{ 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 } ++ aot_jit_attr.TEST_STORE_X86;
     const built_corrupt = try buildSyntheticCoreAndSidecar(allocator, &nops, 0);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = core, .data = built_corrupt.cwasm_bytes });
     try std.testing.expectError(
@@ -3244,7 +3239,7 @@ test "profile reports matching sidecar and rejects wrong identity" {
     const artifacts = try std.fs.path.join(allocator, &.{ fx.scratch, "artifacts" });
     try Io.Dir.cwd().createDirPath(io, artifacts);
 
-    const code = [_]u8{ 0x48, 0x8b, 0x45, 0xc8, 0x48, 0x89, 0x45, 0xc8 };
+    const code = aot_jit_attr.TEST_LOAD_STORE_X86;
     const core = try std.fs.path.join(allocator, &.{ artifacts, "keyvault.4.cwasm" });
     const built = try buildSyntheticCoreAndSidecar(allocator, &code, 0);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = core, .data = built.cwasm_bytes });
@@ -3319,13 +3314,12 @@ test "profile reports matching sidecar and rejects wrong identity" {
         }
     };
 
-    const code_sha = try sha256BytesHex(allocator, &code);
     var mock_ctx: PerfMockCtx = .{
         .scratch = fx.scratch,
         .core = core,
         .sidecar = sidecar,
-        .module_sha = code_sha,
-        .norm_sha = code_sha,
+        .module_sha = built.sidecar_json.object.get("module_text_sha256").?.string,
+        .norm_sha = built.sidecar_json.object.get("normalized_code_sha256").?.string,
     };
 
     const ref_dir = try std.fs.path.join(allocator, &.{ fx.scratch, "reference" });

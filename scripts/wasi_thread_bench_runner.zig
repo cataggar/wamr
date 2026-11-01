@@ -153,14 +153,15 @@ pub fn resolveFixtures(allocator: Allocator, io: std.Io, repo: []const u8) Harne
     for (spec.FIXTURE_SOURCE_FILES) |source_name| {
         const rel_path = try std.fmt.allocPrint(allocator, "tests/benchmarks/wasi-threads/{s}", .{source_name});
         const full_path = try std.fs.path.join(allocator, &.{ repo, rel_path });
-        const stat = std.Io.Dir.cwd().statFile(io, full_path, .{}) catch {
+        const raw_bytes = std.Io.Dir.cwd().readFileAlloc(io, full_path, allocator, .limited(16 * 1024 * 1024)) catch {
             return fail("missing fixture source: {s}", .{full_path});
         };
-        const digest = try spec.sha256File(allocator, io, full_path);
+        const normalized = try std.mem.replaceOwned(u8, allocator, raw_bytes, "\r\n", "\n");
+        const digest = try spec.sha256Bytes(allocator, normalized);
         var item: ObjectMap = .empty;
         try item.put(allocator, "path", .{ .string = rel_path });
         try item.put(allocator, "sha256", .{ .string = digest });
-        try item.put(allocator, "size", .{ .integer = @intCast(stat.size) });
+        try item.put(allocator, "size", .{ .integer = @intCast(normalized.len) });
         const key = try std.fmt.allocPrint(allocator, "source:{s}", .{source_name});
         try result.put(allocator, key, .{ .object = item });
     }

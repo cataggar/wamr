@@ -1749,7 +1749,7 @@ pub fn validateBenchmark(
             if (enabled != .bool or !enabled.bool) {
                 return fail("benchmark_report frame_attribution.enabled must be true", .{});
             }
-            const cwasm_path = try resolvePath(allocator, io, "/", perf_frame.get("cwasm"), "perf.frame_attribution.cwasm");
+            const cwasm_path = try resolvePath(allocator, io, ".", perf_frame.get("cwasm"), "perf.frame_attribution.cwasm");
             if (!std.mem.eql(u8, cwasm_path, config.wamr_cwasm_path)) {
                 return fail("perf.frame_attribution.cwasm does not match wamr.cwasm", .{});
             }
@@ -1757,7 +1757,7 @@ pub fn validateBenchmark(
             if (!std.mem.eql(u8, try sha256File(allocator, io, config.wamr_cwasm_path), cwasm_sha)) {
                 return fail("perf.frame_attribution.cwasm_sha256 does not match wamr.cwasm", .{});
             }
-            const sidecar_path = try resolvePath(allocator, io, "/", perf_frame.get("sidecar"), "perf.frame_attribution.sidecar");
+            const sidecar_path = try resolvePath(allocator, io, ".", perf_frame.get("sidecar"), "perf.frame_attribution.sidecar");
             const sidecar_sha = try requireSha256(allocator, perf_frame.get("sidecar_sha256"), "perf.frame_attribution.sidecar_sha256");
             if (!std.mem.eql(u8, try sha256File(allocator, io, sidecar_path), sidecar_sha)) {
                 return fail("perf.frame_attribution.sidecar_sha256 does not match sidecar file", .{});
@@ -1821,7 +1821,7 @@ pub fn validateWamrIdentity(
         return fail("wamr.manifest SHA-256 does not match benchmark_report precompile artifact", .{});
     }
 
-    const attr_cwasm = try resolvePath(allocator, io, "/", attribution.get("cwasm"), "perf.attribution.cwasm");
+    const attr_cwasm = try resolvePath(allocator, io, ".", attribution.get("cwasm"), "perf.attribution.cwasm");
     if (!std.mem.eql(u8, attr_cwasm, config.wamr_cwasm_path)) {
         return fail("perf.attribution.cwasm ({s}) does not match wamr.cwasm ({s})", .{ attr_cwasm, config.wamr_cwasm_path });
     }
@@ -1928,7 +1928,7 @@ fn deriveWasmtimeCompileCommand(
     const validation = try requireObject(report.get("validation"), "benchmark_report.validation");
     const tools = try requireObject(validation.get("tools"), "benchmark_report.validation.tools");
     const wt_tool = try requireObject(tools.get("wasmtime"), "benchmark_report.validation.tools.wasmtime");
-    const tool_path = try resolvePath(allocator, io, "/", wt_tool.get("path"), "validation.tools.wasmtime.path");
+    const tool_path = try resolvePath(allocator, io, ".", wt_tool.get("path"), "validation.tools.wasmtime.path");
     const expected_tool_sha = try requireSha256(allocator, wt_tool.get("sha256"), "validation.tools.wasmtime.sha256");
     const actual_tool_sha = try sha256File(allocator, io, tool_path);
     if (!std.mem.eql(u8, actual_tool_sha, expected_tool_sha)) {
@@ -3164,6 +3164,11 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, opts:
     const sidecar_sha = try sha256File(allocator, io, sidecar);
 
     const manifest = try std.fs.path.join(allocator, &.{ dir, "component.cwasm.manifest.json" });
+    const cwasm_j = try std.mem.replaceOwned(u8, allocator, cwasm, "\\", "\\\\");
+    const sidecar_j = try std.mem.replaceOwned(u8, allocator, sidecar, "\\", "\\\\");
+    const component_j = try std.mem.replaceOwned(u8, allocator, component, "\\", "\\\\");
+    const core_wasm_j = try std.mem.replaceOwned(u8, allocator, core_wasm, "\\", "\\\\");
+    const manifest_j = try std.mem.replaceOwned(u8, allocator, manifest, "\\", "\\\\");
     const manifest_json = try std.fmt.allocPrint(allocator,
         \\{{
         \\  "version": 2,
@@ -3178,7 +3183,7 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, opts:
         \\    }}
         \\  ]
         \\}}
-    , .{ comp_sha, cwasm, cwasm_sha, core_sha, cwasm_bytes.len });
+    , .{ comp_sha, cwasm_j, cwasm_sha, core_sha, cwasm_bytes.len });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest, .data = manifest_json });
     const manifest_sha = try sha256File(allocator, io, manifest);
 
@@ -3190,12 +3195,15 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, opts:
         try f.setPermissions(io, .executable_file);
     }
     const wamrc_sha = try sha256File(allocator, io, wamrc);
+    const wamrc_j = try std.mem.replaceOwned(u8, allocator, wamrc, "\\", "\\\\");
 
     const wasmtime_bin = try writeFakeWasmtime(allocator, io, dir, opts.fake_wasmtime_opts);
     const wasmtime_sha = try sha256File(allocator, io, wasmtime_bin);
+    const wasmtime_bin_j = try std.mem.replaceOwned(u8, allocator, wasmtime_bin, "\\", "\\\\");
     const wt_comp_cwasm = try std.fs.path.join(allocator, &.{ dir, "component.wasmtime.cwasm" });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = wt_comp_cwasm, .data = "component-wasmtime-cwasm" });
     const wt_comp_cwasm_sha = try sha256File(allocator, io, wt_comp_cwasm);
+    const wt_comp_cwasm_j = try std.mem.replaceOwned(u8, allocator, wt_comp_cwasm, "\\", "\\\\");
 
     const frame_meta = try std.fmt.allocPrint(allocator,
         \\{{
@@ -3206,7 +3214,7 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, opts:
         \\  "sidecar": "{s}",
         \\  "sidecar_sha256": "{s}"
         \\}}
-    , .{ cwasm, cwasm_sha, sidecar, sidecar_sha });
+    , .{ cwasm_j, cwasm_sha, sidecar_j, sidecar_sha });
 
     const fl_extra = if (opts.unclassified_frame_load_samples > 0)
         try std.fmt.allocPrint(allocator, ",\n          \"frame_load\": {{ \"samples\": {d} }}", .{opts.unclassified_frame_load_samples})
@@ -3218,6 +3226,7 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, opts:
     const unknown_insts: i64 = if (opts.unknown_frame_samples == 0) 0 else 1;
 
     const report_path = try std.fs.path.join(allocator, &.{ dir, "bench-report.json" });
+    const report_path_j = try std.mem.replaceOwned(u8, allocator, report_path, "\\", "\\\\");
     const report_part1 = try std.fmt.allocPrint(allocator,
         \\{{
         \\  "schema_version": 1,
@@ -3256,30 +3265,30 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, opts:
         \\  }},
         \\
     , .{
-        component,
+        component_j,
         comp_sha,
-        wamrc,
+        wamrc_j,
         wamrc_sha,
-        wasmtime_bin,
+        wasmtime_bin_j,
         wasmtime_sha,
-        wamrc,
-        manifest,
-        component,
-        wasmtime_bin,
-        wt_comp_cwasm,
-        component,
+        wamrc_j,
+        manifest_j,
+        component_j,
+        wasmtime_bin_j,
+        wt_comp_cwasm_j,
+        component_j,
         frame_meta,
-        manifest,
-        manifest,
+        manifest_j,
+        manifest_j,
         manifest_sha,
         manifest_json.len,
-        cwasm,
+        cwasm_j,
         cwasm_sha,
         cwasm_bytes.len,
-        sidecar,
+        sidecar_j,
         sidecar_sha,
-        wt_comp_cwasm,
-        wt_comp_cwasm,
+        wt_comp_cwasm_j,
+        wt_comp_cwasm_j,
         wt_comp_cwasm_sha,
     });
     const report_part2 = try std.fmt.allocPrint(allocator,
@@ -3329,7 +3338,7 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, opts:
         \\}}
     , .{
         frame_meta,
-        cwasm,
+        cwasm_j,
         unknown_insts,
         opts.unknown_frame_samples,
         origin_cov_pct,
@@ -3345,6 +3354,7 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, opts:
     var wt_profile_json: []const u8 = "null";
     if (opts.wasmtime_profile) {
         const ppath = try std.fs.path.join(allocator, &.{ dir, "wasmtime-profile.json" });
+        const ppath_j = try std.mem.replaceOwned(u8, allocator, ppath, "\\", "\\\\");
         const verified_str = if (opts.wasmtime_profile_verified) "true" else "false";
         const pcontent = try std.fmt.allocPrint(allocator,
             \\{{
@@ -3371,7 +3381,7 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, opts:
         , .{ verified_str, core_sha });
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ppath, .data = pcontent });
         const psha = try sha256File(allocator, io, ppath);
-        wt_profile_json = try std.fmt.allocPrint(allocator, "{{ \"path\": \"{s}\", \"sha256\": \"{s}\" }}", .{ ppath, psha });
+        wt_profile_json = try std.fmt.allocPrint(allocator, "{{ \"path\": \"{s}\", \"sha256\": \"{s}\" }}", .{ ppath_j, psha });
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir, "config.json" });
@@ -3388,7 +3398,7 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, opts:
         \\  }},
         \\  "wasmtime": {{ "profile": {s} }}
         \\}}
-    , .{ report_path, report_sha, core_wasm, core_sha, manifest, cwasm, wt_profile_json });
+    , .{ report_path_j, report_sha, core_wasm_j, core_sha, manifest_j, cwasm_j, wt_profile_json });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = config_path, .data = cfg_json });
 
     return .{
