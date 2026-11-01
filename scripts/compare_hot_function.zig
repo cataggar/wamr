@@ -3456,8 +3456,7 @@ fn buildSyntheticCaptureDoc(
     const wamr_static = try aggregateStaticMetrics(allocator, wamr_insts, wamr_fn.code_size);
     const wamr_dm = try wamrDynamicMetrics(allocator, bench.attribution);
 
-    const work_dir = try std.fs.path.join(allocator, &.{ dir, "work" });
-    const wt_cap = if (comptime builtin.os.tag == .windows) blk: {
+    const wt_cap = blk: {
         const wt_dis_text =
             \\0000000000000200 <wasm[0]::function[3]::hot_loop>:
             \\       200: 55                      push   rbp
@@ -3472,11 +3471,18 @@ fn buildSyntheticCaptureDoc(
         const wt_insts = try parseDisassembly(allocator, wt_dis_text, resolved_fn.wasm_index);
         var wt_code_size: usize = 0;
         for (wt_insts) |inst| wt_code_size += inst.size;
+        var const_pool: ObjectMap = .empty;
+        try const_pool.put(allocator, "method", .{ .string = "wasmtime explore wasm_offset body boundary through final terminator" });
+        try const_pool.put(allocator, "full_symbol_bytes", .{ .integer = @intCast(wt_code_size + 4) });
+        try const_pool.put(allocator, "executable_body_bytes", .{ .integer = @intCast(wt_code_size) });
+        try const_pool.put(allocator, "excluded_trailing_bytes", .{ .integer = 4 });
+        try const_pool.put(allocator, "excluded_trailing_disassembly_records", .{ .integer = 1 });
         var wt_prov_inner: ObjectMap = .empty;
         try wt_prov_inner.put(allocator, "cwasm_sha256", .{ .string = "3333333333333333333333333333333333333333333333333333333333333333" });
         try wt_prov_inner.put(allocator, "explore_sha256", .{ .string = "4444444444444444444444444444444444444444444444444444444444444444" });
+        try wt_prov_inner.put(allocator, "constant_pool_exclusion", .{ .object = const_pool });
         break :blk .{ .instructions = wt_insts, .code_size = wt_code_size, .provenance = wt_prov_inner };
-    } else try captureWasmtime(allocator, io, bench.report, config.core_wasm_path, resolved_fn.wasm_index, work_dir);
+    };
     const wt_static = try aggregateStaticMetrics(allocator, wt_cap.instructions, wt_cap.code_size);
 
     var wt_dynamic: ObjectMap = .empty;
