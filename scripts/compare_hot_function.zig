@@ -1071,8 +1071,8 @@ pub fn isRegister(operand: []const u8) bool {
         "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
         "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
         "ax",  "bx",  "cx",  "dx",  "si",  "di",  "bp",  "sp",
-        "sil", "dil", "bpl", "spl",
-        "al",  "ah",  "bl",  "bh",  "cl",  "ch",  "dl",  "dh",
+        "sil", "dil", "bpl", "spl", "al",  "ah",  "bl",  "bh",
+        "cl",  "ch",  "dl",  "dh",
     }) |reg| {
         if (std.mem.eql(u8, value, reg)) return true;
     }
@@ -3112,9 +3112,11 @@ fn writeFakeWasmtime(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, 
         \\
     , .{ pool_dis, dup_hdr, pool_exp, dup_exp });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = script, .data = content });
-    var file = try std.Io.Dir.cwd().openFile(io, script, .{});
-    defer file.close(io);
-    try file.setPermissions(io, .executable_file);
+    if (comptime builtin.os.tag != .windows) {
+        var file = try std.Io.Dir.cwd().openFile(io, script, .{});
+        defer file.close(io);
+        try file.setPermissions(io, .executable_file);
+    }
     return script;
 }
 
@@ -3182,7 +3184,7 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, opts:
 
     const wamrc = try std.fs.path.join(allocator, &.{ dir, "fake-wamrc" });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = wamrc, .data = "#!/bin/sh\nprintf 'wamrc 2.4.1\n'\n" });
-    {
+    if (comptime builtin.os.tag != .windows) {
         var f = try std.Io.Dir.cwd().openFile(io, wamrc, .{});
         defer f.close(io);
         try f.setPermissions(io, .executable_file);
@@ -3445,7 +3447,26 @@ fn buildSyntheticCaptureDoc(
     const wamr_dm = try wamrDynamicMetrics(allocator, bench.attribution);
 
     const work_dir = try std.fs.path.join(allocator, &.{ dir, "work" });
-    const wt_cap = try captureWasmtime(allocator, io, bench.report, config.core_wasm_path, resolved_fn.wasm_index, work_dir);
+    const wt_cap = if (comptime builtin.os.tag == .windows) blk: {
+        const wt_dis_text =
+            \\0000000000000200 <wasm[0]::function[3]::hot_loop>:
+            \\       200: 55                      push   rbp
+            \\       201: 48 89 e5                mov    rbp,rsp
+            \\       204: 48 83 ec 10             sub    rsp,0x10
+            \\       208: 48 89 f8                mov    rax,rdi
+            \\       20b: 75 02                   jne    0x20f
+            \\       20d: c9                      leave
+            \\       20e: c3                      ret
+            \\
+        ;
+        const wt_insts = try parseDisassembly(allocator, wt_dis_text, resolved_fn.wasm_index);
+        var wt_code_size: usize = 0;
+        for (wt_insts) |inst| wt_code_size += inst.size;
+        var wt_prov_inner: ObjectMap = .empty;
+        try wt_prov_inner.put(allocator, "cwasm_sha256", .{ .string = "3333333333333333333333333333333333333333333333333333333333333333" });
+        try wt_prov_inner.put(allocator, "explore_sha256", .{ .string = "4444444444444444444444444444444444444444444444444444444444444444" });
+        break :blk .{ .instructions = wt_insts, .code_size = wt_code_size, .provenance = wt_prov_inner };
+    } else try captureWasmtime(allocator, io, bench.report, config.core_wasm_path, resolved_fn.wasm_index, work_dir);
     const wt_static = try aggregateStaticMetrics(allocator, wt_cap.instructions, wt_cap.code_size);
 
     var wt_dynamic: ObjectMap = .empty;
@@ -3885,14 +3906,41 @@ test "wamr jump table finder skips inline relative offsets" {
 
     const code = [_]u8{
         0x55,
-        0x49, 0x83, 0xFB, 0x02,
-        0x0F, 0x83, 0x15, 0x00, 0x00, 0x00,
-        0x4C, 0x8D, 0x15, 0x0A, 0x00, 0x00, 0x00,
-        0x4F, 0x63, 0x1C, 0x9A,
-        0x4D, 0x01, 0xDA,
-        0x41, 0xFF, 0xE2,
-        0x08, 0x00, 0x00, 0x00,
-        0x09, 0x00, 0x00, 0x00,
+        0x49,
+        0x83,
+        0xFB,
+        0x02,
+        0x0F,
+        0x83,
+        0x15,
+        0x00,
+        0x00,
+        0x00,
+        0x4C,
+        0x8D,
+        0x15,
+        0x0A,
+        0x00,
+        0x00,
+        0x00,
+        0x4F,
+        0x63,
+        0x1C,
+        0x9A,
+        0x4D,
+        0x01,
+        0xDA,
+        0x41,
+        0xFF,
+        0xE2,
+        0x08,
+        0x00,
+        0x00,
+        0x00,
+        0x09,
+        0x00,
+        0x00,
+        0x00,
         0x90,
         0xC3,
     };
@@ -4032,6 +4080,3 @@ test "example config matches schema shape" {
     }
     try testing.expectEqual(@as(i64, 1), example.get("schema_version").?.integer);
 }
-
-
-

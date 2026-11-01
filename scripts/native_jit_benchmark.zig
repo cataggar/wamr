@@ -14,22 +14,22 @@ pub const max_serial_bytes: usize = 16 * 1024 * 1024;
 pub const max_receipt_bytes: usize = 128 * 1024;
 
 const sample_keys = [_][]const u8{
-    "schema_version",           "kind",                     "qualification",
-    "request_sha256",           "mode",                     "compiler_embedded",
-    "wasm_sha256",              "wasm_bytes",               "cwasm_sha256",
-    "cwasm_bytes",              "workload",                 "expected",
-    "lifecycle",                "clock_resolution_ns",      "compile_ns",
-    "compiler_phases_ns",       "compiler_peak_bytes",      "compiler_retained_bytes",
-    "compiler_polls",           "load_ns",                  "instantiate_ns",
-    "start_ns",                 "growth_ns",                "growth_previous_pages",
-    "fuel_per_invocation",      "invocations",              "memory_before",
-    "memory_after",             "caller_peak_bytes",        "caller_live_after_teardown",
-    "reserved_after_teardown",  "failure_stage",            "failure",
+    "schema_version",          "kind",                "qualification",
+    "request_sha256",          "mode",                "compiler_embedded",
+    "wasm_sha256",             "wasm_bytes",          "cwasm_sha256",
+    "cwasm_bytes",             "workload",            "expected",
+    "lifecycle",               "clock_resolution_ns", "compile_ns",
+    "compiler_phases_ns",      "compiler_peak_bytes", "compiler_retained_bytes",
+    "compiler_polls",          "load_ns",             "instantiate_ns",
+    "start_ns",                "growth_ns",           "growth_previous_pages",
+    "fuel_per_invocation",     "invocations",         "memory_before",
+    "memory_after",            "caller_peak_bytes",   "caller_live_after_teardown",
+    "reserved_after_teardown", "failure_stage",       "failure",
 };
 
 const memory_keys = [_][]const u8{
-    "heap_live_bytes",       "heap_peak_bytes",        "code_bytes",
-    "code_reserved_bytes",   "linear_reserved_bytes",  "linear_committed_bytes",
+    "heap_live_bytes",     "heap_peak_bytes",       "code_bytes",
+    "code_reserved_bytes", "linear_reserved_bytes", "linear_committed_bytes",
 };
 
 pub fn expected() u32 {
@@ -429,12 +429,12 @@ pub fn validateReceipt(
     images: Value,
 ) !void {
     const obj = try requireKeys(receipt, &.{
-        "schema_version",            "kind",                "issuer",
-        "source_commit",             "deployment_receipt_sha256", "os",
-        "arch",                      "hardware_execution",  "platform",
-        "safety",                    "images",              "executables",
-        "compiler_embedded",         "runtime_linkage",     "lifecycle",
-        "allocator",                 "page_policy",         "wasm",
+        "schema_version",    "kind",                      "issuer",
+        "source_commit",     "deployment_receipt_sha256", "os",
+        "arch",              "hardware_execution",        "platform",
+        "safety",            "images",                    "executables",
+        "compiler_embedded", "runtime_linkage",           "lifecycle",
+        "allocator",         "page_policy",               "wasm",
         "aot_module",
     });
     try requireExactInt(obj.get("schema_version").?, 1);
@@ -558,8 +558,8 @@ pub fn report(
     const req_bytes = try std.Io.Dir.cwd().readFileAlloc(io, req_path, allocator, .unlimited);
     const req = try strictJson(allocator, req_bytes);
     const req_obj = try requireKeys(req, &.{
-        "schema_version", "kind",           "evidence_kind", "nonce",
-        "executables",    "receipt",        "receipt_sha256", "images",
+        "schema_version", "kind",    "evidence_kind",  "nonce",
+        "executables",    "receipt", "receipt_sha256", "images",
         "runner",
     });
     try requireExactInt(req_obj.get("schema_version").?, 1);
@@ -748,7 +748,7 @@ pub fn capture(
             try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = stderr_path, .data = res.stderr });
             returncode = .{ .integer = switch (res.term) {
                 .exited => |code| @intCast(code),
-                .signal => |sig| -@as(i64, @intCast(@intFromEnum(sig))),
+                .signal => |sig| -@as(i64, @intCast(@backingInt(sig))),
                 else => 1,
             } };
         } else |err| {
@@ -801,9 +801,9 @@ fn validateNativeOptions(value: Value) !void {
     try requireExactInt(obj.get("growth_pages").?, 1);
 
     const comp = try requireKeys(obj.get("compiler").?, &.{
-        "max_input_bytes",               "max_compiler_bytes", "max_code_bytes",
-        "max_polls",                     "max_functions",      "max_function_bytes",
-        "max_locals",                    "max_blocks_per_function", "max_instructions_per_function",
+        "max_input_bytes", "max_compiler_bytes",      "max_code_bytes",
+        "max_polls",       "max_functions",           "max_function_bytes",
+        "max_locals",      "max_blocks_per_function", "max_instructions_per_function",
     });
     try requireExactInt(comp.get("max_input_bytes").?, 1024 * 1024);
     try requireExactInt(comp.get("max_compiler_bytes").?, 64 * 1024 * 1024);
@@ -816,8 +816,8 @@ fn validateNativeOptions(value: Value) !void {
     try requireExactInt(comp.get("max_instructions_per_function").?, 32768);
 
     const rt = try requireKeys(obj.get("runtime").?, &.{
-        "max_heap_bytes",          "max_reserved_bytes",      "max_code_bytes",
-        "max_memory_pages",        "max_table_elements",      "jit_fuel_per_invocation",
+        "max_heap_bytes",          "max_reserved_bytes", "max_code_bytes",
+        "max_memory_pages",        "max_table_elements", "jit_fuel_per_invocation",
         "aot_fuel_per_invocation",
     });
     try requireExactInt(rt.get("max_heap_bytes").?, 16 * 1024 * 1024);
@@ -831,9 +831,9 @@ fn validateNativeOptions(value: Value) !void {
 
 fn validateNativeBuildOptions(value: Value) !void {
     const obj = try requireKeys(value, &.{
-        "pic",             "single_threaded", "red_zone",
-        "stack_check",     "stack_protector", "unwind_tables",
-        "error_tracing",   "link_libc",       "optimize",
+        "pic",           "single_threaded", "red_zone",
+        "stack_check",   "stack_protector", "unwind_tables",
+        "error_tracing", "link_libc",       "optimize",
     });
     try requireExactBool(obj.get("pic").?, true);
     try requireExactBool(obj.get("single_threaded").?, true);
@@ -858,15 +858,15 @@ pub fn validateNativeReceipt(
     images: Value,
 ) !void {
     const obj = try requireKeys(receipt, &.{
-        "schema_version",            "kind",                "evidence_kind",
-        "issuer",                    "source_commit",       "deployment_receipt_sha256",
-        "os",                        "arch",                "hardware_execution",
-        "platform",                  "safety",              "images",
-        "executables",               "compiler_embedded",   "runtime_linkage",
-        "lifecycle",                 "allocator",           "page_policy",
-        "wasm",                      "aot_module",          "target",
-        "options",                   "build_options",       "adapter",
-        "clock",                     "native_stack",        "memory_observer",
+        "schema_version", "kind",              "evidence_kind",
+        "issuer",         "source_commit",     "deployment_receipt_sha256",
+        "os",             "arch",              "hardware_execution",
+        "platform",       "safety",            "images",
+        "executables",    "compiler_embedded", "runtime_linkage",
+        "lifecycle",      "allocator",         "page_policy",
+        "wasm",           "aot_module",        "target",
+        "options",        "build_options",     "adapter",
+        "clock",          "native_stack",      "memory_observer",
     });
     try requireExactInt(obj.get("schema_version").?, 2);
     try requireExactString(obj.get("kind").?, "wamr-jit-independent-image-deployment-receipt");
@@ -955,9 +955,9 @@ pub fn validateNativeRequest(
     trusted_receipt_sha256: ?[]const u8,
 ) !void {
     const obj = try requireKeys(request, &.{
-        "schema_version", "kind",            "transport",
-        "evidence_kind",  "nonce",           "created_at",
-        "expires_at",     "executables",     "images",
+        "schema_version", "kind",           "transport",
+        "evidence_kind",  "nonce",          "created_at",
+        "expires_at",     "executables",    "images",
         "receipt",        "receipt_sha256",
     });
     try requireExactInt(obj.get("schema_version").?, 2);
@@ -1072,9 +1072,9 @@ pub fn nativeReport(
     try require(std.mem.eql(u8, &cap_sha, trusted_cap));
 
     const cap_obj = try requireKeys(cap, &.{
-        "schema_version",               "kind",                 "evidence_kind",
-        "request_sha256",               "image_receipt_sha256", "adapter_qualification_sha256",
-        "hardware_execution",           "records",
+        "schema_version",     "kind",                 "evidence_kind",
+        "request_sha256",     "image_receipt_sha256", "adapter_qualification_sha256",
+        "hardware_execution", "records",
     });
     try requireExactInt(cap_obj.get("schema_version").?, 1);
     try requireExactString(cap_obj.get("kind").?, "wamr-jit-native-capture-receipt");
@@ -1098,8 +1098,8 @@ pub fn nativeReport(
 
     for (modes) |mode| {
         const record = try requireKeys(records.get(mode).?, &.{
-            "image",      "executable",   "serial",
-            "outcome",    "capture_complete", "started_at",
+            "image",        "executable",       "serial",
+            "outcome",      "capture_complete", "started_at",
             "completed_at", "memory",
         });
         const img_key = if (std.mem.eql(u8, mode, "aot")) "aot" else "jit";

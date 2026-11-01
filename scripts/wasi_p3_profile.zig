@@ -823,9 +823,9 @@ pub fn main(init: std.process.Init) !void {
 
 test "parseArgs validates run and profile subcommands and options" {
     const run_cmd = try parseArgs(&.{
-        "run",                  "--mode",          "aot",
-        "--platform-id=linux",  "--output-dir",    "out",
-        "--cold-samples",       "2",               "--warm-samples=3",
+        "run",                  "--mode",             "aot",
+        "--platform-id=linux",  "--output-dir",       "out",
+        "--cold-samples",       "2",                  "--warm-samples=3",
         "--sample-timeout=900", "--deadline-minutes", "12.5",
     });
     try std.testing.expect(run_cmd == .run);

@@ -321,8 +321,8 @@ fn resolvePath(allocator: Allocator, base: []const u8, p: []const u8) ![]const u
 }
 
 fn resolveRepoRoot(allocator: Allocator, io: std.Io, environ: std.process.Environ) ![]const u8 {
-    if (environ.getPosix("WAMR_REPO_ROOT")) |r| {
-        if (r.len > 0) return allocator.dupe(u8, r);
+    if (environ.getAlloc(allocator, "WAMR_REPO_ROOT") catch null) |r| {
+        if (r.len > 0) return r;
     }
     return std.process.currentPathAlloc(io, allocator);
 }
@@ -814,6 +814,7 @@ pub fn execute(allocator: Allocator, io: std.Io, environ: std.process.Environ, a
                         try fields.put(allocator, "revision", .{ .string = rev });
                         try fields.put(allocator, "revision_order", .{ .integer = @intCast(r_i) });
                         try fields.put(allocator, "pair_kind", .{ .string = "single-infrastructure" });
+                        try fields.put(allocator, "pair_execution", .{ .string = "concurrent-topology-paired-cpus" });
                         try fields.put(allocator, "pair_key", .{ .string = pair_key });
                         try fields.put(allocator, "pair_index", .{ .integer = p_idx });
                         try fields.put(allocator, "phase", .{ .string = ph.name });
@@ -893,6 +894,7 @@ pub fn execute(allocator: Allocator, io: std.Io, environ: std.process.Environ, a
                     try fields.put(allocator, "revision", .{ .string = rev });
                     try fields.put(allocator, "revision_order", .{ .integer = r_ord });
                     try fields.put(allocator, "pair_kind", .{ .string = pair_kind });
+                    try fields.put(allocator, "pair_execution", .{ .string = "sequential-position-balanced" });
                     try fields.put(allocator, "pair_key", .{ .string = pair_key });
                     try fields.put(allocator, "pair_index", .{ .integer = p_idx });
                     try fields.put(allocator, "phase", .{ .string = ph.name });
@@ -964,6 +966,7 @@ pub fn execute(allocator: Allocator, io: std.Io, environ: std.process.Environ, a
                         try fields.put(allocator, "revision", .{ .string = rev });
                         try fields.put(allocator, "revision_order", .{ .integer = r_ord });
                         try fields.put(allocator, "pair_kind", .{ .string = pair_kind });
+                        try fields.put(allocator, "pair_execution", .{ .string = "sequential-position-balanced" });
                         try fields.put(allocator, "pair_key", .{ .string = pair_key });
                         try fields.put(allocator, "pair_index", .{ .integer = p_idx });
                         try fields.put(allocator, "phase", .{ .string = ph.name });
@@ -1123,7 +1126,9 @@ pub fn execute(allocator: Allocator, io: std.Io, environ: std.process.Environ, a
 }
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
+    var arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const io = init.io;
     const raw_args = try init.minimal.args.toSlice(allocator);
     const args = parseArgs(allocator, raw_args[1..]) catch |err| {
@@ -1440,4 +1445,3 @@ test "real fixtures.sha256, calibrated budget.json, and cancelPollSignature vali
     const calibrated_sha = try spec.measurementPlanSha256(allocator, .{ .object = calibrated_plan });
     try std.testing.expect(try spec.isCalibrationCompatibleMeasurementPlanSha256(allocator, .{ .object = candidate_plan }, calibrated_sha));
 }
-

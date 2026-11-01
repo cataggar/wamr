@@ -1058,7 +1058,7 @@ pub fn execute(allocator: Allocator, io: std.Io, environ: std.process.Environ, c
     else
         try std.fs.path.join(allocator, &.{ cwd, output_dir });
 
-    if (std.mem.eql(u8, environ.getPosix("GITHUB_ACTIONS") orelse "", "true") and !std.mem.startsWith(u8, output, "/d/")) {
+    if (std.mem.eql(u8, (environ.getAlloc(allocator, "GITHUB_ACTIONS") catch null) orelse "", "true") and !std.mem.startsWith(u8, output, "/d/")) {
         return fail("GitHub duration-cross output must remain under /d", .{});
     }
     std.Io.Dir.cwd().createDirPath(io, output) catch return fail("cannot create {s}", .{output});
@@ -1232,8 +1232,8 @@ pub fn execute(allocator: Allocator, io: std.Io, environ: std.process.Environ, c
         try readiness.put(allocator, "platform_id", .{ .string = platform_id });
         try readiness.put(allocator, "report_sequence", .{ .integer = report_sequence });
         try readiness.put(allocator, "cohort_id", .{ .string = cli.cohort_id });
-        try readiness.put(allocator, "workflow_run_id", .{ .string = environ.getPosix("GITHUB_RUN_ID") orelse "" });
-        try readiness.put(allocator, "workflow_run_attempt", .{ .string = environ.getPosix("GITHUB_RUN_ATTEMPT") orelse "" });
+        try readiness.put(allocator, "workflow_run_id", .{ .string = (environ.getAlloc(allocator, "GITHUB_RUN_ID") catch null) orelse "" });
+        try readiness.put(allocator, "workflow_run_attempt", .{ .string = (environ.getAlloc(allocator, "GITHUB_RUN_ATTEMPT") catch null) orelse "" });
         try readiness.put(allocator, "host", .{ .object = host });
         try readiness.put(allocator, "host_quiescence_at_start", .{ .object = quiescence });
         try readiness.put(allocator, "cpu_placement", .{ .object = cpu_placement });
@@ -1413,8 +1413,8 @@ pub fn execute(allocator: Allocator, io: std.Io, environ: std.process.Environ, c
     try metadata.put(allocator, "report_sequence", .{ .integer = report_sequence });
     try metadata.put(allocator, "partition", .{ .string = try partitionForSequence(report_sequence) });
     try metadata.put(allocator, "cohort_id", .{ .string = cli.cohort_id });
-    try metadata.put(allocator, "workflow_run_id", .{ .string = environ.getPosix("GITHUB_RUN_ID") orelse "" });
-    try metadata.put(allocator, "workflow_run_attempt", .{ .string = environ.getPosix("GITHUB_RUN_ATTEMPT") orelse "" });
+    try metadata.put(allocator, "workflow_run_id", .{ .string = (environ.getAlloc(allocator, "GITHUB_RUN_ID") catch null) orelse "" });
+    try metadata.put(allocator, "workflow_run_attempt", .{ .string = (environ.getAlloc(allocator, "GITHUB_RUN_ATTEMPT") catch null) orelse "" });
     try metadata.put(allocator, "source_revision", .{ .object = source });
     try metadata.put(allocator, "logical_revisions", .{ .object = logical_revisions });
     try metadata.put(allocator, "artifact_identity", .{ .object = artifact_identity });
@@ -1460,7 +1460,9 @@ pub fn execute(allocator: Allocator, io: std.Io, environ: std.process.Environ, c
 }
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
+    var arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const io = init.io;
     var args_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
     defer args_it.deinit();

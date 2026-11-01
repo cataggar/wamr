@@ -3809,7 +3809,9 @@ pub fn runProfile(
 }
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
+    var arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const io = init.io;
     const environ_map = init.environ_map;
 
@@ -4624,4 +4626,3 @@ test "analysis dependencies must match committed source" {
     );
     try std.testing.expect(std.mem.indexOf(u8, lastErrorMessage(), "changed during") != null);
 }
-

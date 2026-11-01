@@ -548,7 +548,7 @@ pub fn measureWorktree(
             label,
             "wamr-aot",
             m.name,
-            &.{ wt.wamr, "run", "--allow-precompiled", "--", m.wamr_cwasm },
+            &.{ wt.wamr, "run", m.wamr_cwasm },
             warmup,
             samples,
             stop,
@@ -562,7 +562,7 @@ pub fn measureWorktree(
                 label,
                 "wamr-jit",
                 m.name,
-                &.{ wt.wamr, "run", "--jit", "--", m.wasm },
+                &.{ wt.wamr, "run", m.wasm },
                 warmup,
                 samples,
                 stop,
@@ -1219,18 +1219,18 @@ test "parseOptions handles defaults, flags, and validation errors" {
     try std.testing.expectEqualStrings("ReleaseFast", defaults.mode);
 
     const parsed = try parseOptions(&.{
-        "--baseline",         "base-ref",
-        "--target=head-ref",  "--samples",
-        "10",                 "--warmup",
-        "0",                  "--wasmtime",
-        "--wasmtime-path",    "/bin/wt",
-        "--include-jit",      "--budget-ms",
-        "5.25",               "--regression-ratio",
-        "1.25",               "--json",
-        "out.json",           "--out",
-        "out.md",             "--emit",
-        "github",             "--repo",
-        "/tmp/repo",          "--optimize",
+        "--baseline",        "base-ref",
+        "--target=head-ref", "--samples",
+        "10",                "--warmup",
+        "0",                 "--wasmtime",
+        "--wasmtime-path",   "/bin/wt",
+        "--include-jit",     "--budget-ms",
+        "5.25",              "--regression-ratio",
+        "1.25",              "--json",
+        "out.json",          "--out",
+        "out.md",            "--emit",
+        "github",            "--repo",
+        "/tmp/repo",         "--optimize",
         "both",
     });
     try std.testing.expectEqualStrings("base-ref", parsed.baseline);
@@ -1387,7 +1387,7 @@ test "execute orchestrates worktrees, writes JSON and Markdown outputs, and clea
     const fake_wamr = try std.fs.path.join(allocator, &.{ root, "fake-wamr" });
     const fake_wamrc = try std.fs.path.join(allocator, &.{ root, "fake-wamrc" });
 
-    try temp.dir.writeFile(io, .{ .sub_path = "fake-wamr", .data = "#!/bin/sh\nexit 0\n" });
+    try temp.dir.writeFile(io, .{ .sub_path = "fake-wamr", .data = "#!/bin/sh\nif [ \"$1\" != \"run\" ] || [ -z \"$2\" ] || [ -n \"$3\" ]; then exit 2; fi\nexit 0\n" });
     try temp.dir.writeFile(io, .{ .sub_path = "fake-wamrc", .data =
         \\#!/bin/sh
         \\printf 'cwasm' > "$4"

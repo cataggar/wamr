@@ -320,9 +320,10 @@ jobs:
 
       - name: Test benchmark and cohort harness
         if: matrix.platform == 'ubuntu-22.04-x86_64'
+        working-directory: candidate
         run: >-
-          zig test candidate/scripts/bench_wasi_threads.zig &&
-          zig test candidate/scripts/wasi_thread_cohort.zig
+          zig test -lc scripts/bench_wasi_threads.zig &&
+          zig test -lc scripts/wasi_thread_cohort.zig
 
       - name: Verify pinned wasi-libc fixtures
         if: matrix.platform == 'ubuntu-22.04-x86_64'

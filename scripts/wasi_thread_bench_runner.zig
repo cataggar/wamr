@@ -58,7 +58,7 @@ pub fn runProcess(
     }
     const code: i32 = switch (res.term) {
         .exited => |c| @intCast(c),
-        .signal => |sig| -@as(i32, @intCast(@intFromEnum(sig))),
+        .signal => |sig| -@as(i32, @intCast(@backingInt(sig))),
         else => -1,
     };
     return .{ .exit_code = code, .stdout = res.stdout, .stderr = res.stderr };
@@ -279,11 +279,11 @@ pub fn hostQuiescenceDiagnostics(
     try diag.put(allocator, "runner_worker_process_count", .{ .integer = 0 });
 
     var rjob: ObjectMap = .empty;
-    try rjob.put(allocator, "runner_name", .{ .string = environ.getPosix("RUNNER_NAME") orelse "" });
-    try rjob.put(allocator, "github_run_id", .{ .string = environ.getPosix("GITHUB_RUN_ID") orelse "" });
-    try rjob.put(allocator, "github_run_attempt", .{ .string = environ.getPosix("GITHUB_RUN_ATTEMPT") orelse "" });
-    try rjob.put(allocator, "github_job", .{ .string = environ.getPosix("GITHUB_JOB") orelse "" });
-    try rjob.put(allocator, "github_workflow", .{ .string = environ.getPosix("GITHUB_WORKFLOW") orelse "" });
+    try rjob.put(allocator, "runner_name", .{ .string = (environ.getAlloc(allocator, "RUNNER_NAME") catch null) orelse "" });
+    try rjob.put(allocator, "github_run_id", .{ .string = (environ.getAlloc(allocator, "GITHUB_RUN_ID") catch null) orelse "" });
+    try rjob.put(allocator, "github_run_attempt", .{ .string = (environ.getAlloc(allocator, "GITHUB_RUN_ATTEMPT") catch null) orelse "" });
+    try rjob.put(allocator, "github_job", .{ .string = (environ.getAlloc(allocator, "GITHUB_JOB") catch null) orelse "" });
+    try rjob.put(allocator, "github_workflow", .{ .string = (environ.getAlloc(allocator, "GITHUB_WORKFLOW") catch null) orelse "" });
     try diag.put(allocator, "runner_job", .{ .object = rjob });
     return diag;
 }
@@ -478,7 +478,7 @@ pub fn controlledEnv(
 ) HarnessError!std.process.Environ.Map {
     var env_map = environ.createMap(allocator) catch return error.OutOfMemory;
     const parent = std.fs.path.dirname(cache_root) orelse cache_root;
-    const inherited_global = std.mem.trim(u8, environ.getPosix("ZIG_GLOBAL_CACHE_DIR") orelse "", " \t\r\n");
+    const inherited_global = std.mem.trim(u8, env_map.get("ZIG_GLOBAL_CACHE_DIR") orelse "", " \t\r\n");
     const global_cache = if (inherited_global.len > 0)
         try allocator.dupe(u8, inherited_global)
     else

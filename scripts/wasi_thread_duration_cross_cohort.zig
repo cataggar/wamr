@@ -544,7 +544,9 @@ fn loadPlatformReportsFromDir(
 }
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
+    var arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const io = init.io;
     var args_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
     defer args_it.deinit();

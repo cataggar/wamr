@@ -64,14 +64,14 @@ pub const fixtures = [_]FixtureInfo{
 
 pub const required_safety = [_][]const u8{ "bounds_checks", "wx_enforced", "import_checks", "trap_isolation" };
 pub const option_keys = [_][]const u8{
-    "bounds_checks", "wx_enforced", "import_checks", "trap_isolation",
-    "optimize",      "stack_checks", "simd",         "threads",
+    "bounds_checks", "wx_enforced",  "import_checks", "trap_isolation",
+    "optimize",      "stack_checks", "simd",          "threads",
     "memory64",
 };
 pub const platform_keys = [_][]const u8{ "arch", "cpu_model", "active_cpu_count", "azure_sku", "azure_region" };
 pub const source_keys = [_][]const u8{ "commit", "tree_sha256", "tracked_diff_sha256" };
 pub const phase_keys = [_][]const u8{
-    "compile_ticks",          "load_ticks",             "instantiate_ticks",
+    "compile_ticks",         "load_ticks",             "instantiate_ticks",
     "lifecycle_setup_ticks", "first_invocation_ticks", "steady_state_ticks",
 };
 pub const outcomes = [_][]const u8{ "success", "trap", "timeout", "abort", "error" };
@@ -470,19 +470,19 @@ pub fn validatePlatform(platform_val: Value) !void {
 
 pub fn validateImageReceipt(allocator: Allocator, receipt: Value, target: Value, evidence_kind: []const u8) !void {
     const obj = try requireKeys(receipt, &.{
-        "schema_version",      "kind",               "evidence_kind",       "os",
-        "image",               "runtime",            "source",              "target_abi",
-        "platform",            "options",            "compiler",            "compile_profile",
-        "configured_vm_ram_bytes", "compiler_embedded", "runtime_linkage",     "memory_policy",
-        "aot_modules",         "execution_lifecycle",
+        "schema_version",          "kind",                "evidence_kind",   "os",
+        "image",                   "runtime",             "source",          "target_abi",
+        "platform",                "options",             "compiler",        "compile_profile",
+        "configured_vm_ram_bytes", "compiler_embedded",   "runtime_linkage", "memory_policy",
+        "aot_modules",             "execution_lifecycle",
     });
     try requireHeader(obj, "wamr-native-image-receipt");
     const ek = obj.get("evidence_kind").?;
     try require(ek == .string and std.mem.eql(u8, ek.string, evidence_kind));
     const target_obj = target.object;
     for ([_][]const u8{
-        "os",       "image",           "runtime",         "source",        "target_abi",
-        "platform", "options",         "compiler",        "compile_profile", "memory_policy",
+        "os",                  "image",   "runtime",  "source",          "target_abi",
+        "platform",            "options", "compiler", "compile_profile", "memory_policy",
         "execution_lifecycle",
     }) |key| {
         try require(try identical(allocator, obj.get(key).?, target_obj.get(key).?));
@@ -565,10 +565,10 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 
 pub fn validateManifest(allocator: Allocator, manifest: Value, allow_synthetic: bool) !void {
     const obj = try requireKeys(manifest, &.{
-        "schema_version",    "kind",               "evidence_kind", "campaign_id",
-        "created_at",        "expires_at",         "profile",       "warmups",
-        "runs",              "steady_invocations", "targets",       "workloads",
-        "schedule",          "abi_compatibility",  "producer",
+        "schema_version", "kind",               "evidence_kind", "campaign_id",
+        "created_at",     "expires_at",         "profile",       "warmups",
+        "runs",           "steady_invocations", "targets",       "workloads",
+        "schedule",       "abi_compatibility",  "producer",
     });
     try requireHeader(obj, "wamr-native-benchmark-plan");
     const ek = obj.get("evidence_kind").?;
@@ -618,10 +618,10 @@ pub fn validateManifest(allocator: Allocator, manifest: Value, allow_synthetic: 
     for ([_][]const u8{ "linux", "unikraft" }) |os_name| {
         const target = targets_obj.get(os_name).?;
         const t_obj = try requireKeys(target, &.{
-            "os",               "runtime",          "compiler",            "source",
-            "target_abi",       "platform",         "options",             "image",
-            "image_receipt",    "image_receipt_sha256", "aot_modules",     "mode",
-            "jit_preset",       "compile_profile",  "memory_policy",       "execution_lifecycle",
+            "os",            "runtime",              "compiler",      "source",
+            "target_abi",    "platform",             "options",       "image",
+            "image_receipt", "image_receipt_sha256", "aot_modules",   "mode",
+            "jit_preset",    "compile_profile",      "memory_policy", "execution_lifecycle",
         });
         try require(t_obj.get("os").? == .string and std.mem.eql(u8, t_obj.get("os").?.string, os_name));
         try require(t_obj.get("mode").? == .string and std.mem.eql(u8, t_obj.get("mode").?.string, "aot") and
@@ -761,8 +761,8 @@ pub fn createPlan(
     allow_synthetic: bool,
 ) !Value {
     const cfg = try requireKeys(config, &.{
-        "profile",    "warmups",     "runs",       "steady_invocations", "valid_hours",
-        "targets",    "workloads",   "abi_proofs", "producer_source",
+        "profile", "warmups",   "runs",       "steady_invocations", "valid_hours",
+        "targets", "workloads", "abi_proofs", "producer_source",
     });
     const prof = cfg.get("profile").?;
     try require(prof == .string and profileCounts(prof.string) != null);
@@ -824,9 +824,9 @@ pub fn createPlan(
     var targets_map: std.json.ObjectMap = .empty;
     for ([_][]const u8{ "linux", "unikraft" }) |os_name| {
         const spec = try requireKeys(cfg_targets.get(os_name).?, &.{
-            "runtime_path",       "compiler_path",   "compiler_version",   "source",
-            "target_abi",         "platform",        "options",            "image_path",
-            "image_receipt_path", "aot_paths",       "compile_profile",    "memory_policy",
+            "runtime_path",        "compiler_path", "compiler_version", "source",
+            "target_abi",          "platform",      "options",          "image_path",
+            "image_receipt_path",  "aot_paths",     "compile_profile",  "memory_policy",
             "execution_lifecycle",
         });
         const aot_paths = try requireKeys(spec.get("aot_paths").?, wl_names);
@@ -1033,8 +1033,8 @@ pub fn validateCoremarkShortCrcOutput(allocator: Allocator, stdout: []const u8, 
         .{ .k = "[0]crcfinal", .v = "0x988c" },
     };
     const meta_fields = [_][]const u8{
-        "CoreMark Size",     "Total ticks",     "Total time (secs)", "Iterations/Sec",
-        "Compiler version",  "Compiler flags",  "Memory location",
+        "CoreMark Size",    "Total ticks",    "Total time (secs)", "Iterations/Sec",
+        "Compiler version", "Compiler flags", "Memory location",
     };
     const markers = [_][]const u8{
         "2K performance run parameters for coremark.",
@@ -1323,10 +1323,10 @@ pub fn validateResult(allocator: Allocator, result: Value, manifest: Value, run_
     const target = config.object.get("target").?;
     const t_obj = target.object;
     const r_obj = try requireKeys(result, &.{
-        "schema_version",       "kind",           "evidence_kind",  "campaign_id",
-        "run_id",               "config_sha256",  "image_receipt_sha256", "observed",
-        "outcome",              "exit_code",      "clock",          "phase_contract",
-        "phases",               "invocations",    "memory",         "execution_lifecycle",
+        "schema_version", "kind",          "evidence_kind",        "campaign_id",
+        "run_id",         "config_sha256", "image_receipt_sha256", "observed",
+        "outcome",        "exit_code",     "clock",                "phase_contract",
+        "phases",         "invocations",   "memory",               "execution_lifecycle",
         "reset_events",
     });
     try requireHeader(r_obj, "wamr-native-benchmark-result");
@@ -1664,7 +1664,7 @@ pub fn capture(
         stderr_bytes = res.stderr;
         returncode = switch (res.term) {
             .exited => |c| @intCast(c),
-            .signal => |s| -@as(i64, @intCast(@intFromEnum(s))),
+            .signal => |s| -@as(i64, @intCast(@backingInt(s))),
             else => 1,
         };
     } else |err| {
@@ -1732,10 +1732,10 @@ pub fn consumeCapture(allocator: Allocator, io: std.Io, manifest: Value, directo
     const obs_path = try std.fs.path.join(allocator, &.{ directory, "observation.json" });
     const observation = try readJson(allocator, io, obs_path);
     const obs = try requireKeys(observation, &.{
-        "schema_version",        "kind",               "evidence_kind",      "campaign_id",
-        "run_id",                "config_sha256",      "started_at",         "completed_at",
-        "observation_seconds",   "control_plane_seconds", "transport_outcome", "process_returncode",
-        "stdout_sha256",         "stderr_sha256",
+        "schema_version",      "kind",                  "evidence_kind",     "campaign_id",
+        "run_id",              "config_sha256",         "started_at",        "completed_at",
+        "observation_seconds", "control_plane_seconds", "transport_outcome", "process_returncode",
+        "stdout_sha256",       "stderr_sha256",
     });
     try requireHeader(obs, "wamr-native-host-observation");
     const m_obj = manifest.object;
@@ -2191,18 +2191,7 @@ fn runCliInner(
             if (i + 1 >= rest.len) return error.InvalidCliArguments;
             i += 1;
             const val = rest[i];
-            if (std.mem.eql(u8, arg, "--manifest")) manifest_path = val
-            else if (std.mem.eql(u8, arg, "--run-id")) run_id = val
-            else if (std.mem.eql(u8, arg, "--stdout")) stdout_path = val
-            else if (std.mem.eql(u8, arg, "--stderr")) stderr_path = val
-            else if (std.mem.eql(u8, arg, "--started-at")) started_at = val
-            else if (std.mem.eql(u8, arg, "--completed-at")) completed_at = val
-            else if (std.mem.eql(u8, arg, "--observation-seconds")) obs_s = std.fmt.parseFloat(f64, val) catch return error.InvalidCliArguments
-            else if (std.mem.eql(u8, arg, "--control-plane-seconds")) cp_s = std.fmt.parseFloat(f64, val) catch return error.InvalidCliArguments
-            else if (std.mem.eql(u8, arg, "--transport-outcome")) transport_outcome = val
-            else if (std.mem.eql(u8, arg, "--process-returncode")) proc_rc = std.fmt.parseInt(i64, val, 10) catch return error.InvalidCliArguments
-            else if (std.mem.eql(u8, arg, "--out")) out_path = val
-            else return error.InvalidCliArguments;
+            if (std.mem.eql(u8, arg, "--manifest")) manifest_path = val else if (std.mem.eql(u8, arg, "--run-id")) run_id = val else if (std.mem.eql(u8, arg, "--stdout")) stdout_path = val else if (std.mem.eql(u8, arg, "--stderr")) stderr_path = val else if (std.mem.eql(u8, arg, "--started-at")) started_at = val else if (std.mem.eql(u8, arg, "--completed-at")) completed_at = val else if (std.mem.eql(u8, arg, "--observation-seconds")) obs_s = std.fmt.parseFloat(f64, val) catch return error.InvalidCliArguments else if (std.mem.eql(u8, arg, "--control-plane-seconds")) cp_s = std.fmt.parseFloat(f64, val) catch return error.InvalidCliArguments else if (std.mem.eql(u8, arg, "--transport-outcome")) transport_outcome = val else if (std.mem.eql(u8, arg, "--process-returncode")) proc_rc = std.fmt.parseInt(i64, val, 10) catch return error.InvalidCliArguments else if (std.mem.eql(u8, arg, "--out")) out_path = val else return error.InvalidCliArguments;
         }
         const manifest = try readJson(allocator, io, manifest_path orelse return error.InvalidCliArguments);
         try validateManifest(allocator, manifest, false);
@@ -2231,10 +2220,7 @@ fn runCliInner(
             if (i + 1 >= rest.len) return error.InvalidCliArguments;
             i += 1;
             const val = rest[i];
-            if (std.mem.eql(u8, arg, "--manifest")) manifest_path = val
-            else if (std.mem.eql(u8, arg, "--capture")) try captures.append(allocator, val)
-            else if (std.mem.eql(u8, arg, "--out")) out_path = val
-            else return error.InvalidCliArguments;
+            if (std.mem.eql(u8, arg, "--manifest")) manifest_path = val else if (std.mem.eql(u8, arg, "--capture")) try captures.append(allocator, val) else if (std.mem.eql(u8, arg, "--out")) out_path = val else return error.InvalidCliArguments;
         }
         if (captures.items.len == 0) return error.InvalidCliArguments;
         const manifest = try readJson(allocator, io, manifest_path orelse return error.InvalidCliArguments);
@@ -3175,8 +3161,8 @@ test "NativeLinuxProducerTests" {
         const cwasm = try std.fs.path.join(allocator, &.{ fixture_dir, "coremark.cwasm" });
 
         for ([_][]const u8{
-            "opening-clock",        "closing-clock",        "backwards-clock", "output-limit",
-            "reset-clock",          "reset-backwards-clock", "reset-protect",  "steady-opening-clock",
+            "opening-clock",        "closing-clock",         "backwards-clock", "output-limit",
+            "reset-clock",          "reset-backwards-clock", "reset-protect",   "steady-opening-clock",
             "steady-closing-clock", "steady-output-limit",
         }) |fault| {
             var argv: std.ArrayList([]const u8) = .empty;
@@ -3225,4 +3211,3 @@ test "NativeLinuxProducerTests" {
         try std.testing.expect(std.mem.indexOf(u8, dep_res.stdout, prefix) == null);
     }
 }
-

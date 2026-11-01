@@ -442,7 +442,9 @@ fn readGzipOrRaw(allocator: Allocator, io: std.Io, path: []const u8) ![]u8 {
 }
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
+    var arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const io = init.io;
 
     var args_list: std.ArrayList([]const u8) = .empty;

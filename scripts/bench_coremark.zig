@@ -1659,7 +1659,7 @@ pub fn renderTable(
     const baseline = results[0];
     const target = results[1];
     const delta_pct = try computeDeltaPct(allocator, baseline.values, target.values);
-    const sign = if (delta_pct >= 0.0) "+" else "";
+    const sign = if (delta_pct >= 0.0) "+" else "-";
     const guest_joined = try std.mem.join(allocator, " ", opts.guest_args);
 
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -1696,7 +1696,7 @@ pub fn renderTable(
         );
     }
 
-    const delta_s = try decimal_format.fixed(allocator, delta_pct, 2);
+    const delta_s = try decimal_format.fixed(allocator, @abs(delta_pct), 2);
     try w.print("\n**WAMR target vs baseline:** {s}{s}%\n", .{ sign, delta_s });
 
     const wasmtime_results = results[2..];
@@ -3343,6 +3343,19 @@ test "schedule groups samples and table rendering" {
     try std.testing.expect(std.mem.indexOf(u8, table, "CRC validation") != null);
     try std.testing.expect(std.mem.indexOf(u8, table, "Neoverse-N2") != null);
     try std.testing.expect(std.mem.indexOf(u8, table, "host fingerprint") != null);
+
+    const neg_table = try renderTable(allocator, &.{
+        .{ .engine = "WAMR", .version = "origin/main (aaaa)", .optimize = "ReleaseFast", .values = &.{ 100.0, 100.0 } },
+        .{ .engine = "WAMR", .version = "HEAD (bbbb)", .optimize = "ReleaseFast", .values = &.{ 90.0, 90.0 } },
+    }, .{
+        .profile = "authoritative",
+        .warmups = 2,
+        .runs = 2,
+        .fixture = "coremark.wasm",
+        .fixture_sha = "abc",
+        .host = host,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, neg_table, "**WAMR target vs baseline:** -10.00%") != null);
 
     // Full precision raw ratio check
     const raw_ratio: f64 = 0.48059510553690316;

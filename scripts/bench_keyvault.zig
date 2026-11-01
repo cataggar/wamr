@@ -782,7 +782,7 @@ fn isExecutableFile(io: Io, path: []const u8, hooks: Hooks) bool {
     if (hooks.access_override) |override| return override;
     const st = Io.Dir.cwd().statFile(io, path, .{}) catch return false;
     if (st.kind != .file) return false;
-    if (builtin.os.tag == .windows) return true;
+    if (comptime builtin.os.tag == .windows) return true;
     return (st.permissions.toMode() & 0o111) != 0;
 }
 
@@ -2589,7 +2589,7 @@ const TestFixture = struct {
         try Io.Dir.cwd().writeFile(io, .{
             .sub_path = tool,
             .data = "#!/bin/sh\necho pinned-tool-1.0\n",
-            .flags = .{ .permissions = .fromMode(0o755) },
+            .flags = .{ .permissions = if (builtin.os.tag == .windows) .default_file else .fromMode(0o755) },
         });
 
         const sdk_revision = try initGitRepo(allocator, io, sdk);
@@ -3128,7 +3128,7 @@ test "frame artifact binds exact core and fails closed" {
     const sidecar = try frameMetadataPath(allocator, config, artifacts);
     try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(sidecar).?);
     var bad_buf: Io.Writer.Allocating = .init(allocator);
-    try aot_jit_attr.writeCanonicalJson(&bad_buf.writer, built_bad.sidecar_json);
+    try writeCanonicalJson(&bad_buf.writer, built_bad.sidecar_json);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = sidecar, .data = bad_buf.written() });
 
     try std.testing.expectError(
@@ -3141,7 +3141,7 @@ test "frame artifact binds exact core and fails closed" {
     const built_good = try buildSyntheticCoreAndSidecar(allocator, &code, 0);
     const new_sidecar = try frameMetadataPath(allocator, config, artifacts);
     var good_buf: Io.Writer.Allocating = .init(allocator);
-    try aot_jit_attr.writeCanonicalJson(&good_buf.writer, built_good.sidecar_json);
+    try writeCanonicalJson(&good_buf.writer, built_good.sidecar_json);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = new_sidecar, .data = good_buf.written() });
 
     const validated = try validateFrameArtifact(allocator, io, config, artifacts, 10.0, .{}, &diag);
@@ -3252,7 +3252,7 @@ test "profile reports matching sidecar and rejects wrong identity" {
     const sidecar = try frameMetadataPath(allocator, config, artifacts);
     try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(sidecar).?);
     var s_buf: Io.Writer.Allocating = .init(allocator);
-    try aot_jit_attr.writeCanonicalJson(&s_buf.writer, built.sidecar_json);
+    try writeCanonicalJson(&s_buf.writer, built.sidecar_json);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = sidecar, .data = s_buf.written() });
 
     const PerfMockCtx = struct {
@@ -3429,7 +3429,7 @@ test "controlled end to end smoke" {
         \\exit 3
         \\
         ,
-        .flags = .{ .permissions = .fromMode(0o755) },
+        .flags = .{ .permissions = if (builtin.os.tag == .windows) .default_file else .fromMode(0o755) },
     });
 
     var diag: Diagnostic = .{};

@@ -183,10 +183,10 @@ pub fn hostMetadata(
     const env_val = if (runner_environment_opt) |r|
         r
     else
-        (environ.getPosix("RUNNER_ENVIRONMENT") orelse "");
+        ((environ.getAlloc(allocator, "RUNNER_ENVIRONMENT") catch null) orelse "");
     const environment = if (env_val.len > 0)
         env_val
-    else if (std.ascii.eqlIgnoreCase(environ.getPosix("GITHUB_ACTIONS") orelse "", "true"))
+    else if (std.ascii.eqlIgnoreCase((environ.getAlloc(allocator, "GITHUB_ACTIONS") catch null) orelse "", "true"))
         "github-actions-unspecified"
     else
         "local";
@@ -199,13 +199,13 @@ pub fn hostMetadata(
     const cpu = try cpuModel(allocator, io, machine);
     const logical_cpus: i64 = @intCast(std.Thread.getCpuCount() catch 1);
 
-    const runner_name = try allocator.dupe(u8, environ.getPosix("RUNNER_NAME") orelse "");
-    const runner_image = try allocator.dupe(u8, environ.getPosix("ImageOS") orelse "");
-    const runner_os = try allocator.dupe(u8, environ.getPosix("RUNNER_OS") orelse "");
-    const runner_arch = try allocator.dupe(u8, environ.getPosix("RUNNER_ARCH") orelse "");
-    const github_run_id = try allocator.dupe(u8, environ.getPosix("GITHUB_RUN_ID") orelse "");
-    const github_run_attempt = try allocator.dupe(u8, environ.getPosix("GITHUB_RUN_ATTEMPT") orelse "");
-    const github_workflow = try allocator.dupe(u8, environ.getPosix("GITHUB_WORKFLOW") orelse "");
+    const runner_name = try allocator.dupe(u8, (environ.getAlloc(allocator, "RUNNER_NAME") catch null) orelse "");
+    const runner_image = try allocator.dupe(u8, (environ.getAlloc(allocator, "ImageOS") catch null) orelse "");
+    const runner_os = try allocator.dupe(u8, (environ.getAlloc(allocator, "RUNNER_OS") catch null) orelse "");
+    const runner_arch = try allocator.dupe(u8, (environ.getAlloc(allocator, "RUNNER_ARCH") catch null) orelse "");
+    const github_run_id = try allocator.dupe(u8, (environ.getAlloc(allocator, "GITHUB_RUN_ID") catch null) orelse "");
+    const github_run_attempt = try allocator.dupe(u8, (environ.getAlloc(allocator, "GITHUB_RUN_ATTEMPT") catch null) orelse "");
+    const github_workflow = try allocator.dupe(u8, (environ.getAlloc(allocator, "GITHUB_WORKFLOW") catch null) orelse "");
 
     var fp_fields: std.json.ObjectMap = .empty;
     try fp_fields.put(allocator, "system", .{ .string = system });

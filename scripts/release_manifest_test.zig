@@ -241,4 +241,3 @@ test "workflow publication boundary and matrix" {
         try std.testing.expectError(error.FileNotFound, cwd.statFile(io, wf, .{}));
     }
 }
-
