@@ -414,7 +414,11 @@ pub fn validateOptions(options: Value) !void {
     try require(opt == .string and (std.mem.eql(u8, opt.string, "ReleaseFast") or
         std.mem.eql(u8, opt.string, "ReleaseSafe") or
         std.mem.eql(u8, opt.string, "ReleaseSmall") or
-        std.mem.eql(u8, opt.string, "Debug")));
+        std.mem.eql(u8, opt.string, "Debug") or
+        std.mem.eql(u8, opt.string, "fast") or
+        std.mem.eql(u8, opt.string, "safe") or
+        std.mem.eql(u8, opt.string, "small") or
+        std.mem.eql(u8, opt.string, "debug")));
     for (option_keys) |k| {
         if (std.mem.eql(u8, k, "optimize")) continue;
         try require(obj.get(k).? == .bool);
