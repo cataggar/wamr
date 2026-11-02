@@ -201,7 +201,9 @@ Unikraft SDK WAMR source commit:
 published by `cataggar/wamr#1081` and consumed by `cataggar/unikraft#270`
 `support/apps/wamr-aot/build-tool-contract.zig`),
 `578b5619c61c93742e9bcba0af550c0fe675acb7` (the post-Wave-12 / Zig CLI pin
-published by `cataggar/wamr#1130`), or the preserved historical
+published by `cataggar/wamr#1130`),
+`370e8e83ac8298b6faa2b288714ffcc9b8798c4b` (the host receipt/ABI-proof CLI pin
+published by `cataggar/wamr#1131`), or the preserved historical
 Zig 0.16.0 pin `a53205d77be3b880eb8f8b96679512ba58e2331a` (the pin consumed by
 cataggar/unikraft#163). Both targets and both compilers in a campaign must
 still report the exact same commit; mixing supported pins across targets is rejected. A different WAMR revision requires a separately qualified

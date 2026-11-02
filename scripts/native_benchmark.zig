@@ -11,10 +11,12 @@ pub const version: i64 = 2;
 pub const phase_contract = "wamr-embedding-v2";
 pub const unikraft_native_sdk_commit = "bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20";
 pub const post_wave12_unikraft_native_sdk_commit = "578b5619c61c93742e9bcba0af550c0fe675acb7";
+pub const current_unikraft_native_sdk_commit = "370e8e83ac8298b6faa2b288714ffcc9b8798c4b";
 pub const historical_unikraft_native_sdk_commit = "a53205d77be3b880eb8f8b96679512ba58e2331a";
 pub const supported_unikraft_native_sdk_commits = [_][]const u8{
     unikraft_native_sdk_commit,
     post_wave12_unikraft_native_sdk_commit,
+    current_unikraft_native_sdk_commit,
     historical_unikraft_native_sdk_commit,
 };
 pub const unikraft_tiny_correctness_profile = "qcow2-derived-vhd";
@@ -724,6 +726,15 @@ pub fn runConfiguration(allocator: Allocator, manifest: Value, run_id: []const u
     try cfg.put(allocator, "execution_lifecycle", target.object.get("execution_lifecycle").?);
     try cfg.put(allocator, "phase_contract", .{ .string = phase_contract });
     return .{ .object = cfg };
+}
+
+pub fn createRequest(allocator: Allocator, manifest: Value, run_id: []const u8, allow_synthetic: bool) !Value {
+    try validateManifest(allocator, manifest, allow_synthetic);
+    const cfg = try runConfiguration(allocator, manifest, run_id);
+    var doc: std.json.ObjectMap = .empty;
+    try doc.put(allocator, "config", cfg);
+    try doc.put(allocator, "config_sha256", .{ .string = try cacheKeyAlloc(allocator, cfg) });
+    return .{ .object = doc };
 }
 
 fn generateUuidV4(io: std.Io, allocator: Allocator) ![]u8 {
@@ -2148,6 +2159,23 @@ pub fn consumeCapture(allocator: Allocator, io: std.Io, manifest: Value, directo
     return .{ .object = rec };
 }
 
+pub fn importCapture(
+    allocator: Allocator,
+    io: std.Io,
+    manifest: Value,
+    run_id: []const u8,
+    directory: []const u8,
+    stdout: []const u8,
+    stderr: []const u8,
+    opts: ObservationOptions,
+    allow_synthetic: bool,
+) !Value {
+    try validateManifest(allocator, manifest, allow_synthetic);
+    if (std.Io.Dir.cwd().statFile(io, directory, .{})) |_| return error.ValidationFailed else |_| {}
+    try persistObservation(allocator, io, manifest, run_id, directory, stdout, stderr, opts);
+    return try consumeCapture(allocator, io, manifest, directory, allow_synthetic);
+}
+
 fn sampleStatsValue(allocator: Allocator, values: []const f64) !Value {
     if (values.len == 0) return .null;
     const stats = try benchmark_stats.summarize(allocator, values);
@@ -2393,6 +2421,32 @@ pub fn buildReport(
     return .{ .object = out_map };
 }
 
+pub const ReportSummary = struct {
+    document: Value,
+    schema_version: i64,
+    comparable: bool,
+    sdk_commit: []const u8,
+};
+
+pub fn createReport(
+    allocator: Allocator,
+    io: std.Io,
+    manifest: Value,
+    directories: []const []const u8,
+    allow_synthetic: bool,
+) !ReportSummary {
+    const doc = try buildReport(allocator, io, manifest, directories, allow_synthetic);
+    const status_obj = doc.object.get("status").?.object;
+    const plan_obj = doc.object.get("plan").?.object;
+    const unikraft_commit = plan_obj.get("targets").?.object.get("unikraft").?.object.get("source").?.object.get("commit").?.string;
+    return .{
+        .document = doc,
+        .schema_version = doc.object.get("schema_version").?.integer,
+        .comparable = status_obj.get("paired_measurement_complete").?.bool,
+        .sdk_commit = unikraft_commit,
+    };
+}
+
 fn writeJsonDocument(allocator: Allocator, io: std.Io, path: []const u8, doc: Value) !void {
     if (std.Io.Dir.cwd().statFile(io, path, .{})) |_| return error.ValidationFailed else |_| {}
     if (std.fs.path.dirname(path)) |parent| {
@@ -2570,12 +2624,8 @@ fn runCliInner(
             } else return error.InvalidCliArguments;
         }
         const manifest = try readJson(allocator, io, manifest_path orelse return error.InvalidCliArguments);
-        try validateManifest(allocator, manifest, false);
-        const cfg = try runConfiguration(allocator, manifest, run_id orelse return error.InvalidCliArguments);
-        var doc: std.json.ObjectMap = .empty;
-        try doc.put(allocator, "config", cfg);
-        try doc.put(allocator, "config_sha256", .{ .string = try cacheKeyAlloc(allocator, cfg) });
-        try writeJsonDocument(allocator, io, out_path orelse return error.InvalidCliArguments, .{ .object = doc });
+        const doc = try createRequest(allocator, manifest, run_id orelse return error.InvalidCliArguments, false);
+        try writeJsonDocument(allocator, io, out_path orelse return error.InvalidCliArguments, doc);
         return 0;
     } else if (std.mem.eql(u8, cmd, "native-capture")) {
         var manifest_path: ?[]const u8 = null;
@@ -2642,20 +2692,17 @@ fn runCliInner(
             if (std.mem.eql(u8, arg, "--manifest")) manifest_path = val else if (std.mem.eql(u8, arg, "--run-id")) run_id = val else if (std.mem.eql(u8, arg, "--stdout")) stdout_path = val else if (std.mem.eql(u8, arg, "--stderr")) stderr_path = val else if (std.mem.eql(u8, arg, "--started-at")) started_at = val else if (std.mem.eql(u8, arg, "--completed-at")) completed_at = val else if (std.mem.eql(u8, arg, "--observation-seconds")) obs_s = std.fmt.parseFloat(f64, val) catch return error.InvalidCliArguments else if (std.mem.eql(u8, arg, "--control-plane-seconds")) cp_s = std.fmt.parseFloat(f64, val) catch return error.InvalidCliArguments else if (std.mem.eql(u8, arg, "--transport-outcome")) transport_outcome = val else if (std.mem.eql(u8, arg, "--process-returncode")) proc_rc = std.fmt.parseInt(i64, val, 10) catch return error.InvalidCliArguments else if (std.mem.eql(u8, arg, "--out")) out_path = val else return error.InvalidCliArguments;
         }
         const manifest = try readJson(allocator, io, manifest_path orelse return error.InvalidCliArguments);
-        try validateManifest(allocator, manifest, false);
         const out = out_path orelse return error.InvalidCliArguments;
-        if (std.Io.Dir.cwd().statFile(io, out, .{})) |_| return error.ValidationFailed else |_| {}
         const stdout_b = try std.Io.Dir.cwd().readFileAlloc(io, stdout_path orelse return error.InvalidCliArguments, allocator, .limited(64 * 1024 * 1024));
         const stderr_b = try std.Io.Dir.cwd().readFileAlloc(io, stderr_path orelse return error.InvalidCliArguments, allocator, .limited(64 * 1024 * 1024));
-        try persistObservation(allocator, io, manifest, run_id orelse return error.InvalidCliArguments, out, stdout_b, stderr_b, .{
+        const rec = try importCapture(allocator, io, manifest, run_id orelse return error.InvalidCliArguments, out, stdout_b, stderr_b, .{
             .started_at = started_at orelse return error.InvalidCliArguments,
             .completed_at = completed_at orelse return error.InvalidCliArguments,
             .observation_seconds = obs_s orelse return error.InvalidCliArguments,
             .control_plane_seconds = cp_s,
             .transport_outcome = transport_outcome,
             .process_returncode = proc_rc,
-        });
-        const rec = try consumeCapture(allocator, io, manifest, out, false);
+        }, false);
         const res = rec.object.get("result").?;
         return if (res != .null and std.mem.eql(u8, res.object.get("outcome").?.string, "success")) 0 else 1;
     } else if (std.mem.eql(u8, cmd, "native-report")) {
@@ -2672,10 +2719,9 @@ fn runCliInner(
         }
         if (captures.items.len == 0) return error.InvalidCliArguments;
         const manifest = try readJson(allocator, io, manifest_path orelse return error.InvalidCliArguments);
-        try validateManifest(allocator, manifest, false);
-        const doc = try buildReport(allocator, io, manifest, captures.items, false);
-        try writeJsonDocument(allocator, io, out_path orelse return error.InvalidCliArguments, doc);
-        return if (doc.object.get("status").?.object.get("all_attempts_successful").?.bool) 0 else 1;
+        const rep = try createReport(allocator, io, manifest, captures.items, false);
+        try writeJsonDocument(allocator, io, out_path orelse return error.InvalidCliArguments, rep.document);
+        return if (rep.document.object.get("status").?.object.get("all_attempts_successful").?.bool) 0 else 1;
     }
     return error.InvalidCliArguments;
 }
@@ -3242,6 +3288,16 @@ test "NativeBenchmarkTests" {
             post_wave12_fix.manifest.object.get("targets").?.object.get("unikraft").?.object.get("source").?.object.get("commit").?.string,
         );
 
+        const sub_current = try std.fs.path.join(allocator, &.{ root, "t1_current" });
+        try std.Io.Dir.cwd().createDirPath(io, sub_current);
+        const current_fix = try makeSyntheticPlanFixture(allocator, io, sub_current, .{
+            .commit = current_unikraft_native_sdk_commit,
+        });
+        try std.testing.expectEqualStrings(
+            current_unikraft_native_sdk_commit,
+            current_fix.manifest.object.get("targets").?.object.get("unikraft").?.object.get("source").?.object.get("commit").?.string,
+        );
+
         var wrong_commit = try testCloneValue(allocator, fix.manifest);
         for ([_][]const u8{ "linux", "unikraft" }) |os_name| {
             var t_ptr = wrong_commit.object.getPtr("targets").?.object.getPtr(os_name).?;
@@ -3381,9 +3437,9 @@ test "NativeBenchmarkTests" {
 
         var linux_rcfg: std.json.ObjectMap = .empty;
         for ([_][]const u8{
-            "runtime_path",       "compiler_path", "compiler_version", "source",
-            "target_abi",         "platform",      "options",          "image_path",
-            "aot_paths",          "compile_profile", "memory_policy",  "execution_lifecycle",
+            "runtime_path", "compiler_path",   "compiler_version", "source",
+            "target_abi",   "platform",        "options",          "image_path",
+            "aot_paths",    "compile_profile", "memory_policy",    "execution_lifecycle",
         }) |k| {
             try linux_rcfg.put(allocator, k, linux_spec.get(k).?);
         }
@@ -3482,6 +3538,94 @@ test "NativeBenchmarkTests" {
         var bad_receipt_cfg = try testCloneValue(allocator, .{ .object = linux_rcfg });
         try bad_receipt_cfg.object.put(allocator, "compiler_embedded", .{ .bool = true });
         try std.testing.expectError(error.ValidationFailed, createImageReceipt(allocator, io, bad_receipt_cfg, false));
+    }
+
+    // 7. Full v2 producer-to-report chain with current_unikraft_native_sdk_commit
+    {
+        const sub = try std.fs.path.join(allocator, &.{ root, "t7_full_v2_chain" });
+        try std.Io.Dir.cwd().createDirPath(io, sub);
+        const fix = try makeSyntheticPlanFixture(allocator, io, sub, .{
+            .profile = "ci",
+            .warmups = 0,
+            .runs = 1,
+            .steady_invocations = 2,
+            .workloads = &.{ "coremark", "compute" },
+            .same_aot = true,
+            .lifecycle_mode = "snapshot-replay",
+            .commit = current_unikraft_native_sdk_commit,
+            .allow_synthetic = false,
+        });
+
+        const linux_spec = fix.config.object.get("targets").?.object.get("linux").?.object;
+        const unikraft_spec = fix.config.object.get("targets").?.object.get("unikraft").?.object;
+
+        var proofs_map: std.json.ObjectMap = .empty;
+        for ([_][]const u8{ "coremark", "compute" }) |wname| {
+            var proof_cfg: std.json.ObjectMap = .empty;
+            try proof_cfg.put(allocator, "aot_path", linux_spec.get("aot_paths").?.object.get(wname).?);
+            try proof_cfg.put(allocator, "source", linux_spec.get("source").?);
+            try proof_cfg.put(allocator, "linux_target_abi", linux_spec.get("target_abi").?);
+            try proof_cfg.put(allocator, "unikraft_target_abi", unikraft_spec.get("target_abi").?);
+            const proof_doc = try createAbiProof(allocator, io, .{ .object = proof_cfg }, false);
+            const proof_path = try std.fs.path.join(allocator, &.{ sub, try std.fmt.allocPrint(allocator, "chain-{s}-proof.json", .{wname}) });
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = proof_path, .data = try encoded(allocator, proof_doc) });
+            try proofs_map.put(allocator, wname, .{ .string = proof_path });
+        }
+
+        var plan_cfg = try testCloneValue(allocator, fix.config);
+        try plan_cfg.object.put(allocator, "abi_proofs", .{ .object = proofs_map });
+        for ([_][]const u8{ "linux", "unikraft" }) |os_name| {
+            const t_spec = if (std.mem.eql(u8, os_name, "linux")) linux_spec else unikraft_spec;
+            var rcfg: std.json.ObjectMap = .empty;
+            try rcfg.put(allocator, "os", .{ .string = os_name });
+            for ([_][]const u8{
+                "runtime_path", "compiler_path",   "compiler_version", "source",
+                "target_abi",   "platform",        "options",          "image_path",
+                "aot_paths",    "compile_profile", "memory_policy",    "execution_lifecycle",
+            }) |k| {
+                try rcfg.put(allocator, k, t_spec.get(k).?);
+            }
+            try rcfg.put(allocator, "configured_vm_ram_bytes", .{ .integer = 536870912 });
+            const receipt_doc = try createImageReceipt(allocator, io, .{ .object = rcfg }, false);
+            const receipt_path = try std.fs.path.join(allocator, &.{ sub, try std.fmt.allocPrint(allocator, "chain-{s}-receipt.json", .{os_name}) });
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = receipt_path, .data = try encoded(allocator, receipt_doc) });
+            try plan_cfg.object.getPtr("targets").?.object.getPtr(os_name).?.object.put(allocator, "image_receipt_path", .{ .string = receipt_path });
+        }
+
+        const now_ns: i128 = @intCast(std.Io.Clock.real.now(io).nanoseconds);
+        const manifest = try createPlan(allocator, io, plan_cfg, sub, now_ns - 60 * @as(i128, std.time.ns_per_s), false);
+        const created_ns = try parseUtcTimestampNs(manifest.object.get("created_at").?);
+        const started = try formatUtcTimestamp(allocator, created_ns + std.time.ns_per_s);
+        const completed = try formatUtcTimestamp(allocator, created_ns + 2 * std.time.ns_per_s);
+
+        var capture_dirs: std.ArrayList([]const u8) = .empty;
+        for (manifest.object.get("schedule").?.array.items) |entry| {
+            const rid = entry.object.get("run_id").?.string;
+            const req = try createRequest(allocator, manifest, rid, false);
+            const res = try makeSyntheticResult(allocator, manifest, rid, .{});
+            try std.testing.expectEqualStrings(
+                req.object.get("config_sha256").?.string,
+                res.object.get("config_sha256").?.string,
+            );
+            const raw_stdout = try std.fmt.allocPrint(allocator, "boot banner\n{s}{s}\n", .{ prefix, try encoded(allocator, res) });
+            const cap_dir = try std.fs.path.join(allocator, &.{ sub, try std.fmt.allocPrint(allocator, "chain-capture-{s}", .{rid}) });
+            const imported = try importCapture(allocator, io, manifest, rid, cap_dir, raw_stdout, "", .{
+                .started_at = started,
+                .completed_at = completed,
+                .observation_seconds = 1.0,
+                .control_plane_seconds = 0.25,
+                .transport_outcome = "exited",
+                .process_returncode = 0,
+            }, false);
+            try std.testing.expectEqualStrings("success", imported.object.get("result").?.object.get("outcome").?.string);
+            try capture_dirs.append(allocator, cap_dir);
+        }
+
+        const report = try createReport(allocator, io, manifest, capture_dirs.items, false);
+        try std.testing.expect(report.comparable == true);
+        try std.testing.expectEqual(@as(i64, 2), report.schema_version);
+        try std.testing.expectEqualStrings("370e8e83ac8298b6faa2b288714ffcc9b8798c4b", report.sdk_commit);
+        try std.testing.expect(report.document.object.get("status").?.object.get("paired_measurement_complete").?.bool);
     }
 }
 
@@ -3788,9 +3932,9 @@ test "NativeLinuxProducerTests" {
 
         var linux_rcfg: std.json.ObjectMap = .empty;
         for ([_][]const u8{
-            "compiler_path",   "compiler_version",    "source",
-            "target_abi",      "platform",            "options",
-            "compile_profile", "memory_policy",       "execution_lifecycle",
+            "compiler_path",   "compiler_version", "source",
+            "target_abi",      "platform",         "options",
+            "compile_profile", "memory_policy",    "execution_lifecycle",
         }) |k| {
             try linux_rcfg.put(allocator, k, linux_spec.get(k).?);
         }
