@@ -12,7 +12,11 @@ const Files = struct {
     io: std.Io,
 
     fn read(self: Files, path: []const u8) ![]const u8 {
-        return std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(256 * 1024 * 1024));
+        const file = try std.Io.Dir.cwd().openFile(self.io, path, .{});
+        defer file.close(self.io);
+        var buffer: [4096]u8 = undefined;
+        var file_reader = file.readerStreaming(self.io, &buffer);
+        return file_reader.interface.allocRemaining(self.allocator, .limited(256 * 1024 * 1024));
     }
 
     fn parse(self: Files, path: []const u8) !Value {
