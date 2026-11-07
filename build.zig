@@ -1,5 +1,6 @@
 const std = @import("std");
 const threads_feature = @import("src/threads_feature.zig");
+pub const component_embed = @import("build/component_embed.zig");
 
 const fuzz_seed_wasms = [_][]const u8{
     "diamond_call_indirect_then_load.wasm",
@@ -2373,6 +2374,38 @@ pub fn build(b: *std.Build) void {
     });
     const run_component_aot_canonlift_tests = b.addRunArtifact(component_aot_canonlift_tests);
     test_step.dependOn(&run_component_aot_canonlift_tests.step);
+
+    // #1134: wit-zigar comptime host bindings, embedded AOT cores, std.Io
+    // zero-copy WASI 0.3 streams, and stackful async coroutines.
+    const component_wit_zigar_module = b.createModule(.{
+        .root_source_file = b.path("src/tests/component_wit_zigar_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    component_wit_zigar_module.addImport("wamr", lib_module);
+    const component_wit_zigar_tests = b.addTest(.{
+        .root_module = component_wit_zigar_module,
+    });
+    const run_component_wit_zigar_tests = b.addRunArtifact(component_wit_zigar_tests);
+
+    const component_embed_helper_module = b.createModule(.{
+        .root_source_file = b.path("build/component_embed.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    const component_embed_helper_tests = b.addTest(.{
+        .root_module = component_embed_helper_module,
+    });
+    const run_component_embed_helper_tests = b.addRunArtifact(component_embed_helper_tests);
+
+    const test_wit_zigar_step = b.step(
+        "test-wit-zigar",
+        "Run #1134 wit-zigar comptime bindings, embedded AOT, zero-copy stream<u8>, and coroutine tests",
+    );
+    test_wit_zigar_step.dependOn(&run_component_wit_zigar_tests.step);
+    test_wit_zigar_step.dependOn(&run_component_embed_helper_tests.step);
+    test_step.dependOn(&run_component_wit_zigar_tests.step);
+    test_step.dependOn(&run_component_embed_helper_tests.step);
 
     // Cold-start budget tests (issue #395). In-process timing companion
     // to the subprocess harness in #394. Compile a 36-byte noop wasm

@@ -9740,7 +9740,7 @@ pub const WasiCliAdapter = struct {
     /// `ok` (discriminant 0). It represents the eventual completion
     /// of the host-side producer; for the buffered model that's
     /// "now".
-    fn stdinReadViaStreamP3(
+    pub fn stdinReadViaStreamP3(
         ctx_opaque: ?*anyopaque,
         ci: *ComponentInstance,
         _: []const InterfaceValue,
@@ -9764,13 +9764,17 @@ pub const WasiCliAdapter = struct {
         ctx.* = .{ .adapter = self };
 
         var stream_entry = async_mod.AsyncStream{};
+        stream_entry.elem_size_hint = 1;
+        stream_entry.host_driver = async_mod.HostStreamDriver{
+            .context = ctx,
+            .on_read_into = &stdinReadViaStreamOnReadInto,
+            .on_destroy = &readViaStreamOnDestroy,
+        };
         stream_entry.host_handler = async_mod.HostStreamHandler{
             .on_read = &readViaStreamOnRead,
-            .on_destroy = &readViaStreamOnDestroy,
             .ctx = ctx,
         };
         ci.streams.put(self.allocator, stream_handle, stream_entry) catch {
-            self.allocator.destroy(ctx);
             stream_entry.deinit(self.allocator);
             return error.OutOfMemory;
         };
@@ -9814,6 +9818,24 @@ pub const WasiCliAdapter = struct {
         }
     }
 
+    /// Zero-copy `on_read_into` callback for `wasi:cli/stdin.read-via-stream` (#1134).
+    /// Reads directly into guest linear memory slice `dst` without an
+    /// intermediate `AsyncStream.buffer` allocation.
+    fn stdinReadViaStreamOnReadInto(
+        ctx_opaque: ?*anyopaque,
+        dst: []u8,
+    ) async_mod.HostStreamReadInto {
+        const c: *ReadViaStreamCtx = @ptrCast(@alignCast(ctx_opaque.?));
+        switch (c.adapter.stdin.read(dst)) {
+            .ok => |n| return if (n == 0)
+                .{ .action = .eof, .bytes_written = 0 }
+            else
+                .{ .action = .progressed, .bytes_written = @intCast(n) },
+            .closed => return .{ .action = .eof, .bytes_written = 0 },
+            .err => return .{ .action = .err, .bytes_written = 0 },
+        }
+    }
+
     fn readViaStreamOnDestroy(ctx_opaque: ?*anyopaque) void {
         const c: *ReadViaStreamCtx = @ptrCast(@alignCast(ctx_opaque.?));
         c.adapter.allocator.destroy(c);
@@ -9821,7 +9843,7 @@ pub const WasiCliAdapter = struct {
 
     /// `wasi:cli/stdout@0.3.x.write-via-stream:
     ///   (stream<u8>) -> future<result<_, error-code>>`.
-    fn stdoutWriteViaStreamP3(
+    pub fn stdoutWriteViaStreamP3(
         ctx_opaque: ?*anyopaque,
         ci: *ComponentInstance,
         args: []const InterfaceValue,
@@ -9906,14 +9928,17 @@ pub const WasiCliAdapter = struct {
                 }
                 continue;
             }
-            // Install host handler — every future `stream.write` from
-            // the guest goes synchronously to `target`.
-            s.host_handler = async_mod.HostStreamHandler{
-                .on_write = &writeViaStreamOnWrite,
+            // Install zero-copy host driver — every future `stream.write`
+            // from the guest goes directly to `target` without touching
+            // `s.buffer` (#1134).
+            s.elem_size_hint = 1;
+            s.host_driver = async_mod.HostStreamDriver{
+                .context = ctx,
+                .on_write_from = &writeViaStreamOnWriteFrom,
                 .on_drop_writable = &writeViaStreamOnDropWritable,
                 .on_destroy = &writeViaStreamOnDestroy,
-                .ctx = ctx,
             };
+            s.host_handler = null;
             writer_already_closed = s.write_closed;
             handler_installed = true;
             stream_lease.release();
@@ -9945,6 +9970,18 @@ pub const WasiCliAdapter = struct {
         return switch (c.target.write(bytes, c.adapter.allocator)) {
             .ok => true,
             .err, .closed => false,
+        };
+    }
+
+    fn writeViaStreamOnWriteFrom(
+        ctx_opaque: ?*anyopaque,
+        src: []const u8,
+    ) async_mod.HostStreamAction {
+        const c: *WriteViaStreamCtx = @ptrCast(@alignCast(ctx_opaque.?));
+        return switch (c.target.write(src, c.adapter.allocator)) {
+            .ok => .progressed,
+            .closed => .eof,
+            .err => .err,
         };
     }
 
@@ -16916,6 +16953,7 @@ pub const WasiCliAdapter = struct {
         slot.host_driver = .{
             .context = read_ctx,
             .on_read = &fsReadViaStreamOnRead,
+            .on_read_into = &fsReadViaStreamOnReadInto,
             .on_destroy = &fsReadStreamCtxOnDestroy,
         };
 
@@ -17039,6 +17077,59 @@ pub const WasiCliAdapter = struct {
         // trampoline. Treat as EOF so the executor closes the
         // writable end naturally.
         return .eof;
+    }
+
+    /// Zero-copy `host_driver.on_read_into` for a `descriptor.read-via-stream`
+    /// `stream<u8>` slot (#1134). Reads directly into guest memory slice `dst`
+    /// via `readPositional` in `FS_CANCEL_POLL_CHUNK_BYTES` chunks while
+    /// checking `ctx.cancelled.load(.acquire)` between chunks.
+    fn fsReadViaStreamOnReadInto(
+        opaque_ctx: ?*anyopaque,
+        dst: []u8,
+    ) async_mod.HostStreamReadInto {
+        const ctx: *FsReadStreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
+        if (ctx.cancelled.load(.acquire)) return .{ .action = .eof, .bytes_written = 0 };
+        if (dst.len == 0) return .{ .action = .progressed, .bytes_written = 0 };
+        var d_lease = ctx.adapter.lookupFsDescriptor(ctx.desc_handle) orelse
+            return .{ .action = .err, .bytes_written = 0 };
+        defer d_lease.release();
+        const d = d_lease.value();
+        const fs_file: FsDescriptor.FsFile = switch (d.*) {
+            .file => |f| f,
+            .dir, .preopen => return .{ .action = .err, .bytes_written = 0 },
+        };
+        if (!fs_file.flags.read) return .{ .action = .err, .bytes_written = 0 };
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var total_this_call: usize = 0;
+        var current_bytes_read = @atomicLoad(u64, &ctx.bytes_read, .acquire);
+        while (total_this_call < dst.len) {
+            if (ctx.cancelled.load(.acquire)) {
+                return if (total_this_call > 0)
+                    .{ .action = .progressed, .bytes_written = @intCast(total_this_call) }
+                else
+                    .{ .action = .eof, .bytes_written = 0 };
+            }
+            const remaining = dst.len - total_this_call;
+            const chunk_len = @min(remaining, FS_CANCEL_POLL_CHUNK_BYTES);
+            const chunk = dst[total_this_call..][0..chunk_len];
+            const chunk_offset = ctx.offset +% current_bytes_read;
+            const n = fs_file.file.readPositional(io, &.{chunk}, chunk_offset) catch {
+                return if (total_this_call > 0)
+                    .{ .action = .progressed, .bytes_written = @intCast(total_this_call) }
+                else
+                    .{ .action = .err, .bytes_written = 0 };
+            };
+            if (n == 0) break;
+            total_this_call += n;
+            current_bytes_read += @as(u64, n);
+            @atomicStore(u64, &ctx.bytes_read, current_bytes_read, .release);
+            if (n < chunk_len) break;
+        }
+        if (total_this_call == 0) {
+            return .{ .action = .eof, .bytes_written = 0 };
+        }
+        return .{ .action = .progressed, .bytes_written = @intCast(total_this_call) };
     }
 
     /// `[method]descriptor.write-via-stream: func(data: stream<u8>,
@@ -50118,6 +50209,8 @@ test "populateWasiCliP3: stdinReadViaStreamP3 attaches lazy host source (#482, #
     // attached as a callback that `stream.read` invokes on demand.
     const s = ci.streams.getPtr(stream_h) orelse return error.MissingStream;
     try testing.expectEqual(@as(usize, 0), s.buffer.items.len);
+    try testing.expect(s.host_driver != null);
+    try testing.expect(s.host_driver.?.on_read_into != null);
     try testing.expect(s.host_handler != null);
     try testing.expect(s.host_handler.?.on_read != null);
 
@@ -50160,9 +50253,11 @@ test "populateWasiCliP3: writeViaStreamImplP3 drains+attaches stream sink (#482,
     try testing.expectEqualStrings("world", adapter.getStdoutBytes());
     const attached = ci.streams.getPtr(stream_h) orelse return error.MissingStream;
     try testing.expectEqual(@as(usize, 0), attached.buffer.items.len);
-    // Host handler installed — subsequent guest `stream.write` will
-    // forward synchronously (verified separately via #537 executor tests).
-    try testing.expect(attached.host_handler != null);
+    // Host driver installed — subsequent guest `stream.write` will
+    // forward synchronously via zero-copy `on_write_from` (#1134).
+    try testing.expect(attached.host_driver != null);
+    try testing.expect(attached.host_driver.?.on_write_from != null);
+    try testing.expect(attached.host_handler == null);
 
     // Returned future is open (will settle when the guest drops the
     // writer end, not synchronously here).
@@ -50228,7 +50323,8 @@ test "populateWasiCliP3: host-attached sink forwards stream.write to stdout (#53
     var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
     try WasiCliAdapter.stdoutWriteViaStreamP3(&adapter, ci, &args, &results, testing.allocator);
     const future_handle = results[0].handle;
-    try testing.expect(ci.streams.getPtr(handle).?.host_handler != null);
+    try testing.expect(ci.streams.getPtr(handle).?.host_driver != null);
+    try testing.expect(ci.streams.getPtr(handle).?.host_driver.?.on_write_from != null);
 
     // Guest writes 5 bytes via `stream.write` — should forward
     // synchronously to adapter.stdout and complete with count=5.
@@ -63243,11 +63339,12 @@ test "adapter resource safety: wasi:http/incoming-handler HTTP/2 h2c prior-knowl
         // Function section: 1 func of type 0
         0x03, 0x02, 0x01, 0x00,
         // Export section: `"handle"` -> func 1
-        0x07, 0x0a, 0x01, 0x06, 'h',  'a',  'n',  'd',
-        'l',  'e',  0x00, 0x01,
+        0x07, 0x0a, 0x01,
+        0x06, 'h',  'a',  'n',  'd',  'l',  'e',  0x00,
+        0x01,
         // Code section: `local.get 0; local.get 1; call 0; end`
-        0x0a, 0x0a, 0x01, 0x08, 0x00, 0x20, 0x00, 0x20,
-        0x01, 0x10, 0x00, 0x0b,
+        0x0a, 0x0a, 0x01, 0x08, 0x00, 0x20, 0x00,
+        0x20, 0x01, 0x10, 0x00, 0x0b,
     };
     const core_modules = [_]ctypes.CoreModule{.{ .data = &core_wasm }};
     const RES_TYPE_IDX: u32 = 100;
@@ -63826,5 +63923,3 @@ test "adapter resource safety: wasi:http/incoming-handler HTTP/2 protocol error 
     }
     try testing.expect(saw_goaway_protocol_err);
 }
-
-

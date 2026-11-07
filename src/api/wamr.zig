@@ -19,6 +19,18 @@ const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
 const comp_types = @import("../component/types.zig");
 const comp_loader = @import("../component/loader.zig");
 const comp_instance = @import("../component/instance.zig");
+const canon_comptime = @import("../component/canon_comptime.zig");
+const core_backend = @import("../component/core_backend.zig");
+const comp_aot = @import("../component/aot.zig");
+
+/// Comptime Canonical ABI reflection and WAMR host/guest binding engine.
+pub const canon = canon_comptime;
+
+/// Named component import binding entry for `ComponentInstance.linkImports`.
+pub const ImportProvider = struct {
+    name: []const u8,
+    binding: comp_instance.ImportBinding,
+};
 
 /// Host function registration types.
 pub const host = @import("host.zig");
@@ -106,6 +118,27 @@ pub const Component = struct {
         const inst = try comp_instance.instantiate(&self.inner, self.allocator);
         return .{ .inner = inst, .allocator = self.allocator };
     }
+
+    /// Instantiate this component with explicit backend options (e.g. precompiled AOT cores).
+    pub fn instantiateWithOptions(self: *Component, options: core_backend.Options) !ComponentInstance {
+        const inst = try comp_instance.instantiateWithOptions(&self.inner, self.allocator, options);
+        return .{ .inner = inst, .allocator = self.allocator };
+    }
+
+    /// Instantiate this component using in-memory embedded AOT `.cwasm` cores.
+    pub fn instantiateEmbedded(
+        self: *Component,
+        component_bytes: []const u8,
+        embedded_cores: []const comp_aot.EmbeddedCoreInput,
+    ) !ComponentInstance {
+        _ = component_bytes;
+        const manifest = try comp_aot.resolveEmbeddedCoresForComponent(
+            self.arena.allocator(),
+            &self.inner,
+            embedded_cores,
+        );
+        return self.instantiateWithOptions(manifest.instantiationOptions());
+    }
 };
 
 /// A running Component instance.
@@ -120,6 +153,45 @@ pub const ComponentInstance = struct {
     /// Look up an exported function by name.
     pub fn getExport(self: *const ComponentInstance, name: []const u8) ?comp_instance.ComponentInstance.ExportedFunc {
         return self.inner.getExport(name);
+    }
+
+    /// Link host or component imports into this instance and run any deferred
+    /// core `(start)` functions. Accepts either a `std.StringHashMapUnmanaged(comp_instance.ImportBinding)`
+    /// or a slice of `ImportProvider` (`{ .name = ..., .binding = ... }`).
+    pub fn linkImports(self: *ComponentInstance, providers: anytype) !void {
+        const P = @TypeOf(providers);
+        if (P == std.StringHashMapUnmanaged(comp_instance.ImportBinding)) {
+            return self.inner.linkImports(providers);
+        }
+        var map: std.StringHashMapUnmanaged(comp_instance.ImportBinding) = .empty;
+        defer map.deinit(self.allocator);
+        for (providers) |entry| {
+            try map.put(self.allocator, entry.name, entry.binding);
+        }
+        return self.inner.linkImports(map);
+    }
+
+    /// Invoke an exported component function using comptime Canonical ABI
+    /// lowering and lifting (`canon_comptime.CanonLower`).
+    pub fn callTyped(
+        self: *ComponentInstance,
+        comptime FnType: type,
+        name: []const u8,
+        args: canon_comptime.CanonLower(FnType, .{}).ArgsTuple,
+    ) !canon_comptime.CanonLower(FnType, .{}).ZigReturn {
+        return canon_comptime.callTypedExport(FnType, .{}, self.inner, name, args, self.allocator);
+    }
+
+    /// Invoke an exported component function using comptime Canonical ABI
+    /// lowering and lifting with explicit `CallOptions` / `Arch`.
+    pub fn callTypedWithOptions(
+        self: *ComponentInstance,
+        comptime FnType: type,
+        comptime opts: anytype,
+        name: []const u8,
+        args: canon_comptime.CanonLower(FnType, opts).ArgsTuple,
+    ) !canon_comptime.CanonLower(FnType, opts).ZigReturn {
+        return canon_comptime.callTypedExport(FnType, opts, self.inner, name, args, self.allocator);
     }
 };
 
@@ -195,6 +267,10 @@ pub const Instance = struct {
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test {
+    testing.refAllDecls(canon_comptime);
+}
 
 test "wamr: load and instantiate empty module" {
     var runtime = Runtime.init(testing.allocator);
@@ -419,4 +495,102 @@ test "wamr: host function reads memory" {
 
     const result = try instance.callI32("test", &.{});
     try testing.expectEqual(@as(i32, 60), result); // 10 + 20 + 30
+}
+
+test "wamr: ComponentInstance callTyped and linkImports via canon.makeHostFunc" {
+    const core_wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // Type section: (i32, i32) -> i32
+        0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01,
+        0x7f,
+        // Import section: "host"."mul" -> func 0
+        0x02, 0x0c, 0x01, 0x04, 'h',  'o',  's',
+        't',  0x03, 'm',  'u',  'l',  0x00, 0x00,
+        // Function section: 1 function (index 1), type 0
+        0x03,
+        0x02, 0x01, 0x00,
+        // Export section: "calc" -> func 1
+        0x07, 0x08, 0x01, 0x04, 'c',
+        'a',  'l',  'c',  0x00, 0x01,
+        // Code section: call 0(a, b) + 5
+        0x0a, 0x0d, 0x01,
+        0x0b, 0x00, 0x20, 0x00, 0x20, 0x01, 0x10, 0x00,
+        0x41, 0x05, 0x6a, 0x0b,
+    };
+
+    const core_modules = [_]comp_types.CoreModule{.{ .data = &core_wasm }};
+    const core_inline_exports = [_]comp_types.CoreInlineExport{
+        .{ .name = "mul", .sort_idx = .{ .sort = .func, .idx = 0 } },
+    };
+    const core_insts = [_]comp_types.CoreInstanceExpr{
+        .{ .exports = &core_inline_exports },
+        .{ .instantiate = .{
+            .module_idx = 0,
+            .args = &[_]comp_types.CoreInstantiateArg{
+                .{ .name = "host", .instance_idx = 0 },
+            },
+        } },
+    };
+    const aliases = [_]comp_types.Alias{
+        .{ .instance_export = .{
+            .sort = .{ .core = .func },
+            .instance_idx = 1,
+            .name = "calc",
+        } },
+    };
+    const params = [_]comp_types.NamedValType{
+        .{ .name = "a", .type = .s32 },
+        .{ .name = "b", .type = .s32 },
+    };
+    const type_defs = [_]comp_types.TypeDef{
+        .{ .func = .{ .params = &params, .results = .{ .unnamed = .s32 } } },
+    };
+    const imports = [_]comp_types.ImportDecl{
+        .{ .name = "mul", .desc = .{ .func = 0 } },
+    };
+    const canons = [_]comp_types.Canon{
+        .{ .lower = .{ .func_idx = 0, .opts = &.{} } },
+        .{ .lift = .{ .core_func_idx = 1, .type_idx = 0, .opts = &.{} } },
+    };
+    const exports_decl = [_]comp_types.ExportDecl{
+        .{ .name = "calc", .desc = .{ .func = 1 }, .sort_idx = .{ .sort = .func, .idx = 1 } },
+    };
+
+    var comp = Component{
+        .inner = .{
+            .core_modules = &core_modules,
+            .core_instances = &core_insts,
+            .core_types = &.{},
+            .components = &.{},
+            .instances = &.{},
+            .aliases = &aliases,
+            .types = &type_defs,
+            .canons = &canons,
+            .imports = &imports,
+            .exports = &exports_decl,
+        },
+        .arena = std.heap.ArenaAllocator.init(testing.allocator),
+        .allocator = testing.allocator,
+    };
+    defer comp.arena.deinit();
+
+    var inst = try comp.instantiateWithOptions(.{});
+    defer inst.deinit();
+
+    const Host = struct {
+        fn mul(a: i32, b: i32) i32 {
+            return a * b;
+        }
+    };
+
+    const providers = [_]ImportProvider{
+        .{ .name = "mul", .binding = .{ .host_func = canon.makeHostFunc(Host.mul) } },
+    };
+    try inst.linkImports(&providers);
+
+    const out1 = try inst.callTyped(fn (i32, i32) i32, "calc", .{ 6, 7 });
+    try testing.expectEqual(@as(i32, 47), out1);
+
+    const out2 = try inst.callTypedWithOptions(fn (i32, i32) i32, .{ .arch = .wasm32 }, "calc", .{ 8, 9 });
+    try testing.expectEqual(@as(i32, 77), out2);
 }

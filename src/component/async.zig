@@ -9,6 +9,7 @@ const config = @import("../config.zig");
 const stable_resource = @import("../shared/stable_resource.zig");
 const execution_context = @import("../runtime/common/execution_context.zig");
 const task_cancellation = @import("../runtime/common/task_cancellation.zig");
+pub const coro = @import("coro.zig");
 
 // ── Task state ──────────────────────────────────────────────────────────────
 
@@ -66,6 +67,8 @@ pub const WaitableSet = struct {
     /// flag on the `WaitableItem` lets `register`/`setReady` avoid
     /// double-enqueueing the same item.
     ready_queue: std.ArrayListUnmanaged(u32) = .empty, // indices into items
+    /// Event notified when one or more items transition to ready (#1134).
+    ready_event: std.Io.Event = .unset,
 
     pub const WaitableItem = struct {
         kind: Kind,
@@ -94,6 +97,11 @@ pub const WaitableSet = struct {
         defer self.mutex.unlock();
         const idx: u32 = @intCast(self.items.items.len);
         try self.items.append(allocator, item);
+        errdefer _ = self.items.pop();
+        if (item.active and item.ready) {
+            try self.ready_queue.append(allocator, idx);
+            self.ready_event.set(std.Io.Threaded.global_single_threaded.io());
+        }
         return idx;
     }
 
@@ -141,6 +149,7 @@ pub const WaitableSet = struct {
             self.ready_queue.append(allocator, idx) catch return false;
             item.ready = true;
         }
+        self.ready_event.set(std.Io.Threaded.global_single_threaded.io());
         return true;
     }
 
@@ -154,13 +163,41 @@ pub const WaitableSet = struct {
         defer self.mutex.unlock();
         while (self.ready_queue.items.len > 0) {
             const idx = self.ready_queue.orderedRemove(0);
+            if (self.ready_queue.items.len == 0) {
+                self.ready_event.reset();
+            }
             if (idx >= self.items.items.len) continue;
             const item = &self.items.items[idx];
             if (!item.active or !item.ready) continue;
             item.ready = false;
             return item.*;
         }
+        self.ready_event.reset();
         return null;
+    }
+
+    /// Returns true if at least one ready item is queued in `ready_queue`.
+    pub fn hasReady(self: *WaitableSet) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.ready_queue.items.len > 0;
+    }
+
+    /// Wait on `ready_event` using `io` (with optional `timeout_ns`) until at
+    /// least one item in the set is ready.
+    pub fn waitReady(self: *WaitableSet, io: std.Io, timeout_ns: ?u64) bool {
+        if (self.hasReady()) return true;
+        if (timeout_ns) |ns| {
+            self.ready_event.waitTimeout(io, .{
+                .duration = .{
+                    .raw = .{ .nanoseconds = @intCast(ns) },
+                    .clock = .awake,
+                },
+            }) catch {};
+        } else {
+            self.ready_event.wait(io) catch {};
+        }
+        return self.hasReady();
     }
 
     /// Poll for ready items without blocking. Returns the count of
@@ -186,6 +223,7 @@ pub const WaitableSet = struct {
         // The ready_queue is now stale — clear it so subsequent
         // `popReadyEvent` callers don't re-surface drained items.
         self.ready_queue.clearRetainingCapacity();
+        self.ready_event.reset();
         return count;
     }
 
@@ -539,6 +577,13 @@ pub const ComponentThread = struct {
     is_shared: bool = false,
     in_flight: bool = false,
     os_thread: ?std.Thread = null,
+    /// Persistent `*ExecEnv` for stackful cooperative coroutine execution (#1134).
+    coro_env: ?*anyopaque = null,
+    coro_started: bool = false,
+    coro_completed: bool = false,
+    saved_sp_global: u64 = 0,
+    aux_stack_top: ?u32 = null,
+    aux_stack_bottom: ?u32 = null,
 };
 
 /// Thread-local active component thread index for OS-thread-backed
@@ -1166,6 +1211,8 @@ pub const AsyncStream = struct {
     /// correct end.
     read_closed: bool = false,
     write_closed: bool = false,
+    /// Counter of direct guest-memory transfers that bypassed `self.buffer` (#1134).
+    zero_copy_transfers: u64 = 0,
 
     pub const State = enum { open, closed };
     pub const PendingRead = struct {
@@ -1607,6 +1654,26 @@ test "WaitableSet: popReadyEvent surfaces kind/handle/code in FIFO order" {
 
     // Queue drained.
     try std.testing.expect(ws.popReadyEvent() == null);
+    try std.testing.expect(!ws.hasReady());
+}
+
+test "WaitableSet: hasReady and waitReady with std.Io.Event (#1134)" {
+    const allocator = std.testing.allocator;
+    var ws = WaitableSet{};
+    defer ws.deinit(allocator);
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const idx = try ws.register(.{ .kind = .stream_read, .handle = 3 }, allocator);
+    try std.testing.expect(!ws.hasReady());
+    try std.testing.expect(!ws.waitReady(io, 1_000));
+
+    ws.setReady(idx, allocator, 0x10);
+    try std.testing.expect(ws.hasReady());
+    try std.testing.expect(ws.waitReady(io, 1_000));
+
+    const ev = ws.popReadyEvent().?;
+    try std.testing.expectEqual(@as(u32, 3), ev.handle);
+    try std.testing.expect(!ws.hasReady());
 }
 
 test "Future: state transitions through pending/ready" {
@@ -1783,4 +1850,8 @@ test "component resource safety: waitable set producer consumer race" {
         @as(u8, (1 << producer_count) - 1),
         seen,
     );
+}
+
+test {
+    std.testing.refAllDecls(coro);
 }
