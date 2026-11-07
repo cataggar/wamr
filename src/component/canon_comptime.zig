@@ -968,7 +968,7 @@ fn loadSliceFromPtrLen(
 
     if (comptime isBlittable(Child, arch) and @sizeOf(Child) == elem_layout.size) {
         const bytes = try ctx.readBytes(raw_ptr, total_bytes, elem_layout.align_);
-        if (ctx.zero_copy_slices) {
+        if (ctx.zero_copy_slices and (@alignOf(Child) <= 1 or (@intFromPtr(bytes.ptr) % @alignOf(Child) == 0))) {
             const aligned_ptr: [*]const Child = @ptrCast(@alignCast(bytes.ptr));
             return aligned_ptr[0..len];
         }
@@ -3502,17 +3502,14 @@ pub fn callTypedExportByLocal(
     } else null;
 
     // Construct a CallFrame backed by either interpreter ExecEnv or AotInstance.
-    var interp_env: ?*ExecEnv = null;
-    defer if (interp_env) |env| env.destroy();
+    var acquired_call_env: ?comp_instance.ComponentInstance.AcquiredCallEnv = null;
+    defer if (acquired_call_env) |ace| owner_inst.releaseCallEnv(ace);
 
     var frame: CallFrame = blk: {
         if (core_entry.module_inst) |mi| {
-            const env = ExecEnv.create(mi, 4096, allocator) catch return error.OutOfMemory;
-            if (comptime config.lib_wasi_threads) {
-                env.setThreadManager(&owner_inst.thread_manager);
-            }
-            interp_env = env;
-            break :blk .{ .interp = InterpFrame.init(env) };
+            const ace = owner_inst.acquireCallEnv(mi, allocator) catch return error.OutOfMemory;
+            acquired_call_env = ace;
+            break :blk .{ .interp = InterpFrame.init(ace.env) };
         }
         if (core_entry.aot_inst) |ai| {
             break :blk .{ .aot = AotFrame.init(ai, allocator) };
@@ -3521,8 +3518,8 @@ pub fn callTypedExportByLocal(
     };
     defer frame.deinit();
 
-    var active_ctx_scope = if (interp_env) |env|
-        env.thread_context.enter()
+    var active_ctx_scope = if (acquired_call_env) |ace|
+        ace.env.thread_context.enter()
     else if (core_entry.aot_inst) |ai|
         ai.thread_context.enter()
     else
@@ -3860,7 +3857,7 @@ test "storeToMemory and loadFromMemory: round-trip complex nested types (wasm32 
 
     // Test wasm32
     {
-        var mem: [4096]u8 = @splat(0);
+        var mem: [4096]u8 align(16) = @splat(0);
         var bump = BumpAllocator.init(256, mem.len);
         var ctx = bump.memoryContext(&mem, testing.allocator);
 
@@ -3881,7 +3878,7 @@ test "storeToMemory and loadFromMemory: round-trip complex nested types (wasm32 
 
     // Test wasm64 (memory64)
     {
-        var mem: [4096]u8 = @splat(0);
+        var mem: [4096]u8 align(16) = @splat(0);
         var bump = BumpAllocator.init(512, mem.len);
         var ctx = bump.memoryContext(&mem, testing.allocator);
 
@@ -3904,7 +3901,7 @@ test "CanonLower and CanonLift: direct register call and indirect spill (>16 par
         }
     };
 
-    var mem: [4096]u8 = @splat(0);
+    var mem: [4096]u8 align(16) = @splat(0);
     var bump = BumpAllocator.init(64, mem.len);
     var ctx = bump.memoryContext(&mem, testing.allocator);
 

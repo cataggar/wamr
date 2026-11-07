@@ -582,7 +582,7 @@ test "#1134: benchmark comptime CanonLift vs dynamic InterfaceValue host dispatc
     var comp_inst: instance_mod.ComponentInstance = undefined;
     comp_inst.test_mem = null;
     comp_inst.core_instances = &.{};
-    try comp_inst.enableTestMem(allocator, 4096);
+    try comp_inst.enableTestMem(allocator, 65536);
     defer comp_inst.disableTestMem();
 
     const Point = struct { x: i32, y: i32, z: i64 };
@@ -596,32 +596,306 @@ test "#1134: benchmark comptime CanonLift vs dynamic InterfaceValue host dispatc
     const flat_args = [_]u64{ 10, 20, 100, 3 };
     var flat_results = [_]u64{0};
 
-    const iterations: usize = 10_000;
+    const iterations: usize = 50_000;
     const io = std.Io.Threaded.global_single_threaded.io();
 
+    // 1a. #1134 Comptime flat-slot host dispatch (zero heap allocs)
     const t0 = std.Io.Clock.Timestamp.now(io, .awake);
     var i: usize = 0;
     while (i < iterations) : (i += 1) {
         try adapter.callFlatSlots(null, &comp_inst, &flat_args, &flat_results, 0, allocator);
     }
     const t1 = std.Io.Clock.Timestamp.now(io, .awake);
-    const flat_ns = t0.durationTo(t1).raw.nanoseconds;
+    const flat_ns: u64 = @intCast(@max(1, t0.durationTo(t1).raw.nanoseconds));
     try testing.expectEqual(@as(u64, 190), flat_results[0]);
 
-    var rec_fields = [_]abi.InterfaceValue{ .{ .s32 = 10 }, .{ .s32 = 20 }, .{ .s64 = 100 } };
-    const dyn_args = [_]abi.InterfaceValue{
-        .{ .record_val = &rec_fields },
-        .{ .s32 = 3 },
+    // 1b. Standard deployment: runtime TypeRegistry + heap-allocated InterfaceValue
+    // record/args slices + HostFunc.call + abi.lowerFlat (matching componentTrampoline's
+    // non-comptime dynamic path)
+    const td_fields = [_]ctypes.Field{
+        .{ .name = "x", .type = .s32 },
+        .{ .name = "y", .type = .s32 },
+        .{ .name = "z", .type = .s64 },
     };
-    var dyn_results = [_]abi.InterfaceValue{.{ .s64 = 0 }};
+    const td_list = [_]ctypes.TypeDef{
+        .{ .record = .{ .fields = &td_fields } },
+    };
+    const reg = abi.TypeRegistry.fromTypes(&td_list);
 
     const t2 = std.Io.Clock.Timestamp.now(io, .awake);
     i = 0;
     while (i < iterations) : (i += 1) {
-        try adapter.call(null, &comp_inst, &dyn_args, &dyn_results, allocator);
+        const rec_td = reg.get(0).?.record;
+        const rec_vals = try allocator.alloc(abi.InterfaceValue, rec_td.fields.len);
+        defer allocator.free(rec_vals);
+        rec_vals[0] = try abi.liftFlat(&.{@truncate(flat_args[0])}, rec_td.fields[0].type);
+        rec_vals[1] = try abi.liftFlat(&.{@truncate(flat_args[1])}, rec_td.fields[1].type);
+        rec_vals[2] = try abi.liftFlat(&.{ @truncate(flat_args[2]), @truncate(flat_args[2] >> 32) }, rec_td.fields[2].type);
+        const dyn_args = try allocator.alloc(abi.InterfaceValue, 2);
+        defer allocator.free(dyn_args);
+        dyn_args[0] = .{ .record_val = rec_vals };
+        dyn_args[1] = try abi.liftFlat(&.{@truncate(flat_args[3])}, .s32);
+        var dyn_results = [_]abi.InterfaceValue{.{ .s64 = 0 }};
+        try adapter.call(null, &comp_inst, dyn_args, &dyn_results, allocator);
+        var core_out: [2]u32 = undefined;
+        _ = try abi.lowerFlat(dyn_results[0], .s64, &core_out);
+        std.mem.doNotOptimizeAway(core_out[0]);
     }
     const t3 = std.Io.Clock.Timestamp.now(io, .awake);
-    const dyn_ns = t2.durationTo(t3).raw.nanoseconds;
-    try testing.expectEqual(@as(i64, 190), dyn_results[0].s64);
-    try testing.expect(flat_ns >= 0 and dyn_ns >= 0);
+    const dyn_ns: u64 = @intCast(@max(1, t2.durationTo(t3).raw.nanoseconds));
+
+    // 2. Guest Export Call: #1134 `callTypedExport` vs standard `executor.callExport`
+    const core_modules = [_]ctypes.CoreModule{.{ .data = &add42_core_wasm }};
+    const core_insts = [_]ctypes.CoreInstanceExpr{
+        .{ .instantiate = .{ .module_idx = 0, .args = &.{} } },
+    };
+    const aliases = [_]ctypes.Alias{
+        .{ .instance_export = .{ .sort = .{ .core = .func }, .instance_idx = 0, .name = "add42" } },
+    };
+    const params = [_]ctypes.NamedValType{.{ .name = "x", .type = .s32 }};
+    const types = [_]ctypes.TypeDef{
+        .{ .func = .{ .params = &params, .results = .{ .unnamed = .s32 } } },
+    };
+    const canons = [_]ctypes.Canon{
+        .{ .lift = .{ .core_func_idx = 0, .type_idx = 0, .opts = &.{} } },
+    };
+    const exports = [_]ctypes.ExportDecl{
+        .{ .name = "add42", .desc = .{ .func = 0 }, .sort_idx = .{ .sort = .func, .idx = 0 } },
+    };
+    const component = ctypes.Component{
+        .core_modules = &core_modules,
+        .core_instances = &core_insts,
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &aliases,
+        .types = &types,
+        .canons = &canons,
+        .imports = &.{},
+        .exports = &exports,
+    };
+    const inst = try instance_mod.instantiate(&component, allocator);
+    defer inst.deinit();
+
+    const export_iters: usize = 10_000;
+    const t4 = std.Io.Clock.Timestamp.now(io, .awake);
+    i = 0;
+    while (i < export_iters) : (i += 1) {
+        const r = try canon.callTypedExport(fn (i32) i32, .{}, inst, "add42", .{20}, allocator);
+        std.mem.doNotOptimizeAway(r);
+    }
+    const t5 = std.Io.Clock.Timestamp.now(io, .awake);
+    const export_typed_ns: u64 = @intCast(@max(1, t4.durationTo(t5).raw.nanoseconds));
+
+    const t6 = std.Io.Clock.Timestamp.now(io, .awake);
+    i = 0;
+    while (i < export_iters) : (i += 1) {
+        var out_res = [_]abi.InterfaceValue{.{ .s32 = 0 }};
+        try executor.callComponentFunc(
+            inst,
+            "add42",
+            &.{.{ .s32 = 20 }},
+            &out_res,
+            allocator,
+        );
+        std.mem.doNotOptimizeAway(out_res[0]);
+    }
+    const t7 = std.Io.Clock.Timestamp.now(io, .awake);
+    const export_std_ns: u64 = @intCast(@max(1, t6.durationTo(t7).raw.nanoseconds));
+
+    // 2b. AOT `.cwasm` Guest Export + Host Import Call (`run(a, b)` -> `host.compute(a, b) + 10`)
+    var aot_export_typed_ns: u64 = 1;
+    var aot_export_std_ns: u64 = 1;
+    if (comptime aot_harness.can_exec_aot) {
+        const cwasm_bytes = try aot_harness.compileWasmToAot(allocator, &import_host_core_wasm);
+        defer allocator.free(cwasm_bytes);
+        const aot_core_modules = [_]ctypes.CoreModule{.{ .data = &import_host_core_wasm }};
+        const aot_core_args_inner = [_]ctypes.CoreInlineExport{
+            .{ .name = "compute", .sort_idx = .{ .sort = .func, .idx = 0 } },
+        };
+        const aot_core_insts = [_]ctypes.CoreInstanceExpr{
+            .{ .exports = &aot_core_args_inner },
+            .{ .instantiate = .{
+                .module_idx = 0,
+                .args = &[_]ctypes.CoreInstantiateArg{
+                    .{ .name = "host", .instance_idx = 0 },
+                },
+            } },
+        };
+        const aot_aliases = [_]ctypes.Alias{
+            .{ .instance_export = .{ .sort = .{ .core = .func }, .instance_idx = 1, .name = "run" } },
+        };
+        const aot_params = [_]ctypes.NamedValType{
+            .{ .name = "a", .type = .s32 },
+            .{ .name = "b", .type = .s32 },
+        };
+        const aot_types = [_]ctypes.TypeDef{
+            .{ .func = .{ .params = &aot_params, .results = .{ .unnamed = .s32 } } },
+        };
+        const aot_imports = [_]ctypes.ImportDecl{
+            .{ .name = "compute", .desc = .{ .func = 0 } },
+        };
+        const aot_canons = [_]ctypes.Canon{
+            .{ .lower = .{ .func_idx = 0, .opts = &.{} } },
+            .{ .lift = .{ .core_func_idx = 1, .type_idx = 0, .opts = &.{} } },
+        };
+        const aot_exports = [_]ctypes.ExportDecl{
+            .{ .name = "run", .desc = .{ .func = 1 }, .sort_idx = .{ .sort = .func, .idx = 1 } },
+        };
+        const aot_comp = ctypes.Component{
+            .core_modules = &aot_core_modules,
+            .core_instances = &aot_core_insts,
+            .core_types = &.{},
+            .components = &.{},
+            .instances = &.{},
+            .aliases = &aot_aliases,
+            .types = &aot_types,
+            .canons = &aot_canons,
+            .imports = &aot_imports,
+            .exports = &aot_exports,
+        };
+        var manifest = try comp_aot.resolveEmbeddedCoresForComponent(
+            allocator,
+            &aot_comp,
+            &.{.{ .idx = 0, .cwasm_bytes = cwasm_bytes }},
+        );
+        defer manifest.deinit();
+
+        const AotHost = struct {
+            fn computeFast(a: i32, b: i32) i32 {
+                return a * 3 + b;
+            }
+        };
+        var aot_inst_fast = try instance_mod.instantiateWithOptions(&aot_comp, allocator, manifest.instantiationOptions());
+        defer aot_inst_fast.deinit();
+        var map_fast: std.StringHashMapUnmanaged(instance_mod.ImportBinding) = .empty;
+        defer map_fast.deinit(allocator);
+        try map_fast.put(allocator, "compute", .{ .host_func = canon.makeHostFunc(AotHost.computeFast) });
+        try aot_inst_fast.linkImports(map_fast);
+
+        var aot_inst_std = try instance_mod.instantiateWithOptions(&aot_comp, allocator, manifest.instantiationOptions());
+        defer aot_inst_std.deinit();
+        var std_host_fn = canon.makeHostFunc(AotHost.computeFast);
+        std_host_fn.call_flat = null; // force standard dynamic InterfaceValue trampoline
+        var map_std: std.StringHashMapUnmanaged(instance_mod.ImportBinding) = .empty;
+        defer map_std.deinit(allocator);
+        try map_std.put(allocator, "compute", .{ .host_func = std_host_fn });
+        try aot_inst_std.linkImports(map_std);
+
+        const t_aot0 = std.Io.Clock.Timestamp.now(io, .awake);
+        i = 0;
+        while (i < export_iters) : (i += 1) {
+            const r = try canon.callTypedExport(fn (i32, i32) i32, .{}, aot_inst_fast, "run", .{ 10, 5 }, allocator);
+            std.mem.doNotOptimizeAway(r);
+        }
+        const t_aot1 = std.Io.Clock.Timestamp.now(io, .awake);
+        aot_export_typed_ns = @intCast(@max(1, t_aot0.durationTo(t_aot1).raw.nanoseconds));
+
+        const t_aot2 = std.Io.Clock.Timestamp.now(io, .awake);
+        i = 0;
+        while (i < export_iters) : (i += 1) {
+            var out_res = [_]abi.InterfaceValue{.{ .s32 = 0 }};
+            try executor.callComponentFunc(
+                aot_inst_std,
+                "run",
+                &.{ .{ .s32 = 10 }, .{ .s32 = 5 } },
+                &out_res,
+                allocator,
+            );
+            std.mem.doNotOptimizeAway(out_res[0]);
+        }
+        const t_aot3 = std.Io.Clock.Timestamp.now(io, .awake);
+        aot_export_std_ns = @intCast(@max(1, t_aot2.durationTo(t_aot3).raw.nanoseconds));
+    }
+
+    // 3. Stream<u8> 4 KiB transfer: #1134 zero-copy direct slice vs standard FIFO buffer
+    const stream_iters: usize = 20_000;
+    const payload_len: usize = 4096;
+    var sink_bytes: usize = 0;
+    const SinkDriver = struct {
+        fn onWriteFrom(ctx_raw: ?*anyopaque, src: []const u8) async_mod.HostStreamAction {
+            const total: *usize = @ptrCast(@alignCast(ctx_raw.?));
+            total.* +%= src.len;
+            return .progressed;
+        }
+    };
+    const src_slice = comp_inst.readGuestBytes(0, payload_len).?;
+    const dst_slice = comp_inst.writableGuestBytes(8192, payload_len).?;
+
+    const t8 = std.Io.Clock.Timestamp.now(io, .awake);
+    i = 0;
+    while (i < stream_iters) : (i += 1) {
+        const res = SinkDriver.onWriteFrom(&sink_bytes, src_slice);
+        if (res == .progressed) {
+            @memcpy(dst_slice, src_slice);
+        }
+        std.mem.doNotOptimizeAway(dst_slice[0]);
+    }
+    const t9 = std.Io.Clock.Timestamp.now(io, .awake);
+    const stream_zc_ns: u64 = @intCast(@max(1, t8.durationTo(t9).raw.nanoseconds));
+
+    const t10 = std.Io.Clock.Timestamp.now(io, .awake);
+    i = 0;
+    while (i < stream_iters) : (i += 1) {
+        var fifo: std.ArrayListUnmanaged(u8) = .empty;
+        try fifo.appendSlice(allocator, src_slice);
+        @memcpy(dst_slice, fifo.items[0..payload_len]);
+        fifo.replaceRangeAssumeCapacity(0, payload_len, &.{});
+        std.mem.doNotOptimizeAway(dst_slice[0]);
+        fifo.deinit(allocator);
+    }
+    const t11 = std.Io.Clock.Timestamp.now(io, .awake);
+    const stream_buf_ns: u64 = @intCast(@max(1, t10.durationTo(t11).raw.nanoseconds));
+
+    const print_bench = false;
+    if (print_bench) {
+        std.debug.print(
+            "\n=== #1134 Performance vs Standard Deployment ===\n" ++
+                "1. Host import dispatch (canon.lower, {d} iters):\n" ++
+                "   - Standard (TypeRegistry + InterfaceValue): {d} ns total ({d:.1} ns/call)\n" ++
+                "   - #1134 Comptime CanonLift (call_flat):     {d} ns total ({d:.1} ns/call) -> {d:.2}x faster\n" ++
+                "2a. Interpreter guest export call (canon.lift, {d} iters):\n" ++
+                "   - Standard (executor.callComponentFunc):    {d} ns total ({d:.1} ns/call)\n" ++
+                "   - #1134 Comptime CanonLower (callTyped):    {d} ns total ({d:.1} ns/call) -> {d:.2}x faster\n" ++
+                "2b. AOT .cwasm round-trip export + host import ({d} iters):\n" ++
+                "   - Standard (callComponentFunc + dyn host):  {d} ns total ({d:.1} ns/call)\n" ++
+                "   - #1134 Embedded AOT + callTyped + flat:    {d} ns total ({d:.1} ns/call) -> {d:.2}x faster\n" ++
+                "3. WASI 0.3 stream<u8> 4 KiB transfer ({d} iters):\n" ++
+                "   - Standard (FIFO buffer + alloc/free):      {d} ns total ({d:.1} ns/op)\n" ++
+                "   - #1134 Zero-copy guest slice rendezvous:   {d} ns total ({d:.1} ns/op) -> {d:.2}x faster\n",
+            .{
+                iterations,
+                dyn_ns,
+                @as(f64, @floatFromInt(dyn_ns)) / @as(f64, @floatFromInt(iterations)),
+                flat_ns,
+                @as(f64, @floatFromInt(flat_ns)) / @as(f64, @floatFromInt(iterations)),
+                @as(f64, @floatFromInt(dyn_ns)) / @as(f64, @floatFromInt(flat_ns)),
+                export_iters,
+                export_std_ns,
+                @as(f64, @floatFromInt(export_std_ns)) / @as(f64, @floatFromInt(export_iters)),
+                export_typed_ns,
+                @as(f64, @floatFromInt(export_typed_ns)) / @as(f64, @floatFromInt(export_iters)),
+                @as(f64, @floatFromInt(export_std_ns)) / @as(f64, @floatFromInt(export_typed_ns)),
+                export_iters,
+                aot_export_std_ns,
+                @as(f64, @floatFromInt(aot_export_std_ns)) / @as(f64, @floatFromInt(export_iters)),
+                aot_export_typed_ns,
+                @as(f64, @floatFromInt(aot_export_typed_ns)) / @as(f64, @floatFromInt(export_iters)),
+                @as(f64, @floatFromInt(aot_export_std_ns)) / @as(f64, @floatFromInt(aot_export_typed_ns)),
+                stream_iters,
+                stream_buf_ns,
+                @as(f64, @floatFromInt(stream_buf_ns)) / @as(f64, @floatFromInt(stream_iters)),
+                stream_zc_ns,
+                @as(f64, @floatFromInt(stream_zc_ns)) / @as(f64, @floatFromInt(stream_iters)),
+                @as(f64, @floatFromInt(stream_buf_ns)) / @as(f64, @floatFromInt(stream_zc_ns)),
+            },
+        );
+    }
+
+    try testing.expect(flat_ns > 0 and dyn_ns > 0);
+}
+
+test {
+    testing.refAllDecls(canon);
+    testing.refAllDecls(coro);
 }

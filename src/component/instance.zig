@@ -811,6 +811,12 @@ pub const ComponentInstance = struct {
         if (config.lib_wasi_threads) {} else null,
     realloc_env_owner: if (config.lib_wasi_threads) void else ?*core_types.ModuleInstance =
         if (config.lib_wasi_threads) {} else null,
+    call_env: if (config.lib_wasi_threads) void else ?*ExecEnv =
+        if (config.lib_wasi_threads) {} else null,
+    call_env_owner: if (config.lib_wasi_threads) void else ?*core_types.ModuleInstance =
+        if (config.lib_wasi_threads) {} else null,
+    call_env_in_use: if (config.lib_wasi_threads) void else bool =
+        if (config.lib_wasi_threads) {} else false,
 
     /// Counter of `hostAllocGuest` (`cabi_realloc`) invocations on this
     /// instance. Used by zero-copy `stream<u8>` and comptime binding tests
@@ -1532,6 +1538,54 @@ pub const ComponentInstance = struct {
         var frame: executor.CallFrame = .{ .interp = executor.InterpFrame.init(env) };
         defer frame.deinit();
         return executor.callRealloc(&frame, local_idx, 0, 0, alignment, size) catch null;
+    }
+
+    pub const AcquiredCallEnv = struct {
+        env: *ExecEnv,
+        owned: bool,
+    };
+
+    pub fn acquireCallEnv(
+        self: *ComponentInstance,
+        owner: *core_types.ModuleInstance,
+        allocator: std.mem.Allocator,
+    ) !AcquiredCallEnv {
+        if (comptime config.lib_wasi_threads) {
+            const env = try ExecEnv.create(owner, 4096, allocator);
+            env.setThreadManager(&self.thread_manager);
+            return .{ .env = env, .owned = true };
+        }
+        if (!self.call_env_in_use) {
+            if (self.call_env_owner != owner) {
+                if (self.call_env) |old| old.destroy();
+                self.call_env = ExecEnv.create(owner, 4096, self.allocator) catch null;
+                self.call_env_owner = if (self.call_env != null) owner else null;
+            }
+            if (self.call_env) |env| {
+                self.call_env_in_use = true;
+                env.sp = 0;
+                env.call_depth = 0;
+                env.label_top = 0;
+                env.exception = null;
+                env.host_trap = null;
+                return .{ .env = env, .owned = false };
+            }
+        }
+        const env = try ExecEnv.create(owner, 4096, allocator);
+        return .{ .env = env, .owned = true };
+    }
+
+    pub fn releaseCallEnv(
+        self: *ComponentInstance,
+        acquired: AcquiredCallEnv,
+    ) void {
+        if (acquired.owned) {
+            acquired.env.destroy();
+            return;
+        }
+        if (comptime !config.lib_wasi_threads) {
+            self.call_env_in_use = false;
+        }
     }
 
     /// Allocate `size` bytes inside the canonical guest linear memory
@@ -2370,6 +2424,12 @@ pub const ComponentInstance = struct {
                 env.destroy();
                 self.realloc_env = null;
                 self.realloc_env_owner = null;
+            }
+            if (self.call_env) |env| {
+                env.destroy();
+                self.call_env = null;
+                self.call_env_owner = null;
+                self.call_env_in_use = false;
             }
         }
         // Children are allocated independently of `module_arena` so we

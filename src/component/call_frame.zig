@@ -160,13 +160,20 @@ pub const InterpFrame = struct {
 /// the operand stack.
 pub const AotFrame = struct {
     ai: *aot_runtime.AotInstance,
-    /// Args buffered by `pushSlot` / `pushSlotsU32`, consumed by the
-    /// next `executeCore`. Caller-owned allocator.
+    /// Inline fast-path storage for up to 20 core arguments (covers
+    /// `MAX_FLAT_PARAMS == 16` plus retptr/task handles without heap alloc).
+    inline_args: [20]core_types.Value = undefined,
+    inline_arg_types: [20]core_types.ValType = undefined,
+    inline_arg_len: usize = 0,
+    /// Fallback heap buffers when a core function exceeds 20 arguments.
     args: std.ArrayList(core_types.Value),
     arg_types: std.ArrayList(core_types.ValType),
+    /// Inline fast-path storage for up to 4 scalar results.
+    inline_results: [4]aot_runtime.ScalarResult = undefined,
     /// Results from the most recent `executeCore`, consumed by
     /// `popSlot` / `popSlotsU32`.
     results: []aot_runtime.ScalarResult = &.{},
+    results_heap: bool = false,
     result_cursor: usize = 0,
     allocator: Allocator,
 
@@ -182,12 +189,26 @@ pub const AotFrame = struct {
     pub fn deinit(self: *AotFrame) void {
         self.args.deinit(self.allocator);
         self.arg_types.deinit(self.allocator);
-        if (self.results.len > 0) self.allocator.free(self.results);
+        if (self.results_heap and self.results.len > 0) {
+            self.allocator.free(self.results);
+        }
     }
 
     pub fn pushSlot(self: *AotFrame, v: core_types.Value) FrameError!void {
+        const vt = std.meta.activeTag(v);
+        if (self.args.items.len == 0 and self.inline_arg_len < self.inline_args.len) {
+            self.inline_args[self.inline_arg_len] = v;
+            self.inline_arg_types[self.inline_arg_len] = vt;
+            self.inline_arg_len += 1;
+            return;
+        }
+        if (self.args.items.len == 0 and self.inline_arg_len > 0) {
+            self.args.appendSlice(self.allocator, self.inline_args[0..self.inline_arg_len]) catch return error.OutOfMemory;
+            self.arg_types.appendSlice(self.allocator, self.inline_arg_types[0..self.inline_arg_len]) catch return error.OutOfMemory;
+            self.inline_arg_len = 0;
+        }
         self.args.append(self.allocator, v) catch return error.OutOfMemory;
-        self.arg_types.append(self.allocator, std.meta.activeTag(v)) catch return error.OutOfMemory;
+        self.arg_types.append(self.allocator, vt) catch return error.OutOfMemory;
     }
 
     pub fn popSlot(self: *AotFrame, t: core_types.ValType) FrameError!core_types.Value {
@@ -279,40 +300,53 @@ pub const AotFrame = struct {
         // Free the previous result buffer (if any) before running the
         // next core call; popSlot consumed up to result_cursor but the
         // backing slice itself is owned by the frame.
-        if (self.results.len > 0) {
+        if (self.results_heap and self.results.len > 0) {
             self.allocator.free(self.results);
-            self.results = &.{};
-            self.result_cursor = 0;
         }
+        self.results = &.{};
+        self.results_heap = false;
+        self.result_cursor = 0;
+
         // `arg_types` is the canonical list of types we recorded as args
         // were pushed via `pushSlot`. The advisory `param_types` from
         // the caller is ignored — the active source of truth is what
         // the canon-ABI lowering actually emitted.
         _ = param_types;
 
-        const results_out = self.allocator.alloc(aot_runtime.ScalarResult, result_types.len) catch
-            return error.OutOfMemory;
-        errdefer self.allocator.free(results_out);
+        const use_heap_results = result_types.len > self.inline_results.len;
+        const results_out: []aot_runtime.ScalarResult = if (use_heap_results)
+            self.allocator.alloc(aot_runtime.ScalarResult, result_types.len) catch
+                return error.OutOfMemory
+        else
+            self.inline_results[0..result_types.len];
+        errdefer if (use_heap_results) self.allocator.free(results_out);
+
+        const active_arg_types: []const core_types.ValType = if (self.args.items.len > 0)
+            self.arg_types.items
+        else
+            self.inline_arg_types[0..self.inline_arg_len];
+        const active_args: []const core_types.Value = if (self.args.items.len > 0)
+            self.args.items
+        else
+            self.inline_args[0..self.inline_arg_len];
 
         const got = aot_runtime.callFuncScalar(
             self.ai,
             func_idx.value(),
-            self.arg_types.items,
+            active_arg_types,
             result_types,
-            self.args.items,
+            active_args,
             results_out,
         ) catch return error.TrapInCoreFunction;
 
         // Reset args for the next call (e.g. a subsequent post_return).
+        self.inline_arg_len = 0;
         self.args.clearRetainingCapacity();
         self.arg_types.clearRetainingCapacity();
 
-        // Convert the (slice-into-out) view into an owned slice of the
-        // same allocator. `aot_runtime.callFuncScalar` returns a slice
-        // pointing into `results_out`; we keep the whole `results_out`
-        // buffer to back popSlot.
         std.debug.assert(got.ptr == results_out.ptr);
         self.results = results_out;
+        self.results_heap = use_heap_results;
         self.result_cursor = got.len;
     }
 };
