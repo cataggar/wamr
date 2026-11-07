@@ -3162,6 +3162,7 @@ fn dispatchAsyncCanon(
                                     dst_slice[tail_offset..total_bytes],
                                 ) catch return error.OutOfMemory;
                             }
+                            if (got_count > 0) s.zero_copy_transfers +%= 1;
                             env.pushI32(@bitCast(async_canon.packStatus(
                                 .completed,
                                 got_count,
@@ -3275,11 +3276,12 @@ fn dispatchAsyncCanon(
                             ))) catch return error.StackOverflow;
                             return;
                         }
+                        const got_count: u32 = @as(u32, @intCast(got)) / elem_size;
+                        if (got_count > 0) s.zero_copy_transfers +%= 1;
                         stream_lease.release();
                         if (release_context) |release| {
                             release(callback_context);
                         }
-                        const got_count: u32 = @as(u32, @intCast(got)) / elem_size;
                         env.pushI32(@bitCast(async_canon.packStatus(
                             .completed,
                             got_count,
@@ -3318,6 +3320,45 @@ fn dispatchAsyncCanon(
                     );
                 }
                 env.pushI32(@bitCast(async_canon.packStatus(.completed, take))) catch
+                    return error.StackOverflow;
+                return;
+            }
+
+            // Writer parked first with empty FIFO (#1134): copy directly from
+            // the parked writer's guest linear-memory slice into the reader's
+            // destination slice without allocating in `s.buffer`.
+            if (s.pending_write) |pw| {
+                if (pw.elem_size != elem_size) return error.LowerError;
+                const transfer_count = @min(max_count, pw.count);
+                const transfer_bytes = std.math.mul(u32, transfer_count, elem_size) catch
+                    return error.MemoryNotAvailable;
+                const pw_total_bytes = std.math.mul(u32, pw.count, elem_size) catch
+                    return error.MemoryNotAvailable;
+                const src = comp_inst.readGuestBytes(pw.guest_ptr, pw_total_bytes) orelse
+                    return error.MemoryNotAvailable;
+                const dst = comp_inst.writableGuestBytes(guest_ptr, transfer_bytes) orelse
+                    return error.MemoryNotAvailable;
+                copyGuestMemoryBytes(dst, src[0..transfer_bytes]);
+                s.zero_copy_transfers +%= 1;
+
+                var writer_completed_count: u32 = transfer_count;
+                if (pw.count > transfer_count) {
+                    const rem_bytes = pw_total_bytes - transfer_bytes;
+                    if (s.buffer_limit == null or rem_bytes <= s.buffer_limit.?) {
+                        s.buffer.appendSlice(comp_inst.allocator, src[transfer_bytes..pw_total_bytes]) catch
+                            return error.OutOfMemory;
+                        writer_completed_count = pw.count;
+                    }
+                }
+                s.pending_write = null;
+                s.write_ready = true;
+                const write_waitable = s.write_waitable;
+                stream_lease.release();
+                _ = comp_inst.notifyWaitable(
+                    write_waitable,
+                    async_canon.packStatus(.completed, writer_completed_count),
+                );
+                env.pushI32(@bitCast(async_canon.packStatus(.completed, transfer_count))) catch
                     return error.StackOverflow;
                 return;
             }
@@ -3436,6 +3477,7 @@ fn dispatchAsyncCanon(
                     }
                     s = stream_lease.value();
                     s.host_write_inflight = false;
+                    if (accepted) s.zero_copy_transfers +%= 1;
                     stream_lease.release();
                     if (release_context) |release| {
                         release(callback_context);
@@ -3457,7 +3499,8 @@ fn dispatchAsyncCanon(
                 const transfer_bytes = transfer_count * elem_size;
                 const dst = comp_inst.writableGuestBytes(pr.guest_ptr, transfer_bytes) orelse
                     return error.MemoryNotAvailable;
-                @memcpy(dst, src[0..transfer_bytes]);
+                copyGuestMemoryBytes(dst, src[0..transfer_bytes]);
+                s.zero_copy_transfers +%= 1;
 
                 // Any tail past `transfer_count` overflows the parked
                 // reader's request; buffer it for the next reader.
@@ -3523,6 +3566,7 @@ fn dispatchAsyncCanon(
                         s.host_write_inflight = false;
                         switch (action) {
                             .progressed => {
+                                if (callback_kind == .from) s.zero_copy_transfers +%= 1;
                                 env.pushI32(@bitCast(async_canon.packStatus(.completed, count))) catch
                                     return error.StackOverflow;
                                 return;
@@ -4110,14 +4154,23 @@ fn dispatchAsyncCanon(
             const ws_handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
 
             const is_wait = op == .waitable_set_wait;
-            //Bounded drive loop. Each iteration first asks the host
-            // async-event driver to advance time / drain host I/O,
-            // then re-checks `popReadyEvent`. Caps total iterations
-            // to keep the runtime responsive when the guest has
-            // non-host work (e.g. `futures::join!` peer rendezvous
-            // — the cli-stdio-roundtrip path).
+            const active_coro = if (is_wait) async_mod.coro.getActiveTask() else null;
+            if (active_coro) |task| {
+                task.suspendTask();
+            }
+            defer if (active_coro) |task| {
+                task.resumeTask();
+            };
+
+            // Bounded drive loop. Each iteration first asks the host
+            // async-event driver (or `std.Io.Event` on `WaitableSet`) to
+            // advance time / drain host I/O / run cooperative subtasks,
+            // then re-checks `popReadyEvent`.
             try runReadyComponentThreads(comp_inst, thread_context, task_manager, allocator);
-            const max_iters: usize = if (is_wait) 256 else 1;
+            _ = drivePendingHostStreamReads(comp_inst, allocator);
+            const has_driver = comp_inst.async_event_driver != null;
+            const has_shared_workers = comp_inst.threads.hasActiveSharedThreads();
+            const max_iters: usize = if (!is_wait) 1 else if (has_driver) 256 else if (has_shared_workers) 8 else 2;
             var iter: usize = 0;
             while (iter < max_iters) : (iter += 1) {
                 var waitable_lease = comp_inst.waitable_sets.acquire(ws_handle) orelse {
@@ -4125,6 +4178,12 @@ fn dispatchAsyncCanon(
                     return;
                 };
                 const item = waitable_lease.value().popReadyEvent();
+                const has_registered = blk: {
+                    for (waitable_lease.value().items.items) |it| {
+                        if (it.active) break :blk true;
+                    }
+                    break :blk false;
+                };
                 waitable_lease.release();
                 if (item) |ready_item| {
                     if (out_ptr != 0) {
@@ -4138,12 +4197,36 @@ fn dispatchAsyncCanon(
                     return;
                 }
                 if (!is_wait) break;
-                const driver = comp_inst.async_event_driver orelse break;
-                // ~10ms-per-iteration budget: short enough to stay
-                // responsive, long enough to coalesce many timers.
-                // The driver is allowed to ignore the hint when it
-                // has due work to deliver immediately.
-                _ = driver(comp_inst.async_event_driver_ctx, comp_inst, 10 * std.time.ns_per_ms, allocator);
+                try runReadyComponentThreads(comp_inst, thread_context, task_manager, allocator);
+                if (drivePendingHostStreamReads(comp_inst, allocator)) continue;
+
+                if (comp_inst.async_event_driver) |driver| {
+                    // ~10ms-per-iteration budget: short enough to stay
+                    // responsive, long enough to coalesce many timers.
+                    // The driver is allowed to ignore the hint when it
+                    // has due work to deliver immediately.
+                    _ = driver(comp_inst.async_event_driver_ctx, comp_inst, 10 * std.time.ns_per_ms, allocator);
+                } else {
+                    if (!has_registered or !comp_inst.threads.hasActiveSharedThreads()) break;
+                    var wait_lease = comp_inst.waitable_sets.acquire(ws_handle) orelse break;
+                    if (!wait_lease.value().hasReady()) {
+                        const ready_event = &wait_lease.value().ready_event;
+                        wait_lease.unlock();
+                        ready_event.waitTimeout(std.Io.Threaded.global_single_threaded.io(), .{
+                            .duration = .{
+                                .raw = std.Io.Duration.fromNanoseconds(@intCast(1 * std.time.ns_per_ms)),
+                                .clock = .awake,
+                            },
+                        }) catch {};
+                        wait_lease.lock();
+                    }
+                    const survived = !wait_lease.isClosing();
+                    wait_lease.release();
+                    if (!survived) {
+                        comp_inst.waitable_sets.collectRetired();
+                        break;
+                    }
+                }
             }
 
             // No ready waitable — `none` event-code. Caller (wit-bindgen
@@ -4388,6 +4471,20 @@ fn dispatchAsyncCanon(
             const current_idx = comp_inst.threads.activeThreadIdx();
             if (current_idx == 0) return error.Trap;
             const current_entry = comp_inst.threads.get(current_idx) orelse return error.Trap;
+            const sp_binding = resolveComponentThreadSpBinding(comp_inst, current_entry);
+            if (sp_binding) |spb| {
+                current_entry.saved_sp_global = spb.read();
+            }
+            const active_coro = async_mod.coro.getActiveTask();
+            var coro_resumed = false;
+            if (active_coro) |task| {
+                task.suspendTask();
+            }
+            defer if (!coro_resumed) {
+                if (active_coro) |task| {
+                    task.resumeTask();
+                }
+            };
             current_entry.state = .suspended;
             try runReadyComponentThreads(comp_inst, thread_context, task_manager, allocator);
             comp_inst.threads.mutex.lock();
@@ -4395,6 +4492,12 @@ fn dispatchAsyncCanon(
             comp_inst.threads.mutex.unlock();
             if (comp_inst.threads.get(current_idx)) |ce| {
                 ce.state = .running;
+                if (active_coro) |task| {
+                    task.resumeTask();
+                    coro_resumed = true;
+                } else if (sp_binding) |spb| {
+                    if (ce.saved_sp_global != 0) spb.write(ce.saved_sp_global);
+                }
                 comp_inst.threads.removeFromReadyQueue(current_idx);
             }
             const outcome = threadCancellationOutcome(info.cancellable, task_manager, allocator);
@@ -5065,6 +5168,39 @@ fn joinSharedComponentThreads(comp_inst: *ComponentInstance) ExecutionError!void
     }
 }
 
+fn copyGuestMemoryBytes(dst: []u8, src: []const u8) void {
+    std.debug.assert(dst.len == src.len);
+    if (dst.len == 0 or @intFromPtr(dst.ptr) == @intFromPtr(src.ptr)) return;
+    if (@intFromPtr(dst.ptr) < @intFromPtr(src.ptr)) {
+        std.mem.copyForwards(u8, dst, src);
+    } else {
+        std.mem.copyBackwards(u8, dst, src);
+    }
+}
+
+fn resolveComponentThreadSpBinding(
+    comp_inst: *ComponentInstance,
+    entry: *const async_mod.ComponentThread,
+) ?async_mod.coro.StackPointerBinding {
+    return switch (entry.target) {
+        .interp => |t| blk: {
+            const mi: *core_types.ModuleInstance = @ptrCast(@alignCast(t.module_inst_ptr));
+            const b = async_mod.coro.StackPointerBinding.fromModuleInstance(mi);
+            break :blk if (b != .wasm_global) b else null;
+        },
+        .implicit_main => blk: {
+            for (comp_inst.core_instances) |ci_entry| {
+                if (ci_entry.module_inst) |mi| {
+                    const b = async_mod.coro.StackPointerBinding.fromModuleInstance(mi);
+                    if (b != .wasm_global) break :blk b;
+                }
+            }
+            break :blk null;
+        },
+        .aot => null,
+    };
+}
+
 fn executeComponentThread(
     comp_inst: *ComponentInstance,
     thread_idx: u32,
@@ -5081,13 +5217,29 @@ fn executeComponentThread(
 
     const prev_thread_idx = comp_inst.threads.activeThreadIdx();
     const target = entry.target;
+    const sp_binding = resolveComponentThreadSpBinding(comp_inst, entry);
+    const saved_caller_sp: ?u64 = if (sp_binding) |spb| spb.read() else null;
+    if (sp_binding) |spb| {
+        if (entry.saved_sp_global != 0) {
+            spb.write(entry.saved_sp_global);
+        }
+    }
     comp_inst.threads.removeFromReadyQueue(thread_idx);
     entry.state = .running;
     entry.in_flight = true;
+    entry.coro_started = true;
     comp_inst.threads.mutex.lock();
     comp_inst.threads.current_thread_idx = thread_idx;
     comp_inst.threads.mutex.unlock();
     defer {
+        if (sp_binding) |spb| {
+            if (saved_caller_sp) |caller_sp| {
+                spb.write(caller_sp);
+            }
+        }
+        if (comp_inst.threads.get(thread_idx)) |e| {
+            e.coro_completed = true;
+        }
         comp_inst.threads.mutex.lock();
         comp_inst.threads.current_thread_idx = prev_thread_idx;
         comp_inst.threads.mutex.unlock();
@@ -5171,6 +5323,20 @@ fn switchComponentThread(
         return error.Trap;
     }
     const should_run_target = if (is_promote) target_entry.state == .ready else true;
+    const sp_binding = resolveComponentThreadSpBinding(comp_inst, current_entry);
+    if (sp_binding) |spb| {
+        current_entry.saved_sp_global = spb.read();
+    }
+    const active_coro = async_mod.coro.getActiveTask();
+    var coro_resumed = false;
+    if (active_coro) |task| {
+        task.suspendTask();
+    }
+    defer if (!coro_resumed) {
+        if (active_coro) |task| {
+            task.resumeTask();
+        }
+    };
 
     if (is_yield) {
         comp_inst.threads.enqueueReady(allocator, current_idx) catch return error.OutOfMemory;
@@ -5189,6 +5355,12 @@ fn switchComponentThread(
     if (comp_inst.threads.get(current_idx)) |ce| {
         ce.state = .running;
         comp_inst.threads.removeFromReadyQueue(current_idx);
+        if (active_coro) |task| {
+            task.resumeTask();
+            coro_resumed = true;
+        } else if (sp_binding) |spb| {
+            if (ce.saved_sp_global != 0) spb.write(ce.saved_sp_global);
+        }
     }
 
     return threadCancellationOutcome(cancellable, task_manager, allocator);
@@ -5267,6 +5439,7 @@ pub fn drivePendingHostStreamReads(
                                     };
                                 }
                                 if (count > 0) {
+                                    stream.zero_copy_transfers +%= 1;
                                     stream.pending_read = null;
                                     registration = stream.read_waitable orelse continue;
                                     stream_lease.release();
@@ -9651,6 +9824,58 @@ pub const ComponentTrampolineCtx = struct {
 ///
 /// Either spill path requires `lower_opts.memory_idx` to resolve the linear
 /// memory; if absent the trampoline traps.
+fn singleFlatCoreType(registry: TypeRegistry, vt: ctypes.ValType) ctypes.CoreValType {
+    return switch (vt) {
+        .s64, .u64 => .i64,
+        .f32 => .f32,
+        .f64 => .f64,
+        .record => |idx| blk: {
+            const td = registry.get(idx) orelse break :blk .i32;
+            for (td.record.fields) |f| {
+                if (abi.flattenCount(registry, f.type) > 0) break :blk singleFlatCoreType(registry, f.type);
+            }
+            break :blk .i32;
+        },
+        .tuple => |idx| blk: {
+            const td = registry.get(idx) orelse break :blk .i32;
+            for (td.tuple.fields) |f| {
+                if (abi.flattenCount(registry, f) > 0) break :blk singleFlatCoreType(registry, f);
+            }
+            break :blk .i32;
+        },
+        .type_idx => |idx| blk: {
+            const td = registry.get(idx) orelse break :blk .i32;
+            break :blk switch (td) {
+                .val => |inner| singleFlatCoreType(registry, inner),
+                .record => |r| rec: {
+                    for (r.fields) |f| {
+                        if (abi.flattenCount(registry, f.type) > 0) break :rec singleFlatCoreType(registry, f.type);
+                    }
+                    break :rec .i32;
+                },
+                .tuple => |tup| tup_blk: {
+                    for (tup.fields) |f| {
+                        if (abi.flattenCount(registry, f) > 0) break :tup_blk singleFlatCoreType(registry, f);
+                    }
+                    break :tup_blk .i32;
+                },
+                else => .i32,
+            };
+        },
+        else => .i32,
+    };
+}
+
+fn coreValueToFlatSlot(v: core_types.Value) u64 {
+    return switch (v) {
+        .i32 => |i| @as(u32, @bitCast(i)),
+        .i64 => |i| @bitCast(i),
+        .f32 => |f| @as(u32, @bitCast(f)),
+        .f64 => |f| @bitCast(f),
+        else => 0,
+    };
+}
+
 pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core_runtime_types.HostFnError!void {
     const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
     const ctx: *ComponentTrampolineCtx = @ptrCast(@alignCast(ctx_opaque.?));
@@ -9713,6 +9938,48 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
     var result_dest_ptr: u32 = 0;
     if (has_retptr) {
         result_dest_ptr = @bitCast(env.popI32() catch |err| return trampolineTrap(env, ctx, err, .lift_args));
+    }
+
+    // Comptime-generated flat canonical-ABI fast path (#1134): bypasses
+    // runtime `InterfaceValue` allocation and `TypeRegistry` traversal.
+    if (!is_async_lower and ctx.lift_target == null) {
+        if (ctx.host_func.call_flat) |call_flat| {
+            var flat_args: [MAX_FLAT_PARAMS]u64 = undefined;
+            const arg_count: usize = if (params_spill) 1 else flat_params;
+            var idx: usize = arg_count;
+            while (idx > 0) {
+                idx -= 1;
+                const val = env.pop() catch |err| return trampolineTrap(env, ctx, err, .lift_args);
+                flat_args[idx] = coreValueToFlatSlot(val);
+            }
+            var flat_results_buf: [MAX_FLAT_RESULTS]u64 = .{0};
+            var lower_binding: ComponentInstance.CanonLowerCallBinding = undefined;
+            const lower_scope = bindLowerCallContext(
+                ctx.comp_inst,
+                resolveLowerCallCtx(ctx.comp_inst, ctx.lower_opts),
+                &lower_binding,
+            );
+            defer if (lower_scope) |scope| scope.deinit();
+            call_flat(
+                ctx.host_func.context,
+                ctx.comp_inst,
+                flat_args[0..arg_count],
+                &flat_results_buf,
+                result_dest_ptr,
+                allocator,
+            ) catch |err| return trampolineTrap(env, ctx, err, .host_call);
+            if (!results_spill and flat_results == 1 and ctx.result_types.len > 0) {
+                const raw_res = flat_results_buf[0];
+                switch (singleFlatCoreType(registry, ctx.result_types[0])) {
+                    .i32 => env.pushI32(@bitCast(@as(u32, @truncate(raw_res)))) catch |err| return trampolineTrap(env, ctx, err, .lower_results),
+                    .i64 => env.pushI64(@bitCast(raw_res)) catch |err| return trampolineTrap(env, ctx, err, .lower_results),
+                    .f32 => env.pushF32(@bitCast(@as(u32, @truncate(raw_res)))) catch |err| return trampolineTrap(env, ctx, err, .lower_results),
+                    .f64 => env.pushF64(@bitCast(raw_res)) catch |err| return trampolineTrap(env, ctx, err, .lower_results),
+                    else => unreachable,
+                }
+            }
+            return;
+        }
     }
 
     // Lift args. Stack-buffer the common ≤8-param case so high-volume
@@ -10822,7 +11089,39 @@ fn dispatchAotComponentTrampoline(
     else
         TypeRegistry.init(ctx.comp_inst.component);
 
-    if (countFlatTypes(registry, ctx.param_types) > MAX_FLAT_PARAMS) return error.UnsupportedSignature;
+    const flat_params = countFlatTypes(registry, ctx.param_types);
+    if (flat_params > MAX_FLAT_PARAMS) return error.UnsupportedSignature;
+
+    if (ctx.lift_target == null) {
+        const result_is_int_or_void = lowered_sig.result_types.len == 0 or
+            (lowered_sig.result_types.len == 1 and
+                (lowered_sig.result_types[0] == .i32 or lowered_sig.result_types[0] == .i64));
+        if (result_is_int_or_void) {
+            if (ctx.host_func.call_flat) |call_flat| {
+                const retptr: u32 = if (lowered_sig.has_retptr)
+                    @truncate(regs[lowered_sig.param_types.len])
+                else
+                    0;
+                var flat_results_buf: [MAX_FLAT_RESULTS]u64 = .{0};
+                var lower_binding: ComponentInstance.CanonLowerCallBinding = undefined;
+                const lower_scope = bindLowerCallContext(
+                    ctx.comp_inst,
+                    resolveAotLowerCallCtx(ctx, caller_vmctx),
+                    &lower_binding,
+                );
+                defer if (lower_scope) |scope| scope.deinit();
+                try call_flat(
+                    ctx.host_func.context,
+                    ctx.comp_inst,
+                    regs[0..lowered_sig.param_types.len],
+                    &flat_results_buf,
+                    retptr,
+                    allocator,
+                );
+                return flat_results_buf[0];
+            }
+        }
+    }
 
     var args_stack_buf: [8]InterfaceValue = undefined;
     const args_heap: ?[]InterfaceValue = if (ctx.param_types.len <= args_stack_buf.len)
@@ -13597,42 +13896,49 @@ test "component shared-everything threads: thread.spawn-indirect (is_shared=true
         // mem[4] = thread.index()
         0x41, 0x04,
         0x10, 0x00,
-        0x36, 0x02, 0x00,
+        0x36, 0x02,
+        0x00,
         // mem[8] = available_parallelism(shared=true)
-        0x41, 0x08,
-        0x10, 0x02,
-        0x36, 0x02, 0x00,
+        0x41,
+        0x08, 0x10,
+        0x02, 0x36,
+        0x02, 0x00,
         // mem[12] = available_parallelism(shared=false)
         0x41, 0x0C,
         0x10, 0x03,
-        0x36, 0x02, 0x00,
+        0x36, 0x02,
+        0x00,
         // mem[32] = spawn_indirect(elem=0, ctx=0)
-        0x41, 0x20,
-        0x41, 0x00,
-        0x41, 0x00,
-        0x10, 0x01,
-        0x36, 0x02, 0x00,
+        0x41,
+        0x20, 0x41,
+        0x00, 0x41,
+        0x00, 0x10,
+        0x01, 0x36,
+        0x02, 0x00,
         // mem[36] = spawn_indirect(elem=0, ctx=1)
         0x41, 0x24,
         0x41, 0x00,
         0x41, 0x01,
         0x10, 0x01,
-        0x36, 0x02, 0x00,
+        0x36, 0x02,
+        0x00,
         // mem[40] = spawn_indirect(elem=0, ctx=2)
-        0x41, 0x28,
-        0x41, 0x00,
-        0x41, 0x02,
-        0x10, 0x01,
-        0x36, 0x02, 0x00,
+        0x41,
+        0x28, 0x41,
+        0x00, 0x41,
+        0x02, 0x10,
+        0x01, 0x36,
+        0x02, 0x00,
         // mem[44] = spawn_indirect(elem=0, ctx=3)
         0x41, 0x2C,
         0x41, 0x00,
         0x41, 0x03,
         0x10, 0x01,
-        0x36, 0x02, 0x00,
+        0x36, 0x02,
+        0x00,
         // return 1
-        0x41, 0x01,
-        0x0B,
+        0x41,
+        0x01, 0x0B,
     };
     const functions = [_]core_types_mod.WasmFunction{
         .{
@@ -13958,5 +14264,3 @@ test "component shared-everything threads: worker trap in thread.spawn-indirect 
     try testing.expect(inst.thread_termination.isTerminating());
     try testing.expectEqual(@as(usize, 0), inst.thread_manager.activeComponentThreadCount());
 }
-
-

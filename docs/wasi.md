@@ -776,6 +776,10 @@ against the upstream `v0.2.0-draft` WIT vendored under
 ## See also
 
 * [`README.md`](../README.md) — quick-start build / test invocations.
+* [`component-embed-wit-zigar.md`](component-embed-wit-zigar.md) —
+  build-time `.cwasm` component embedding, `wit-zigar` comptime host/guest
+  bindings, stackful coroutines, and zero-copy WASI 0.3 `stream<u8>`
+  deployment guide & benchmarks (#1134).
 * [`tests/wasi-conformance-audit.md`](../tests/wasi-conformance-audit.md)
   — date-stamped audit log behind `tests/wasi-testsuite-expectations.toml`
   (Preview 1 + 2; #583 C2 / PR #584).

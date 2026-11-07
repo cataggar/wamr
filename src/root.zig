@@ -155,6 +155,9 @@ pub const component_loader = @import("component/loader.zig");
 /// Component Model canonical ABI (lifting/lowering).
 pub const canonical_abi = @import("component/canonical_abi.zig");
 
+/// Comptime Component Model canonical ABI reflection and host/guest bindings (`wit-zigar`, #1134).
+pub const component_canon_comptime = @import("component/canon_comptime.zig");
+
 /// Component Model function executor.
 pub const component_executor = @import("component/executor.zig");
 
@@ -169,6 +172,9 @@ pub const component_aot_compile = @import("component/aot_compile.zig");
 
 /// Component Model async ABI (tasks, futures, streams).
 pub const component_async = @import("component/async.zig");
+
+/// Component Model stackful coroutine & shadow-stack runtime (#1134).
+pub const component_coro = @import("component/coro.zig");
 
 /// Component composition and linking.
 pub const component_compose = @import("component/compose.zig");
