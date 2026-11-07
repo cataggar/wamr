@@ -149,6 +149,204 @@ pub const LoadedManifest = struct {
     }
 };
 
+/// Per-core input descriptor for in-memory embedded AOT resolution
+/// (`@embedFile`-backed `.cwasm` slices paired with an embedded
+/// component binary).
+pub const EmbeddedCoreInput = struct {
+    idx: u32 = 0,
+    cwasm_bytes: []const u8,
+    sha256: ?[]const u8 = null,
+    core_sha256: ?[]const u8 = null,
+};
+
+/// In-memory counterpart to `LoadedManifest` for host binaries that
+/// embed `.wasm` and `.cwasm` artifacts via `@embedFile` with zero
+/// filesystem I/O. `pcs` borrows `cwasm_bytes` from the caller's
+/// embedded blobs and `core_wasm` directly from `expected_component_bytes`.
+pub const EmbeddedManifest = struct {
+    pcs: []const core_backend.PrecompiledCore,
+    allocator: std.mem.Allocator,
+
+    pub fn precompiledCores(self: *const EmbeddedManifest) []const core_backend.PrecompiledCore {
+        return self.pcs;
+    }
+
+    pub fn instantiationOptions(self: *const EmbeddedManifest) core_backend.Options {
+        return .{ .precompiled_cores = self.pcs };
+    }
+
+    pub fn deinit(self: *EmbeddedManifest) void {
+        self.allocator.free(self.pcs);
+    }
+};
+
+/// Compute the lowercase hex SHA-256 digest of `bytes`.
+pub fn sha256Hex(bytes: []const u8) [64]u8 {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    var hex_buf: [64]u8 = undefined;
+    const hex_chars = "0123456789abcdef";
+    for (digest, 0..) |b, i| {
+        hex_buf[i * 2] = hex_chars[b >> 4];
+        hex_buf[i * 2 + 1] = hex_chars[b & 0x0f];
+    }
+    return hex_buf;
+}
+
+/// Resolve an in-memory list of embedded `.cwasm` cores against an
+/// embedded component binary without any filesystem I/O.
+///
+/// Parses `expected_component_bytes` into a scratch arena, recursively
+/// Resolve in-memory `@embedFile` `.cwasm` slices against a parsed
+/// `ctypes.Component` without performing any filesystem I/O.
+///
+/// Walks all `core_modules` across the root component and any nested
+/// sub-components, verifies optional `sha256` digests on each `.cwasm`,
+/// and binds each entry's `core_wasm` slice directly into `live`'s
+/// `core_modules` so `Options.findPrecompiledEntry` matches by slice
+/// identity during `instance.instantiateWithOptions`.
+pub fn resolveEmbeddedCoresForComponent(
+    allocator: std.mem.Allocator,
+    live: *const ctypes.Component,
+    cores: []const EmbeddedCoreInput,
+) LoadError!EmbeddedManifest {
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+
+    const Visit = struct { data: []const u8, local_idx: u32, hex: [64]u8, consumed: bool = false };
+    var visits: std.ArrayList(Visit) = .empty;
+    defer visits.deinit(scratch.allocator());
+
+    const Walker = struct {
+        fn walk(
+            comp: *const ctypes.Component,
+            list: *std.ArrayList(Visit),
+            alloc: std.mem.Allocator,
+        ) error{OutOfMemory}!void {
+            for (comp.core_modules, 0..) |cm, mi| {
+                try list.append(alloc, .{
+                    .data = cm.data,
+                    .local_idx = @intCast(mi),
+                    .hex = sha256Hex(cm.data),
+                });
+            }
+            for (comp.components) |child| try walk(child, list, alloc);
+        }
+    };
+    Walker.walk(live, &visits, scratch.allocator()) catch return error.OutOfMemory;
+
+    const pcs = allocator.alloc(core_backend.PrecompiledCore, cores.len) catch return error.OutOfMemory;
+    errdefer allocator.free(pcs);
+
+    for (cores, 0..) |mod, i| {
+        if (mod.sha256) |expected_sha| {
+            const actual_sha = sha256Hex(mod.cwasm_bytes);
+            if (!std.mem.eql(u8, &actual_sha, expected_sha)) return error.CwasmHashMismatch;
+        }
+        if (mod.core_sha256) |want| {
+            const match = blk: {
+                for (visits.items) |*v| {
+                    if (!v.consumed and std.mem.eql(u8, &v.hex, want)) {
+                        v.consumed = true;
+                        break :blk v.*;
+                    }
+                }
+                for (visits.items) |v| {
+                    if (std.mem.eql(u8, &v.hex, want)) break :blk v;
+                }
+                break :blk null;
+            };
+            const v = match orelse return error.ManifestCoreMismatch;
+            pcs[i] = .{
+                .module_idx = v.local_idx,
+                .cwasm_bytes = mod.cwasm_bytes,
+                .core_wasm = v.data,
+            };
+        } else {
+            if (mod.idx >= live.core_modules.len) return error.ManifestCoreMismatch;
+            const cm = live.core_modules[mod.idx];
+            pcs[i] = .{
+                .module_idx = mod.idx,
+                .cwasm_bytes = mod.cwasm_bytes,
+                .core_wasm = cm.data,
+            };
+        }
+    }
+
+    return .{
+        .pcs = pcs,
+        .allocator = allocator,
+    };
+}
+
+/// Resolve in-memory `@embedFile` `.cwasm` slices against a component
+/// binary without performing any filesystem I/O.
+///
+/// Mirror of the resolution step in `loadManifest`: parses
+/// `expected_component_bytes` into a temporary `ctypes.Component`,
+/// walks all `core_modules` across the root component and any nested
+/// sub-components, verifies optional `sha256` digests on each `.cwasm`,
+/// and binds each entry's `core_wasm` slice directly into
+/// `expected_component_bytes` so `Options.findPrecompiledEntry` matches
+/// by slice identity during `instance.instantiateWithOptions`.
+pub fn resolveEmbeddedCores(
+    allocator: std.mem.Allocator,
+    expected_component_bytes: []const u8,
+    cores: []const EmbeddedCoreInput,
+) LoadError!EmbeddedManifest {
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const live = component_loader.load(expected_component_bytes, scratch.allocator()) catch
+        return error.ComponentParseFailed;
+    return resolveEmbeddedCoresForComponent(allocator, &live, cores);
+}
+
+/// Parse and validate an embedded `<stem>.cwasm.json` manifest string
+/// and its corresponding `@embedFile` `.cwasm` slices entirely in memory.
+pub fn loadEmbeddedManifest(
+    allocator: std.mem.Allocator,
+    manifest_json: []const u8,
+    cwasm_blobs: []const []const u8,
+    expected_component_bytes: []const u8,
+) LoadError!EmbeddedManifest {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const parsed = std.json.parseFromSliceLeaky(
+        Manifest,
+        arena.allocator(),
+        manifest_json,
+        .{ .ignore_unknown_fields = true },
+    ) catch return error.ManifestParseFailed;
+
+    if (parsed.version != 1 and parsed.version != manifest_format_version)
+        return error.ManifestVersionMismatch;
+    if (!std.mem.eql(u8, parsed.wamr_build_id, config.version))
+        return error.ManifestBuildIdMismatch;
+
+    const expected_comp_sha = sha256Hex(expected_component_bytes);
+    if (!std.mem.eql(u8, &expected_comp_sha, parsed.component_sha256))
+        return error.ManifestComponentMismatch;
+
+    if (cwasm_blobs.len != parsed.modules.len)
+        return error.ManifestCoreMismatch;
+
+    const inputs = arena.allocator().alloc(EmbeddedCoreInput, parsed.modules.len) catch
+        return error.OutOfMemory;
+    for (parsed.modules, 0..) |mod, i| {
+        const blob_sha = sha256Hex(cwasm_blobs[i]);
+        if (!std.mem.eql(u8, &blob_sha, mod.sha256)) return error.CwasmHashMismatch;
+        inputs[i] = .{
+            .idx = mod.idx,
+            .cwasm_bytes = cwasm_blobs[i],
+            .sha256 = mod.sha256,
+            .core_sha256 = mod.core_sha256,
+        };
+    }
+
+    return resolveEmbeddedCores(allocator, expected_component_bytes, inputs);
+}
+
 /// Options controlling `precompileComponent`. Today only the target
 /// arch is exposed; future options (opt level, dump-ir hooks, …) slot
 /// in here without breaking the API.
@@ -363,4 +561,252 @@ test "defaultManifestPathFor: strips .wasm and appends .cwasm.json (#645)" {
     const c = try defaultManifestPathFor(alloc, "/tmp/a.wasm.bak");
     defer alloc.free(c);
     try std.testing.expectEqualStrings("/tmp/a.wasm.bak.cwasm.json", c);
+}
+
+const test_core_wasm = [_]u8{
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f,
+    0x03, 0x02, 0x01, 0x00, 0x05, 0x03, 0x01, 0x00,
+    0x01, 0x07, 0x12, 0x02, 0x06, 'm',  'e',  'm',
+    'o',  'r',  'y',  0x02, 0x00, 0x05, 'a',  'd',
+    'd',  '4',  '2',  0x00, 0x00, 0x0a, 0x09, 0x01,
+    0x07, 0x00, 0x20, 0x00, 0x41, 0x2a, 0x6a, 0x0b,
+};
+
+fn writeTestLeb(out: *std.ArrayList(u8), allocator: std.mem.Allocator, v: u32) !void {
+    var x = v;
+    while (true) {
+        var b: u8 = @intCast(x & 0x7f);
+        x >>= 7;
+        if (x != 0) b |= 0x80;
+        try out.append(allocator, b);
+        if (x == 0) break;
+    }
+}
+
+fn buildTestMinimalComponent(allocator: std.mem.Allocator) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, &.{ 0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00 });
+    try out.append(allocator, 1);
+    try writeTestLeb(&out, allocator, @intCast(test_core_wasm.len));
+    try out.appendSlice(allocator, &test_core_wasm);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try writeTestLeb(&body, allocator, 1);
+    try body.append(allocator, 0x00);
+    try writeTestLeb(&body, allocator, 0);
+    try writeTestLeb(&body, allocator, 0);
+
+    try out.append(allocator, 2);
+    try writeTestLeb(&out, allocator, @intCast(body.items.len));
+    try out.appendSlice(allocator, body.items);
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn buildTestNestedComponent(allocator: std.mem.Allocator) ![]u8 {
+    const sub_bytes = try buildTestMinimalComponent(allocator);
+    defer allocator.free(sub_bytes);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, &.{ 0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00 });
+    try out.append(allocator, 4);
+    try writeTestLeb(&out, allocator, @intCast(sub_bytes.len));
+    try out.appendSlice(allocator, sub_bytes);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try writeTestLeb(&body, allocator, 1);
+    try body.append(allocator, 0x00);
+    try writeTestLeb(&body, allocator, 0);
+    try writeTestLeb(&body, allocator, 0);
+
+    try out.append(allocator, 5);
+    try writeTestLeb(&out, allocator, @intCast(body.items.len));
+    try out.appendSlice(allocator, body.items);
+
+    return out.toOwnedSlice(allocator);
+}
+
+test "resolveEmbeddedCores: resolves top-level and nested cores with zero-copy slice identity" {
+    const alloc = std.testing.allocator;
+    const comp_bytes = try buildTestMinimalComponent(alloc);
+    defer alloc.free(comp_bytes);
+
+    const fake_cwasm = "WAMR_CWASM_PAYLOAD_0";
+    const cwasm_sha = sha256Hex(fake_cwasm);
+    const core_sha = sha256Hex(&test_core_wasm);
+
+    // 1. Match by core_sha256 + verify cwasm sha256.
+    var embedded = try resolveEmbeddedCores(alloc, comp_bytes, &.{
+        .{
+            .idx = 0,
+            .cwasm_bytes = fake_cwasm,
+            .sha256 = &cwasm_sha,
+            .core_sha256 = &core_sha,
+        },
+    });
+    defer embedded.deinit();
+
+    const pcs = embedded.precompiledCores();
+    try std.testing.expectEqual(@as(usize, 1), pcs.len);
+    try std.testing.expectEqual(@as(u32, 0), pcs[0].module_idx);
+    try std.testing.expectEqual(@intFromPtr(fake_cwasm.ptr), @intFromPtr(pcs[0].cwasm_bytes.ptr));
+    try std.testing.expect(pcs[0].core_wasm != null);
+
+    // Parse component_bytes separately as `instantiateWithOptions` caller would,
+    // and verify `Options.findPrecompiledEntry` matches by slice identity.
+    var parse_arena = std.heap.ArenaAllocator.init(alloc);
+    defer parse_arena.deinit();
+    const live = try component_loader.load(comp_bytes, parse_arena.allocator());
+    const opts = embedded.instantiationOptions();
+    const matched = opts.findPrecompiledEntry(live.core_modules[0].data, 0);
+    try std.testing.expect(matched != null);
+    try std.testing.expectEqualSlices(u8, fake_cwasm, matched.?.cwasm_bytes);
+
+    // 2. Fallback match by idx when core_sha256 is null.
+    var fallback = try resolveEmbeddedCores(alloc, comp_bytes, &.{
+        .{ .idx = 0, .cwasm_bytes = fake_cwasm },
+    });
+    defer fallback.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fallback.precompiledCores().len);
+    try std.testing.expect(fallback.instantiationOptions().findPrecompiledEntry(live.core_modules[0].data, 0) != null);
+
+    // 3. Nested sub-component core resolution via core_sha256.
+    const nested_bytes = try buildTestNestedComponent(alloc);
+    defer alloc.free(nested_bytes);
+    var nested_embedded = try resolveEmbeddedCores(alloc, nested_bytes, &.{
+        .{
+            .idx = 0,
+            .cwasm_bytes = fake_cwasm,
+            .sha256 = &cwasm_sha,
+            .core_sha256 = &core_sha,
+        },
+    });
+    defer nested_embedded.deinit();
+    const nested_live = try component_loader.load(nested_bytes, parse_arena.allocator());
+    try std.testing.expectEqual(@as(usize, 0), nested_live.core_modules.len);
+    try std.testing.expectEqual(@as(usize, 1), nested_live.components.len);
+    const sub_core_data = nested_live.components[0].core_modules[0].data;
+    try std.testing.expect(nested_embedded.instantiationOptions().findPrecompiledEntry(sub_core_data, 0) != null);
+}
+
+test "resolveEmbeddedCores and loadEmbeddedManifest: reject hash, version, and core mismatches" {
+    const alloc = std.testing.allocator;
+    const comp_bytes = try buildTestNestedComponent(alloc);
+    defer alloc.free(comp_bytes);
+
+    const fake_cwasm = "WAMR_CWASM_NESTED_0";
+    const cwasm_sha = sha256Hex(fake_cwasm);
+    const core_sha = sha256Hex(&test_core_wasm);
+    const comp_sha = sha256Hex(comp_bytes);
+    const bad_sha = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    // Bad cwasm sha256 in resolveEmbeddedCores.
+    try std.testing.expectError(
+        error.CwasmHashMismatch,
+        resolveEmbeddedCores(alloc, comp_bytes, &.{
+            .{ .idx = 0, .cwasm_bytes = fake_cwasm, .sha256 = bad_sha, .core_sha256 = &core_sha },
+        }),
+    );
+
+    // Bad core_sha256 in resolveEmbeddedCores.
+    try std.testing.expectError(
+        error.ManifestCoreMismatch,
+        resolveEmbeddedCores(alloc, comp_bytes, &.{
+            .{ .idx = 0, .cwasm_bytes = fake_cwasm, .sha256 = &cwasm_sha, .core_sha256 = bad_sha },
+        }),
+    );
+
+    // Valid loadEmbeddedManifest round-trip in memory.
+    const manifest_json = try std.fmt.allocPrint(
+        alloc,
+        \\{{
+        \\  "version": {d},
+        \\  "wamr_build_id": "{s}",
+        \\  "component_sha256": "{s}",
+        \\  "modules": [
+        \\    {{
+        \\      "idx": 0,
+        \\      "path": "nested.0.cwasm",
+        \\      "sha256": "{s}",
+        \\      "core_sha256": "{s}"
+        \\    }}
+        \\  ]
+        \\}}
+    ,
+        .{ manifest_format_version, config.version, &comp_sha, &cwasm_sha, &core_sha },
+    );
+    defer alloc.free(manifest_json);
+
+    var loaded = try loadEmbeddedManifest(alloc, manifest_json, &.{fake_cwasm}, comp_bytes);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), loaded.precompiledCores().len);
+
+    // Corrupted cwasm blob triggers CwasmHashMismatch.
+    try std.testing.expectError(
+        error.CwasmHashMismatch,
+        loadEmbeddedManifest(alloc, manifest_json, &.{"corrupted"}, comp_bytes),
+    );
+
+    // Wrong blob count triggers ManifestCoreMismatch.
+    try std.testing.expectError(
+        error.ManifestCoreMismatch,
+        loadEmbeddedManifest(alloc, manifest_json, &.{}, comp_bytes),
+    );
+
+    // Wrong component bytes triggers ManifestComponentMismatch.
+    try std.testing.expectError(
+        error.ManifestComponentMismatch,
+        loadEmbeddedManifest(alloc, manifest_json, &.{fake_cwasm}, "wrong-component"),
+    );
+
+    // Invalid component binary in resolveEmbeddedCores triggers ComponentParseFailed.
+    try std.testing.expectError(
+        error.ComponentParseFailed,
+        resolveEmbeddedCores(alloc, "invalid-wasm", &.{}),
+    );
+
+    // Out-of-range idx when core_sha256 is null triggers ManifestCoreMismatch.
+    try std.testing.expectError(
+        error.ManifestCoreMismatch,
+        resolveEmbeddedCores(alloc, comp_bytes, &.{
+            .{ .idx = 99, .cwasm_bytes = fake_cwasm },
+        }),
+    );
+
+    // Malformed JSON triggers ManifestParseFailed.
+    try std.testing.expectError(
+        error.ManifestParseFailed,
+        loadEmbeddedManifest(alloc, "{not-json", &.{}, comp_bytes),
+    );
+
+    // Unsupported version triggers ManifestVersionMismatch.
+    const bad_ver_json = try std.fmt.allocPrint(
+        alloc,
+        "{{\"version\":99,\"wamr_build_id\":\"{s}\",\"component_sha256\":\"{s}\",\"modules\":[]}}",
+        .{ config.version, &comp_sha },
+    );
+    defer alloc.free(bad_ver_json);
+    try std.testing.expectError(
+        error.ManifestVersionMismatch,
+        loadEmbeddedManifest(alloc, bad_ver_json, &.{}, comp_bytes),
+    );
+
+    // Mismatched build id triggers ManifestBuildIdMismatch.
+    const bad_build_json = try std.fmt.allocPrint(
+        alloc,
+        "{{\"version\":{d},\"wamr_build_id\":\"stale-build\",\"component_sha256\":\"{s}\",\"modules\":[]}}",
+        .{ manifest_format_version, &comp_sha },
+    );
+    defer alloc.free(bad_build_json);
+    try std.testing.expectError(
+        error.ManifestBuildIdMismatch,
+        loadEmbeddedManifest(alloc, bad_build_json, &.{}, comp_bytes),
+    );
 }

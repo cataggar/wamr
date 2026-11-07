@@ -299,6 +299,20 @@ pub const HostFunc = struct {
         results: []InterfaceValue,
         allocator: std.mem.Allocator,
     ) anyerror!void = null,
+    /// Optional comptime-specialized flat-slot fast path (`wit-zigar`
+    /// `CanonLift` / `CanonLower`). When non-null, `componentTrampoline`
+    /// and `dispatchAotComponentTrampoline` can invoke the host function
+    /// directly with raw 64-bit flat core slots and optional `retptr`,
+    /// bypassing `[]InterfaceValue` allocation and dynamic `TypeRegistry`
+    /// walks on the hot path (#1134).
+    call_flat: ?*const fn (
+        ctx: ?*anyopaque,
+        ci: *ComponentInstance,
+        flat_args: []const u64,
+        flat_results: []u64,
+        retptr: u64,
+        allocator: std.mem.Allocator,
+    ) anyerror!void = null,
     /// Optional component-level function type index, for Phase 2B validation.
     type_idx: ?u32 = null,
 };
@@ -797,6 +811,11 @@ pub const ComponentInstance = struct {
         if (config.lib_wasi_threads) {} else null,
     realloc_env_owner: if (config.lib_wasi_threads) void else ?*core_types.ModuleInstance =
         if (config.lib_wasi_threads) {} else null,
+
+    /// Counter of `hostAllocGuest` (`cabi_realloc`) invocations on this
+    /// instance. Used by zero-copy `stream<u8>` and comptime binding tests
+    /// to verify zero `cabi_realloc` calls on the fast path (#1134).
+    realloc_call_count: usize = 0,
 
     /// Resolved canon-lower opts for an in-flight host import call.
     /// `memory` and `realloc` are pre-resolved from the canon-lower
@@ -1413,10 +1432,19 @@ pub const ComponentInstance = struct {
     /// Returns null if no such instance is present, the memory is missing,
     /// or the slice is out of bounds.
     pub fn readGuestBytes(self: *const ComponentInstance, ptr: u32, len: u32) ?[]const u8 {
+        return self.readGuestBytes64(ptr, len);
+    }
+
+    /// 64-bit (`wasm64` / `memory64` & `wasm32`) bounds-checked slice into
+    /// the active or canonical guest linear memory. Safely rejects overflow
+    /// and out-of-range addresses on both 32-bit and 64-bit hosts (#1134).
+    pub fn readGuestBytes64(self: *const ComponentInstance, ptr: u64, len: u64) ?[]const u8 {
+        const end64 = std.math.add(u64, ptr, len) catch return null;
+        const start = std.math.cast(usize, ptr) orelse return null;
+        const end = std.math.cast(usize, end64) orelse return null;
         if (self.test_mem) |tm| {
-            const end = @as(usize, ptr) + @as(usize, len);
             if (end > tm.buffer.len) return null;
-            return tm.buffer[ptr..end];
+            return tm.buffer[start..end];
         }
         // Mirror `writableGuestBytes`: when the in-flight canon-lower
         // pinned a specific `(memory $m)`, read from THAT memory so
@@ -1426,15 +1454,13 @@ pub const ComponentInstance = struct {
         // (#715.)
         if (self.activeCanonLowerCallCtx()) |cctx| {
             if (cctx.memory) |mem| {
-                const end = @as(usize, ptr) + @as(usize, len);
                 if (end > mem.byteLen()) return null;
-                return mem.data[ptr..end];
+                return mem.data[start..end];
             }
         }
         const mem = self.canonicalMemory() orelse return null;
-        const end = @as(usize, ptr) + @as(usize, len);
         if (end > mem.byteLen()) return null;
-        return mem.data[ptr..end];
+        return mem.data[start..end];
     }
 
     /// Return the "canonical" guest memory: the one that
@@ -1516,6 +1542,7 @@ pub const ComponentInstance = struct {
     /// host-constructed lists / strings into guest memory before the
     /// canonical ABI sees a `(ptr, len)` PtrLen.
     pub fn hostAllocGuest(self: *ComponentInstance, size: u32, align_: u32) ?u32 {
+        _ = @atomicRmw(usize, &self.realloc_call_count, .Add, 1, .monotonic);
         if (self.test_mem) |tm| return tm.alloc(size, align_);
         const saved_may_leave = @atomicLoad(bool, &self.may_leave, .acquire);
         @atomicStore(bool, &self.may_leave, false, .release);
@@ -1577,10 +1604,19 @@ pub const ComponentInstance = struct {
     /// test_mem shim) covering `[ptr, ptr+len)`. Returns null if the
     /// range is out of bounds.
     pub fn writableGuestBytes(self: *ComponentInstance, ptr: u32, len: u32) ?[]u8 {
+        return self.writableGuestBytes64(ptr, len);
+    }
+
+    /// 64-bit (`wasm64` / `memory64` & `wasm32`) bounds-checked mutable slice
+    /// into the active or canonical guest linear memory. Safely rejects
+    /// overflow and out-of-range addresses on both 32-bit and 64-bit hosts (#1134).
+    pub fn writableGuestBytes64(self: *ComponentInstance, ptr: u64, len: u64) ?[]u8 {
+        const end64 = std.math.add(u64, ptr, len) catch return null;
+        const start = std.math.cast(usize, ptr) orelse return null;
+        const end = std.math.cast(usize, end64) orelse return null;
         if (self.test_mem) |tm| {
-            const end = @as(usize, ptr) + @as(usize, len);
             if (end > tm.buffer.len) return null;
-            return tm.buffer[ptr..end];
+            return tm.buffer[start..end];
         }
         // When the in-flight canon-lower pinned a specific `(memory $m)`,
         // write into THAT memory — the `hostAllocGuest` ptr above came
@@ -1589,15 +1625,13 @@ pub const ComponentInstance = struct {
         // memory and silently corrupt unrelated guest state. (#715.)
         if (self.activeCanonLowerCallCtx()) |cctx| {
             if (cctx.memory) |mem| {
-                const end = @as(usize, ptr) + @as(usize, len);
                 if (end > mem.byteLen()) return null;
-                return mem.data[ptr..end];
+                return mem.data[start..end];
             }
         }
         const mem = self.canonicalMemory() orelse return null;
-        const end = @as(usize, ptr) + @as(usize, len);
         if (end > mem.byteLen()) return null;
-        return mem.data[ptr..end];
+        return mem.data[start..end];
     }
 
     /// Allocate `bytes.len` bytes in guest memory at `alignment` byte
